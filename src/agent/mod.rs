@@ -1221,7 +1221,10 @@ impl Agent {
                     crate::question::user_exchange_text(exchange),
                 ));
             }
-            messages.push(ChatMessage::plain("assistant", &turn.assistant_content));
+            messages.push(ChatMessage::plain(
+                "assistant",
+                assistant_replay_content(turn),
+            ));
             if !turn.tool_reports.is_empty() {
                 messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
             }
@@ -1362,11 +1365,24 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
             crate::question::user_exchange_text(exchange),
         ));
     }
-    messages.push(ChatMessage::plain("assistant", &turn.assistant_content));
+    messages.push(ChatMessage::plain(
+        "assistant",
+        assistant_replay_content(turn),
+    ));
     if !turn.tool_reports.is_empty() {
         messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
     }
     overflow::estimate_messages_tokens(&messages)
+}
+
+fn assistant_replay_content(turn: &crate::state::Turn) -> &str {
+    if !turn.assistant_content.trim().is_empty() {
+        return &turn.assistant_content;
+    }
+    turn.assistant_reasoning
+        .as_deref()
+        .filter(|reasoning| !reasoning.trim().is_empty())
+        .unwrap_or(&turn.assistant_content)
 }
 
 fn evicted_turn_entries(
@@ -2604,6 +2620,17 @@ mod tests {
 
         turn.tool_reports.push("persisted tool result".to_string());
         assert!(turn_context_tokens(&turn) > without_reports);
+
+        turn.tool_reports.clear();
+        turn.assistant_content.clear();
+        turn.assistant_reasoning = Some("replayed reasoning ".repeat(1_000));
+        assert_eq!(
+            assistant_replay_content(&turn),
+            turn.assistant_reasoning.as_deref().unwrap()
+        );
+        let with_replayed_reasoning = turn_context_tokens(&turn);
+        turn.assistant_reasoning = None;
+        assert!(with_replayed_reasoning > turn_context_tokens(&turn));
     }
 
     #[test]
