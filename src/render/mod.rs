@@ -1005,7 +1005,9 @@ impl StreamRenderer {
             self.switch_mode(chunk.kind)?;
         }
         let mut stdout = io::stdout();
-        if self.plain || chunk.kind == ChatStreamKind::Reasoning {
+        if chunk.kind == ChatStreamKind::Reasoning {
+            write_full_reasoning_chunk(&mut stdout, &text)?;
+        } else if self.plain {
             write!(stdout, "{text}")?;
         } else {
             write!(stdout, "{}", self.markdown.push(&text))?;
@@ -1205,12 +1207,11 @@ impl StreamRenderer {
                     self.clear_summary_lines()?;
                     self.end_active_stream_line()?;
                     let mut stdout = io::stdout();
-                    execute!(stdout, SetForegroundColor(Color::Green))?;
                     writeln!(stdout)?;
                     stdout.flush()?;
                 }
                 let mut stdout = io::stdout();
-                write!(stdout, "{text}")?;
+                write_full_reasoning_chunk(&mut stdout, &text)?;
                 stdout.flush()?;
                 self.subagent_mode = Some(ChatStreamKind::Reasoning);
             }
@@ -1396,7 +1397,6 @@ impl StreamRenderer {
                 if self.mode.is_some() {
                     writeln!(stdout)?;
                 }
-                execute!(stdout, SetForegroundColor(Color::Green))?;
             }
             ChatStreamKind::Content => {
                 if self.mode == Some(ChatStreamKind::Reasoning) {
@@ -3601,6 +3601,12 @@ fn normalize_stream_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn write_full_reasoning_chunk(writer: &mut impl Write, text: &str) -> Result<()> {
+    execute!(writer, SetForegroundColor(Color::Green))?;
+    write!(writer, "{text}")?;
+    Ok(())
+}
+
 fn print_reasoning(reasoning: &str) -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, SetForegroundColor(Color::Green))?;
@@ -3623,6 +3629,22 @@ mod tests {
             .into_iter()
             .map(|line| strip_ansi_for_test(&line))
             .collect()
+    }
+
+    #[test]
+    fn full_reasoning_reapplies_color_for_every_chunk() {
+        let mut green = Vec::new();
+        execute!(green, SetForegroundColor(Color::Green)).unwrap();
+        let green = String::from_utf8(green).unwrap();
+        let mut output = Vec::new();
+
+        write_full_reasoning_chunk(&mut output, "用户").unwrap();
+        execute!(output, ResetColor).unwrap();
+        write_full_reasoning_chunk(&mut output, "询问明天几号").unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches(&green).count(), 2);
+        assert!(output.ends_with("询问明天几号"));
     }
 
     #[test]
