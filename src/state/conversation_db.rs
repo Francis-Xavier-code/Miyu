@@ -4,6 +4,7 @@ use crate::question::QuestionExchange;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -50,11 +51,40 @@ pub struct Turn {
     pub status: TurnStatus,
     pub tool_reports: Vec<String>,
     pub question_exchanges: Vec<QuestionExchange>,
+    pub followups: Vec<TurnFollowup>,
     pub hidden: bool,
     pub is_summary: bool,
     pub owner_pid: Option<i64>,
     pub token_total: u64,
     pub token_usage_estimated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueuedPromptAttachment {
+    Binary { mime: String, data_base64: String },
+    Path { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedPrompt {
+    pub prompt_id: String,
+    pub seq: i64,
+    pub content: String,
+    pub display_content: String,
+    pub attachments: Vec<QueuedPromptAttachment>,
+    pub submitted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFollowup {
+    pub prompt_id: String,
+    pub content: String,
+    pub display_content: String,
+    pub attachments: Vec<QueuedPromptAttachment>,
+    pub submitted_at: String,
+    pub preceding_assistant_content: Option<String>,
+    pub preceding_assistant_reasoning: Option<String>,
 }
 
 pub struct ConversationDb {
@@ -106,6 +136,29 @@ impl ConversationDb {
             CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status);",
         )?;
         conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS queued_prompts (
+                seq                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_id                   TEXT NOT NULL UNIQUE,
+                content                     TEXT NOT NULL,
+                display_content             TEXT NOT NULL,
+                attachments                 TEXT NOT NULL DEFAULT '[]',
+                status                      TEXT NOT NULL DEFAULT 'queued',
+                submitted_at                TEXT NOT NULL,
+                queue_session_id             TEXT,
+                owner_pid                    INTEGER,
+                consumed_at                 TEXT,
+                turn_id                     TEXT,
+                context_content              TEXT,
+                preceding_assistant_content  TEXT,
+                preceding_assistant_reasoning TEXT,
+                FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_queued_prompts_status_seq
+                ON queued_prompts(status, seq);
+            CREATE INDEX IF NOT EXISTS idx_queued_prompts_turn_seq
+                ON queued_prompts(turn_id, seq);",
+        )?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_loaded_items (
                 kind            TEXT NOT NULL,
                 name            TEXT NOT NULL,
@@ -134,10 +187,14 @@ impl ConversationDb {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         add_column_if_missing(&conn, "turns", "compact_parent_summary_seq", "INTEGER")?;
+        add_column_if_missing(&conn, "queued_prompts", "queue_session_id", "TEXT")?;
+        add_column_if_missing(&conn, "queued_prompts", "owner_pid", "INTEGER")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_turns_visible_seq ON turns(hidden, seq);
              CREATE INDEX IF NOT EXISTS idx_turns_visible_summary_seq
-                 ON turns(is_summary, hidden, seq);",
+                 ON turns(is_summary, hidden, seq);
+             CREATE INDEX IF NOT EXISTS idx_queued_prompts_session_status_seq
+                 ON queued_prompts(queue_session_id, status, seq);",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -240,6 +297,180 @@ impl ConversationDb {
         Ok(())
     }
 
+    pub fn enqueue_prompt(
+        &self,
+        prompt_id: &str,
+        content: &str,
+        display_content: &str,
+        attachments: &[QueuedPromptAttachment],
+        queue_session_id: &str,
+        owner_pid: u32,
+    ) -> Result<QueuedPrompt> {
+        let conn = self.conn.lock().unwrap();
+        let submitted_at = Utc::now().to_rfc3339();
+        let attachments_json = serde_json::to_string(attachments)?;
+        conn.execute(
+            "INSERT INTO queued_prompts
+                (prompt_id, content, display_content, attachments, status, submitted_at,
+                 queue_session_id, owner_pid)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7)",
+            params![
+                prompt_id,
+                content,
+                display_content,
+                attachments_json,
+                submitted_at,
+                queue_session_id,
+                owner_pid as i64
+            ],
+        )?;
+        let seq = conn.last_insert_rowid();
+        Ok(QueuedPrompt {
+            prompt_id: prompt_id.to_string(),
+            seq,
+            content: content.to_string(),
+            display_content: display_content.to_string(),
+            attachments: attachments.to_vec(),
+            submitted_at,
+        })
+    }
+
+    pub fn load_queued_prompts(&self, queue_session_id: &str) -> Result<Vec<QueuedPrompt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT prompt_id, seq, content, display_content, attachments, submitted_at
+             FROM queued_prompts
+             WHERE status = 'queued' AND queue_session_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![queue_session_id], |row| {
+                let attachments_json: String = row.get(4)?;
+                let attachments = serde_json::from_str(&attachments_json).unwrap_or_default();
+                Ok(QueuedPrompt {
+                    prompt_id: row.get(0)?,
+                    seq: row.get(1)?,
+                    content: row.get(2)?,
+                    display_content: row.get(3)?,
+                    attachments,
+                    submitted_at: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn consume_queued_prompts(
+        &self,
+        turn_id: &str,
+        prompts: &[(String, String)],
+        preceding_assistant_content: Option<&str>,
+        preceding_assistant_reasoning: Option<&str>,
+        queue_session_id: &str,
+    ) -> Result<()> {
+        if prompts.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let running: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE turn_id = ?1 AND status = 'running')",
+            params![turn_id],
+            |row| row.get(0),
+        )?;
+        if !running {
+            bail!("cannot consume queued prompts into a non-running turn");
+        }
+        let consumed_at = Utc::now().to_rfc3339();
+        for (index, (prompt_id, context_content)) in prompts.iter().enumerate() {
+            let preceding_content = (index == 0)
+                .then_some(preceding_assistant_content)
+                .flatten();
+            let preceding_reasoning = (index == 0)
+                .then_some(preceding_assistant_reasoning)
+                .flatten();
+            let affected = tx.execute(
+                "UPDATE queued_prompts
+                  SET status = 'consumed', consumed_at = ?1, turn_id = ?2,
+                      context_content = ?3, preceding_assistant_content = ?4,
+                      preceding_assistant_reasoning = ?5
+                  WHERE prompt_id = ?6 AND status = 'queued' AND queue_session_id = ?7",
+                params![
+                    consumed_at,
+                    turn_id,
+                    context_content,
+                    preceding_content,
+                    preceding_reasoning,
+                    prompt_id,
+                    queue_session_id
+                ],
+            )?;
+            if affected != 1 {
+                bail!("queued prompt changed before it could be consumed: {prompt_id}");
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn discard_queued_prompts(&self, queue_session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM queued_prompts
+             WHERE status = 'queued' AND queue_session_id = ?1",
+            params![queue_session_id],
+        )?)
+    }
+
+    pub fn discard_stale_queued_prompts(
+        &self,
+        current_session_id: &str,
+        current_pid: u32,
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT prompt_id, queue_session_id, owner_pid
+             FROM queued_prompts WHERE status = 'queued'",
+        )?;
+        let queued_prompts = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let stale_prompt_ids = queued_prompts
+            .into_iter()
+            .filter_map(|row| {
+                let (prompt_id, session_id, owner_pid) = row;
+                if session_id.as_deref() == Some(current_session_id) {
+                    return None;
+                }
+                let owner_pid = owner_pid.and_then(|pid| u32::try_from(pid).ok());
+                let stale = session_id.is_none()
+                    || owner_pid == Some(current_pid)
+                    || !owner_pid.is_some_and(crate::alarm::process_exists);
+                stale.then_some(prompt_id)
+            })
+            .collect::<Vec<_>>();
+        drop(stmt);
+        if stale_prompt_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = conn.transaction()?;
+        let mut discarded = 0usize;
+        for prompt_id in stale_prompt_ids {
+            discarded += tx.execute(
+                "DELETE FROM queued_prompts WHERE prompt_id = ?1 AND status = 'queued'",
+                params![prompt_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(discarded)
+    }
+
     pub fn load_session_loaded_items(
         &self,
         kind: &str,
@@ -304,7 +535,7 @@ impl ConversationDb {
         let mut turns = stmt
             .query_map([], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        attach_question_exchanges_locked(&conn, &mut turns)?;
+        attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
@@ -320,7 +551,7 @@ impl ConversationDb {
         let mut turns = stmt
             .query_map(params![exclude_turn_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        attach_question_exchanges_locked(&conn, &mut turns)?;
+        attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
@@ -340,7 +571,7 @@ impl ConversationDb {
         let mut turns = stmt
             .query_map([], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        attach_question_exchanges_locked(&conn, &mut turns)?;
+        attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
@@ -355,7 +586,7 @@ impl ConversationDb {
         let mut turns = stmt
             .query_map(params![exclude_turn_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        attach_question_exchanges_locked(&conn, &mut turns)?;
+        attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
@@ -432,7 +663,7 @@ impl ConversationDb {
             .query_map(params![count as i64], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
-        attach_question_exchanges_locked(&conn, &mut to_remove)?;
+        attach_turn_children_locked(&conn, &mut to_remove)?;
         for turn in &to_remove {
             conn.execute(
                 "DELETE FROM turns WHERE turn_id = ?1",
@@ -456,7 +687,7 @@ impl ConversationDb {
         let mut turns = stmt
             .query_map(params![count], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        attach_question_exchanges_locked(&conn, &mut turns)?;
+        attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
@@ -599,6 +830,14 @@ impl ConversationDb {
 
     pub fn reset(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM queued_prompts", [])?;
+        conn.execute("DELETE FROM turns", [])?;
+        conn.execute("DELETE FROM session_loaded_items", [])?;
+        Ok(())
+    }
+
+    pub fn reset_history(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM turns", [])?;
         conn.execute("DELETE FROM session_loaded_items", [])?;
         Ok(())
@@ -724,7 +963,7 @@ impl ConversationDb {
     }
 
     pub fn recover_stale_running_turns(&self) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT turn_id, owner_pid FROM turns WHERE status = 'running'")?;
         let stale_turn_ids: Vec<String> = stmt
@@ -749,15 +988,20 @@ impl ConversationDb {
         if stale_turn_ids.is_empty() {
             return Ok(0);
         }
+        let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
         let mut affected = 0usize;
         for turn_id in &stale_turn_ids {
-            affected += conn.execute(
+            let turn_affected = tx.execute(
                 "UPDATE turns SET assistant_content = ?1, assistant_timestamp = ?2, status = 'interrupted'
                  WHERE turn_id = ?3 AND status = 'running'",
                 params![INTERRUPTED_TEXT, now, turn_id],
             )?;
+            if turn_affected == 1 {
+                affected += 1;
+            }
         }
+        tx.commit()?;
         Ok(affected)
     }
 
@@ -931,6 +1175,25 @@ fn turn_chars(turn: &Turn) -> usize {
             .filter_map(|exchange| serde_json::to_string(exchange).ok())
             .map(|exchange| exchange.chars().count())
             .sum::<usize>()
+        + turn
+            .followups
+            .iter()
+            .map(|followup| {
+                followup.content.chars().count()
+                    + followup
+                        .preceding_assistant_content
+                        .as_deref()
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or(0)
+                    + followup
+                        .preceding_assistant_reasoning
+                        .as_deref()
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or(0)
+            })
+            .sum::<usize>()
 }
 
 #[allow(dead_code)]
@@ -959,12 +1222,18 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
         tool_reports,
         question_exchanges: Vec::new(),
+        followups: Vec::new(),
         hidden: hidden != 0,
         is_summary: is_summary != 0,
         owner_pid: row.get(11)?,
         token_total: row.get::<_, i64>(12)?.max(0) as u64,
         token_usage_estimated: row.get::<_, i64>(13)? != 0,
     })
+}
+
+fn attach_turn_children_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+    attach_question_exchanges_locked(conn, turns)?;
+    attach_followups_locked(conn, turns)
 }
 
 fn attach_question_exchanges_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
@@ -997,6 +1266,55 @@ fn attach_question_exchanges_locked(conn: &Connection, turns: &mut [Turn]) -> Re
             let exchange = serde_json::from_str::<QuestionExchange>(&payload)
                 .with_context(|| format!("invalid question exchange for turn {turn_id}"))?;
             turns[index].question_exchanges.push(exchange);
+        }
+    }
+    Ok(())
+}
+
+fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+    if turns.is_empty() {
+        return Ok(());
+    }
+    let indexes = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.turn_id.clone(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let turn_ids = indexes.keys().collect::<Vec<_>>();
+    for chunk in turn_ids.chunks(900) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT prompt_id, turn_id, COALESCE(context_content, content), display_content,
+                    attachments, submitted_at, preceding_assistant_content,
+                    preceding_assistant_reasoning
+             FROM queued_prompts
+             WHERE status = 'consumed' AND turn_id IN ({placeholders})
+             ORDER BY seq ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                TurnFollowup {
+                    prompt_id: row.get(0)?,
+                    content: row.get(2)?,
+                    display_content: row.get(3)?,
+                    attachments: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or_default(),
+                    submitted_at: row.get(5)?,
+                    preceding_assistant_content: row.get(6)?,
+                    preceding_assistant_reasoning: row.get(7)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (turn_id, followup) = row?;
+            let Some(index) = indexes.get(&turn_id).copied() else {
+                continue;
+            };
+            turns[index].followups.push(followup);
         }
     }
     Ok(())

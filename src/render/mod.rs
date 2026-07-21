@@ -15,6 +15,15 @@ use std::io::{self, IsTerminal, Write};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+fn rendered_physical_rows(widths: &[usize], terminal_width: usize) -> u16 {
+    let columns = terminal_width.max(1);
+    widths
+        .iter()
+        .map(|width| (*width).max(1).div_ceil(columns))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReasoningDisplayMode {
     Hidden,
@@ -204,6 +213,20 @@ impl CommandLiveDisplay {
         Ok(())
     }
 
+    fn tick_changes_layout(&self) -> bool {
+        self.tick_changes_layout_at_width(command_terminal_width())
+    }
+
+    fn tick_changes_layout_at_width(&self, width: usize) -> bool {
+        let next_widths = self
+            .rendered_lines(width, true)
+            .iter()
+            .map(|line| command_ansi_width(line))
+            .collect::<Vec<_>>();
+        rendered_physical_rows(&self.rendered_line_widths, width)
+            != rendered_physical_rows(&next_widths, width)
+    }
+
     fn redraw(&mut self, spinning: bool) -> Result<()> {
         let width = command_terminal_width();
         let lines = self.rendered_lines(width, spinning);
@@ -257,13 +280,8 @@ impl CommandLiveDisplay {
         if self.rendered_line_widths.is_empty() {
             return Ok(());
         }
-        let columns = command_terminal_width().max(1);
-        let rendered_rows = self
-            .rendered_line_widths
-            .iter()
-            .map(|width| (*width).max(1).div_ceil(columns))
-            .sum::<usize>()
-            .min(u16::MAX as usize) as u16;
+        let rendered_rows =
+            rendered_physical_rows(&self.rendered_line_widths, command_terminal_width());
         let mut stdout = io::stdout();
         if rendered_rows > 1 {
             execute!(stdout, MoveUp(rendered_rows - 1))?;
@@ -693,6 +711,7 @@ pub struct StreamRenderer {
     plain: bool,
     mode: Option<ChatStreamKind>,
     cursor_hidden: bool,
+    external_cursor_control: bool,
     markdown: MarkdownStreamRenderer,
     reasoning_text: String,
     reasoning_tokens: usize,
@@ -709,6 +728,7 @@ pub struct StreamRenderer {
     live_summary: bool,
     wait_spinner: Option<WaitSpinner>,
     last_tick: Option<std::time::Instant>,
+    preparing_question_started_at: Option<std::time::Instant>,
     subagent_mode: Option<ChatStreamKind>,
     sent_meme_filter: SentMemeStreamFilter,
 }
@@ -727,6 +747,7 @@ impl StreamRenderer {
             plain,
             mode: None,
             cursor_hidden: false,
+            external_cursor_control: false,
             markdown: MarkdownStreamRenderer::new(),
             reasoning_text: String::new(),
             reasoning_tokens: 0,
@@ -743,9 +764,14 @@ impl StreamRenderer {
             live_summary: io::stdout().is_terminal(),
             wait_spinner: None,
             last_tick: None,
+            preparing_question_started_at: None,
             subagent_mode: None,
             sent_meme_filter: SentMemeStreamFilter::default(),
         }
+    }
+
+    pub fn use_external_cursor_control(&mut self) {
+        self.external_cursor_control = true;
     }
 
     pub fn start_waiting(&mut self) -> Result<()> {
@@ -765,6 +791,7 @@ impl StreamRenderer {
     }
 
     pub fn start_reasoning_phase(&mut self, received_at: std::time::Instant) -> Result<()> {
+        self.preparing_question_started_at = None;
         if self.reasoning_mode == ReasoningDisplayMode::Summary {
             self.reasoning_started_at = Some(received_at);
             self.reasoning_elapsed = None;
@@ -782,6 +809,13 @@ impl StreamRenderer {
     }
 
     fn waiting_phase_text(&self) -> String {
+        if let Some(started_at) = self.preparing_question_started_at {
+            return format!(
+                "{} · {}",
+                t("~ Preparing question", "~ 准备问题"),
+                format_reasoning_elapsed(started_at.elapsed())
+            );
+        }
         match self.reasoning_mode {
             ReasoningDisplayMode::Summary => {
                 if self.reasoning_title.is_some() || !self.reasoning_text.is_empty() {
@@ -865,7 +899,9 @@ impl StreamRenderer {
             .unwrap_or(true);
         if should_tick {
             let subagent_timer_active = self.has_running_subagent_timer();
-            if self.tool_call_mode == ToolCallDisplayMode::Summary
+            if self.preparing_question_started_at.is_some() && self.wait_spinner.is_some() {
+                self.set_waiting_phase(self.waiting_phase_text());
+            } else if self.tool_call_mode == ToolCallDisplayMode::Summary
                 && !self.tool_stats.is_empty()
                 && self.wait_spinner.is_some()
             {
@@ -892,6 +928,26 @@ impl StreamRenderer {
             }
         }
         Ok(())
+    }
+
+    pub fn chunk_changes_layout(&self, chunk: &ChatStreamChunk) -> bool {
+        match chunk.kind {
+            ChatStreamKind::Reasoning => self.reasoning_mode == ReasoningDisplayMode::Full,
+            ChatStreamKind::ReasoningReset
+            | ChatStreamKind::ReasoningPartStart
+            | ChatStreamKind::ReasoningPartEnd => false,
+            ChatStreamKind::Content | ChatStreamKind::ToolCall => true,
+        }
+    }
+
+    pub(crate) fn transient_output_changes_layout(&self) -> bool {
+        self.wait_spinner
+            .as_ref()
+            .is_some_and(WaitSpinner::tick_changes_layout)
+            || self
+                .command_display
+                .as_ref()
+                .is_some_and(CommandLiveDisplay::tick_changes_layout)
     }
 
     pub fn write_chunk(&mut self, chunk: ChatStreamChunk) -> Result<()> {
@@ -961,6 +1017,9 @@ impl StreamRenderer {
     pub fn write_tool_call(&mut self, name: &str, arguments: &str) -> Result<()> {
         if self.plain {
             return Ok(());
+        }
+        if name == "ask_question" {
+            return self.start_preparing_question();
         }
         self.release_transient_output()?;
         if is_silent_tool(name) {
@@ -1260,6 +1319,7 @@ impl StreamRenderer {
     }
 
     pub fn prepare_for_external_output(&mut self) -> Result<()> {
+        self.preparing_question_started_at = None;
         self.release_transient_output()?;
         self.finalize_tools_summary()?;
         self.show_cursor()?;
@@ -1298,6 +1358,7 @@ impl StreamRenderer {
     }
 
     pub fn finish(&mut self) -> Result<()> {
+        self.preparing_question_started_at = None;
         self.stop_waiting()?;
         if let Some(mut display) = self.command_display.take() {
             display.commit(self.tool_call_mode == ToolCallDisplayMode::Summary)?;
@@ -1668,6 +1729,9 @@ impl StreamRenderer {
     }
 
     fn hide_cursor(&mut self) -> Result<()> {
+        if self.external_cursor_control {
+            return Ok(());
+        }
         if !self.cursor_hidden && !self.plain && self.wait_spinner.is_none() {
             execute!(io::stdout(), Hide)?;
             self.cursor_hidden = true;
@@ -1676,6 +1740,9 @@ impl StreamRenderer {
     }
 
     fn show_cursor(&mut self) -> Result<()> {
+        if self.external_cursor_control {
+            return Ok(());
+        }
         if self.cursor_hidden && !self.plain {
             execute!(io::stdout(), Show)?;
             self.cursor_hidden = false;
@@ -1742,13 +1809,17 @@ impl StreamRenderer {
     }
 
     fn start_preparing_question(&mut self) -> Result<()> {
-        if self.plain || !WaitSpinner::supported() {
+        if self.plain || self.preparing_question_started_at.is_some() {
             return Ok(());
         }
         self.release_transient_output()?;
+        self.preparing_question_started_at = Some(std::time::Instant::now());
+        if !WaitSpinner::supported() {
+            return Ok(());
+        }
         self.hide_cursor()?;
         self.wait_spinner = Some(WaitSpinner::start(
-            t("~ Preparing question", "~ 准备提问").to_string(),
+            self.waiting_phase_text(),
             SpinnerStyle::Braille,
         ));
         self.last_tick = None;
@@ -3699,6 +3770,21 @@ mod tests {
     }
 
     #[test]
+    fn command_display_detects_output_row_growth_before_redraw() {
+        let mut display = CommandLiveDisplay::new(r#"{"command":"printf ok"}"#, 3, true);
+        display.rendered_line_widths = display
+            .rendered_lines(80, true)
+            .iter()
+            .map(|line| command_ansi_width(line))
+            .collect();
+        assert!(!display.tick_changes_layout_at_width(80));
+
+        display.push(CommandOutputStream::Stdout, b"one\n");
+
+        assert!(display.tick_changes_layout_at_width(80));
+    }
+
+    #[test]
     fn committed_command_blocks_end_with_exactly_one_blank_line() {
         let mut live = Vec::new();
         write_command_block_gap(&mut live, false).unwrap();
@@ -4717,6 +4803,42 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_summary_reserves_one_blank_line_before_subagent_activity() {
+        let mut output = Vec::new();
+        write_activity_summary(
+            &mut output,
+            "思考 · 59 词元 · 2.5s",
+            SummaryStyle::Reasoning,
+        )
+        .unwrap();
+        write!(output, "~ Linux 游戏兼容性调查×1 运行中").unwrap();
+        let output = strip_ansi_for_test(&String::from_utf8(output).unwrap());
+
+        assert_eq!(
+            output,
+            "思考 · 59 词元 · 2.5s\n\n~ Linux 游戏兼容性调查×1 运行中"
+        );
+    }
+
+    #[test]
+    fn external_cursor_control_suppresses_renderer_visibility_changes() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            false,
+            true,
+            10,
+        );
+        renderer.use_external_cursor_control();
+
+        renderer.hide_cursor().unwrap();
+        assert!(!renderer.cursor_hidden);
+        renderer.cursor_hidden = true;
+        renderer.show_cursor().unwrap();
+        assert!(renderer.cursor_hidden);
+    }
+
+    #[test]
     fn pending_summary_reasoning_does_not_add_a_leading_newline_on_finish() {
         assert!(!stream_needs_terminating_newline(
             Some(ChatStreamKind::Reasoning),
@@ -4948,6 +5070,55 @@ mod tests {
         assert_eq!(renderer.waiting_phase_text(), "1.2s");
         assert!(!renderer.waiting_phase_text().contains("思考"));
         assert!(!renderer.waiting_phase_text().contains("词元"));
+    }
+
+    #[test]
+    fn preparing_question_phase_overrides_reasoning_timer_until_handoff() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        renderer.reasoning_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        renderer.preparing_question_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1_200));
+
+        let phase = renderer.waiting_phase_text();
+
+        assert!(phase.starts_with(t("~ Preparing question · ", "~ 准备问题 · ")));
+        assert!(phase.ends_with("1.2s"));
+        renderer.prepare_for_external_output().unwrap();
+        assert!(renderer.preparing_question_started_at.is_none());
+    }
+
+    #[test]
+    fn only_full_reasoning_and_content_chunks_change_output_layout() {
+        let summary = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        let full = StreamRenderer::new(
+            ReasoningDisplayMode::Full,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        let chunk = |kind| ChatStreamChunk {
+            kind,
+            text: "chunk".to_string(),
+        };
+
+        assert!(!summary.chunk_changes_layout(&chunk(ChatStreamKind::Reasoning)));
+        assert!(full.chunk_changes_layout(&chunk(ChatStreamKind::Reasoning)));
+        assert!(summary.chunk_changes_layout(&chunk(ChatStreamKind::Content)));
+        assert!(summary.chunk_changes_layout(&chunk(ChatStreamKind::ToolCall)));
     }
 
     #[test]

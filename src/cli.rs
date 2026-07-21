@@ -1,22 +1,26 @@
-use crate::agent::{archive_and_delete_visible_turns, Agent, AgentEvent, AgentMode};
+use crate::agent::{
+    archive_and_delete_visible_turns, Agent, AgentEvent, AgentMode, AgentTurnControl,
+};
 use crate::config::{ActiveProviderModelConfig, AppConfig};
 use crate::i18n::{is_zh, text as t};
-use crate::llm::{OpenAiCompatibleClient, ThinkingVariantOptions};
+use crate::llm::{ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions};
 use crate::memory::MemoryStore;
 use crate::paths::MiyuPaths;
 use crate::render;
 use crate::shell;
-use crate::state::{StateStore, Turn, TurnStatus};
+use crate::state::{QueuedPrompt, QueuedPromptAttachment, StateStore, Turn, TurnStatus};
 use crate::tools;
 use anyhow::{bail, Result};
+use base64::Engine;
 use chrono::{DateTime, Local};
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use crossterm::cursor::{self, Hide, MoveTo, Show};
+use crossterm::cursor::{self, Hide, MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::style::Print;
-use crossterm::terminal::{self, Clear, ClearType};
+use crossterm::terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -24,7 +28,7 @@ use std::ffi::OsString;
 use std::io::Cursor;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REPL_MAX_VISIBLE_INPUT_ROWS: u16 = 12;
 const REPL_PASTE_PLACEHOLDER_MIN_LINES: usize = 3;
@@ -38,6 +42,7 @@ struct PastedText {
 struct ReplFooterStatus {
     provider: String,
     model: String,
+    mixed_models: bool,
     thinking: Option<String>,
     token_usage: ReplTokenUsage,
 }
@@ -57,18 +62,20 @@ impl ReplFooterStatus {
         cumulative_tokens: Option<u64>,
     ) -> Self {
         let active = config.active_provider_model_choices();
+        let mixed_models = active.len() > 1;
         let (provider_id, model) = match active.as_slice() {
             [] => ("-".to_string(), t("None", "无").to_string()),
             [choice] => (
                 choice.provider_id.clone(),
                 short_model_name(&choice.model, &choice.provider_id),
             ),
-            _ => (String::new(), t("Mixed", "混合").to_string()),
+            _ => ("mixed".to_string(), t("Mixed", "混合").to_string()),
         };
 
         Self {
             model,
             provider: provider_id,
+            mixed_models,
             thinking: None,
             token_usage: ReplTokenUsage {
                 turn_tokens: 0,
@@ -129,7 +136,11 @@ impl ReplFooterStatus {
     }
 
     fn update_thinking_variant(&mut self, variant: Option<&str>) {
-        self.thinking = variant.map(str::to_string);
+        self.thinking = if self.mixed_models {
+            None
+        } else {
+            variant.map(str::to_string)
+        };
     }
 }
 
@@ -184,13 +195,14 @@ fn repl_footer_left(mode: AgentMode, footer: &ReplFooterStatus, width: usize) ->
         return compact;
     }
 
-    let fixed_width = visible_width(&mode)
-        .saturating_add(if thinking.is_empty() {
-            0
-        } else {
-            1 + thinking.len()
-        })
-        .saturating_add(1);
+    let fixed_width =
+        visible_width(&mode)
+            .saturating_add(3)
+            .saturating_add(if thinking.is_empty() {
+                0
+            } else {
+                3 + visible_width(colored_thinking)
+            });
     let model_budget = width.saturating_sub(fixed_width).max(1);
     let model = truncate_display(&footer.model, model_budget);
     repl_footer_left_parts(&mode, &model, None, colored_thinking)
@@ -202,14 +214,18 @@ fn repl_footer_left_parts(
     provider: Option<&str>,
     thinking: &str,
 ) -> String {
-    let mut parts = vec![mode.to_string(), model.to_string()];
+    let mut endpoint = model.to_string();
     if let Some(provider) = provider.filter(|provider| !provider.is_empty()) {
-        parts.push(provider.to_string());
+        if !endpoint.is_empty() {
+            endpoint.push(' ');
+        }
+        endpoint.push_str(provider);
     }
+    let mut parts = vec![mode.to_string(), endpoint];
     if !thinking.is_empty() {
         parts.push(thinking.to_string());
     }
-    parts.join(" ")
+    parts.join(" · ")
 }
 
 fn print_mixed_model_endpoint(show: bool, result: &crate::llm::ChatResult, variant: Option<&str>) {
@@ -2688,6 +2704,7 @@ fn print_variant_updated() {
 }
 
 async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
+    let _cursor_restore = ReplCursorRestore;
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
@@ -2696,6 +2713,7 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     let mut mode = initial_mode;
     let mut input_history = load_repl_input_history(&state)?;
     let mut prefill = None::<String>;
+    let mut live_repl = None::<LiveReplTail>;
 
     crate::default_kb::check_update_if_due(paths).ok();
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
@@ -2721,14 +2739,20 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     loop {
         let thinking_summary = client.thinking_variant_summary();
         footer.update_thinking_variant(thinking_summary.as_deref());
-        let (input, pasted_images) = match read_repl_input(
-            paths,
-            mode,
-            prefill.take(),
-            &input_history,
-            &footer,
-            show_shortcut_hint,
-        )? {
+        let next_input = if let Some(live) = live_repl.as_mut() {
+            live.set_footer(footer.clone());
+            read_live_repl_input(live, paths)?
+        } else {
+            read_repl_input(
+                paths,
+                mode,
+                prefill.take(),
+                &input_history,
+                &footer,
+                show_shortcut_hint,
+            )?
+        };
+        let (input, pasted_images) = match next_input {
             Some((new_mode, input, pasted_images)) => {
                 mode = new_mode;
                 (input, pasted_images)
@@ -2826,7 +2850,15 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
             } else {
                 println!("{}: {removed}", t("undone messages", "已撤销消息数"));
             }
-            prefill = prompt;
+            if let Some(prompt) = prompt {
+                if let Some(live) = live_repl.as_mut() {
+                    live.editor.input = prompt;
+                    live.editor.cursor = live.editor.input.chars().count();
+                    live.editor.history_clean_index = None;
+                } else {
+                    prefill = Some(prompt);
+                }
+            }
             continue;
         }
         if command.eq_ignore_ascii_case("/pop") {
@@ -2906,6 +2938,11 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
             run_reset(paths, None)?;
             input_history.clear();
+            if let Some(live) = live_repl.as_mut() {
+                live.editor.history.clear();
+                live.editor.history_index = 0;
+                live.queued.clear();
+            }
             cumulative_tokens = 0;
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
             continue;
@@ -2914,6 +2951,11 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         {
             run_reset(paths, Some("all"))?;
             input_history.clear();
+            if let Some(live) = live_repl.as_mut() {
+                live.editor.history.clear();
+                live.editor.history_index = 0;
+                live.queued.clear();
+            }
             agent.reset_memory()?;
             cumulative_tokens = 0;
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
@@ -2923,6 +2965,9 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
             continue;
         }
         input_history.push(input.to_string());
+        if let Some(live) = live_repl.as_mut() {
+            live.editor.record_history(input);
+        }
         if agent.mode() != mode {
             let registry =
                 build_tool_registry(&config, paths, mode, crate::question_tui::available(false))?;
@@ -2938,30 +2983,50 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
             config.display.readable_tool_names,
             config.display.command_output_lines,
         );
-        renderer.start_waiting()?;
-        let chat_result = {
-            let renderer_cell = std::cell::RefCell::new(&mut renderer);
-            let chat = agent.chat_stream_with_images(input, &pasted_images, |event| {
-                handle_agent_event(&mut *renderer_cell.borrow_mut(), event)
-            });
-            tokio::pin!(chat);
-            let mut spinner_tick = tokio::time::interval(render::wait_spinner::SPINNER_INTERVAL);
-            spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            spinner_tick.tick().await;
-            loop {
-                tokio::select! {
-                    result = &mut chat => break result.map(Some),
-                    signal = tokio::signal::ctrl_c() => {
-                        signal?;
-                        break Ok(None);
-                    }
-                    _ = spinner_tick.tick() => {
-                        renderer_cell.borrow_mut().tick_spinner()?;
-                    }
-                }
-            }
-        };
-        renderer.finish()?;
+        let control = AgentTurnControl::new(
+            mode,
+            build_tool_registry(
+                &config,
+                paths,
+                AgentMode::Normal,
+                crate::question_tui::available(false),
+            )?,
+            build_tool_registry(
+                &config,
+                paths,
+                AgentMode::Plan,
+                crate::question_tui::available(false),
+            )?,
+            build_tool_registry(
+                &config,
+                paths,
+                AgentMode::Chat,
+                crate::question_tui::available(false),
+            )?,
+        );
+        if live_repl.is_none() {
+            live_repl = Some(LiveReplTail::new(
+                mode,
+                input_history.clone(),
+                state.load_queued_prompts()?,
+                footer.clone(),
+            )?);
+        }
+        let live = live_repl.as_mut().expect("live REPL was initialized");
+        let chat_result = run_live_agent_turn(
+            live,
+            paths,
+            &state,
+            &mut agent,
+            LiveAgentInput {
+                content: input,
+                images: &pasted_images,
+            },
+            &control,
+            &mut renderer,
+        )
+        .await;
+        mode = live.mode();
         match chat_result {
             Ok(Some(result)) => {
                 let context_window =
@@ -3019,17 +3084,34 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
                 }
                 show_shortcut_hint = false;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(live) = live_repl.as_mut() {
+                    synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                        live.reload_queue(&state)
+                    })?;
+                }
+            }
             Err(err) if crate::question::is_question_cancelled(&err) => {
+                if let Some(live) = live_repl.as_mut() {
+                    synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                        live.reload_queue(&state)
+                    })?;
+                }
                 footer.update_session_tokens(agent.effective_context_tokens()?);
                 continue;
             }
             Err(err) => {
+                if let Some(live) = live_repl.as_mut() {
+                    synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                        live.reload_queue(&state)
+                    })?;
+                }
                 eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
                 continue;
             }
         }
     }
+    state.discard_queued_prompts()?;
     Ok(())
 }
 
@@ -3581,6 +3663,1157 @@ fn print_repl_help() {
         "  Esc Esc     {}",
         t("interrupt running reply", "中断当前回复")
     );
+}
+
+struct LiveReplEditor {
+    mode: AgentMode,
+    input: String,
+    cursor: usize,
+    history: Vec<String>,
+    history_index: usize,
+    history_clean_index: Option<usize>,
+    is_pasted: bool,
+    pasted_images: Vec<Option<crate::clipboard::PastedImage>>,
+    pasted_texts: Vec<Option<PastedText>>,
+    escape_armed_until: Option<Instant>,
+}
+
+struct LiveSubmission {
+    content: String,
+    display_content: String,
+    images: Vec<Option<crate::clipboard::PastedImage>>,
+}
+
+struct LiveAgentInput<'a> {
+    content: &'a str,
+    images: &'a [Option<crate::clipboard::PastedImage>],
+}
+
+enum LiveEditorAction {
+    None,
+    Redraw,
+    ClearScreen,
+    Submit(LiveSubmission),
+    Interrupt,
+    Exit,
+}
+
+impl LiveReplEditor {
+    fn new(mode: AgentMode, history: Vec<String>) -> Self {
+        let history_index = history.len();
+        Self {
+            mode,
+            input: String::new(),
+            cursor: 0,
+            history,
+            history_index,
+            history_clean_index: None,
+            is_pasted: false,
+            pasted_images: Vec::new(),
+            pasted_texts: Vec::new(),
+            escape_armed_until: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.history_clean_index = None;
+        self.is_pasted = false;
+        self.pasted_images.clear();
+        self.pasted_texts.clear();
+        self.escape_armed_until = None;
+    }
+
+    fn submit(&mut self) -> Option<LiveSubmission> {
+        let display_content = strip_terminal_control_sequences(&self.input);
+        let content = expand_pasted_text_placeholders(&display_content, &self.pasted_texts);
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            return None;
+        }
+        let display_content = display_content.trim().to_string();
+        let images = std::mem::take(&mut self.pasted_images);
+        self.input.clear();
+        self.cursor = 0;
+        self.history_clean_index = None;
+        self.is_pasted = false;
+        self.pasted_texts.clear();
+        Some(LiveSubmission {
+            content,
+            display_content,
+            images,
+        })
+    }
+
+    fn record_history(&mut self, content: &str) {
+        self.history.push(content.to_string());
+        self.history_index = self.history.len();
+    }
+
+    fn handle_event(
+        &mut self,
+        event: Event,
+        paths: &MiyuPaths,
+        allow_interrupt: bool,
+    ) -> Result<LiveEditorAction> {
+        let is_escape = matches!(
+            &event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            })
+        );
+        if !is_escape {
+            self.escape_armed_until = None;
+        }
+        match event {
+            Event::Key(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..
+            }) => return Ok(LiveEditorAction::None),
+            Event::Resize(_, _) => return Ok(LiveEditorAction::Redraw),
+            Event::Paste(text) => {
+                insert_pasted_text_at_cursor(
+                    &mut self.input,
+                    &mut self.cursor,
+                    text,
+                    &mut self.pasted_texts,
+                );
+                self.history_clean_index = None;
+                self.is_pasted = true;
+                return Ok(LiveEditorAction::Redraw);
+            }
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match code {
+                KeyCode::Tab => {
+                    if self.input.starts_with('/') {
+                        if let Some(completed) = complete_repl_command(&self.input) {
+                            self.input = completed.to_string();
+                            self.cursor = self.input.chars().count();
+                            self.history_clean_index = None;
+                        }
+                    } else {
+                        self.mode = match self.mode {
+                            AgentMode::Normal => AgentMode::Plan,
+                            AgentMode::Plan => AgentMode::Chat,
+                            AgentMode::Chat => AgentMode::Normal,
+                        };
+                    }
+                }
+                KeyCode::Esc => {
+                    if allow_interrupt
+                        && self
+                            .escape_armed_until
+                            .is_some_and(|deadline| Instant::now() < deadline)
+                    {
+                        self.escape_armed_until = None;
+                        return Ok(LiveEditorAction::Interrupt);
+                    }
+                    self.clear();
+                    if allow_interrupt {
+                        self.escape_armed_until = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some((start, _)) = placeholder_at_cursor(&self.input, self.cursor) {
+                        self.cursor = start;
+                    } else {
+                        self.cursor = self.cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some((_, end)) = placeholder_at_cursor(&self.input, self.cursor) {
+                        self.cursor = end;
+                    } else {
+                        self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                    }
+                }
+                KeyCode::Home => self.cursor = 0,
+                KeyCode::End => self.cursor = self.input.chars().count(),
+                KeyCode::Up => {
+                    if !self.history.is_empty()
+                        && repl_should_browse_history(
+                            &self.input,
+                            &self.history,
+                            self.history_clean_index,
+                        )
+                    {
+                        if self.input.is_empty() {
+                            self.history_index = self.history.len();
+                        }
+                        self.history_index = self.history_index.saturating_sub(1);
+                        self.input = self
+                            .history
+                            .get(self.history_index)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.cursor = self.input.chars().count();
+                        self.history_clean_index = Some(self.history_index);
+                        self.is_pasted = false;
+                        self.pasted_images.clear();
+                        self.pasted_texts.clear();
+                    } else {
+                        self.cursor = repl_move_cursor_vertical("  ", &self.input, self.cursor, -1);
+                    }
+                }
+                KeyCode::Down => {
+                    if repl_history_is_clean(&self.input, &self.history, self.history_clean_index) {
+                        if self.history_index + 1 < self.history.len() {
+                            self.history_index += 1;
+                            self.input = self
+                                .history
+                                .get(self.history_index)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.cursor = self.input.chars().count();
+                            self.history_clean_index = Some(self.history_index);
+                        } else {
+                            self.history_index = self.history.len();
+                            self.input.clear();
+                            self.cursor = 0;
+                            self.history_clean_index = None;
+                        }
+                        self.is_pasted = false;
+                        self.pasted_images.clear();
+                        self.pasted_texts.clear();
+                    } else {
+                        self.cursor = repl_move_cursor_vertical("  ", &self.input, self.cursor, 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    return Ok(self
+                        .submit()
+                        .map(LiveEditorAction::Submit)
+                        .unwrap_or(LiveEditorAction::None));
+                }
+                KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    insert_newline_at_cursor(&mut self.input, &mut self.cursor);
+                    self.history_clean_index = None;
+                    self.is_pasted = false;
+                }
+                KeyCode::Char('c')
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if self.input.is_empty() {
+                        return Ok(LiveEditorAction::Interrupt);
+                    }
+                    self.clear();
+                }
+                KeyCode::Char('d')
+                    if modifiers.contains(KeyModifiers::CONTROL) && self.input.is_empty() =>
+                {
+                    return Ok(LiveEditorAction::Exit);
+                }
+                KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some((start, end)) =
+                        placeholder_before_or_at_cursor(&self.input, self.cursor)
+                    {
+                        clear_placeholder_payload(
+                            &self.input,
+                            start,
+                            end,
+                            &mut self.pasted_images,
+                            &mut self.pasted_texts,
+                        );
+                        remove_range_chars(&mut self.input, start, end);
+                        self.cursor = start;
+                    } else {
+                        remove_word_before_cursor(&mut self.input, &mut self.cursor);
+                    }
+                    self.history_clean_index = None;
+                    self.is_pasted = false;
+                }
+                KeyCode::Backspace => {
+                    if self.cursor > 0 {
+                        if let Some((start, end)) =
+                            placeholder_before_or_at_cursor(&self.input, self.cursor)
+                        {
+                            clear_placeholder_payload(
+                                &self.input,
+                                start,
+                                end,
+                                &mut self.pasted_images,
+                                &mut self.pasted_texts,
+                            );
+                            remove_range_chars(&mut self.input, start, end);
+                            self.cursor = start;
+                        } else {
+                            remove_char_before_cursor(&mut self.input, &mut self.cursor);
+                        }
+                        self.history_clean_index = None;
+                    }
+                    self.is_pasted = false;
+                }
+                KeyCode::Delete => {
+                    if let Some((start, end)) =
+                        placeholder_after_or_at_cursor(&self.input, self.cursor)
+                    {
+                        clear_placeholder_payload(
+                            &self.input,
+                            start,
+                            end,
+                            &mut self.pasted_images,
+                            &mut self.pasted_texts,
+                        );
+                        remove_range_chars(&mut self.input, start, end);
+                    } else {
+                        remove_char_at_cursor(&mut self.input, self.cursor);
+                    }
+                    self.history_clean_index = None;
+                    self.is_pasted = false;
+                }
+                KeyCode::Char('c' | 'C')
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if let Some(selected) =
+                        placeholder_text_near_cursor(&self.input, self.cursor, &self.pasted_texts)
+                    {
+                        let _ = crate::clipboard::write_clipboard_text(&selected)?;
+                    }
+                }
+                KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.paste_clipboard(paths)?;
+                }
+                KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(LiveEditorAction::ClearScreen);
+                }
+                KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !is_disallowed_control_char(ch) {
+                        if let Some((_, end)) = placeholder_at_cursor(&self.input, self.cursor) {
+                            self.cursor = end;
+                        }
+                        insert_char_at_cursor(&mut self.input, &mut self.cursor, ch);
+                        self.history_clean_index = None;
+                    }
+                    self.is_pasted = false;
+                }
+                _ => return Ok(LiveEditorAction::None),
+            },
+            _ => return Ok(LiveEditorAction::None),
+        }
+        Ok(LiveEditorAction::Redraw)
+    }
+
+    fn paste_clipboard(&mut self, paths: &MiyuPaths) -> Result<()> {
+        match crate::clipboard::read_clipboard() {
+            Ok(crate::clipboard::ClipboardContent::Image(image)) => {
+                let index = self.pasted_images.len() + 1;
+                let placeholder = match image.write_temp_file(&paths.cache_dir, index) {
+                    Ok(path) => {
+                        let filename = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("image");
+                        format!("[Image {index}: {filename}]")
+                    }
+                    Err(_) => format!("[Image {index}]"),
+                };
+                insert_str_at_cursor(&mut self.input, &mut self.cursor, &placeholder);
+                self.pasted_images
+                    .push(Some(crate::clipboard::PastedImage::Binary(image)));
+                self.is_pasted = false;
+            }
+            Ok(crate::clipboard::ClipboardContent::ImagePath(path)) => {
+                let index = self.pasted_images.len() + 1;
+                let filename = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                insert_str_at_cursor(
+                    &mut self.input,
+                    &mut self.cursor,
+                    &format!("[Image {index}: {filename}]"),
+                );
+                self.pasted_images
+                    .push(Some(crate::clipboard::PastedImage::Path(path)));
+                self.is_pasted = false;
+            }
+            Ok(crate::clipboard::ClipboardContent::TextPath(path)) => {
+                insert_str_at_cursor(&mut self.input, &mut self.cursor, &path);
+                self.is_pasted = false;
+            }
+            _ => {
+                if let Ok(Some(text)) = crate::clipboard::read_clipboard_text() {
+                    insert_pasted_text_at_cursor(
+                        &mut self.input,
+                        &mut self.cursor,
+                        text,
+                        &mut self.pasted_texts,
+                    );
+                    self.is_pasted = true;
+                }
+            }
+        }
+        self.history_clean_index = None;
+        Ok(())
+    }
+}
+
+struct LiveReplTail {
+    editor: LiveReplEditor,
+    queued: Vec<QueuedPrompt>,
+    pending_chunks: Vec<ChatStreamChunk>,
+    footer: ReplFooterStatus,
+    output_cursor: (u16, u16),
+    tail_start: u16,
+    tail_rows: u16,
+    rendered: bool,
+    external_output_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveTailPlacement {
+    output_row: u16,
+    tail_start: u16,
+    overflow: u16,
+    anchored: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CursorAfterUpdate {
+    Shown,
+    Hidden,
+}
+
+fn synchronized_terminal_update<T>(
+    cursor_after: CursorAfterUpdate,
+    update: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let mut stdout = io::stdout();
+    execute!(stdout, Hide, BeginSynchronizedUpdate)?;
+    let result = update();
+    let end = match cursor_after {
+        CursorAfterUpdate::Shown => execute!(stdout, EndSynchronizedUpdate, Show),
+        CursorAfterUpdate::Hidden => execute!(stdout, EndSynchronizedUpdate),
+    };
+    match result {
+        Ok(value) => {
+            end?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = end;
+            Err(error)
+        }
+    }
+}
+
+fn update_live_output_in_place<T>(
+    rendered: bool,
+    output_cursor: (u16, u16),
+    update: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !rendered {
+        return update();
+    }
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        Hide,
+        BeginSynchronizedUpdate,
+        SavePosition,
+        MoveTo(output_cursor.0, output_cursor.1)
+    )?;
+    let result = update();
+    let restore = execute!(stdout, RestorePosition, EndSynchronizedUpdate, Show);
+    match result {
+        Ok(value) => {
+            restore?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = restore;
+            Err(error)
+        }
+    }
+}
+
+fn live_tail_placement(
+    output_col: u16,
+    output_row: u16,
+    total_rows: u16,
+    terminal_rows: u16,
+) -> LiveTailPlacement {
+    let terminal_rows = terminal_rows.max(1);
+    let last_row = terminal_rows.saturating_sub(2);
+    let natural_start = output_row.saturating_add(u16::from(output_col > 0));
+    let natural_end = natural_start.saturating_add(total_rows.saturating_sub(1));
+    let overflow = natural_end.saturating_sub(last_row);
+    let output_row = output_row.saturating_sub(overflow);
+    let natural_start = output_row.saturating_add(u16::from(output_col > 0));
+    let anchored = overflow > 0 || natural_end == last_row;
+    let anchored_start = last_row.saturating_add(1).saturating_sub(total_rows);
+    let tail_start = if anchored {
+        natural_start.max(anchored_start)
+    } else {
+        natural_start
+    };
+    LiveTailPlacement {
+        output_row,
+        tail_start,
+        overflow,
+        anchored,
+    }
+}
+
+impl LiveReplTail {
+    fn new(
+        mode: AgentMode,
+        history: Vec<String>,
+        queued: Vec<QueuedPrompt>,
+        footer: ReplFooterStatus,
+    ) -> Result<Self> {
+        Ok(Self {
+            editor: LiveReplEditor::new(mode, history),
+            queued,
+            pending_chunks: Vec::new(),
+            footer,
+            output_cursor: cursor::position()?,
+            tail_start: 0,
+            tail_rows: 0,
+            rendered: false,
+            external_output_active: false,
+        })
+    }
+
+    fn mode(&self) -> AgentMode {
+        self.editor.mode
+    }
+
+    fn set_footer(&mut self, footer: ReplFooterStatus) {
+        self.footer = footer;
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        if !self.rendered {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        let (_, terminal_rows) = terminal::size().unwrap_or((80, 24));
+        for offset in 0..self.tail_rows {
+            let row = self.tail_start.saturating_add(offset);
+            if row >= terminal_rows {
+                break;
+            }
+            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        }
+        queue!(stdout, MoveTo(self.output_cursor.0, self.output_cursor.1))?;
+        stdout.flush()?;
+        self.rendered = false;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        self.resume_at(cursor::position()?)
+    }
+
+    fn resume_at(&mut self, (output_col, output_row): (u16, u16)) -> Result<()> {
+        let (cols, terminal_rows) = terminal::size().unwrap_or((80, 24));
+        let terminal_rows = terminal_rows.max(1);
+        let editor_rows = repl_input_rendered_rows(
+            &self.editor.input,
+            self.editor.is_pasted,
+            false,
+            usize::from(cols),
+        );
+        let mut queue_lines =
+            queued_prompt_lines(&self.queued, self.editor.mode, usize::from(cols));
+        let queue_gap = u16::from(!queue_lines.is_empty());
+        let max_queue_rows = terminal_rows.saturating_sub(editor_rows).saturating_sub(3) as usize;
+        if queue_lines.len() > max_queue_rows {
+            let omitted = queue_lines.len() - max_queue_rows.saturating_sub(1);
+            let mut clipped = vec![format!(
+                "\x1b[2m… {}\x1b[0m",
+                if is_zh() {
+                    format!("已隐藏 {omitted} 行排队内容")
+                } else {
+                    format!("{omitted} queued lines hidden")
+                }
+            )];
+            let keep = max_queue_rows.saturating_sub(1);
+            clipped.extend(queue_lines.split_off(queue_lines.len().saturating_sub(keep)));
+            queue_lines = clipped;
+        }
+        let total_rows = 1u16
+            .saturating_add(queue_lines.len().min(u16::MAX as usize) as u16)
+            .saturating_add(queue_gap)
+            .saturating_add(editor_rows);
+        let placement = live_tail_placement(output_col, output_row, total_rows, terminal_rows);
+        if placement.overflow > 0 {
+            let mut stdout = io::stdout();
+            queue!(stdout, MoveTo(0, terminal_rows.saturating_sub(1)))?;
+            for _ in 0..placement.overflow {
+                queue!(stdout, Print("\n"))?;
+            }
+            stdout.flush()?;
+        }
+        let output_row = placement.output_row;
+        let tail_start = placement.tail_start;
+
+        let mut stdout = io::stdout();
+        queue!(stdout, MoveTo(0, tail_start), Clear(ClearType::CurrentLine))?;
+        let mut row = tail_start.saturating_add(1);
+        for line in &queue_lines {
+            queue!(
+                stdout,
+                MoveTo(0, row),
+                Clear(ClearType::CurrentLine),
+                Print(line)
+            )?;
+            row = row.saturating_add(1);
+        }
+        if !queue_lines.is_empty() {
+            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            row = row.saturating_add(1);
+        }
+        stdout.flush()?;
+
+        let mut input_row = row;
+        let mut rendered_rows = 0u16;
+        render_repl_input_with_footer(
+            &mut stdout,
+            &mut input_row,
+            &mut rendered_rows,
+            self.editor.mode,
+            &self.editor.input,
+            self.editor.cursor,
+            self.editor.is_pasted,
+            &self.footer,
+            false,
+        )?;
+        self.output_cursor = (output_col, output_row);
+        self.tail_start = tail_start;
+        self.tail_rows = total_rows;
+        self.rendered = true;
+        Ok(())
+    }
+
+    fn redraw(&mut self) -> Result<()> {
+        let output_cursor = self.output_cursor;
+        self.suspend()?;
+        self.resume_at(output_cursor)
+    }
+
+    fn clear_screen(&mut self) -> Result<()> {
+        self.suspend()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        self.output_cursor = (0, 0);
+        self.tail_start = 0;
+        self.tail_rows = 0;
+        self.resume_at((0, 0))
+    }
+
+    fn enqueue(&mut self, prompt: QueuedPrompt) -> Result<()> {
+        let output_cursor = self.output_cursor;
+        self.suspend()?;
+        self.append_queued(prompt);
+        self.resume_at(output_cursor)
+    }
+
+    fn append_queued(&mut self, prompt: QueuedPrompt) {
+        self.queued.push(prompt);
+        self.queued.sort_by_key(|prompt| prompt.seq);
+    }
+
+    fn queue_stream_chunk(&mut self, chunk: ChatStreamChunk) {
+        if let Some(pending) = self
+            .pending_chunks
+            .last_mut()
+            .filter(|pending| pending.kind == chunk.kind)
+        {
+            pending.text.push_str(&chunk.text);
+        } else {
+            self.pending_chunks.push(chunk);
+        }
+    }
+
+    fn flush_pending_chunks(&mut self, renderer: &mut render::StreamRenderer) -> Result<()> {
+        for chunk in std::mem::take(&mut self.pending_chunks) {
+            renderer.write_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn discard_pending_chunks(&mut self) {
+        self.pending_chunks.clear();
+    }
+
+    fn tick_spinner(&mut self, renderer: &mut render::StreamRenderer) -> Result<()> {
+        let changes_layout = renderer.transient_output_changes_layout()
+            || self
+                .pending_chunks
+                .iter()
+                .any(|chunk| renderer.chunk_changes_layout(chunk));
+        if changes_layout {
+            return synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                self.suspend()?;
+                self.flush_pending_chunks(renderer)?;
+                renderer.tick_spinner()?;
+                self.resume()
+            });
+        }
+
+        let rendered = self.rendered;
+        let output_cursor = self.output_cursor;
+        let chunks = std::mem::take(&mut self.pending_chunks);
+        update_live_output_in_place(rendered, output_cursor, || {
+            for chunk in chunks {
+                renderer.write_chunk(chunk)?;
+            }
+            renderer.tick_spinner()
+        })
+    }
+
+    fn commit_submission(&mut self, submission: &LiveSubmission) -> Result<()> {
+        self.suspend()?;
+        write_committed_user_messages(
+            &[(submission.display_content.as_str(), self.editor.mode)],
+            true,
+        )?;
+        self.output_cursor = cursor::position()?;
+        Ok(())
+    }
+
+    fn consume_queued(&mut self, prompt_ids: &[String], mode: AgentMode) -> Result<()> {
+        self.suspend()?;
+        let ids = prompt_ids.iter().collect::<std::collections::HashSet<_>>();
+        let consumed = self
+            .queued
+            .iter()
+            .filter(|prompt| ids.contains(&prompt.prompt_id))
+            .map(|prompt| (prompt.display_content.as_str(), mode))
+            .collect::<Vec<_>>();
+        write_committed_user_messages(&consumed, true)?;
+        self.queued
+            .retain(|prompt| !ids.contains(&prompt.prompt_id));
+        let output_cursor = cursor::position()?;
+        self.output_cursor = output_cursor;
+        self.resume_at(output_cursor)
+    }
+
+    fn reload_queue(&mut self, state: &StateStore) -> Result<()> {
+        let output_cursor = self.output_cursor;
+        self.suspend()?;
+        self.queued = state.load_queued_prompts()?;
+        self.resume_at(output_cursor)
+    }
+}
+
+fn repl_input_rendered_rows(
+    input: &str,
+    is_pasted: bool,
+    show_shortcut_hint: bool,
+    cols: usize,
+) -> u16 {
+    let suggestions = repl_command_suggestions(input);
+    let lines = repl_input_lines(input);
+    let display_lines =
+        repl_visible_input_lines("  ", &lines, REPL_MAX_VISIBLE_INPUT_ROWS, is_pasted);
+    let input_rows = repl_wrapped_input_rows_for_cols("  ", &display_lines, cols)
+        .len()
+        .max(1)
+        .min(u16::MAX as usize) as u16;
+    input_rows.saturating_add(if show_shortcut_hint && suggestions.is_empty() {
+        4
+    } else {
+        3
+    })
+}
+
+fn queued_prompt_lines(prompts: &[QueuedPrompt], mode: AgentMode, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        if index > 0 {
+            lines.push(String::new());
+        }
+        lines.extend(submitted_echo_lines(mode, &prompt.display_content, cols));
+        lines.push(format!(
+            "{} {}",
+            submitted_echo_bar(mode),
+            primary_footer_text(t("Queued", "排队中"))
+        ));
+    }
+    lines
+}
+
+fn write_committed_user_messages(messages: &[(&str, AgentMode)], leading_gap: bool) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    let (col, _) = cursor::position()?;
+    if col > 0 {
+        writeln!(stdout)?;
+    }
+    let cols = terminal_cols();
+    write!(
+        stdout,
+        "{}",
+        committed_user_messages_text(messages, leading_gap, cols)
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn committed_user_messages_text(
+    messages: &[(&str, AgentMode)],
+    leading_gap: bool,
+    cols: usize,
+) -> String {
+    let mut output = String::new();
+    if leading_gap {
+        output.push('\n');
+    }
+    for (index, (content, mode)) in messages.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        for line in submitted_echo_lines(*mode, content, cols) {
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+    output.push('\n');
+    output
+}
+
+fn queued_prompt_attachments(
+    images: &[Option<crate::clipboard::PastedImage>],
+) -> Vec<QueuedPromptAttachment> {
+    images
+        .iter()
+        .filter_map(|image| match image {
+            Some(crate::clipboard::PastedImage::Binary(image)) => {
+                Some(QueuedPromptAttachment::Binary {
+                    mime: image.mime.clone(),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(&image.data),
+                })
+            }
+            Some(crate::clipboard::PastedImage::Path(path)) => {
+                Some(QueuedPromptAttachment::Path { path: path.clone() })
+            }
+            None => None,
+        })
+        .collect()
+}
+
+fn persist_queued_submission(
+    state: &StateStore,
+    submission: &LiveSubmission,
+) -> Result<QueuedPrompt> {
+    let prompt_id = format!(
+        "queued_{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        rand::random::<u16>()
+    );
+    state.enqueue_prompt(
+        &prompt_id,
+        &submission.content,
+        &submission.display_content,
+        &queued_prompt_attachments(&submission.images),
+    )
+}
+
+struct LiveRawMode {
+    show_cursor_on_drop: bool,
+}
+
+struct ReplCursorRestore;
+
+impl Drop for ReplCursorRestore {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), Show);
+    }
+}
+
+impl LiveRawMode {
+    fn start() -> Result<Self> {
+        enable_live_raw_mode()?;
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        Ok(Self {
+            show_cursor_on_drop: true,
+        })
+    }
+
+    fn keep_cursor_hidden(&mut self) {
+        self.show_cursor_on_drop = false;
+    }
+}
+
+fn enable_live_raw_mode() -> Result<()> {
+    terminal::enable_raw_mode()?;
+    if let Err(error) = restore_live_output_processing() {
+        let _ = terminal::disable_raw_mode();
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_live_output_processing() -> Result<()> {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // Raw input is required for key events, but renderer output still relies on newline translation.
+    unsafe {
+        if libc::tcgetattr(libc::STDOUT_FILENO, attributes.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut attributes = attributes.assume_init();
+        attributes.c_oflag |= libc::OPOST | libc::ONLCR;
+        if libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &attributes) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_live_output_processing() -> Result<()> {
+    Ok(())
+}
+
+impl Drop for LiveRawMode {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.show_cursor_on_drop {
+            let _ = execute!(stdout, DisableBracketedPaste, Show);
+        } else {
+            let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn read_live_repl_input(
+    live: &mut LiveReplTail,
+    paths: &MiyuPaths,
+) -> Result<
+    Option<(
+        AgentMode,
+        String,
+        Vec<Option<crate::clipboard::PastedImage>>,
+    )>,
+> {
+    let mut raw = LiveRawMode::start()?;
+    if !live.rendered {
+        synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
+    }
+    loop {
+        match live.editor.handle_event(event::read()?, paths, false)? {
+            LiveEditorAction::None => {}
+            LiveEditorAction::Redraw => {
+                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.redraw())?
+            }
+            LiveEditorAction::ClearScreen => {
+                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.clear_screen())?
+            }
+            LiveEditorAction::Submit(submission) => {
+                let mode = live.mode();
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                    live.commit_submission(&submission)
+                })?;
+                raw.keep_cursor_hidden();
+                return Ok(Some((mode, submission.content, submission.images)));
+            }
+            LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn handle_live_agent_event(
+    live: &mut LiveReplTail,
+    renderer: &mut render::StreamRenderer,
+    event: AgentEvent,
+) -> Result<()> {
+    let event = match event {
+        AgentEvent::Chunk(chunk) => {
+            live.queue_stream_chunk(chunk);
+            return Ok(());
+        }
+        event => event,
+    };
+    if live.external_output_active && matches!(&event, AgentEvent::SpinnerTick) {
+        return Ok(());
+    }
+    if matches!(&event, AgentEvent::SpinnerTick) {
+        return live.tick_spinner(renderer);
+    }
+    match event {
+        AgentEvent::PrepareForExternalOutput { ready } => {
+            let result = synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                live.suspend()?;
+                live.flush_pending_chunks(renderer)?;
+                renderer.prepare_for_external_output()?;
+                live.external_output_active = true;
+                Ok(())
+            });
+            if result.is_ok() {
+                let _ = ready.send(());
+            }
+            result
+        }
+        AgentEvent::QueuedPromptsConsumed { prompt_ids, mode } => {
+            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                live.suspend()?;
+                live.flush_pending_chunks(renderer)?;
+                renderer.prepare_for_external_output()?;
+                live.consume_queued(&prompt_ids, mode)
+            })
+        }
+        event => {
+            let finishes_external_output =
+                live.external_output_active && matches!(&event, AgentEvent::ToolResult { .. });
+            if live.external_output_active && !finishes_external_output {
+                return synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                    handle_agent_event(renderer, event)
+                });
+            }
+            let question = matches!(&event, AgentEvent::AskQuestion { .. });
+            if question {
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                    live.suspend()?;
+                    live.flush_pending_chunks(renderer)
+                })?;
+                handle_agent_event(renderer, event)?;
+                enable_live_raw_mode()?;
+                execute!(io::stdout(), EnableBracketedPaste)?;
+                return synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume());
+            }
+            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                live.suspend()?;
+                live.flush_pending_chunks(renderer)?;
+                handle_agent_event(renderer, event)?;
+                if finishes_external_output {
+                    live.external_output_active = false;
+                }
+                live.resume()
+            })
+        }
+    }
+}
+
+async fn run_live_agent_turn(
+    live: &mut LiveReplTail,
+    paths: &MiyuPaths,
+    state: &StateStore,
+    agent: &mut Agent,
+    input: LiveAgentInput<'_>,
+    control: &AgentTurnControl,
+    renderer: &mut render::StreamRenderer,
+) -> Result<Option<crate::llm::ChatResult>> {
+    renderer.use_external_cursor_control();
+    let mut raw = LiveRawMode::start()?;
+    synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+        live.external_output_active = false;
+        live.suspend()?;
+        renderer.start_waiting()?;
+        live.resume()
+    })?;
+
+    let result = {
+        let live_cell = std::cell::RefCell::new(&mut *live);
+        let renderer_cell = std::cell::RefCell::new(&mut *renderer);
+        let chat = agent.chat_stream_with_control(input.content, input.images, control, |event| {
+            handle_live_agent_event(
+                &mut live_cell.borrow_mut(),
+                &mut renderer_cell.borrow_mut(),
+                event,
+            )
+        });
+        tokio::pin!(chat);
+        let mut input_tick = tokio::time::interval(Duration::from_millis(16));
+        input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        input_tick.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = input_tick.tick() => {
+                    if !event::poll(Duration::ZERO)? {
+                        continue;
+                    }
+                    let event = event::read()?;
+                    let mut live = live_cell.borrow_mut();
+                    if matches!(
+                        &event,
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Enter,
+                            kind,
+                            ..
+                        }) if *kind != KeyEventKind::Release
+                    ) && live.editor.input.trim_start().starts_with('/')
+                    {
+                        if live.external_output_active {
+                            continue;
+                        }
+                        synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                            live.suspend()?;
+                            let mut renderer = renderer_cell.borrow_mut();
+                            live.flush_pending_chunks(&mut renderer)?;
+                            renderer.write_system_message(t(
+                                "REPL commands are available after the current reply finishes",
+                                "当前回复结束后才能执行 REPL 命令",
+                            ))?;
+                            live.resume()
+                        })?;
+                        continue;
+                    }
+                    let mode_before = live.mode();
+                    match live.editor.handle_event(event, paths, true)? {
+                        LiveEditorAction::None => {}
+                        LiveEditorAction::Redraw if !live.external_output_active => {
+                            synchronized_terminal_update(CursorAfterUpdate::Shown, || live.redraw())?
+                        }
+                        LiveEditorAction::ClearScreen if !live.external_output_active => {
+                            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                                live.clear_screen()
+                            })?
+                        }
+                        LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
+                        LiveEditorAction::Submit(submission) => {
+                            let prompt = persist_queued_submission(state, &submission)?;
+                            live.editor.record_history(&submission.content);
+                            if live.external_output_active {
+                                live.append_queued(prompt);
+                            } else {
+                                synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                                    live.enqueue(prompt)
+                                })?;
+                            }
+                        }
+                        LiveEditorAction::Interrupt | LiveEditorAction::Exit => break Ok(None),
+                    }
+                    if live.mode() != mode_before {
+                        control.set_mode(live.mode());
+                    }
+                },
+                result = &mut chat => break result.map(Some),
+            }
+        }
+    };
+
+    if matches!(&result, Ok(None)) {
+        live.discard_pending_chunks();
+    }
+    synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+        live.external_output_active = false;
+        live.suspend()?;
+        live.flush_pending_chunks(renderer)?;
+        renderer.finish()?;
+        live.output_cursor = cursor::position()?;
+        Ok(())
+    })?;
+    raw.keep_cursor_hidden();
+    result
 }
 
 fn read_repl_input(
@@ -5008,6 +6241,7 @@ fn truncate_visible_width(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod repl_input_tests {
     use super::*;
+    use crate::llm::ChatStreamKind;
 
     fn sample_pop_turn(status: TurnStatus) -> Turn {
         Turn {
@@ -5021,6 +6255,7 @@ mod repl_input_tests {
             status,
             tool_reports: vec!["hidden tool report".to_string()],
             question_exchanges: Vec::new(),
+            followups: Vec::new(),
             hidden: false,
             is_summary: false,
             owner_pid: None,
@@ -5242,7 +6477,236 @@ mod repl_input_tests {
         for mode in [AgentMode::Normal, AgentMode::Plan, AgentMode::Chat] {
             let line = repl_footer_left(mode, &footer, 120);
             assert!(line.contains("\x1b[1m\x1b[34mhigh\x1b[0m"));
+            assert_eq!(
+                strip_terminal_control_sequences(&line),
+                format!(
+                    "{} · {} {} · high",
+                    mode.label(),
+                    footer.model,
+                    footer.provider
+                )
+            );
         }
+    }
+
+    #[test]
+    fn mixed_footer_uses_dim_provider_and_hides_global_variant() {
+        let mut config = AppConfig::default();
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| !provider.models.is_empty())
+            .unwrap();
+        let provider_id = provider.id.clone();
+        let first_model = provider.models[0].clone();
+        let second_model = "footer-second-model".to_string();
+        provider.models.push(second_model.clone());
+        config.active_provider_models = Some(vec![
+            ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: first_model,
+            },
+            ActiveProviderModelConfig {
+                provider_id,
+                model: second_model,
+            },
+        ]);
+        let mut footer = ReplFooterStatus::from_config(&config, 0, None);
+        footer.update_thinking_variant(Some("mixed"));
+
+        let line = repl_footer_left(AgentMode::Normal, &footer, 120);
+
+        assert_eq!(footer.provider, "mixed");
+        assert!(footer.thinking.is_none());
+        assert_eq!(
+            strip_terminal_control_sequences(&line),
+            format!(
+                "{} · {} mixed",
+                AgentMode::Normal.label(),
+                t("Mixed", "混合")
+            )
+        );
+        assert!(line.contains("\x1b[2mmixed\x1b[0m"));
+        assert!(!line.contains(&primary_footer_text("mixed")));
+    }
+
+    #[test]
+    fn committed_user_message_keeps_one_blank_line_before_output() {
+        let output = committed_user_messages_text(&[("hello", AgentMode::Normal)], true, 80);
+
+        assert_eq!(
+            strip_terminal_control_sequences(&output),
+            "\n┃\n┃ hello\n┃\n\n"
+        );
+    }
+
+    #[test]
+    fn queued_message_uses_full_height_bar_and_primary_status() {
+        let prompt = QueuedPrompt {
+            prompt_id: "q1".to_string(),
+            seq: 1,
+            content: "follow up".to_string(),
+            display_content: "follow up".to_string(),
+            attachments: Vec::new(),
+            submitted_at: String::new(),
+        };
+
+        let normal = queued_prompt_lines(std::slice::from_ref(&prompt), AgentMode::Normal, 80);
+        let plan = queued_prompt_lines(&[prompt], AgentMode::Plan, 80);
+
+        assert_eq!(normal.len(), 4);
+        assert_eq!(normal[0], submitted_echo_bar(AgentMode::Normal));
+        assert_eq!(normal[2], submitted_echo_bar(AgentMode::Normal));
+        assert!(normal[3].starts_with(&submitted_echo_bar(AgentMode::Normal)));
+        assert!(normal[3].contains(&primary_footer_text(t("Queued", "排队中"))));
+        assert!(plan
+            .iter()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with(&submitted_echo_bar(AgentMode::Plan))));
+        assert_ne!(normal[0], plan[0]);
+    }
+
+    #[test]
+    fn live_tail_moves_naturally_and_releases_after_output_shrinks() {
+        assert_eq!(
+            live_tail_placement(0, 4, 5, 24),
+            LiveTailPlacement {
+                output_row: 4,
+                tail_start: 4,
+                overflow: 0,
+                anchored: false,
+            }
+        );
+        assert_eq!(
+            live_tail_placement(0, 20, 5, 24),
+            LiveTailPlacement {
+                output_row: 18,
+                tail_start: 18,
+                overflow: 2,
+                anchored: true,
+            }
+        );
+        assert_eq!(
+            live_tail_placement(0, 6, 5, 24),
+            LiveTailPlacement {
+                output_row: 6,
+                tail_start: 6,
+                overflow: 0,
+                anchored: false,
+            }
+        );
+        assert_eq!(live_tail_placement(0, 6, 5, 30).tail_start, 6);
+    }
+
+    #[test]
+    fn live_editor_restores_clear_screen_and_double_escape_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let escape = || Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut editor = LiveReplEditor::new(AgentMode::Normal, Vec::new());
+        editor.input = "draft".to_string();
+        assert!(matches!(
+            editor.handle_event(escape(), &paths, true).unwrap(),
+            LiveEditorAction::Redraw
+        ));
+        assert!(editor.input.is_empty());
+        assert!(matches!(
+            editor.handle_event(escape(), &paths, true).unwrap(),
+            LiveEditorAction::Interrupt
+        ));
+
+        let clear = Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            editor.handle_event(clear, &paths, true).unwrap(),
+            LiveEditorAction::ClearScreen
+        ));
+
+        assert!(matches!(
+            editor.handle_event(escape(), &paths, false).unwrap(),
+            LiveEditorAction::Redraw
+        ));
+        assert!(matches!(
+            editor.handle_event(escape(), &paths, false).unwrap(),
+            LiveEditorAction::Redraw
+        ));
+
+        editor.input = "/help".to_string();
+        editor.cursor = editor.input.chars().count();
+        assert!(matches!(
+            editor
+                .handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    &paths,
+                    false,
+                )
+                .unwrap(),
+            LiveEditorAction::Submit(_)
+        ));
+        assert!(editor.history.is_empty());
+        editor.record_history("ordinary prompt");
+        assert_eq!(editor.history, ["ordinary prompt"]);
+    }
+
+    #[test]
+    fn spinner_does_not_resume_tail_during_external_output() {
+        let config = AppConfig::default();
+        let mut live = LiveReplTail {
+            editor: LiveReplEditor::new(AgentMode::Normal, Vec::new()),
+            queued: Vec::new(),
+            pending_chunks: Vec::new(),
+            footer: ReplFooterStatus::from_config(&config, 0, None),
+            output_cursor: (0, 0),
+            tail_start: 0,
+            tail_rows: 0,
+            rendered: false,
+            external_output_active: true,
+        };
+        let mut renderer = render::StreamRenderer::new(
+            render::ReasoningDisplayMode::Hidden,
+            render::ToolCallDisplayMode::Hidden,
+            true,
+            true,
+            10,
+        );
+
+        handle_live_agent_event(&mut live, &mut renderer, AgentEvent::SpinnerTick).unwrap();
+
+        assert!(live.external_output_active);
+        assert!(!live.rendered);
+    }
+
+    #[test]
+    fn live_tail_coalesces_adjacent_stream_chunks_and_can_discard_them() {
+        let config = AppConfig::default();
+        let mut live = LiveReplTail {
+            editor: LiveReplEditor::new(AgentMode::Normal, Vec::new()),
+            queued: Vec::new(),
+            pending_chunks: Vec::new(),
+            footer: ReplFooterStatus::from_config(&config, 0, None),
+            output_cursor: (0, 0),
+            tail_start: 0,
+            tail_rows: 0,
+            rendered: false,
+            external_output_active: false,
+        };
+
+        for (kind, text) in [
+            (ChatStreamKind::Reasoning, "one"),
+            (ChatStreamKind::Reasoning, " two"),
+            (ChatStreamKind::Content, "answer"),
+            (ChatStreamKind::Content, " text"),
+        ] {
+            live.queue_stream_chunk(ChatStreamChunk {
+                kind,
+                text: text.to_string(),
+            });
+        }
+
+        assert_eq!(live.pending_chunks.len(), 2);
+        assert_eq!(live.pending_chunks[0].text, "one two");
+        assert_eq!(live.pending_chunks[1].text, "answer text");
+        live.discard_pending_chunks();
+        assert!(live.pending_chunks.is_empty());
     }
 
     #[test]
@@ -6089,6 +7553,7 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             let _ = responder.send(response);
             Ok(())
         }
+        AgentEvent::QueuedPromptsConsumed { .. } => Ok(()),
         AgentEvent::SpinnerTick => renderer.tick_spinner(),
         AgentEvent::CompactStart => {
             renderer.write_system_message(t("Compacting context...", "正在压缩上下文..."))?;

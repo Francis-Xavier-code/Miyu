@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 #[allow(unused_imports)]
 pub use conversation_db::{
-    interrupted_text, pending_placeholder, ConversationDb, Turn, TurnStatus,
+    interrupted_text, pending_placeholder, ConversationDb, QueuedPrompt, QueuedPromptAttachment,
+    Turn, TurnFollowup, TurnStatus,
 };
 pub use usage::UsageSnapshot;
 
@@ -21,13 +22,32 @@ pub use usage::UsageSnapshot;
 pub struct StateStore {
     state_dir: PathBuf,
     conv_db: Arc<ConversationDb>,
+    queue_session_id: Arc<str>,
+    queue_owner_pid: u32,
 }
 
 impl StateStore {
     pub fn new(paths: &MiyuPaths) -> Result<Self> {
         let state_dir = paths.state_dir.clone();
         let conv_db = Arc::new(ConversationDb::open(&state_dir)?);
-        Ok(Self { state_dir, conv_db })
+        let queue_owner_pid = std::process::id();
+        let queue_session_id: Arc<str> = format!(
+            "queue_{}_{}_{}",
+            queue_owner_pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+            rand::random::<u64>()
+        )
+        .into();
+        conv_db.discard_stale_queued_prompts(&queue_session_id, queue_owner_pid)?;
+        Ok(Self {
+            state_dir,
+            conv_db,
+            queue_session_id,
+            queue_owner_pid,
+        })
     }
 
     pub fn init_files(&self) -> Result<()> {
@@ -47,7 +67,7 @@ impl StateStore {
         let file = self.prompt_fingerprint_file();
         let previous = std::fs::read_to_string(&file).unwrap_or_default();
         if previous.trim() != fingerprint {
-            self.conv_db.reset()?;
+            self.conv_db.reset_history()?;
             self.clear_last_usage()?;
             std::fs::write(file, format!("{fingerprint}\n"))?;
         }
@@ -104,6 +124,47 @@ impl StateStore {
         exchange: &crate::question::QuestionExchange,
     ) -> Result<()> {
         self.conv_db.append_question_exchange(turn_id, exchange)
+    }
+
+    pub fn enqueue_prompt(
+        &self,
+        prompt_id: &str,
+        content: &str,
+        display_content: &str,
+        attachments: &[QueuedPromptAttachment],
+    ) -> Result<QueuedPrompt> {
+        self.conv_db.enqueue_prompt(
+            prompt_id,
+            content,
+            display_content,
+            attachments,
+            &self.queue_session_id,
+            self.queue_owner_pid,
+        )
+    }
+
+    pub fn load_queued_prompts(&self) -> Result<Vec<QueuedPrompt>> {
+        self.conv_db.load_queued_prompts(&self.queue_session_id)
+    }
+
+    pub fn consume_queued_prompts(
+        &self,
+        turn_id: &str,
+        prompts: &[(String, String)],
+        preceding_assistant_content: Option<&str>,
+        preceding_assistant_reasoning: Option<&str>,
+    ) -> Result<()> {
+        self.conv_db.consume_queued_prompts(
+            turn_id,
+            prompts,
+            preceding_assistant_content,
+            preceding_assistant_reasoning,
+            &self.queue_session_id,
+        )
+    }
+
+    pub fn discard_queued_prompts(&self) -> Result<usize> {
+        self.conv_db.discard_queued_prompts(&self.queue_session_id)
     }
 
     pub fn load_session_loaded_tools(&self) -> Result<BTreeSet<String>> {
@@ -341,6 +402,25 @@ fn turn_chars(turn: &Turn) -> usize {
             .filter_map(|exchange| serde_json::to_string(exchange).ok())
             .map(|exchange| exchange.chars().count())
             .sum::<usize>()
+        + turn
+            .followups
+            .iter()
+            .map(|followup| {
+                followup.content.chars().count()
+                    + followup
+                        .preceding_assistant_content
+                        .as_deref()
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or(0)
+                    + followup
+                        .preceding_assistant_reasoning
+                        .as_deref()
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or(0)
+            })
+            .sum::<usize>()
 }
 
 fn turns_to_entries(turns: Vec<Turn>) -> Vec<StoredConversationEntry> {
@@ -364,6 +444,30 @@ fn turns_to_entries(turns: Vec<Turn>) -> Vec<StoredConversationEntry> {
                 timestamp: exchange.answered_at.clone(),
                 role: "user_clarification".to_string(),
                 content: crate::question::user_exchange_text(exchange),
+                reasoning: None,
+            });
+        }
+        for followup in turn.followups {
+            if followup
+                .preceding_assistant_content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+                || followup
+                    .preceding_assistant_reasoning
+                    .as_deref()
+                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
+            {
+                entries.push(StoredConversationEntry {
+                    timestamp: followup.submitted_at.clone(),
+                    role: "assistant".to_string(),
+                    content: followup.preceding_assistant_content.unwrap_or_default(),
+                    reasoning: followup.preceding_assistant_reasoning,
+                });
+            }
+            entries.push(StoredConversationEntry {
+                timestamp: followup.submitted_at,
+                role: "user".to_string(),
+                content: followup.content,
                 reasoning: None,
             });
         }
@@ -557,6 +661,54 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_keeps_consumed_prompts_attached_to_the_interrupted_turn() {
+        let (_temp, store) = test_store();
+        store
+            .enqueue_prompt("q1", "followup", "followup", &[])
+            .unwrap();
+        store.start_turn("turn_1", "initial", 999999).unwrap();
+        store
+            .consume_queued_prompts(
+                "turn_1",
+                &[("q1".to_string(), "followup".to_string())],
+                None,
+                None,
+            )
+            .unwrap();
+
+        store.interrupt_turn("turn_1").unwrap();
+
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+        let turns = store.load_turns().unwrap();
+        assert_eq!(turns[0].status, TurnStatus::Interrupted);
+        assert_eq!(turns[0].followups.len(), 1);
+        assert_eq!(turns[0].followups[0].prompt_id, "q1");
+    }
+
+    #[test]
+    fn stale_turn_recovery_keeps_consumed_prompts_consumed() {
+        let (_temp, store) = test_store();
+        store
+            .enqueue_prompt("q1", "followup", "followup", &[])
+            .unwrap();
+        store.start_turn("turn_1", "initial", 999999).unwrap();
+        store
+            .consume_queued_prompts(
+                "turn_1",
+                &[("q1".to_string(), "followup".to_string())],
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(store.recover_stale_turns().unwrap(), 1);
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+        let turns = store.load_turns().unwrap();
+        assert_eq!(turns[0].status, TurnStatus::Interrupted);
+        assert_eq!(turns[0].followups[0].prompt_id, "q1");
+    }
+
+    #[test]
     fn undo_removes_last_turn() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
@@ -614,6 +766,152 @@ mod tests {
         let last_seq = turns.last().unwrap().seq;
         let turn_ids = turns.into_iter().map(|turn| turn.turn_id).collect();
         (last_seq, turn_ids)
+    }
+
+    #[test]
+    fn queued_prompts_persist_and_attach_to_a_turn_in_order() {
+        let (_temp, store) = test_store();
+        let first = store
+            .enqueue_prompt(
+                "q1",
+                "first expanded",
+                "first",
+                &[QueuedPromptAttachment::Path {
+                    path: "/tmp/image.png".to_string(),
+                }],
+            )
+            .unwrap();
+        let second = store
+            .enqueue_prompt("q2", "second expanded", "second", &[])
+            .unwrap();
+
+        assert!(first.seq < second.seq);
+        assert_eq!(
+            store.load_queued_prompts().unwrap(),
+            vec![first.clone(), second]
+        );
+
+        store.start_turn("t1", "initial", 999999).unwrap();
+        store
+            .consume_queued_prompts(
+                "t1",
+                &[
+                    ("q1".to_string(), "first context".to_string()),
+                    ("q2".to_string(), "second context".to_string()),
+                ],
+                Some("before followup"),
+                Some("reasoning before followup"),
+            )
+            .unwrap();
+        store.complete_turn("t1", "final answer", None).unwrap();
+
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+        let turns = store.load_turns().unwrap();
+        assert_eq!(turns[0].followups.len(), 2);
+        assert_eq!(turns[0].followups[0].content, "first context");
+        assert_eq!(turns[0].followups[0].attachments, first.attachments);
+        assert_eq!(
+            turns[0].followups[0]
+                .preceding_assistant_reasoning
+                .as_deref(),
+            Some("reasoning before followup")
+        );
+        assert!(turns[0].followups[1].preceding_assistant_content.is_none());
+
+        let history = store.load_conversation().unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| (entry.role.as_str(), entry.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "initial"),
+                ("assistant", "before followup"),
+                ("user", "first context"),
+                ("user", "second context"),
+                ("assistant", "final answer"),
+            ]
+        );
+
+        store
+            .enqueue_prompt("q3", "still queued", "still queued", &[])
+            .unwrap();
+        store.reset_conversation().unwrap();
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_prompts_survive_prompt_changes_but_not_a_new_store_session() {
+        let (temp, store) = test_store();
+        store.reset_if_prompt_changed("system prompt one").unwrap();
+        store
+            .enqueue_prompt("q1", "queued content", "queued", &[])
+            .unwrap();
+        store.reset_if_prompt_changed("system prompt two").unwrap();
+        assert_eq!(store.load_queued_prompts().unwrap().len(), 1);
+        drop(store);
+
+        let paths = MiyuPaths {
+            config_dir: temp.path().join("config"),
+            config_file: temp.path().join("config/config.jsonc"),
+            skills_dir: temp.path().join("config/skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish/miyu.fish"),
+            bash_hook_file: temp.path().join("shell/bash-hook.sh"),
+            zsh_hook_file: temp.path().join("shell/zsh-hook.zsh"),
+            scripts_dir: temp.path().join("config/scripts"),
+            system_scripts_dir: PathBuf::new(),
+        };
+        let reopened = StateStore::new(&paths).unwrap();
+        assert!(reopened.load_queued_prompts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_queue_cleanup_preserves_another_live_process_session() {
+        let (_temp, store) = test_store();
+        let live_owner = std::process::id();
+        store
+            .conv_db
+            .enqueue_prompt(
+                "other-q",
+                "content",
+                "display",
+                &[],
+                "other-session",
+                live_owner,
+            )
+            .unwrap();
+        let different_pid = live_owner.wrapping_add(1).max(1);
+
+        assert_eq!(
+            store
+                .conv_db
+                .discard_stale_queued_prompts("new-session", different_pid)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .conv_db
+                .load_queued_prompts("other-session")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn normal_session_cleanup_discards_unsent_prompts() {
+        let (_temp, store) = test_store();
+        store
+            .enqueue_prompt("q1", "content", "display", &[])
+            .unwrap();
+
+        assert_eq!(store.discard_queued_prompts().unwrap(), 1);
+        assert!(store.load_queued_prompts().unwrap().is_empty());
     }
 
     #[test]

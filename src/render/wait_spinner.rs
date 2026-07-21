@@ -10,7 +10,7 @@ const WIDTH: usize = 7;
 const TRAIL_LEN: usize = 6;
 const HOLD_END: usize = 9;
 const HOLD_START: usize = 30;
-pub(crate) const SPINNER_INTERVAL: Duration = Duration::from_millis(42);
+pub(crate) const SPINNER_INTERVAL: Duration = Duration::from_millis(40);
 const MIN_FADE_ALPHA: f64 = 0.12;
 const ACTIVE_DOTS: [&str; TRAIL_LEN] = ["▪", "▪", "▫", "▫", "·", "·"];
 const INACTIVE_DOT: &str = "·";
@@ -66,6 +66,23 @@ impl WaitSpinner {
 
     pub(crate) fn set_sub_phase(&mut self, sub_phase: Option<String>) {
         self.sub_phase = sub_phase;
+    }
+
+    pub(crate) fn tick_changes_layout(&self) -> bool {
+        let terminal_width = terminal::size()
+            .map(|(width, _)| usize::from(width))
+            .unwrap_or(120);
+        self.tick_changes_layout_at_width(terminal_width)
+    }
+
+    fn tick_changes_layout_at_width(&self, terminal_width: usize) -> bool {
+        let (output, _) = render_frame_at_width(self.frame, self, terminal_width);
+        let next_widths = output
+            .lines()
+            .map(super::command_ansi_width)
+            .collect::<Vec<_>>();
+        super::rendered_physical_rows(&self.rendered_line_widths, terminal_width)
+            != super::rendered_physical_rows(&next_widths, terminal_width)
     }
 
     pub(crate) fn tick(&mut self) -> Result<()> {
@@ -312,12 +329,7 @@ fn clear_spinner_lines_with_writer(
     if widths.is_empty() {
         return Ok(());
     }
-    let columns = terminal_width.max(1);
-    let rows = widths
-        .iter()
-        .map(|width| (*width).max(1).div_ceil(columns))
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16;
+    let rows = super::rendered_physical_rows(widths, terminal_width);
     if rows > 1 {
         execute!(stdout, MoveUp(rows - 1))?;
     }
@@ -336,6 +348,11 @@ fn clear_spinner_lines_with_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_runs_at_least_twenty_four_frames_per_second() {
+        assert!(SPINNER_INTERVAL <= Duration::from_millis(41));
+    }
 
     fn make_spinner(phase: &str, sub_phase: Option<&str>, style: SpinnerStyle) -> WaitSpinner {
         WaitSpinner {
@@ -395,6 +412,27 @@ mod tests {
         assert!(frame.contains("输入法诊断"));
         assert!(frame.contains("第 1 轮"));
         assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn detects_sub_phase_row_growth_before_tick() {
+        let mut spinner = make_spinner(
+            "~ Linux 游戏兼容性调查×1 运行中",
+            Some("↳ Black Myth: Wukong"),
+            SpinnerStyle::Braille,
+        );
+        let (rendered, _) = render_frame_at_width(0, &spinner, 80);
+        spinner.rendered_line_widths = rendered
+            .lines()
+            .map(crate::render::command_ansi_width)
+            .collect();
+        assert!(!spinner.tick_changes_layout_at_width(80));
+
+        spinner.set_sub_phase(Some(
+            "↳ Black Myth: Wukong\n↳ 收集游戏兼容性信号".to_string(),
+        ));
+
+        assert!(spinner.tick_changes_layout_at_width(80));
     }
 
     #[test]

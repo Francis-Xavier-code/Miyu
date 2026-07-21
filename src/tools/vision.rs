@@ -108,9 +108,13 @@ pub async fn print_image_file(path: &Path, size: Option<String>) -> Result<()> {
     println!();
     io::stdout().flush()?;
     let mut command = Command::new("chafa");
+    if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        command.args(["--probe", "off", "--relative", "off"]);
+    }
     if let Some(size) = size {
         command.arg("--size").arg(size);
     }
+    command.kill_on_drop(true);
     let status = command
         .arg(path)
         .stdin(Stdio::null())
