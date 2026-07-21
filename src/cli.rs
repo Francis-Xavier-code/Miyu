@@ -4075,6 +4075,7 @@ struct LiveTailPlacement {
 
 #[derive(Clone, Copy)]
 enum CursorAfterUpdate {
+    Preserve,
     Shown,
     Hidden,
 }
@@ -4084,11 +4085,18 @@ fn synchronized_terminal_update<T>(
     update: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let mut stdout = io::stdout();
-    execute!(stdout, Hide, BeginSynchronizedUpdate)?;
+    match cursor_after {
+        CursorAfterUpdate::Preserve => execute!(stdout, BeginSynchronizedUpdate)?,
+        CursorAfterUpdate::Shown | CursorAfterUpdate::Hidden => {
+            execute!(stdout, Hide, BeginSynchronizedUpdate)?
+        }
+    }
     let result = update();
     let end = match cursor_after {
         CursorAfterUpdate::Shown => execute!(stdout, EndSynchronizedUpdate, Show),
-        CursorAfterUpdate::Hidden => execute!(stdout, EndSynchronizedUpdate),
+        CursorAfterUpdate::Preserve | CursorAfterUpdate::Hidden => {
+            execute!(stdout, EndSynchronizedUpdate)
+        }
     };
     match result {
         Ok(value) => {
@@ -4113,13 +4121,12 @@ fn update_live_output_in_place<T>(
     let mut stdout = io::stdout();
     execute!(
         stdout,
-        Hide,
         BeginSynchronizedUpdate,
         SavePosition,
         MoveTo(output_cursor.0, output_cursor.1)
     )?;
     let result = update();
-    let restore = execute!(stdout, RestorePosition, EndSynchronizedUpdate, Show);
+    let restore = execute!(stdout, RestorePosition, EndSynchronizedUpdate);
     match result {
         Ok(value) => {
             restore?;
@@ -4350,7 +4357,7 @@ impl LiveReplTail {
                 .iter()
                 .any(|chunk| renderer.chunk_changes_layout(chunk));
         if changes_layout {
-            return synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+            return synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                 self.suspend()?;
                 self.flush_pending_chunks(renderer)?;
                 renderer.tick_spinner()?;
@@ -4609,10 +4616,10 @@ fn read_live_repl_input(
         match live.editor.handle_event(event::read()?, paths, false)? {
             LiveEditorAction::None => {}
             LiveEditorAction::Redraw => {
-                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.redraw())?
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?
             }
             LiveEditorAction::ClearScreen => {
-                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.clear_screen())?
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.clear_screen())?
             }
             LiveEditorAction::Submit(submission) => {
                 let mode = live.mode();
@@ -4663,7 +4670,7 @@ fn handle_live_agent_event(
             result
         }
         AgentEvent::QueuedPromptsConsumed { prompt_ids, mode } => {
-            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                 live.suspend()?;
                 live.flush_pending_chunks(renderer)?;
                 renderer.prepare_for_external_output()?;
@@ -4674,7 +4681,7 @@ fn handle_live_agent_event(
             let finishes_external_output =
                 live.external_output_active && matches!(&event, AgentEvent::ToolResult { .. });
             if live.external_output_active && !finishes_external_output {
-                return synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                return synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                     handle_agent_event(renderer, event)
                 });
             }
@@ -4689,7 +4696,12 @@ fn handle_live_agent_event(
                 execute!(io::stdout(), EnableBracketedPaste)?;
                 return synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume());
             }
-            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+            let cursor_after = if finishes_external_output {
+                CursorAfterUpdate::Shown
+            } else {
+                CursorAfterUpdate::Preserve
+            };
+            synchronized_terminal_update(cursor_after, || {
                 live.suspend()?;
                 live.flush_pending_chunks(renderer)?;
                 handle_agent_event(renderer, event)?;
@@ -4755,7 +4767,7 @@ async fn run_live_agent_turn(
                         if live.external_output_active {
                             continue;
                         }
-                        synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                             live.suspend()?;
                             let mut renderer = renderer_cell.borrow_mut();
                             live.flush_pending_chunks(&mut renderer)?;
@@ -4771,10 +4783,12 @@ async fn run_live_agent_turn(
                     match live.editor.handle_event(event, paths, true)? {
                         LiveEditorAction::None => {}
                         LiveEditorAction::Redraw if !live.external_output_active => {
-                            synchronized_terminal_update(CursorAfterUpdate::Shown, || live.redraw())?
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                                live.redraw()
+                            })?
                         }
                         LiveEditorAction::ClearScreen if !live.external_output_active => {
-                            synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                                 live.clear_screen()
                             })?
                         }
@@ -4785,7 +4799,7 @@ async fn run_live_agent_turn(
                             if live.external_output_active {
                                 live.append_queued(prompt);
                             } else {
-                                synchronized_terminal_update(CursorAfterUpdate::Shown, || {
+                                synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                                     live.enqueue(prompt)
                                 })?;
                             }
