@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 urlencoding = "2.1"
+vte = "0.15"
 rustc-hash = "2"
 
 [build-dependencies]

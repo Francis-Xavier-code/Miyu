@@ -68,13 +68,7 @@ impl WaitSpinner {
         self.sub_phase = sub_phase;
     }
 
-    pub(crate) fn tick_changes_layout(&self) -> bool {
-        let terminal_width = terminal::size()
-            .map(|(width, _)| usize::from(width))
-            .unwrap_or(120);
-        self.tick_changes_layout_at_width(terminal_width)
-    }
-
+    #[cfg(test)]
     fn tick_changes_layout_at_width(&self, terminal_width: usize) -> bool {
         let (output, _) = render_frame_at_width(self.frame, self, terminal_width);
         let next_widths = output
@@ -85,7 +79,7 @@ impl WaitSpinner {
             != super::rendered_physical_rows(&next_widths, terminal_width)
     }
 
-    pub(crate) fn tick(&mut self) -> Result<()> {
+    pub(crate) fn tick(&mut self, writer: &mut impl Write) -> Result<()> {
         let terminal_width = terminal::size()
             .map(|(width, _)| usize::from(width))
             .unwrap_or(120);
@@ -95,7 +89,7 @@ impl WaitSpinner {
                 .lines()
                 .map(super::command_ansi_width)
                 .collect::<Vec<_>>();
-            write_spinner_lines(&output, &self.rendered_line_widths, terminal_width)?;
+            write_spinner_lines(writer, &output, &self.rendered_line_widths, terminal_width)?;
             self.rendered_line_widths = widths;
         }
         let total = total_frames_for_style(self.style);
@@ -103,8 +97,8 @@ impl WaitSpinner {
         Ok(())
     }
 
-    pub(crate) fn stop(&mut self) -> Result<()> {
-        clear_spinner_lines(&self.rendered_line_widths)?;
+    pub(crate) fn stop(&mut self, writer: &mut impl Write) -> Result<()> {
+        clear_spinner_lines(writer, &self.rendered_line_widths)?;
         self.rendered_line_widths.clear();
         Ok(())
     }
@@ -288,36 +282,35 @@ fn paint_for_style(text: &str, style: SpinnerStyle) -> String {
 }
 
 fn write_spinner_lines(
+    writer: &mut impl Write,
     output: &str,
     previous_widths: &[usize],
     terminal_width: usize,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
     if !previous_widths.is_empty() {
-        clear_spinner_lines_with_writer(&mut stdout, previous_widths, terminal_width)?;
+        clear_spinner_lines_with_writer(writer, previous_widths, terminal_width)?;
     }
     let output_lines = output.lines().collect::<Vec<_>>();
     for (index, line) in output_lines.iter().enumerate() {
-        execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        write!(stdout, "{line}")?;
+        execute!(writer, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        write!(writer, "{line}")?;
         if index + 1 < output_lines.len() {
-            write!(stdout, "\n")?;
+            writeln!(writer)?;
         }
     }
-    stdout.flush()?;
+    writer.flush()?;
     Ok(())
 }
 
-fn clear_spinner_lines(widths: &[usize]) -> Result<()> {
+fn clear_spinner_lines(writer: &mut impl Write, widths: &[usize]) -> Result<()> {
     if widths.is_empty() {
         return Ok(());
     }
-    let mut stdout = io::stdout();
     let terminal_width = terminal::size()
         .map(|(width, _)| usize::from(width))
         .unwrap_or(120);
-    clear_spinner_lines_with_writer(&mut stdout, widths, terminal_width)?;
-    stdout.flush()?;
+    clear_spinner_lines_with_writer(writer, widths, terminal_width)?;
+    writer.flush()?;
     Ok(())
 }
 

@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use base64::Engine;
 use chrono::{DateTime, Local};
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use crossterm::cursor::{self, Hide, MoveTo, RestorePosition, SavePosition, Show};
+use crossterm::cursor::{self, Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -29,6 +29,9 @@ use std::io::Cursor;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+use vte::{Params as VteParams, Parser as VteParser, Perform as VtePerform};
 
 const REPL_MAX_VISIBLE_INPUT_ROWS: u16 = 12;
 const REPL_PASTE_PLACEHOLDER_MIN_LINES: usize = 3;
@@ -2601,6 +2604,46 @@ async fn handle_post_turn_overflow(
     Ok(None)
 }
 
+async fn handle_live_post_turn_overflow(
+    live: &mut LiveReplTail,
+    agent: &Agent,
+    renderer: &mut render::StreamRenderer,
+    context_tokens: u64,
+    show_token_usage: bool,
+    cumulative_tokens: Option<&mut u64>,
+) -> Result<Option<crate::llm::ChatResult>> {
+    let compact_result = agent
+        .handle_overflow_after_turn(context_tokens, |event| {
+            handle_live_agent_event(live, renderer, event)
+        })
+        .await?;
+    renderer.finish()?;
+    live.apply_renderer_frame(renderer)?;
+    if let Some(compact_result) = compact_result {
+        let mut cumulative_display = None;
+        if let Some(total) = cumulative_tokens {
+            if let Some(usage) = compact_result.usage.as_ref() {
+                *total = total.saturating_add(render::usage_total(usage));
+                cumulative_display = Some(*total);
+            }
+        }
+        if show_token_usage {
+            if let Some(usage) = compact_result.usage.as_ref() {
+                let frame = render::token_usage_output(
+                    render::usage_total(usage),
+                    agent.effective_context_tokens()?,
+                    agent.context_window(),
+                    cumulative_display,
+                    compact_result.usage_estimated,
+                );
+                live.apply_output_frame(frame.strip_suffix('\n').unwrap_or(&frame).as_bytes())?;
+            }
+        }
+        return Ok(Some(compact_result));
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VariantOutcome {
     Updated,
@@ -3049,12 +3092,17 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
                         .as_deref()
                         .and_then(|model| client.thinking_variant_for(provider_id, model))
                 });
-                print_mixed_model_endpoint(
-                    show_mixed_model_endpoint(&config, true),
-                    &result,
-                    endpoint_variant.as_deref(),
-                );
-                match handle_post_turn_overflow(
+                if show_mixed_model_endpoint(&config, true) {
+                    let provider = result.provider_id.as_deref().unwrap_or("-");
+                    let model = result.model.as_deref().unwrap_or("-");
+                    let frame = format!(
+                        "\x1b[2m{}\x1b[0m\n",
+                        mixed_model_endpoint_label(provider, model, endpoint_variant.as_deref())
+                    );
+                    live.apply_output_frame(frame.as_bytes())?;
+                }
+                match handle_live_post_turn_overflow(
+                    live,
                     &agent,
                     &mut renderer,
                     context_tokens,
@@ -3078,7 +3126,8 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
                         footer.update_session_tokens(agent.effective_context_tokens()?);
                     }
                     Err(err) => {
-                        eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
+                        let frame = format!("\x1b[31m{}: {err}\x1b[0m\n", t("error", "错误"));
+                        live.apply_output_frame(frame.as_bytes())?;
                         continue;
                     }
                 }
@@ -3102,11 +3151,12 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
             }
             Err(err) => {
                 if let Some(live) = live_repl.as_mut() {
+                    let frame = format!("\x1b[31m{}: {err}\x1b[0m\n", t("error", "错误"));
+                    live.apply_output_frame(frame.as_bytes())?;
                     synchronized_terminal_update(CursorAfterUpdate::Shown, || {
                         live.reload_queue(&state)
                     })?;
                 }
-                eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
                 continue;
             }
         }
@@ -3693,6 +3743,7 @@ enum LiveEditorAction {
     None,
     Redraw,
     ClearScreen,
+    EmptySubmit,
     Submit(LiveSubmission),
     Interrupt,
     Exit,
@@ -3886,7 +3937,7 @@ impl LiveReplEditor {
                     return Ok(self
                         .submit()
                         .map(LiveEditorAction::Submit)
-                        .unwrap_or(LiveEditorAction::None));
+                        .unwrap_or(LiveEditorAction::EmptySubmit));
                 }
                 KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
                     insert_newline_at_cursor(&mut self.input, &mut self.cursor);
@@ -4061,8 +4112,10 @@ struct LiveReplTail {
     output_cursor: (u16, u16),
     tail_start: u16,
     tail_rows: u16,
+    input_cursor: (u16, u16),
     rendered: bool,
     external_output_active: bool,
+    raw_mode_handoff: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4071,6 +4124,263 @@ struct LiveTailPlacement {
     tail_start: u16,
     overflow: u16,
     anchored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalFrameLayout {
+    cursor: (u16, u16),
+    occupied_bottom: Option<u16>,
+}
+
+struct TerminalFrameTracker {
+    columns: usize,
+    bottom_margin: Option<usize>,
+    cursor_col: usize,
+    cursor_row: usize,
+    saved_cursor: (usize, usize, bool),
+    pending_wrap: bool,
+    pending_text: String,
+    occupied_bottom: Option<usize>,
+}
+
+impl TerminalFrameTracker {
+    fn new(start: (u16, u16), columns: u16, bottom_margin: Option<u16>) -> Self {
+        let columns = usize::from(columns.max(1));
+        let cursor_col = usize::from(start.0).min(columns.saturating_sub(1));
+        let cursor_row = usize::from(start.1);
+        Self {
+            columns,
+            bottom_margin: bottom_margin.map(usize::from),
+            cursor_col,
+            cursor_row,
+            saved_cursor: (cursor_col, cursor_row, false),
+            pending_wrap: false,
+            pending_text: String::new(),
+            occupied_bottom: None,
+        }
+    }
+
+    fn finish(mut self) -> TerminalFrameLayout {
+        self.flush_text();
+        TerminalFrameLayout {
+            cursor: (
+                self.cursor_col.min(u16::MAX as usize) as u16,
+                self.cursor_row.min(u16::MAX as usize) as u16,
+            ),
+            occupied_bottom: self
+                .occupied_bottom
+                .map(|row| row.min(u16::MAX as usize) as u16),
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.pending_text);
+        for grapheme in text.graphemes(true) {
+            self.print_width(UnicodeWidthStr::width(grapheme));
+        }
+    }
+
+    fn print_width(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        if self.pending_wrap || self.cursor_col.saturating_add(width) > self.columns {
+            self.cursor_col = 0;
+            self.index();
+            self.pending_wrap = false;
+        }
+        self.occupied_bottom = Some(
+            self.occupied_bottom
+                .map_or(self.cursor_row, |row| row.max(self.cursor_row)),
+        );
+        let next_col = self.cursor_col.saturating_add(width);
+        if next_col >= self.columns {
+            self.cursor_col = self.columns.saturating_sub(1);
+            self.pending_wrap = true;
+        } else {
+            self.cursor_col = next_col;
+        }
+    }
+
+    fn index(&mut self) {
+        if self
+            .bottom_margin
+            .is_some_and(|bottom| self.cursor_row >= bottom)
+        {
+            return;
+        }
+        self.cursor_row = self.cursor_row.saturating_add(1);
+    }
+
+    fn move_down(&mut self, count: usize) {
+        self.pending_wrap = false;
+        self.cursor_row = self.cursor_row.saturating_add(count);
+        if let Some(bottom) = self.bottom_margin {
+            self.cursor_row = self.cursor_row.min(bottom);
+        }
+    }
+
+    fn move_up(&mut self, count: usize) {
+        self.pending_wrap = false;
+        self.cursor_row = self.cursor_row.saturating_sub(count);
+    }
+
+    fn move_right(&mut self, count: usize) {
+        self.pending_wrap = false;
+        self.cursor_col = self
+            .cursor_col
+            .saturating_add(count)
+            .min(self.columns.saturating_sub(1));
+    }
+
+    fn move_left(&mut self, count: usize) {
+        self.pending_wrap = false;
+        self.cursor_col = self.cursor_col.saturating_sub(count);
+    }
+
+    fn set_row(&mut self, row: usize) {
+        self.pending_wrap = false;
+        self.cursor_row = row;
+        if let Some(bottom) = self.bottom_margin {
+            self.cursor_row = self.cursor_row.min(bottom);
+        }
+    }
+
+    fn set_col(&mut self, col: usize) {
+        self.pending_wrap = false;
+        self.cursor_col = col.min(self.columns.saturating_sub(1));
+    }
+
+    fn param(params: &VteParams, index: usize, default: usize) -> usize {
+        params
+            .iter()
+            .nth(index)
+            .and_then(|param| param.first())
+            .copied()
+            .map(usize::from)
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    }
+}
+
+impl VtePerform for TerminalFrameTracker {
+    fn print(&mut self, character: char) {
+        self.pending_text.push(character);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.flush_text();
+        match byte {
+            b'\n' => {
+                self.cursor_col = 0;
+                self.pending_wrap = false;
+                self.index();
+            }
+            b'\r' => self.set_col(0),
+            0x08 => self.move_left(1),
+            b'\t' => {
+                let next = (self.cursor_col / 8 + 1) * 8;
+                self.set_col(next);
+            }
+            0x0b | 0x0c => {
+                self.pending_wrap = false;
+                self.index();
+            }
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &VteParams,
+        _intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        self.flush_text();
+        if ignore {
+            return;
+        }
+        let count = Self::param(params, 0, 1);
+        match action {
+            'A' => self.move_up(count),
+            'B' | 'e' => self.move_down(count),
+            'C' | 'a' => self.move_right(count),
+            'D' => self.move_left(count),
+            'E' => {
+                self.move_down(count);
+                self.set_col(0);
+            }
+            'F' => {
+                self.move_up(count);
+                self.set_col(0);
+            }
+            'G' | '`' => self.set_col(count.saturating_sub(1)),
+            'H' | 'f' => {
+                self.set_row(Self::param(params, 0, 1).saturating_sub(1));
+                self.set_col(Self::param(params, 1, 1).saturating_sub(1));
+            }
+            'd' => self.set_row(count.saturating_sub(1)),
+            's' => {
+                self.saved_cursor = (self.cursor_col, self.cursor_row, self.pending_wrap);
+            }
+            'u' => {
+                (self.cursor_col, self.cursor_row, self.pending_wrap) = self.saved_cursor;
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], ignore: bool, byte: u8) {
+        self.flush_text();
+        if ignore {
+            return;
+        }
+        match byte {
+            b'7' => self.saved_cursor = (self.cursor_col, self.cursor_row, self.pending_wrap),
+            b'8' => {
+                (self.cursor_col, self.cursor_row, self.pending_wrap) = self.saved_cursor;
+            }
+            b'D' => {
+                self.pending_wrap = false;
+                self.index();
+            }
+            b'E' => {
+                self.cursor_col = 0;
+                self.pending_wrap = false;
+                self.index();
+            }
+            b'M' => self.move_up(1),
+            _ => {}
+        }
+    }
+}
+
+fn terminal_frame_layout(
+    frame: &[u8],
+    start: (u16, u16),
+    columns: u16,
+    bottom_margin: Option<u16>,
+) -> TerminalFrameLayout {
+    let mut parser = VteParser::new();
+    let mut tracker = TerminalFrameTracker::new(start, columns, bottom_margin);
+    parser.advance(&mut tracker, frame);
+    tracker.finish()
+}
+
+fn live_frame_output_bottom(frame_margin: u16, layout: TerminalFrameLayout) -> Option<u16> {
+    let ends_on_free_line = layout.cursor.0 == 0
+        && layout
+            .occupied_bottom
+            .is_none_or(|bottom| layout.cursor.1 > bottom);
+    if ends_on_free_line {
+        Some(frame_margin)
+    } else {
+        frame_margin.checked_sub(1)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4110,35 +4420,6 @@ fn synchronized_terminal_update<T>(
     }
 }
 
-fn update_live_output_in_place<T>(
-    rendered: bool,
-    output_cursor: (u16, u16),
-    update: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    if !rendered {
-        return update();
-    }
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        BeginSynchronizedUpdate,
-        SavePosition,
-        MoveTo(output_cursor.0, output_cursor.1)
-    )?;
-    let result = update();
-    let restore = execute!(stdout, RestorePosition, EndSynchronizedUpdate);
-    match result {
-        Ok(value) => {
-            restore?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = restore;
-            Err(error)
-        }
-    }
-}
-
 fn live_tail_placement(
     output_col: u16,
     output_row: u16,
@@ -4167,6 +4448,13 @@ fn live_tail_placement(
     }
 }
 
+fn max_live_tail_start(terminal_rows: u16, tail_rows: u16) -> u16 {
+    terminal_rows
+        .max(1)
+        .saturating_sub(1)
+        .saturating_sub(tail_rows)
+}
+
 impl LiveReplTail {
     fn new(
         mode: AgentMode,
@@ -4182,8 +4470,10 @@ impl LiveReplTail {
             output_cursor: cursor::position()?,
             tail_start: 0,
             tail_rows: 0,
+            input_cursor: (0, 0),
             rendered: false,
             external_output_active: false,
+            raw_mode_handoff: false,
         })
     }
 
@@ -4292,11 +4582,102 @@ impl LiveReplTail {
             &self.footer,
             false,
         )?;
+        self.input_cursor = cursor::position()?;
         self.output_cursor = (output_col, output_row);
         self.tail_start = tail_start;
         self.tail_rows = total_rows;
         self.rendered = true;
         Ok(())
+    }
+
+    fn apply_output_frame(&mut self, frame: &[u8]) -> Result<()> {
+        if frame.is_empty() {
+            return Ok(());
+        }
+        if !self.rendered {
+            io::stdout().write_all(frame)?;
+            io::stdout().flush()?;
+            self.output_cursor = cursor::position()?;
+            return Ok(());
+        }
+
+        let (columns, terminal_rows) = terminal::size().unwrap_or((80, 24));
+        let terminal_rows = terminal_rows.max(1);
+        let unbounded = terminal_frame_layout(frame, self.output_cursor, columns, None);
+        let natural_tail = unbounded
+            .cursor
+            .1
+            .saturating_add(u16::from(unbounded.cursor.0 > 0));
+        let occupied_tail = unbounded
+            .occupied_bottom
+            .map(|row| row.saturating_add(1))
+            .unwrap_or(0);
+        let desired_tail = natural_tail.max(occupied_tail);
+        let max_tail = max_live_tail_start(terminal_rows, self.tail_rows);
+        let next_tail = desired_tail.min(max_tail);
+        let shift = i32::from(next_tail) - i32::from(self.tail_start);
+        let frame_margin = if shift < 0 {
+            self.tail_start
+        } else {
+            next_tail
+        };
+        let output_bottom = live_frame_output_bottom(frame_margin, unbounded);
+        let leading_scroll = output_bottom
+            .map(|bottom| self.output_cursor.1.saturating_sub(bottom))
+            .unwrap_or(0);
+        let frame_start = if let Some(bottom) = output_bottom.filter(|_| leading_scroll > 0) {
+            (0, bottom)
+        } else {
+            self.output_cursor
+        };
+        let bounded = terminal_frame_layout(frame, frame_start, columns, output_bottom);
+
+        let mut transaction = Vec::with_capacity(frame.len().saturating_add(96));
+        if shift > 0 {
+            queue!(
+                transaction,
+                MoveTo(0, self.tail_start.saturating_add(1)),
+                Print(format!("\x1b[{shift}L"))
+            )?;
+        }
+        if let Some(bottom) = output_bottom {
+            queue!(
+                transaction,
+                Print(format!("\x1b[1;{}r", bottom.saturating_add(1)))
+            )?;
+        }
+        if let Some(bottom) = output_bottom.filter(|_| leading_scroll > 0) {
+            queue!(transaction, MoveTo(0, bottom))?;
+            for _ in 0..leading_scroll {
+                queue!(transaction, Print("\n"))?;
+            }
+        }
+        queue!(transaction, MoveTo(frame_start.0, frame_start.1))?;
+        transaction.extend_from_slice(frame);
+        queue!(transaction, Print("\x1b[r"))?;
+        if shift < 0 {
+            queue!(
+                transaction,
+                MoveTo(0, next_tail.saturating_add(1)),
+                Print(format!("\x1b[{}M", -shift))
+            )?;
+        }
+        let input_row = (i32::from(self.input_cursor.1) + shift)
+            .clamp(0, i32::from(terminal_rows.saturating_sub(1))) as u16;
+        queue!(transaction, MoveTo(self.input_cursor.0, input_row))?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&transaction)?;
+        stdout.flush()?;
+
+        self.output_cursor = bounded.cursor;
+        self.tail_start = next_tail;
+        self.input_cursor.1 = input_row;
+        Ok(())
+    }
+
+    fn apply_renderer_frame(&mut self, renderer: &mut render::StreamRenderer) -> Result<()> {
+        let frame = renderer.take_output_frame();
+        self.apply_output_frame(&frame)
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -4351,29 +4732,9 @@ impl LiveReplTail {
     }
 
     fn tick_spinner(&mut self, renderer: &mut render::StreamRenderer) -> Result<()> {
-        let changes_layout = renderer.transient_output_changes_layout()
-            || self
-                .pending_chunks
-                .iter()
-                .any(|chunk| renderer.chunk_changes_layout(chunk));
-        if changes_layout {
-            return synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
-                self.suspend()?;
-                self.flush_pending_chunks(renderer)?;
-                renderer.tick_spinner()?;
-                self.resume()
-            });
-        }
-
-        let rendered = self.rendered;
-        let output_cursor = self.output_cursor;
-        let chunks = std::mem::take(&mut self.pending_chunks);
-        update_live_output_in_place(rendered, output_cursor, || {
-            for chunk in chunks {
-                renderer.write_chunk(chunk)?;
-            }
-            renderer.tick_spinner()
-        })
+        self.flush_pending_chunks(renderer)?;
+        renderer.tick_spinner()?;
+        self.apply_renderer_frame(renderer)
     }
 
     fn commit_submission(&mut self, submission: &LiveSubmission) -> Result<()> {
@@ -4384,6 +4745,16 @@ impl LiveReplTail {
         )?;
         self.output_cursor = cursor::position()?;
         Ok(())
+    }
+
+    fn commit_empty_submission(&mut self) -> Result<()> {
+        let mode = self.editor.mode;
+        self.editor.clear();
+        self.suspend()?;
+        write_committed_user_messages(&[("", mode)], true)?;
+        let output_cursor = cursor::position()?;
+        self.output_cursor = output_cursor;
+        self.resume_at(output_cursor)
     }
 
     fn consume_queued(&mut self, prompt_ids: &[String], mode: AgentMode) -> Result<()> {
@@ -4531,13 +4902,15 @@ fn persist_queued_submission(
 
 struct LiveRawMode {
     show_cursor_on_drop: bool,
+    restore_terminal_on_drop: bool,
 }
 
 struct ReplCursorRestore;
 
 impl Drop for ReplCursorRestore {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
+        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -4547,11 +4920,23 @@ impl LiveRawMode {
         execute!(io::stdout(), EnableBracketedPaste)?;
         Ok(Self {
             show_cursor_on_drop: true,
+            restore_terminal_on_drop: true,
         })
+    }
+
+    fn adopt() -> Self {
+        Self {
+            show_cursor_on_drop: true,
+            restore_terminal_on_drop: true,
+        }
     }
 
     fn keep_cursor_hidden(&mut self) {
         self.show_cursor_on_drop = false;
+    }
+
+    fn handoff(&mut self) {
+        self.restore_terminal_on_drop = false;
     }
 }
 
@@ -4588,6 +4973,9 @@ fn restore_live_output_processing() -> Result<()> {
 
 impl Drop for LiveRawMode {
     fn drop(&mut self) {
+        if !self.restore_terminal_on_drop {
+            return;
+        }
         let mut stdout = io::stdout();
         if self.show_cursor_on_drop {
             let _ = execute!(stdout, DisableBracketedPaste, Show);
@@ -4608,7 +4996,11 @@ fn read_live_repl_input(
         Vec<Option<crate::clipboard::PastedImage>>,
     )>,
 > {
-    let mut raw = LiveRawMode::start()?;
+    let mut raw = if std::mem::take(&mut live.raw_mode_handoff) {
+        LiveRawMode::adopt()
+    } else {
+        LiveRawMode::start()?
+    };
     if !live.rendered {
         synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
     }
@@ -4620,6 +5012,11 @@ fn read_live_repl_input(
             }
             LiveEditorAction::ClearScreen => {
                 synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.clear_screen())?
+            }
+            LiveEditorAction::EmptySubmit => {
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                    live.commit_empty_submission()
+                })?
             }
             LiveEditorAction::Submit(submission) => {
                 let mode = live.mode();
@@ -4657,23 +5054,25 @@ fn handle_live_agent_event(
     }
     match event {
         AgentEvent::PrepareForExternalOutput { ready } => {
-            let result = synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-                live.suspend()?;
+            let result = (|| {
                 live.flush_pending_chunks(renderer)?;
                 renderer.prepare_for_external_output()?;
+                live.apply_renderer_frame(renderer)?;
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
                 live.external_output_active = true;
                 Ok(())
-            });
+            })();
             if result.is_ok() {
                 let _ = ready.send(());
             }
             result
         }
         AgentEvent::QueuedPromptsConsumed { prompt_ids, mode } => {
+            live.flush_pending_chunks(renderer)?;
+            renderer.prepare_for_external_output()?;
+            live.apply_renderer_frame(renderer)?;
             synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                 live.suspend()?;
-                live.flush_pending_chunks(renderer)?;
-                renderer.prepare_for_external_output()?;
                 live.consume_queued(&prompt_ids, mode)
             })
         }
@@ -4681,35 +5080,29 @@ fn handle_live_agent_event(
             let finishes_external_output =
                 live.external_output_active && matches!(&event, AgentEvent::ToolResult { .. });
             if live.external_output_active && !finishes_external_output {
-                return synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
-                    handle_agent_event(renderer, event)
-                });
+                handle_agent_event(renderer, event)?;
+                return live.apply_renderer_frame(renderer);
             }
             let question = matches!(&event, AgentEvent::AskQuestion { .. });
             if question {
-                synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-                    live.suspend()?;
-                    live.flush_pending_chunks(renderer)
-                })?;
+                live.flush_pending_chunks(renderer)?;
+                renderer.prepare_for_external_output()?;
+                live.apply_renderer_frame(renderer)?;
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
                 handle_agent_event(renderer, event)?;
                 enable_live_raw_mode()?;
                 execute!(io::stdout(), EnableBracketedPaste)?;
-                return synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume());
+                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
+                return live.apply_renderer_frame(renderer);
             }
-            let cursor_after = if finishes_external_output {
-                CursorAfterUpdate::Shown
-            } else {
-                CursorAfterUpdate::Preserve
-            };
-            synchronized_terminal_update(cursor_after, || {
-                live.suspend()?;
-                live.flush_pending_chunks(renderer)?;
-                handle_agent_event(renderer, event)?;
-                if finishes_external_output {
-                    live.external_output_active = false;
-                }
-                live.resume()
-            })
+            live.flush_pending_chunks(renderer)?;
+            handle_agent_event(renderer, event)?;
+            live.apply_renderer_frame(renderer)?;
+            if finishes_external_output {
+                live.external_output_active = false;
+                synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
+            }
+            Ok(())
         }
     }
 }
@@ -4724,13 +5117,18 @@ async fn run_live_agent_turn(
     renderer: &mut render::StreamRenderer,
 ) -> Result<Option<crate::llm::ChatResult>> {
     renderer.use_external_cursor_control();
-    let mut raw = LiveRawMode::start()?;
-    synchronized_terminal_update(CursorAfterUpdate::Shown, || {
-        live.external_output_active = false;
-        live.suspend()?;
-        renderer.start_waiting()?;
-        live.resume()
-    })?;
+    renderer.use_buffered_output();
+    let mut raw = if std::mem::take(&mut live.raw_mode_handoff) {
+        LiveRawMode::adopt()
+    } else {
+        LiveRawMode::start()?
+    };
+    live.external_output_active = false;
+    if !live.rendered {
+        live.resume_at(live.output_cursor)?;
+    }
+    renderer.start_waiting()?;
+    live.apply_renderer_frame(renderer)?;
 
     let result = {
         let live_cell = std::cell::RefCell::new(&mut *live);
@@ -4767,16 +5165,13 @@ async fn run_live_agent_turn(
                         if live.external_output_active {
                             continue;
                         }
-                        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
-                            live.suspend()?;
-                            let mut renderer = renderer_cell.borrow_mut();
-                            live.flush_pending_chunks(&mut renderer)?;
-                            renderer.write_system_message(t(
-                                "REPL commands are available after the current reply finishes",
-                                "当前回复结束后才能执行 REPL 命令",
-                            ))?;
-                            live.resume()
-                        })?;
+                        let mut renderer = renderer_cell.borrow_mut();
+                        live.flush_pending_chunks(&mut renderer)?;
+                        renderer.write_system_message(t(
+                            "REPL commands are available after the current reply finishes",
+                            "当前回复结束后才能执行 REPL 命令",
+                        ))?;
+                        live.apply_renderer_frame(&mut renderer)?;
                         continue;
                     }
                     let mode_before = live.mode();
@@ -4793,6 +5188,7 @@ async fn run_live_agent_turn(
                             })?
                         }
                         LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
+                        LiveEditorAction::EmptySubmit => {}
                         LiveEditorAction::Submit(submission) => {
                             let prompt = persist_queued_submission(state, &submission)?;
                             live.editor.record_history(&submission.content);
@@ -4818,15 +5214,12 @@ async fn run_live_agent_turn(
     if matches!(&result, Ok(None)) {
         live.discard_pending_chunks();
     }
-    synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-        live.external_output_active = false;
-        live.suspend()?;
-        live.flush_pending_chunks(renderer)?;
-        renderer.finish()?;
-        live.output_cursor = cursor::position()?;
-        Ok(())
-    })?;
-    raw.keep_cursor_hidden();
+    live.external_output_active = false;
+    live.flush_pending_chunks(renderer)?;
+    renderer.finish()?;
+    live.apply_renderer_frame(renderer)?;
+    raw.handoff();
+    live.raw_mode_handoff = true;
     result
 }
 
@@ -6296,6 +6689,55 @@ mod repl_input_tests {
     }
 
     #[test]
+    fn terminal_frame_tracks_ansi_and_wide_graphemes() {
+        let layout = terminal_frame_layout("\x1b[32mAB\x1b[0m\n中👨‍👩‍👧‍👦".as_bytes(), (3, 2), 12, None);
+
+        assert_eq!(layout.cursor, (4, 3));
+        assert_eq!(layout.occupied_bottom, Some(3));
+    }
+
+    #[test]
+    fn terminal_frame_wraps_before_the_next_wide_grapheme() {
+        let layout = terminal_frame_layout("中🙂".as_bytes(), (8, 1), 10, None);
+
+        assert_eq!(layout.cursor, (2, 2));
+        assert_eq!(layout.occupied_bottom, Some(2));
+    }
+
+    #[test]
+    fn terminal_frame_applies_cursor_motion_without_losing_bottom_occupancy() {
+        let layout = terminal_frame_layout(b"first\nsecond\x1b[1A\x1b[3G!", (0, 4), 20, None);
+
+        assert_eq!(layout.cursor, (3, 4));
+        assert_eq!(layout.occupied_bottom, Some(5));
+    }
+
+    #[test]
+    fn terminal_frame_scroll_margin_keeps_cursor_above_live_input() {
+        let layout = terminal_frame_layout("one\n二\nthree".as_bytes(), (0, 5), 20, Some(5));
+
+        assert_eq!(layout.cursor, (5, 5));
+        assert_eq!(layout.occupied_bottom, Some(5));
+    }
+
+    #[test]
+    fn live_frame_uses_the_gap_only_for_a_terminating_newline() {
+        let content = terminal_frame_layout(b"answer", (0, 5), 20, None);
+        assert_eq!(live_frame_output_bottom(6, content), Some(5));
+
+        let terminated = terminal_frame_layout(b"answer\n", (0, 5), 20, None);
+        assert_eq!(live_frame_output_bottom(6, terminated), Some(6));
+        let bounded = terminal_frame_layout(
+            b"answer\n",
+            (0, 5),
+            20,
+            live_frame_output_bottom(6, terminated),
+        );
+        assert_eq!(bounded.cursor, (0, 6));
+        assert_eq!(bounded.occupied_bottom, Some(5));
+    }
+
+    #[test]
     fn models_is_the_cli_model_selector() {
         let matches = localized_command()
             .try_get_matches_from(["miyu", "models", "1"])
@@ -6582,6 +7024,8 @@ mod repl_input_tests {
 
     #[test]
     fn live_tail_moves_naturally_and_releases_after_output_shrinks() {
+        assert_eq!(max_live_tail_start(6, 5), 0);
+        assert_eq!(max_live_tail_start(24, 5), 18);
         assert_eq!(
             live_tail_placement(0, 4, 5, 24),
             LiveTailPlacement {
@@ -6644,6 +7088,18 @@ mod repl_input_tests {
             LiveEditorAction::Redraw
         ));
 
+        assert!(matches!(
+            editor
+                .handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    &paths,
+                    false,
+                )
+                .unwrap(),
+            LiveEditorAction::EmptySubmit
+        ));
+        assert!(editor.history.is_empty());
+
         editor.input = "/help".to_string();
         editor.cursor = editor.input.chars().count();
         assert!(matches!(
@@ -6672,8 +7128,10 @@ mod repl_input_tests {
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,
+            input_cursor: (0, 0),
             rendered: false,
             external_output_active: true,
+            raw_mode_handoff: false,
         };
         let mut renderer = render::StreamRenderer::new(
             render::ReasoningDisplayMode::Hidden,
@@ -6700,8 +7158,10 @@ mod repl_input_tests {
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,
+            input_cursor: (0, 0),
             rendered: false,
             external_output_active: false,
+            raw_mode_handoff: false,
         };
 
         for (kind, text) in [
