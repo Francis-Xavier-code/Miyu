@@ -1815,7 +1815,7 @@
       if (end > plainStart) parent.appendChild(document.createTextNode(text.slice(plainStart, end)));
     };
     while (index < text.length) {
-      if (text[index] === "\\" && index + 1 < text.length && "\\`*_[]".includes(text[index + 1])) {
+      if (text[index] === "\\" && index + 1 < text.length && "\\`*_[]|~".includes(text[index + 1])) {
         flushPlain(index);
         parent.appendChild(document.createTextNode(text[index + 1]));
         index += 2;
@@ -1858,6 +1858,18 @@
             plainStart = index;
             continue;
           }
+        }
+      }
+      if (text.startsWith("~~", index)) {
+        const end = text.indexOf("~~", index + 2);
+        if (end > index + 2 && text.slice(index + 2, end).trim()) {
+          flushPlain(index);
+          const deletion = document.createElement("del");
+          appendInline(deletion, text.slice(index + 2, end), depth + 1);
+          parent.appendChild(deletion);
+          index = end + 2;
+          plainStart = index;
+          continue;
         }
       }
       const strongMarker = text.startsWith("**", index) ? "**" : text.startsWith("__", index) ? "__" : null;
@@ -1910,8 +1922,114 @@
     return wrapper;
   }
 
-  function isMarkdownBlockStart(line) {
-    return /^\s*```/.test(line) || /^#{1,6}\s+/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line) || /^\s*>/.test(line);
+  function parseTableRow(line) {
+    const text = String(line || "").trim();
+    const cells = [];
+    let cell = "";
+    let codeFenceLength = 0;
+    let hasSeparator = false;
+    let endedWithSeparator = false;
+    for (let index = 0; index < text.length;) {
+      if (text[index] === "\\" && index + 1 < text.length) {
+        cell += text.slice(index, index + 2);
+        index += 2;
+        endedWithSeparator = false;
+        continue;
+      }
+      if (text[index] === "`") {
+        let end = index + 1;
+        while (end < text.length && text[end] === "`") end += 1;
+        const runLength = end - index;
+        if (!codeFenceLength) codeFenceLength = runLength;
+        else if (codeFenceLength === runLength) codeFenceLength = 0;
+        cell += text.slice(index, end);
+        index = end;
+        endedWithSeparator = false;
+        continue;
+      }
+      if (text[index] === "|" && !codeFenceLength) {
+        cells.push(cell.trim());
+        cell = "";
+        hasSeparator = true;
+        endedWithSeparator = true;
+        index += 1;
+        continue;
+      }
+      cell += text[index];
+      endedWithSeparator = false;
+      index += 1;
+    }
+    cells.push(cell.trim());
+    if (text.startsWith("|")) cells.shift();
+    if (endedWithSeparator) cells.pop();
+    return { cells, hasSeparator };
+  }
+
+  function tableAlignments(line) {
+    const row = parseTableRow(line);
+    if (!row.hasSeparator || !row.cells.length) return null;
+    const alignments = [];
+    for (const cell of row.cells) {
+      const marker = cell.match(/^(:)?-{3,}(:)?$/);
+      if (!marker) return null;
+      alignments.push(marker[1] && marker[2] ? "center" : marker[2] ? "right" : marker[1] ? "left" : "");
+    }
+    return alignments;
+  }
+
+  function isTableStart(lines, index) {
+    if (index + 1 >= lines.length) return false;
+    const header = parseTableRow(lines[index]);
+    const alignments = tableAlignments(lines[index + 1]);
+    return Boolean(alignments && header.hasSeparator && header.cells.length === alignments.length);
+  }
+
+  function isHorizontalRule(line) {
+    const text = String(line || "").trim();
+    return /^(?:\*\s*){3,}$/.test(text) || /^(?:-\s*){3,}$/.test(text) || /^(?:_\s*){3,}$/.test(text);
+  }
+
+  function markdownTable(lines, startIndex) {
+    const headers = parseTableRow(lines[startIndex]).cells;
+    const alignments = tableAlignments(lines[startIndex + 1]);
+    const wrapper = document.createElement("div");
+    wrapper.className = "markdown-table-scroll";
+    const table = document.createElement("table");
+    const head = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    headers.forEach((content, column) => {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      if (alignments[column]) cell.className = `align-${alignments[column]}`;
+      appendInline(cell, content);
+      headRow.appendChild(cell);
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    const body = document.createElement("tbody");
+    let index = startIndex + 2;
+    while (index < lines.length && lines[index].trim()) {
+      const row = parseTableRow(lines[index]);
+      if (!row.hasSeparator) break;
+      const tableRow = document.createElement("tr");
+      for (let column = 0; column < headers.length; column += 1) {
+        const cell = document.createElement("td");
+        if (alignments[column]) cell.className = `align-${alignments[column]}`;
+        appendInline(cell, row.cells[column] || "");
+        tableRow.appendChild(cell);
+      }
+      body.appendChild(tableRow);
+      index += 1;
+    }
+    if (body.children.length) table.appendChild(body);
+    wrapper.appendChild(table);
+    return { node: wrapper, nextIndex: index };
+  }
+
+  function isMarkdownBlockStart(lines, index) {
+    const line = lines[index];
+    return /^\s*```/.test(line) || /^#{1,6}\s+/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line) || /^\s*>/.test(line) || isHorizontalRule(line) || isTableStart(lines, index);
   }
 
   function renderMarkdown(container, source) {
@@ -1937,6 +2055,17 @@
         fragment.appendChild(codeBlock(language, codeLines.join("\n")));
         continue;
       }
+      if (isTableStart(lines, index)) {
+        const rendered = markdownTable(lines, index);
+        fragment.appendChild(rendered.node);
+        index = rendered.nextIndex;
+        continue;
+      }
+      if (isHorizontalRule(line)) {
+        fragment.appendChild(document.createElement("hr"));
+        index += 1;
+        continue;
+      }
       const heading = line.match(/^(#{1,6})\s+(.+)$/);
       if (heading) {
         const level = Math.min(6, heading[1].length + 1);
@@ -1949,14 +2078,29 @@
       const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
       if (unordered) {
         const list = document.createElement("ul");
+        let hasTask = false;
         while (index < lines.length) {
           const itemMatch = lines[index].match(/^\s*[-*+]\s+(.+)$/);
           if (!itemMatch) break;
           const item = document.createElement("li");
-          appendInline(item, itemMatch[1]);
+          const task = itemMatch[1].match(/^\[([ xX])\]\s+(.*)$/);
+          if (task) {
+            hasTask = true;
+            item.className = "task-list-item";
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = task[1].toLowerCase() === "x";
+            checkbox.disabled = true;
+            const content = document.createElement("span");
+            appendInline(content, task[2]);
+            item.append(checkbox, content);
+          } else {
+            appendInline(item, itemMatch[1]);
+          }
           list.appendChild(item);
           index += 1;
         }
+        if (hasTask) list.classList.add("task-list");
         fragment.appendChild(list);
         continue;
       }
@@ -1989,7 +2133,7 @@
       }
       const paragraphLines = [line];
       index += 1;
-      while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines, index)) {
         paragraphLines.push(lines[index]);
         index += 1;
       }

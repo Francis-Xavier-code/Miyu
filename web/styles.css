@@ -1035,11 +1035,81 @@ textarea:disabled {
   color: var(--accent);
 }
 
+.markdown-body .task-list-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 7px;
+  list-style: none;
+}
+
+.markdown-body .task-list-item input {
+  width: 14px;
+  height: 14px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+  opacity: 1;
+}
+
 .markdown-body blockquote {
   margin: 6px 0 15px;
   padding: 7px 11px;
   border-left: 2px solid var(--cyan);
   color: var(--text-soft);
+}
+
+.markdown-body hr {
+  height: 1px;
+  margin: 20px 0;
+  border: 0;
+  background: var(--line);
+}
+
+.markdown-body del {
+  color: var(--text-faint);
+}
+
+.markdown-body .markdown-table-scroll {
+  max-width: 100%;
+  margin: 8px 0 15px;
+  overflow-x: auto;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.markdown-body table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  min-width: 80px;
+  max-width: 360px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body th {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.markdown-body tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--surface-2) 48%, transparent);
+}
+
+.markdown-body .align-center {
+  text-align: center;
+}
+
+.markdown-body .align-right {
+  text-align: right;
 }
 
 .markdown-body code:not(pre code) {
