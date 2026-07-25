@@ -7,7 +7,8 @@ use anyhow::{bail, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
@@ -267,6 +268,10 @@ fn handle_editing_key(
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             insert_text(&mut state.edit_buffer, &mut state.edit_cursor, "\n");
         }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Shift+Enter 与 Ctrl+J 相同：自定义答案编辑时插入换行
+            insert_text(&mut state.edit_buffer, &mut state.edit_cursor, "\n");
+        }
         KeyCode::Esc => {
             state.editing = false;
             state.edit_buffer.clear();
@@ -352,6 +357,7 @@ struct QuestionSession {
     stdout: io::Stdout,
     anchor_y: u16,
     panel_lines: u16,
+    keyboard_enhancement_active: bool,
 }
 
 impl QuestionSession {
@@ -363,6 +369,17 @@ impl QuestionSession {
             let _ = terminal::disable_raw_mode();
             return Err(err.into());
         }
+        // 1. 尽量启用键盘增强，使 Shift+Enter 可被识别
+        // 2. Windows 旧控制台可能不支持，失败时仍保持普通输入
+        let keyboard_enhancement_active = if cfg!(windows) {
+            false
+        } else {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .is_ok()
+        };
         let (_, cursor_y) =
             crossterm::cursor::position().unwrap_or((0, panel_lines.saturating_sub(1)));
         let anchor_y = cursor_y.saturating_sub(panel_lines.saturating_sub(1));
@@ -370,6 +387,7 @@ impl QuestionSession {
             stdout,
             anchor_y,
             panel_lines,
+            keyboard_enhancement_active,
         })
     }
 
@@ -488,7 +506,14 @@ impl QuestionSession {
 
 impl Drop for QuestionSession {
     fn drop(&mut self) {
+        // 1. 恢复括号粘贴与光标
+        // 2. 若启用过键盘增强则 Pop
+        // 3. 退出 raw mode
         let _ = execute!(self.stdout, DisableBracketedPaste, Show);
+        if self.keyboard_enhancement_active {
+            let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
+            self.keyboard_enhancement_active = false;
+        }
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -591,8 +616,8 @@ fn draw(
             footer_lines.push(format!(
                 "\x1b[2m{}\x1b[0m",
                 t(
-                    "Enter save · Ctrl+J newline · Esc stop editing",
-                    "Enter 保存 · Ctrl+J 换行 · Esc 退出编辑"
+                    "Enter save · Shift+Enter newline · Ctrl+J newline · Esc stop editing",
+                    "Enter 保存 · Shift+Enter 换行 · Ctrl+J 换行 · Esc 退出编辑"
                 )
             ));
         } else {
@@ -1146,6 +1171,7 @@ mod tests {
             stdout: io::stdout(),
             anchor_y: 8,
             panel_lines: 12,
+            keyboard_enhancement_active: false,
         });
         session.resize_to_terminal(3);
         assert_eq!(session.panel_lines, 2);
@@ -1196,6 +1222,30 @@ mod tests {
             &request,
             &mut state,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.edit_buffer, "前\n");
+    }
+
+    #[test]
+    fn shift_enter_inserts_custom_answer_newline() {
+        let request = QuestionRequest {
+            questions: vec![QuestionPrompt {
+                header: "说明".to_string(),
+                question: "补充说明".to_string(),
+                options: Vec::new(),
+                multiple: false,
+                custom: true,
+            }],
+        };
+        let mut state = QuestionState::new(&request);
+        state.editing = true;
+        state.edit_buffer = "前".to_string();
+        state.edit_cursor = 1;
+        handle_editing_key(
+            &request,
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
         )
         .unwrap();
         assert_eq!(state.edit_buffer, "前\n");
