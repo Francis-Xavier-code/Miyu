@@ -510,6 +510,7 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Clear current conversation history",
             "清空当前会话历史",
         ),
+        ("web", "Start the local Miyu WebUI", "启动本地 Miyu WebUI"),
     ];
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
@@ -524,7 +525,8 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         .mut_subcommand("memory", localize_memory_command)
         .mut_subcommand("skills", localize_skills_command)
         .mut_subcommand("config", localize_config_command)
-        .mut_subcommand("reset", localize_reset_command);
+        .mut_subcommand("reset", localize_reset_command)
+        .mut_subcommand("web", localize_web_command);
     command
 }
 
@@ -588,6 +590,29 @@ fn localize_reset_command(command: clap::Command) -> clap::Command {
             "all 同时清空长期记忆",
         ))
     })
+}
+
+fn localize_web_command(command: clap::Command) -> clap::Command {
+    command
+        .mut_arg("port", |arg| arg.help(t("Local TCP port", "本地 TCP 端口")))
+        .mut_arg("no_open", |arg| {
+            arg.help(t(
+                "Do not open the WebUI in a browser",
+                "不自动在浏览器中打开 WebUI",
+            ))
+        })
+        .mut_arg("password", |arg| {
+            arg.help(t(
+                "Require a password; omit the value to enter it securely",
+                "要求访问密码；省略参数值时安全输入",
+            ))
+        })
+        .mut_arg("password_file", |arg| {
+            arg.help(t(
+                "Read the WebUI password from a file",
+                "从文件读取 WebUI 访问密码",
+            ))
+        })
 }
 
 fn localize_kb_command(mut command: clap::Command) -> clap::Command {
@@ -725,6 +750,7 @@ pub enum Command {
     Memory(MemoryArgs),
     Skills(SkillsArgs),
     Reset(ResetArgs),
+    Web(WebArgs),
 }
 
 #[derive(Debug, Args)]
@@ -736,6 +762,33 @@ pub struct MessageArgs {
 #[derive(Debug, Args)]
 pub struct ResetArgs {
     pub scope: Option<String>,
+}
+
+#[derive(Args)]
+pub struct WebArgs {
+    #[arg(long, default_value_t = 4096)]
+    pub port: u16,
+
+    #[arg(long)]
+    pub no_open: bool,
+
+    #[arg(short = 'p', long, num_args = 0..=1, default_missing_value = "")]
+    pub password: Option<String>,
+
+    #[arg(long, value_name = "PATH", conflicts_with = "password")]
+    pub password_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for WebArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebArgs")
+            .field("port", &self.port)
+            .field("no_open", &self.no_open)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_file", &self.password_file)
+            .finish()
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1012,6 +1065,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::Memory(args)) => run_memory(&paths, args),
         Some(Command::Skills(args)) => run_skills(&paths, args),
         Some(Command::Reset(args)) => run_reset(&paths, args.scope.as_deref()),
+        Some(Command::Web(args)) => crate::web::run(paths, args).await,
         None => {
             let message = join_message(cli.message);
             if message.is_empty() && io::stdin().is_terminal() {
@@ -5063,11 +5117,13 @@ fn handle_live_agent_event(
                 Ok(())
             })();
             if result.is_ok() {
-                let _ = ready.send(());
+                let _ = ready.send(true);
             }
             result
         }
-        AgentEvent::QueuedPromptsConsumed { prompt_ids, mode } => {
+        AgentEvent::QueuedPromptsConsumed {
+            prompt_ids, mode, ..
+        } => {
             live.flush_pending_chunks(renderer)?;
             renderer.prepare_for_external_output()?;
             live.apply_renderer_frame(renderer)?;
@@ -6658,6 +6714,8 @@ mod repl_input_tests {
             user_timestamp: "2026-07-19 10:42".to_string(),
             assistant_content: "first answer line\nsecond answer line".to_string(),
             assistant_reasoning: Some("private reasoning".to_string()),
+            assistant_provider_id: None,
+            assistant_model: None,
             assistant_timestamp: Some("2026-07-19 10:43".to_string()),
             status,
             tool_reports: vec!["hidden tool report".to_string()],
@@ -6776,6 +6834,66 @@ mod repl_input_tests {
                 .to_vec()
         )
         .is_err());
+    }
+
+    #[test]
+    fn web_is_a_cli_subcommand_with_local_server_options() {
+        let cli = parse_args(
+            ["miyu", "web", "--port", "4100", "--no-open"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs {
+                port: 4100,
+                no_open: true,
+                password: None,
+                password_file: None,
+            }))
+        ));
+
+        let cli = parse_args(["miyu", "web"].map(OsString::from).to_vec()).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs {
+                port: 4096,
+                no_open: false,
+                password: None,
+                password_file: None,
+            }))
+        ));
+
+        let cli = parse_args(
+            ["miyu", "web", "-p", "secret", "--no-open"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs {
+                password: Some(password),
+                no_open: true,
+                ..
+            })) if password == "secret"
+        ));
+
+        let cli = parse_args(
+            ["miyu", "web", "-p", "--no-open"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs {
+                password: Some(password),
+                no_open: true,
+                ..
+            })) if password.is_empty()
+        ));
     }
 
     #[test]
@@ -7950,7 +8068,7 @@ fn join_message(parts: Vec<String>) -> String {
     parts.join(" ").trim().to_string()
 }
 
-fn build_tool_registry(
+pub(crate) fn build_tool_registry(
     config: &AppConfig,
     paths: &MiyuPaths,
     mode: AgentMode,
@@ -7977,6 +8095,7 @@ fn build_tool_registry(
 
 fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) -> Result<()> {
     match event {
+        AgentEvent::TurnStarted { .. } => Ok(()),
         AgentEvent::Chunk(chunk) => {
             renderer.write_chunk(chunk)?;
             renderer.tick_spinner()
@@ -8013,9 +8132,10 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
         }
         AgentEvent::PrepareForExternalOutput { ready } => {
             renderer.prepare_for_external_output()?;
-            let _ = ready.send(());
+            let _ = ready.send(true);
             Ok(())
         }
+        AgentEvent::Image { .. } => Ok(()),
         AgentEvent::AskQuestion { request, responder } => {
             renderer.prepare_for_external_output()?;
             let response = crate::question_tui::ask(&request).unwrap_or_else(|err| {

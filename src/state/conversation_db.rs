@@ -47,6 +47,8 @@ pub struct Turn {
     pub user_timestamp: String,
     pub assistant_content: String,
     pub assistant_reasoning: Option<String>,
+    pub assistant_provider_id: Option<String>,
+    pub assistant_model: Option<String>,
     pub assistant_timestamp: Option<String>,
     pub status: TurnStatus,
     pub tool_reports: Vec<String>,
@@ -85,6 +87,26 @@ pub struct TurnFollowup {
     pub submitted_at: String,
     pub preceding_assistant_content: Option<String>,
     pub preceding_assistant_reasoning: Option<String>,
+    pub preceding_assistant_provider_id: Option<String>,
+    pub preceding_assistant_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAsset {
+    pub asset_id: String,
+    pub turn_id: String,
+    pub tool_id: Option<String>,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub alt: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageAssetData {
+    pub asset: ImageAsset,
+    pub bytes: Vec<u8>,
 }
 
 pub struct ConversationDb {
@@ -133,7 +155,23 @@ impl ConversationDb {
                 tool_reports     TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_turns_seq ON turns(seq);
-            CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status);",
+             CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status);",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS image_assets (
+                asset_id    TEXT PRIMARY KEY,
+                turn_id     TEXT NOT NULL,
+                tool_id     TEXT,
+                mime        TEXT NOT NULL,
+                width       INTEGER NOT NULL DEFAULT 0,
+                height      INTEGER NOT NULL DEFAULT 0,
+                alt         TEXT NOT NULL DEFAULT '',
+                data        BLOB NOT NULL,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_image_assets_turn
+                ON image_assets(turn_id, created_at, asset_id);",
         )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS queued_prompts (
@@ -173,6 +211,7 @@ impl ConversationDb {
         add_column_if_missing(&conn, "turns", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&conn, "turns", "is_summary", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&conn, "turns", "owner_pid", "INTEGER")?;
+        add_column_if_missing(&conn, "turns", "queue_session_id", "TEXT")?;
         add_column_if_missing(&conn, "turns", "token_total", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(
             &conn,
@@ -187,8 +226,17 @@ impl ConversationDb {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         add_column_if_missing(&conn, "turns", "compact_parent_summary_seq", "INTEGER")?;
+        add_column_if_missing(&conn, "turns", "assistant_provider_id", "TEXT")?;
+        add_column_if_missing(&conn, "turns", "assistant_model", "TEXT")?;
         add_column_if_missing(&conn, "queued_prompts", "queue_session_id", "TEXT")?;
         add_column_if_missing(&conn, "queued_prompts", "owner_pid", "INTEGER")?;
+        add_column_if_missing(
+            &conn,
+            "queued_prompts",
+            "preceding_assistant_provider_id",
+            "TEXT",
+        )?;
+        add_column_if_missing(&conn, "queued_prompts", "preceding_assistant_model", "TEXT")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_turns_visible_seq ON turns(hidden, seq);
              CREATE INDEX IF NOT EXISTS idx_turns_visible_summary_seq
@@ -201,14 +249,28 @@ impl ConversationDb {
         })
     }
 
-    pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
+    pub fn start_turn(
+        &self,
+        turn_id: &str,
+        user_content: &str,
+        owner_pid: u32,
+        queue_session_id: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let seq = self.next_seq_locked(&conn)?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status, owner_pid)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
-            params![turn_id, seq, user_content, now, PENDING_PLACEHOLDER, owner_pid as i64],
+            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status, owner_pid, queue_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+            params![
+                turn_id,
+                seq,
+                user_content,
+                now,
+                PENDING_PLACEHOLDER,
+                owner_pid as i64,
+                queue_session_id
+            ],
         )?;
         Ok(())
     }
@@ -220,7 +282,7 @@ impl ConversationDb {
         content: &str,
         reasoning: Option<&str>,
     ) -> Result<()> {
-        self.complete_turn_with_usage(turn_id, content, reasoning, None, false)
+        self.complete_turn_with_usage(turn_id, content, reasoning, None, None, None, false)
     }
 
     pub fn complete_turn_with_usage(
@@ -228,6 +290,8 @@ impl ConversationDb {
         turn_id: &str,
         content: &str,
         reasoning: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
         token_total: Option<u64>,
         token_usage_estimated: bool,
     ) -> Result<()> {
@@ -236,10 +300,20 @@ impl ConversationDb {
         let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         conn.execute(
-            "UPDATE turns SET assistant_content = ?1, assistant_reasoning = ?2, assistant_timestamp = ?3,
-                    status = 'completed', token_total = ?4, token_usage_estimated = ?5
-             WHERE turn_id = ?6",
-            params![content, reasoning, now, token_total, token_usage_estimated, turn_id],
+            "UPDATE turns SET assistant_content = ?1, assistant_reasoning = ?2,
+                    assistant_provider_id = ?3, assistant_model = ?4, assistant_timestamp = ?5,
+                    status = 'completed', token_total = ?6, token_usage_estimated = ?7
+             WHERE turn_id = ?8",
+            params![
+                content,
+                reasoning,
+                provider_id,
+                model,
+                now,
+                token_total,
+                token_usage_estimated,
+                turn_id
+            ],
         )?;
         Ok(())
     }
@@ -275,6 +349,56 @@ impl ConversationDb {
             params![encoded, turn_id],
         )?;
         Ok(())
+    }
+
+    pub fn insert_image_asset(&self, asset: &ImageAsset, data: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO image_assets
+                (asset_id, turn_id, tool_id, mime, width, height, alt, data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                asset.asset_id,
+                asset.turn_id,
+                asset.tool_id,
+                asset.mime,
+                i64::from(asset.width),
+                i64::from(asset.height),
+                asset.alt,
+                data,
+                asset.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_image_assets(&self) -> Result<Vec<ImageAsset>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT asset_id, turn_id, tool_id, mime, width, height, alt, created_at
+             FROM image_assets ORDER BY turn_id ASC, created_at ASC, asset_id ASC",
+        )?;
+        let assets = stmt
+            .query_map([], map_image_asset_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(assets)
+    }
+
+    pub fn load_image_asset(&self, asset_id: &str) -> Result<Option<ImageAssetData>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT asset_id, turn_id, tool_id, mime, width, height, alt, created_at, data
+             FROM image_assets WHERE asset_id = ?1",
+            params![asset_id],
+            |row| {
+                Ok(ImageAssetData {
+                    asset: map_image_asset_row(row)?,
+                    bytes: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn append_question_exchange(
@@ -366,6 +490,8 @@ impl ConversationDb {
         prompts: &[(String, String)],
         preceding_assistant_content: Option<&str>,
         preceding_assistant_reasoning: Option<&str>,
+        preceding_assistant_provider_id: Option<&str>,
+        preceding_assistant_model: Option<&str>,
         queue_session_id: &str,
     ) -> Result<()> {
         if prompts.is_empty() {
@@ -393,14 +519,18 @@ impl ConversationDb {
                 "UPDATE queued_prompts
                   SET status = 'consumed', consumed_at = ?1, turn_id = ?2,
                       context_content = ?3, preceding_assistant_content = ?4,
-                      preceding_assistant_reasoning = ?5
-                  WHERE prompt_id = ?6 AND status = 'queued' AND queue_session_id = ?7",
+                      preceding_assistant_reasoning = ?5,
+                      preceding_assistant_provider_id = ?6,
+                      preceding_assistant_model = ?7
+                   WHERE prompt_id = ?8 AND status = 'queued' AND queue_session_id = ?9",
                 params![
                     consumed_at,
                     turn_id,
                     context_content,
                     preceding_content,
                     preceding_reasoning,
+                    preceding_assistant_provider_id,
+                    preceding_assistant_model,
                     prompt_id,
                     queue_session_id
                 ],
@@ -420,6 +550,15 @@ impl ConversationDb {
              WHERE status = 'queued' AND queue_session_id = ?1",
             params![queue_session_id],
         )?)
+    }
+
+    pub fn remove_queued_prompt(&self, prompt_id: &str, queue_session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM queued_prompts
+             WHERE prompt_id = ?1 AND status = 'queued' AND queue_session_id = ?2",
+            params![prompt_id, queue_session_id],
+        )? == 1)
     }
 
     pub fn discard_stale_queued_prompts(
@@ -528,7 +667,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns ORDER BY seq ASC",
         )?;
@@ -544,7 +683,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns WHERE turn_id != ?1 ORDER BY seq ASC",
         )?;
@@ -564,7 +703,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns WHERE hidden = 0 ORDER BY seq ASC",
         )?;
@@ -579,7 +718,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns WHERE hidden = 0 AND turn_id != ?1 ORDER BY seq ASC",
         )?;
@@ -629,7 +768,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns WHERE is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
         )?;
@@ -655,7 +794,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns WHERE is_summary = 0 ORDER BY seq ASC LIMIT ?1",
         )?;
@@ -677,7 +816,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
-                    assistant_reasoning, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
+                    assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns
              WHERE hidden = 0 AND is_summary = 0 AND status != 'running'
@@ -938,6 +1077,38 @@ impl ConversationDb {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    pub fn running_turn_queue_target(
+        &self,
+    ) -> Result<Option<(String, Option<String>, Option<u32>)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT turns.turn_id,
+                    COALESCE(
+                        turns.queue_session_id,
+                        (SELECT queued_prompts.queue_session_id
+                           FROM queued_prompts
+                          WHERE queued_prompts.owner_pid = turns.owner_pid
+                            AND queued_prompts.queue_session_id IS NOT NULL
+                          ORDER BY queued_prompts.seq DESC
+                          LIMIT 1)
+                    ),
+                    turns.owner_pid
+               FROM turns
+              WHERE turns.status = 'running'
+              ORDER BY turns.seq DESC
+              LIMIT 1",
+            [],
+            |row| {
+                let owner_pid = row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|pid| u32::try_from(pid).ok());
+                Ok((row.get(0)?, row.get(1)?, owner_pid))
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     #[allow(dead_code)]
@@ -1207,10 +1378,8 @@ pub fn interrupted_text() -> &'static str {
 }
 
 fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
-    let tool_reports_json: String = row.get(8)?;
+    let tool_reports_json: String = row.get(10)?;
     let tool_reports: Vec<String> = serde_json::from_str(&tool_reports_json).unwrap_or_default();
-    let hidden: i64 = row.get(9)?;
-    let is_summary: i64 = row.get(10)?;
     Ok(Turn {
         turn_id: row.get(0)?,
         seq: row.get(1)?,
@@ -1218,16 +1387,31 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         user_timestamp: row.get(3)?,
         assistant_content: row.get(4)?,
         assistant_reasoning: row.get(5)?,
-        assistant_timestamp: row.get(6)?,
-        status: TurnStatus::from_str(row.get::<_, String>(7)?.as_str()),
+        assistant_provider_id: row.get(6)?,
+        assistant_model: row.get(7)?,
+        assistant_timestamp: row.get(8)?,
+        status: TurnStatus::from_str(row.get::<_, String>(9)?.as_str()),
         tool_reports,
         question_exchanges: Vec::new(),
         followups: Vec::new(),
-        hidden: hidden != 0,
-        is_summary: is_summary != 0,
-        owner_pid: row.get(11)?,
-        token_total: row.get::<_, i64>(12)?.max(0) as u64,
-        token_usage_estimated: row.get::<_, i64>(13)? != 0,
+        hidden: row.get::<_, i64>(11)? != 0,
+        is_summary: row.get::<_, i64>(12)? != 0,
+        owner_pid: row.get(13)?,
+        token_total: row.get::<_, i64>(14)?.max(0) as u64,
+        token_usage_estimated: row.get::<_, i64>(15)? != 0,
+    })
+}
+
+fn map_image_asset_row(row: &rusqlite::Row) -> rusqlite::Result<ImageAsset> {
+    Ok(ImageAsset {
+        asset_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        tool_id: row.get(2)?,
+        mime: row.get(3)?,
+        width: row.get::<_, i64>(4)?.max(0) as u32,
+        height: row.get::<_, i64>(5)?.max(0) as u32,
+        alt: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -1288,7 +1472,8 @@ fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> 
         let sql = format!(
             "SELECT prompt_id, turn_id, COALESCE(context_content, content), display_content,
                     attachments, submitted_at, preceding_assistant_content,
-                    preceding_assistant_reasoning
+                    preceding_assistant_reasoning, preceding_assistant_provider_id,
+                    preceding_assistant_model
              FROM queued_prompts
              WHERE status = 'consumed' AND turn_id IN ({placeholders})
              ORDER BY seq ASC"
@@ -1306,6 +1491,8 @@ fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> 
                     submitted_at: row.get(5)?,
                     preceding_assistant_content: row.get(6)?,
                     preceding_assistant_reasoning: row.get(7)?,
+                    preceding_assistant_provider_id: row.get(8)?,
+                    preceding_assistant_model: row.get(9)?,
                 },
             ))
         })?;

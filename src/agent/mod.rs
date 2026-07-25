@@ -23,6 +23,7 @@ use chrono::Local;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -44,17 +45,21 @@ impl PendingTurnGuard {
         }
     }
 
-    pub fn complete(
+    pub fn complete_with_model(
         mut self,
         content: &str,
         reasoning: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
         token_total: Option<u64>,
         token_usage_estimated: bool,
     ) -> Result<()> {
-        self.state.complete_turn_with_usage(
+        self.state.complete_turn_with_usage_and_model(
             &self.turn_id,
             content,
             reasoning,
+            provider_id,
+            model,
             token_total,
             token_usage_estimated,
         )?;
@@ -155,6 +160,9 @@ impl AgentMode {
 
 #[derive(Debug)]
 pub enum AgentEvent {
+    TurnStarted {
+        turn_id: String,
+    },
     Chunk(ChatStreamChunk),
     ReasoningStart {
         received_at: Instant,
@@ -188,7 +196,12 @@ pub enum AgentEvent {
         chunk: Vec<u8>,
     },
     PrepareForExternalOutput {
-        ready: oneshot::Sender<()>,
+        ready: oneshot::Sender<bool>,
+    },
+    Image {
+        name: String,
+        path: PathBuf,
+        alt: String,
     },
     AskQuestion {
         request: QuestionRequest,
@@ -197,6 +210,8 @@ pub enum AgentEvent {
     QueuedPromptsConsumed {
         prompt_ids: Vec<String>,
         mode: AgentMode,
+        provider_id: Option<String>,
+        model: Option<String>,
     },
     SpinnerTick,
     CompactStart,
@@ -222,6 +237,11 @@ where
         tools::ToolProgressEvent::PrepareForExternalOutput { ready } => {
             on_event(AgentEvent::PrepareForExternalOutput { ready })
         }
+        tools::ToolProgressEvent::Image { path, alt } => on_event(AgentEvent::Image {
+            name: name.to_string(),
+            path,
+            alt,
+        }),
         tools::ToolProgressEvent::CommandOutput { stream, chunk } => {
             on_event(AgentEvent::CommandOutput {
                 name: name.to_string(),
@@ -334,7 +354,7 @@ impl Agent {
         current_turn_id: &str,
         messages: &mut Vec<ChatMessage>,
         queued: Vec<QueuedPrompt>,
-        preceding_assistant: (Option<&str>, Option<&str>),
+        preceding_assistant: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
         control: &AgentTurnControl,
         on_event: &mut F,
     ) -> Result<()>
@@ -359,7 +379,7 @@ impl Agent {
             .iter()
             .map(|(prompt, input)| (prompt.prompt_id.clone(), input.content.clone()))
             .collect::<Vec<_>>();
-        self.state.consume_queued_prompts(
+        self.state.consume_queued_prompts_with_model(
             current_turn_id,
             &consumed,
             preceding_assistant
@@ -368,10 +388,18 @@ impl Agent {
             preceding_assistant
                 .1
                 .filter(|reasoning| !reasoning.trim().is_empty()),
+            preceding_assistant
+                .2
+                .filter(|provider_id| !provider_id.trim().is_empty()),
+            preceding_assistant
+                .3
+                .filter(|model| !model.trim().is_empty()),
         )?;
         on_event(AgentEvent::QueuedPromptsConsumed {
             prompt_ids: consumed.iter().map(|(id, _)| id.clone()).collect(),
             mode,
+            provider_id: preceding_assistant.2.map(str::to_string),
+            model: preceding_assistant.3.map(str::to_string),
         })?;
 
         for (_, input) in prepared {
@@ -541,6 +569,10 @@ impl Agent {
         self.state
             .start_turn(&turn_id, &input, std::process::id())?;
         let guard = PendingTurnGuard::new(self.state.clone(), turn_id.clone());
+        let mut on_event = on_event;
+        on_event(AgentEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+        })?;
         let mut messages = self.chat_messages(&turn_id, &input)?;
         if let Some(last) = messages.last_mut() {
             *last = prepared.message;
@@ -554,7 +586,6 @@ impl Agent {
                 );
             }
         }
-        let mut on_event = on_event;
         if self.mode != AgentMode::Plan {
             if let Some(reminder) = memes::auto_meme_reminder(&self.config, &input) {
                 messages.push(ChatMessage::system(reminder));
@@ -576,9 +607,11 @@ impl Agent {
             self.state.append_persisted_context(&turn_id, &report)?;
         }
         let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
-        guard.complete(
+        guard.complete_with_model(
             &result.content,
             result.reasoning.as_deref(),
+            result.provider_id.as_deref(),
+            result.model.as_deref(),
             token_total,
             result.usage_estimated,
         )?;
@@ -974,7 +1007,12 @@ impl Agent {
                             current_turn_id,
                             messages,
                             queued,
-                            (Some(&result.content), result.reasoning.as_deref()),
+                            (
+                                Some(&result.content),
+                                result.reasoning.as_deref(),
+                                result.provider_id.as_deref(),
+                                result.model.as_deref(),
+                            ),
                             control,
                             on_event,
                         )
@@ -1327,7 +1365,12 @@ impl Agent {
                         current_turn_id,
                         messages,
                         queued,
-                        (Some(&result.content), result.reasoning.as_deref()),
+                        (
+                            Some(&result.content),
+                            result.reasoning.as_deref(),
+                            result.provider_id.as_deref(),
+                            result.model.as_deref(),
+                        ),
                         control,
                         on_event,
                     )
@@ -2934,6 +2977,8 @@ mod tests {
             user_timestamp: String::new(),
             assistant_content: "answer".to_string(),
             assistant_reasoning: Some("hidden reasoning ".repeat(1_000)),
+            assistant_provider_id: None,
+            assistant_model: None,
             assistant_timestamp: None,
             status: crate::state::TurnStatus::Completed,
             tool_reports: Vec::new(),
@@ -3460,7 +3505,10 @@ mod tests {
 
         let result = agent
             .chat_stream_with_control("initial prompt", &[], &control, |event| {
-                if let AgentEvent::QueuedPromptsConsumed { prompt_ids, mode } = event {
+                if let AgentEvent::QueuedPromptsConsumed {
+                    prompt_ids, mode, ..
+                } = event
+                {
                     consumed = Some((prompt_ids, mode));
                 }
                 Ok(())

@@ -328,8 +328,10 @@ async fn show_meme(
     let ids = meme_ids(&memes);
     let meme = find_meme_in(memes, id)?.with_context(|| format!("meme not found: {id}"))?;
     let size = meme_print_size(&args, &config.plugins.memes);
-    progress.prepare_for_external_output().await;
-    vision::print_image_file(&meme.path, size).await?;
+    progress.report_image(meme.path.clone(), meme.item.description.clone());
+    if progress.prepare_for_external_output().await {
+        vision::print_image_file(&meme.path, size).await?;
+    }
     Ok(json!({
         "success": true,
         "id": unique_short_id_from_ids(&ids, &meme.item.id),

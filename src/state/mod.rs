@@ -4,19 +4,27 @@ mod usage;
 use crate::llm::Usage;
 use crate::memory::EvictedTurn;
 use crate::paths::MiyuPaths;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[allow(unused_imports)]
 pub use conversation_db::{
-    interrupted_text, pending_placeholder, ConversationDb, QueuedPrompt, QueuedPromptAttachment,
-    Turn, TurnFollowup, TurnStatus,
+    interrupted_text, pending_placeholder, ConversationDb, ImageAsset, ImageAssetData,
+    QueuedPrompt, QueuedPromptAttachment, Turn, TurnFollowup, TurnStatus,
 };
 pub use usage::UsageSnapshot;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningTurnQueueTarget {
+    pub turn_id: String,
+    pub queue_session_id: Option<String>,
+    pub owner_pid: Option<u32>,
+}
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
@@ -80,7 +88,8 @@ impl StateStore {
     }
 
     pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
-        self.conv_db.start_turn(turn_id, user_content, owner_pid)
+        self.conv_db
+            .start_turn(turn_id, user_content, owner_pid, &self.queue_session_id)
     }
 
     #[allow(dead_code)]
@@ -97,11 +106,13 @@ impl StateStore {
         self.conv_db.interrupt_turn(turn_id)
     }
 
-    pub fn complete_turn_with_usage(
+    pub fn complete_turn_with_usage_and_model(
         &self,
         turn_id: &str,
         content: &str,
         reasoning: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
         token_total: Option<u64>,
         token_usage_estimated: bool,
     ) -> Result<()> {
@@ -109,6 +120,8 @@ impl StateStore {
             turn_id,
             content,
             reasoning,
+            provider_id,
+            model,
             token_total,
             token_usage_estimated,
         )
@@ -116,6 +129,81 @@ impl StateStore {
 
     pub fn append_persisted_context(&self, turn_id: &str, report: &str) -> Result<()> {
         self.conv_db.append_tool_report(turn_id, report.trim())
+    }
+
+    pub fn save_image_asset(
+        &self,
+        turn_id: &str,
+        tool_id: Option<&str>,
+        path: &Path,
+        alt: &str,
+    ) -> Result<ImageAsset> {
+        const MAX_STORED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("reading image metadata: {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("image path is not a file: {}", path.display());
+        }
+        if metadata.len() > MAX_STORED_IMAGE_BYTES {
+            bail!("image exceeds the 20 MiB WebUI storage limit");
+        }
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading image for WebUI: {}", path.display()))?;
+        let reader = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .context("detecting image format")?;
+        let format = reader.format().context("unsupported image format")?;
+        let (width, height) = reader
+            .into_dimensions()
+            .context("reading image dimensions")?;
+        if width == 0
+            || height == 0
+            || width > 40_000
+            || height > 40_000
+            || u64::from(width) * u64::from(height) > 40_000_000
+        {
+            bail!("image dimensions are outside the WebUI safety limit");
+        }
+        let fallback_alt = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+        let alt = if alt.trim().is_empty() {
+            fallback_alt
+        } else {
+            alt.trim()
+        }
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(500)
+        .collect::<String>();
+        let asset = ImageAsset {
+            asset_id: format!(
+                "img_{:032x}_{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0),
+                rand::random::<u64>()
+            ),
+            turn_id: turn_id.to_string(),
+            tool_id: tool_id.map(str::to_string),
+            mime: format.to_mime_type().to_string(),
+            width,
+            height,
+            alt,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.conv_db.insert_image_asset(&asset, &bytes)?;
+        Ok(asset)
+    }
+
+    pub fn load_image_assets(&self) -> Result<Vec<ImageAsset>> {
+        self.conv_db.load_image_assets()
+    }
+
+    pub fn load_image_asset(&self, asset_id: &str) -> Result<Option<ImageAssetData>> {
+        self.conv_db.load_image_asset(asset_id)
     }
 
     pub fn append_question_exchange(
@@ -143,10 +231,68 @@ impl StateStore {
         )
     }
 
+    pub fn running_turn_queue_target(&self) -> Result<Option<RunningTurnQueueTarget>> {
+        Ok(self.conv_db.running_turn_queue_target()?.map(
+            |(turn_id, queue_session_id, owner_pid)| RunningTurnQueueTarget {
+                turn_id,
+                queue_session_id,
+                owner_pid,
+            },
+        ))
+    }
+
+    pub fn enqueue_prompt_for_target(
+        &self,
+        target: &RunningTurnQueueTarget,
+        prompt_id: &str,
+        content: &str,
+        display_content: &str,
+        attachments: &[QueuedPromptAttachment],
+    ) -> Result<QueuedPrompt> {
+        let queue_session_id = target
+            .queue_session_id
+            .as_deref()
+            .context("running turn does not expose a queue session")?;
+        let owner_pid = target
+            .owner_pid
+            .context("running turn does not expose an owner process")?;
+        self.conv_db.enqueue_prompt(
+            prompt_id,
+            content,
+            display_content,
+            attachments,
+            queue_session_id,
+            owner_pid,
+        )
+    }
+
+    pub fn load_queued_prompts_for_target(
+        &self,
+        target: &RunningTurnQueueTarget,
+    ) -> Result<Vec<QueuedPrompt>> {
+        let Some(queue_session_id) = target.queue_session_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        self.conv_db.load_queued_prompts(queue_session_id)
+    }
+
+    pub fn remove_queued_prompt_for_target(
+        &self,
+        target: &RunningTurnQueueTarget,
+        prompt_id: &str,
+    ) -> Result<bool> {
+        let Some(queue_session_id) = target.queue_session_id.as_deref() else {
+            return Ok(false);
+        };
+        self.conv_db
+            .remove_queued_prompt(prompt_id, queue_session_id)
+    }
+
     pub fn load_queued_prompts(&self) -> Result<Vec<QueuedPrompt>> {
         self.conv_db.load_queued_prompts(&self.queue_session_id)
     }
 
+    #[cfg(test)]
     pub fn consume_queued_prompts(
         &self,
         turn_id: &str,
@@ -159,12 +305,39 @@ impl StateStore {
             prompts,
             preceding_assistant_content,
             preceding_assistant_reasoning,
+            None,
+            None,
+            &self.queue_session_id,
+        )
+    }
+
+    pub fn consume_queued_prompts_with_model(
+        &self,
+        turn_id: &str,
+        prompts: &[(String, String)],
+        preceding_assistant_content: Option<&str>,
+        preceding_assistant_reasoning: Option<&str>,
+        preceding_assistant_provider_id: Option<&str>,
+        preceding_assistant_model: Option<&str>,
+    ) -> Result<()> {
+        self.conv_db.consume_queued_prompts(
+            turn_id,
+            prompts,
+            preceding_assistant_content,
+            preceding_assistant_reasoning,
+            preceding_assistant_provider_id,
+            preceding_assistant_model,
             &self.queue_session_id,
         )
     }
 
     pub fn discard_queued_prompts(&self) -> Result<usize> {
         self.conv_db.discard_queued_prompts(&self.queue_session_id)
+    }
+
+    pub fn remove_queued_prompt(&self, prompt_id: &str) -> Result<bool> {
+        self.conv_db
+            .remove_queued_prompt(prompt_id, &self.queue_session_id)
     }
 
     pub fn load_session_loaded_tools(&self) -> Result<BTreeSet<String>> {
@@ -741,24 +914,55 @@ mod tests {
         assert_eq!(turns[0].turn_id, "turn_1");
     }
 
+    fn test_paths(root: &Path) -> MiyuPaths {
+        MiyuPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.jsonc"),
+            skills_dir: root.join("config/skills"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            pictures_dir: root.join("pictures"),
+            fish_hook_file: root.join("fish/miyu.fish"),
+            bash_hook_file: root.join("shell/bash-hook.sh"),
+            zsh_hook_file: root.join("shell/zsh-hook.zsh"),
+            scripts_dir: root.join("config/scripts"),
+            system_scripts_dir: PathBuf::new(),
+        }
+    }
+
     fn test_store() -> (tempfile::TempDir, StateStore) {
         let temp = tempfile::tempdir().unwrap();
-        let store = StateStore::new(&MiyuPaths {
-            config_dir: temp.path().join("config"),
-            config_file: temp.path().join("config/config.jsonc"),
-            skills_dir: temp.path().join("config/skills"),
-            data_dir: temp.path().join("data"),
-            cache_dir: temp.path().join("cache"),
-            state_dir: temp.path().join("state"),
-            pictures_dir: temp.path().join("pictures"),
-            fish_hook_file: temp.path().join("fish/miyu.fish"),
-            bash_hook_file: temp.path().join("shell/bash-hook.sh"),
-            zsh_hook_file: temp.path().join("shell/zsh-hook.zsh"),
-            scripts_dir: temp.path().join("config/scripts"),
-            system_scripts_dir: PathBuf::new(),
-        })
-        .unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn image_assets_persist_with_metadata_and_are_removed_with_history() {
+        let (temp, store) = test_store();
+        store.init_files().unwrap();
+        store.start_turn("turn_image", "show it", 999999).unwrap();
+        let path = temp.path().join("sample.png");
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([30, 120, 210, 255]))
+            .save(&path)
+            .unwrap();
+
+        let saved = store
+            .save_image_asset("turn_image", Some("tool_1"), &path, "sample image")
+            .unwrap();
+        assert_eq!(saved.mime, "image/png");
+        assert_eq!((saved.width, saved.height), (3, 2));
+        assert_eq!(store.load_image_assets().unwrap(), vec![saved.clone()]);
+        let loaded = store.load_image_asset(&saved.asset_id).unwrap().unwrap();
+        assert_eq!(loaded.asset, saved);
+        assert!(!loaded.bytes.is_empty());
+
+        store.reset_conversation().unwrap();
+        assert!(store.load_image_assets().unwrap().is_empty());
+        assert!(store
+            .load_image_asset(&loaded.asset.asset_id)
+            .unwrap()
+            .is_none());
     }
 
     fn visible_snapshot(store: &StateStore) -> (i64, Vec<String>) {
@@ -838,6 +1042,25 @@ mod tests {
             .unwrap();
         store.reset_conversation().unwrap();
         assert!(store.load_queued_prompts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn running_turn_exposes_its_queue_as_a_cross_process_target() {
+        let (temp, owner_store) = test_store();
+        owner_store
+            .start_turn("running", "still working", std::process::id())
+            .unwrap();
+        let web_store = StateStore::new(&test_paths(temp.path())).unwrap();
+
+        let target = web_store.running_turn_queue_target().unwrap().unwrap();
+        assert_eq!(target.turn_id, "running");
+        assert!(target.queue_session_id.is_some());
+        assert_eq!(target.owner_pid, Some(std::process::id()));
+
+        let queued = web_store
+            .enqueue_prompt_for_target(&target, "followup", "next", "next", &[])
+            .unwrap();
+        assert_eq!(owner_store.load_queued_prompts().unwrap(), vec![queued]);
     }
 
     #[test]

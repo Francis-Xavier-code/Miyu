@@ -95,8 +95,15 @@ async fn print_image(
             path.display()
         )
     }
-    progress.prepare_for_external_output().await;
-    print_image_file(&path, print_size(&args, print_config)).await?;
+    progress.report_image(
+        path.clone(),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image"),
+    );
+    if progress.prepare_for_external_output().await {
+        print_image_file(&path, print_size(&args, print_config)).await?;
+    }
     Ok(format!(
         "{}: {}",
         t("printed image in terminal", "已在终端打印图片"),
