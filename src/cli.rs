@@ -823,6 +823,10 @@ pub struct ResetArgs {
 
 #[derive(Args)]
 pub struct WebArgs {
+    /// stop | status | restart（缺省为启动 daemon）
+    #[arg(value_enum)]
+    pub action: Option<WebAction>,
+
     #[arg(long, default_value_t = 4096)]
     pub port: u16,
 
@@ -832,14 +836,26 @@ pub struct WebArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
-    #[arg(long, conflicts_with = "status")]
+    /// 兼容旧写法，等价于 `miyu web stop`
+    #[arg(long, hide = true, conflicts_with = "status")]
     pub stop: bool,
 
-    #[arg(long, conflicts_with = "stop")]
+    /// 兼容旧写法，等价于 `miyu web status`
+    #[arg(long, hide = true, conflicts_with = "stop")]
     pub status: bool,
 
     #[arg(long)]
     pub public: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WebAction {
+    /// 停止 daemon
+    Stop,
+    /// 查看 daemon 状态
+    Status,
+    /// 重启 daemon（按本次参数重新启动）
+    Restart,
 }
 
 impl std::fmt::Debug for WebArgs {
@@ -1214,7 +1230,16 @@ fn initialize_models_cache(paths: &MiyuPaths) {
 }
 
 async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
-    if args.status {
+    let action = args.action.or_else(|| {
+        if args.stop {
+            Some(WebAction::Stop)
+        } else if args.status {
+            Some(WebAction::Status)
+        } else {
+            None
+        }
+    });
+    if action == Some(WebAction::Status) {
         if let Some(info) = ipc::daemon_info(paths).await {
             println!(
                 "Miyu daemon: running (pid {}, WebUI {})",
@@ -1226,7 +1251,7 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
         }
         return Ok(());
     }
-    if args.stop {
+    if matches!(action, Some(WebAction::Stop) | Some(WebAction::Restart)) {
         if ipc::daemon_info(paths).await.is_some() {
             send_ipc_command(paths, IpcCommand::Shutdown).await?;
             ipc::wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
@@ -1234,7 +1259,11 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
         } else {
             println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
         }
-        return Ok(());
+        if action == Some(WebAction::Stop) {
+            return Ok(());
+        }
+        // Restart falls through to the normal start path with this
+        // invocation's port/password arguments.
     }
     if args.public && args.password.is_none() && args.password_file.is_none() {
         bail!(
@@ -9334,6 +9363,7 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
+                action: None,
                 port: 4100,
                 password: None,
                 password_file: None,
@@ -9342,6 +9372,18 @@ mod repl_input_tests {
                 public: false,
             }))
         ));
+
+        for (arg, expected) in [
+            ("stop", WebAction::Stop),
+            ("status", WebAction::Status),
+            ("restart", WebAction::Restart),
+        ] {
+            let cli = parse_args(["miyu", "web", arg].map(OsString::from).to_vec()).unwrap();
+            match cli.command {
+                Some(Command::Web(args)) => assert!(args.action == Some(expected)),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
 
         let cli = parse_args(["miyu", "web", "--status"].map(OsString::from).to_vec()).unwrap();
         assert!(matches!(
@@ -9359,6 +9401,7 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
+                action: None,
                 port: 4096,
                 password: None,
                 password_file: None,

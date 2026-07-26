@@ -54,9 +54,10 @@ miyu config
 `miyu` 会按需以自身进程启动 daemon（同一个可执行文件，无需额外安装）。daemon 是唯一持有模型客户端、工具和会话状态的进程，REPL、shell hook 与 WebUI 都通过本地 Unix socket 使用它。重新编译后无需手动重启：客户端通过构建指纹发现旧 daemon 会自动将其替换。
 
 ```text
-miyu web --no-open  # 启动 daemon 并显示 WebUI 地址
-miyu web --status   # 查看 daemon 状态
-miyu web --stop     # 停止 daemon
+miyu web          # 启动 daemon 并显示 WebUI 地址
+miyu web status   # 查看 daemon 状态
+miyu web stop     # 停止 daemon
+miyu web restart  # 重启 daemon
 ```
 
 设置 `MIYU_DIRECT=1` 可临时绕过 daemon，使用原有单进程模式。
