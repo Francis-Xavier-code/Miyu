@@ -95,6 +95,8 @@
     sidebarStatusDot: document.getElementById("sidebarStatusDot"),
     sidebarConnectionStatus: document.getElementById("sidebarConnectionStatus"),
     newChatButton: document.getElementById("newChatButton"),
+    matugenThemeLink: document.getElementById("matugenThemeLink"),
+    schemeHint: document.getElementById("schemeHint"),
     sessionList: document.getElementById("sessionList"),
     sessionItems: document.getElementById("sessionItems"),
     archivedSection: document.getElementById("archivedSection"),
@@ -211,6 +213,9 @@
     modelMenuError: "",
     submitting: false,
     pendingSubmission: null,
+    colorScheme: null,
+    matugenAvailable: null,
+    finishedTurnArticles: new Map(),
     bootstrapPromise: null,
     resyncing: false,
     nearBottom: true,
@@ -317,6 +322,38 @@
     const themeColor = document.querySelector('meta[name="theme-color"]');
     if (themeColor) themeColor.content = selected === "graphite" ? "#171821" : "#f6f0e2";
     if (persist) safeStorageSet("miyu.web.theme", selected);
+  }
+
+  /*
+   * 配色方案(与明暗正交):
+   * - madobe  窗边预设(logo 派生 token,styles.css 内置)
+   * - matugen 壁纸取色(后端 /theme.css 输出整套 MD3 token)
+   * 通过禁用 /theme.css 的 <link> 切换,不改后端与 matugen 模板。
+   */
+  function setColorScheme(scheme, persist = true) {
+    const requested = scheme === "madobe" ? "madobe" : "matugen";
+    const selected = requested === "matugen" && state.matugenAvailable === false ? "madobe" : requested;
+    state.colorScheme = selected;
+    if (elements.matugenThemeLink) elements.matugenThemeLink.disabled = selected !== "matugen";
+    document.querySelectorAll("[data-scheme-choice]").forEach((button) => {
+      const active = button.dataset.schemeChoice === selected;
+      button.classList.toggle("selected", active);
+      button.setAttribute("aria-pressed", String(active));
+      if (button.dataset.schemeChoice === "matugen") button.disabled = state.matugenAvailable === false;
+    });
+    if (elements.schemeHint) elements.schemeHint.hidden = state.matugenAvailable !== false;
+    if (persist) safeStorageSet("miyu.web.colorScheme", requested);
+  }
+
+  async function probeMatugenTheme() {
+    try {
+      const response = await fetch("/theme.css", { method: "HEAD", cache: "no-store" });
+      state.matugenAvailable = response.ok;
+    } catch (_) {
+      state.matugenAvailable = false;
+    }
+    // 无持久化记录时:matugen 可用则维持现状(matugen),否则窗边。默认值不写入存储。
+    setColorScheme(safeStorageGet("miyu.web.colorScheme") || (state.matugenAvailable ? "matugen" : "madobe"), false);
   }
 
   function setMode(mode, persist = true) {
@@ -2971,6 +3008,7 @@
     details.open = false;
     const summary = document.createElement("summary");
     const atom = makeIconSlot("atom", "reasoning-icon");
+    if (live) for (let index = 0; index < 3; index += 1) atom.appendChild(document.createElement("i"));
     const titleNode = document.createElement("span");
     titleNode.className = "reasoning-title";
     titleNode.textContent = title || (live ? "正在思考" : "已思考");
@@ -3173,14 +3211,32 @@
     const turnId = String(turn?.id || "");
     elements.timeline.appendChild(createUserMessage(turn?.user_content || "", turn?.user_timestamp, { turnId }));
 
-    const exchanges = Array.isArray(turn?.question_exchanges) ? turn.question_exchanges : [];
-    for (const exchange of exchanges) elements.timeline.appendChild(createPersistedQuestion(exchange, turnId));
+    /*
+     * 本页会话内完成的 turn:优先复用 live 流式渲染出的 article(含按时序排列的
+     * 思考签 / 工具签 / 正文块),避免用扁平的「单 reasoning + 正文」重建而丢失时序。
+     * 历史重载(后端快照没有 parts 顺序)才退回扁平重建。
+     */
+    const stash = turnId && turn?.status !== "running" ? state.finishedTurnArticles.get(turnId) : null;
+    let stashIndex = 0;
+    const takeStash = (kind) => {
+      if (!stash || stashIndex >= stash.length || stash[stashIndex].kind !== kind) return null;
+      return stash[stashIndex++].article;
+    };
+
+    // 已回答的问题卡在 live article 内部原位保留;仅在无存档时用快照重建。
+    if (!stash) {
+      const exchanges = Array.isArray(turn?.question_exchanges) ? turn.question_exchanges : [];
+      for (const exchange of exchanges) elements.timeline.appendChild(createPersistedQuestion(exchange, turnId));
+    }
 
     const followups = Array.isArray(turn?.followups) ? turn.followups : [];
     for (const followup of followups) {
       const precedingContent = String(followup?.preceding_assistant_content || "");
       const precedingReasoning = String(followup?.preceding_assistant_reasoning || "");
-      if (precedingContent.trim() || precedingReasoning.trim()) {
+      const stashedSegment = takeStash("segment");
+      if (stashedSegment) {
+        elements.timeline.appendChild(stashedSegment);
+      } else if (precedingContent.trim() || precedingReasoning.trim()) {
         elements.timeline.appendChild(createAssistantMessage({
           content: precedingContent,
           reasoning: precedingReasoning,
@@ -3196,11 +3252,17 @@
         followupId: String(followup?.id || "")
       }));
     }
+    let leftoverSegment;
+    while ((leftoverSegment = takeStash("segment"))) elements.timeline.appendChild(leftoverSegment);
 
     const assistantContent = String(turn?.assistant_content || "");
     const assistantReasoning = String(turn?.assistant_reasoning || "");
     const assets = turn?.status === "running" ? [] : (Array.isArray(turn?.assets) ? turn.assets : []);
-    if (assistantContent.trim() || assistantReasoning.trim() || assets.length) {
+    const stashedFinal = takeStash("final");
+    if (stashedFinal) {
+      stashedFinal.classList.toggle("is-muted", turn?.active_context === false);
+      elements.timeline.appendChild(stashedFinal);
+    } else if (assistantContent.trim() || assistantReasoning.trim() || assets.length) {
       elements.timeline.appendChild(createAssistantMessage({
         content: assistantContent,
         reasoning: assistantReasoning,
@@ -3216,7 +3278,7 @@
       }));
     }
     if (turn?.status === "running" || turn?.status === "interrupted") elements.timeline.appendChild(createTurnStatus(turn));
-    else if (!assistantContent.trim() && !assistantReasoning.trim() && (asFiniteNumber(turn?.token_total) > 0 || turn?.active_context === false)) {
+    else if (!stashedFinal && !assistantContent.trim() && !assistantReasoning.trim() && (asFiniteNumber(turn?.token_total) > 0 || turn?.active_context === false)) {
       const metadata = createTurnStatus({ ...turn, status: "completed" });
       metadata.querySelector("span:nth-child(2)").textContent = "本轮已完成";
       metadata.querySelector(".icon-slot").replaceChildren(createIcon("check"));
@@ -3231,6 +3293,12 @@
     elements.timeline.replaceChildren();
     const turns = [...state.turns].sort((left, right) => asFiniteNumber(left?.seq) - asFiniteNumber(right?.seq));
     state.turns = turns;
+    if (state.finishedTurnArticles.size) {
+      const knownTurnIds = new Set(turns.map((turn) => String(turn?.id)));
+      for (const key of [...state.finishedTurnArticles.keys()]) {
+        if (!knownTurnIds.has(key)) state.finishedTurnArticles.delete(key);
+      }
+    }
     if (turns.length === 0) {
       elements.timeline.hidden = true;
       elements.emptyState.hidden = false;
@@ -3285,6 +3353,7 @@
       tools: new Map(),
       questions: new Map(),
       contextOperation: null,
+      typing: null,
       ended: false
     };
   }
@@ -3368,6 +3437,38 @@
     status?.remove();
   }
 
+  /* 发送后、第一个内容 part 到达前:气泡内三点弹跳等待动画 */
+  function showTypingIndicator(live) {
+    if (!live || live.ended || live.typing) return;
+    ensureLiveArticle(live);
+    if (live.blocks.childElementCount > 0) return;
+    const indicator = document.createElement("div");
+    indicator.className = "typing-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 3; index += 1) indicator.appendChild(document.createElement("i"));
+    live.blocks.appendChild(indicator);
+    live.typing = indicator;
+    contentAdded();
+  }
+
+  function clearTypingIndicator(live) {
+    if (!live?.typing) return;
+    live.typing.remove();
+    live.typing = null;
+  }
+
+  /* 完成态保时序:live 渲染出的 article 按 turn 存档,重渲染时原样复用 */
+  function stashLiveArticle(live, kind) {
+    if (!live?.article || !live.turnId) return;
+    clearTypingIndicator(live);
+    if (!live.blocks || live.blocks.childElementCount === 0) return;
+    live.article.classList.remove("live-assistant");
+    const key = String(live.turnId);
+    const list = state.finishedTurnArticles.get(key) || [];
+    list.push({ kind, article: live.article });
+    state.finishedTurnArticles.set(key, list);
+  }
+
   function updateLiveStopButton(live) {
     if (!live.stopButton) return;
     live.stopButton.disabled = live.ended || live.cancellationRequested;
@@ -3438,7 +3539,7 @@
     endpoint.className = "assistant-endpoint";
     endpoint.hidden = true;
     const metaText = document.createElement("span");
-    metaText.textContent = "正在生成";
+    metaText.textContent = "";
     const spacer = document.createElement("span");
     spacer.className = "meta-spacer";
     const copy = makeCopyButton(() => live.assistantText, "复制回复");
@@ -3475,9 +3576,9 @@
     const text = String(delta || "");
     if (!text) return;
     ensureLiveArticle(live);
+    clearTypingIndicator(live);
     if (!live.currentText) {
       finalizeLiveReasoning(live);
-      if (live.meta) live.meta.textContent = "正在生成";
       const element = document.createElement("div");
       element.className = "markdown-body live-text-block";
       const block = { element, raw: "", renderFrame: null };
@@ -3495,6 +3596,7 @@
 
   function ensureLiveReasoning(live) {
     ensureLiveArticle(live);
+    clearTypingIndicator(live);
     if (live.reasoning) return live.reasoning;
     breakLiveText(live);
     live.contextOperation = null;
@@ -3560,7 +3662,6 @@
       live.reasoningStarted = true;
       breakLiveText(live);
       ensureLiveReasoning(live);
-      if (live.meta) live.meta.textContent = "正在思考";
       return;
     }
     if (name === "reasoning.part_start") {
@@ -3568,7 +3669,6 @@
       live.reasoningStarted = true;
       breakLiveText(live);
       ensureLiveReasoning(live);
-      if (live.meta) live.meta.textContent = "正在思考";
       return;
     }
     if (name === "reasoning.reset") {
@@ -3723,6 +3823,7 @@
 
   function createTool(live, data) {
     ensureLiveArticle(live);
+    clearTypingIndicator(live);
     breakLiveText(live);
     finalizeLiveReasoning(live);
     live.contextOperation = null;
@@ -3830,6 +3931,7 @@
         const assetId = String(asset.id || asset.url);
         if (!live.assets.some((item) => String(item?.id || item?.url) === assetId)) {
           ensureLiveArticle(live);
+          clearTypingIndicator(live);
           breakLiveText(live);
           finalizeLiveReasoning(live);
           live.contextOperation = null;
@@ -4040,6 +4142,7 @@
   }
 
   function createQuestion(live, data) {
+    clearTypingIndicator(live);
     const questionId = String(data?.question_id || "");
     if (!questionId) return null;
     if (live.questions.has(questionId)) return live.questions.get(questionId);
@@ -4260,6 +4363,7 @@
 
   function createContextOperation(live, kind) {
     ensureLiveArticle(live);
+    clearTypingIndicator(live);
     breakLiveText(live);
     finalizeLiveReasoning(live);
     const block = document.createElement("section");
@@ -4305,6 +4409,7 @@
 
   function appendRunNotice(live, message, error = false) {
     ensureLiveArticle(live);
+    clearTypingIndicator(live);
     breakLiveText(live);
     const notice = document.createElement("div");
     notice.className = `run-notice${error ? " is-error" : ""}`;
@@ -4354,6 +4459,7 @@
     }
     renderQueueTray();
 
+    stashLiveArticle(live, "segment");
     removeLiveStopButton(live);
     live.article = null;
     live.blocks = null;
@@ -4372,6 +4478,7 @@
     live.questions = new Map();
     live.contextOperation = null;
     if (["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+    showTypingIndicator(live);
     contentAdded();
   }
 
@@ -4417,6 +4524,7 @@
     if (!live || live.ended) return;
     const runId = live.runId;
     live.ended = true;
+    clearTypingIndicator(live);
     finalizeLiveReasoning(live);
     setLiveEndpoint(live, data?.provider_id, data?.model);
     removeLiveStopButton(live);
@@ -4444,6 +4552,7 @@
     }
 
     updateLocalTurnFromLive(live, kind, data);
+    stashLiveArticle(live, "final");
     if (kind === "completed") {
       // 上下文条展示全局（默认会话）上下文；其他会话的 run 不覆盖它。
       const updatesGlobalContext = !data?.session_id || String(data.session_id) === String(state.currentSessionId || "");
@@ -4579,6 +4688,7 @@
 
     if (name === "run.started") {
       if (live && ["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+      if (live && !live.ended) showTypingIndicator(live);
       renderSessionList();
       updateConversationChrome();
       updateControlState();
@@ -5024,6 +5134,7 @@
         const live = createLiveForRun(runId, content);
         live.userText = content;
         ensureLiveUser(live, content);
+        showTypingIndicator(live);
         elements.composerInput.value = "";
         resizeComposer();
         updateRuntimeUsage();
@@ -5188,6 +5299,7 @@
     elements.themeButton.addEventListener("click", () => setTheme(elements.body.dataset.theme === "graphite" ? "linen" : "graphite"));
     elements.sidebarThemeButton.addEventListener("click", () => setTheme(elements.body.dataset.theme === "graphite" ? "linen" : "graphite"));
     document.querySelectorAll("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => setTheme(button.dataset.themeChoice)));
+    document.querySelectorAll("[data-scheme-choice]").forEach((button) => button.addEventListener("click", () => setColorScheme(button.dataset.schemeChoice)));
     elements.modeSwitch.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
     elements.modelButton.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -5269,6 +5381,9 @@
   function initialize() {
     renderIconSlots();
     setTheme(safeStorageGet("miyu.web.theme") || "graphite", false);
+    const storedScheme = safeStorageGet("miyu.web.colorScheme");
+    if (storedScheme) setColorScheme(storedScheme, false);
+    probeMatugenTheme();
     setMode(safeStorageGet("miyu.web.mode") || "normal", false);
     setSettingsView("interface");
     bindEvents();

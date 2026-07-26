@@ -7,8 +7,11 @@
   <meta name="theme-color" content="#171821">
   <title>Miyu</title>
   <link rel="stylesheet" href="/styles.css">
-  <!-- matugen 生成的 MD3 token 覆盖;文件不存在时 404,浏览器静默忽略 -->
-  <link rel="stylesheet" href="/theme.css">
+  <!-- matugen 生成的 MD3 token 覆盖;文件不存在时 404,浏览器静默忽略。
+       app.js 依据「配色方案」设置切换 link.disabled:窗边=禁用,Matugen=启用 -->
+  <link rel="stylesheet" href="/theme.css" id="matugenThemeLink">
+  <!-- 用户选定「窗边」时在首帧就禁用 matugen 覆盖,避免 defer 的 app.js 生效前闪一下取色主题 -->
+  <script>try { if (localStorage.getItem("miyu.web.colorScheme") === "madobe") document.getElementById("matugenThemeLink").disabled = true; } catch (e) {}</script>
   <script defer src="/app.js"></script>
 </head>
 <body data-theme="graphite">
@@ -209,11 +212,19 @@
         </nav>
         <div class="settings-content">
           <section class="settings-section settings-panel" data-settings-panel="interface">
-          <h2>界面主题</h2>
-          <div class="theme-options" role="group" aria-label="界面主题">
-            <button type="button" data-theme-choice="linen"><i class="theme-swatch linen"></i><span>晨光</span></button>
-            <button type="button" data-theme-choice="graphite"><i class="theme-swatch graphite"></i><span>夜阑</span></button>
+          <h2>明暗</h2>
+          <div class="theme-options" role="group" aria-label="明暗">
+            <button type="button" data-theme-choice="linen"><i class="theme-swatch linen"></i><span>晨光 · 亮</span></button>
+            <button type="button" data-theme-choice="graphite"><i class="theme-swatch graphite"></i><span>夜阑 · 暗</span></button>
           </div>
+          </section>
+          <section class="settings-section settings-panel" data-settings-panel="interface">
+          <h2>配色方案</h2>
+          <div class="theme-options" role="group" aria-label="配色方案">
+            <button type="button" data-scheme-choice="madobe"><i class="theme-swatch hue-madobe"></i><span>窗边</span></button>
+            <button type="button" data-scheme-choice="matugen"><i class="theme-swatch hue-matugen"></i><span>Matugen · 壁纸取色</span></button>
+          </div>
+          <p class="settings-description scheme-hint" id="schemeHint" hidden>未检测到 matugen 输出（~/.config/miyu/webui-theme.css）</p>
           </section>
           <section class="settings-section settings-panel" data-settings-panel="interface">
           <h2>当前模型</h2>
