@@ -47,6 +47,22 @@ miyu config
   ./target/release/miyu --version
   ```
 
+  安装只需复制单个 `miyu` 可执行文件（例如 `cp ./target/release/miyu ~/.local/bin/`）。
+
+### 后台服务
+
+`miyu` 会按需以自身进程启动 daemon（同一个可执行文件，无需额外安装）。daemon 是唯一持有模型客户端、工具和会话状态的进程，REPL、shell hook 与 WebUI 都通过本地 Unix socket 使用它。重新编译后无需手动重启：客户端通过构建指纹发现旧 daemon 会自动将其替换。
+
+```text
+miyu web --no-open  # 启动 daemon 并显示 WebUI 地址
+miyu web --status   # 查看 daemon 状态
+miyu web --stop     # 停止 daemon
+```
+
+设置 `MIYU_DIRECT=1` 可临时绕过 daemon，使用原有单进程模式。
+
+daemon 模式下 TUI 的 `/models`、`/config`、`/variant`、`/undo`、`/pop`、`/compact`、`/reset`、`/reset all`、`/history`、`/clear` 和 `/help` 均可用，token/context 状态由 daemon 提供。
+
   各发行版依赖示例：
 
   ```

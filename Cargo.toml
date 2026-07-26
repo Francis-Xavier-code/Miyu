@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/SHORiN-KiWATA/Miyu"
 description = "Command-line AI assistant"
+autobins = false
+
+[[bin]]
+name = "miyu"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -60,3 +65,8 @@ base64 = "0.22"
 
 [dev-dependencies]
 tiktoken-rs = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

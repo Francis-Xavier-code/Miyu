@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
-const PENDING_PLACEHOLDER: &str = "<system-reminder>上一轮prompt正在被另一个进程处理，你只需要回应用户当前的prompt，不要处理上一轮的prompt</system-reminder>";
+const PENDING_PLACEHOLDER: &str = "<system-reminder>上一轮prompt正在由另一轮回复处理中，你只需要回应用户当前的prompt，不要处理上一轮的prompt</system-reminder>";
 const INTERRUPTED_TEXT: &str =
     "<system-reminder>上一轮prompt已被中断，除非用户重新要求否则不要处理上一轮的prompt</system-reminder>";
 
@@ -109,6 +109,42 @@ pub struct ImageAssetData {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub persona: String,
+    pub name: String,
+    pub kind: String,
+    pub parent_session_id: Option<String>,
+    pub workspace: Option<String>,
+    pub archived: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOverview {
+    pub record: SessionRecord,
+    pub turn_count: i64,
+    pub last_user_content: Option<String>,
+}
+
+const SESSION_COLUMNS: &str = "session_id, persona, name, kind, parent_session_id, workspace, archived, created_at, updated_at";
+
+fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        session_id: row.get("session_id")?,
+        persona: row.get("persona")?,
+        name: row.get("name")?,
+        kind: row.get("kind")?,
+        parent_session_id: row.get("parent_session_id")?,
+        workspace: row.get("workspace")?,
+        archived: row.get("archived")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
 pub struct ConversationDb {
     conn: Mutex<Connection>,
 }
@@ -123,7 +159,7 @@ impl ConversationDb {
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)?;
         let db_path = state_dir.join("conversation.db");
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open conversation db: {}", db_path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -131,145 +167,268 @@ impl ConversationDb {
              PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;",
         )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS question_exchanges (
-                turn_id         TEXT NOT NULL,
-                exchange_index  INTEGER NOT NULL,
-                payload         TEXT NOT NULL,
-                PRIMARY KEY (turn_id, exchange_index),
-                FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_question_exchanges_turn
-                ON question_exchanges(turn_id, exchange_index);",
-        )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS turns (
-                turn_id          TEXT PRIMARY KEY,
-                seq              INTEGER NOT NULL UNIQUE,
-                user_content     TEXT NOT NULL,
-                user_timestamp   TEXT NOT NULL,
-                assistant_content TEXT NOT NULL,
-                assistant_reasoning TEXT,
-                assistant_timestamp TEXT,
-                status           TEXT NOT NULL DEFAULT 'running',
-                tool_reports     TEXT NOT NULL DEFAULT '[]'
-            );
-            CREATE INDEX IF NOT EXISTS idx_turns_seq ON turns(seq);
-             CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status);",
-        )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS image_assets (
-                asset_id    TEXT PRIMARY KEY,
-                turn_id     TEXT NOT NULL,
-                tool_id     TEXT,
-                mime        TEXT NOT NULL,
-                width       INTEGER NOT NULL DEFAULT 0,
-                height      INTEGER NOT NULL DEFAULT 0,
-                alt         TEXT NOT NULL DEFAULT '',
-                data        BLOB NOT NULL,
-                created_at  TEXT NOT NULL,
-                FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_image_assets_turn
-                ON image_assets(turn_id, created_at, asset_id);",
-        )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS queued_prompts (
-                seq                         INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt_id                   TEXT NOT NULL UNIQUE,
-                content                     TEXT NOT NULL,
-                display_content             TEXT NOT NULL,
-                attachments                 TEXT NOT NULL DEFAULT '[]',
-                status                      TEXT NOT NULL DEFAULT 'queued',
-                submitted_at                TEXT NOT NULL,
-                queue_session_id             TEXT,
-                owner_pid                    INTEGER,
-                consumed_at                 TEXT,
-                turn_id                     TEXT,
-                context_content              TEXT,
-                preceding_assistant_content  TEXT,
-                preceding_assistant_reasoning TEXT,
-                FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_queued_prompts_status_seq
-                ON queued_prompts(status, seq);
-            CREATE INDEX IF NOT EXISTS idx_queued_prompts_turn_seq
-                ON queued_prompts(turn_id, seq);",
-        )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_loaded_items (
-                kind            TEXT NOT NULL,
-                name            TEXT NOT NULL,
-                source_turn_id  TEXT,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL,
-                PRIMARY KEY (kind, name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_loaded_items_source_turn
-                ON session_loaded_items(source_turn_id);",
-        )?;
-        add_column_if_missing(&conn, "turns", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(&conn, "turns", "is_summary", "INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(&conn, "turns", "owner_pid", "INTEGER")?;
-        add_column_if_missing(&conn, "turns", "queue_session_id", "TEXT")?;
-        add_column_if_missing(&conn, "turns", "token_total", "INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(
-            &conn,
-            "turns",
-            "token_usage_estimated",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "turns",
-            "compact_reversible",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        add_column_if_missing(&conn, "turns", "compact_parent_summary_seq", "INTEGER")?;
-        add_column_if_missing(&conn, "turns", "assistant_provider_id", "TEXT")?;
-        add_column_if_missing(&conn, "turns", "assistant_model", "TEXT")?;
-        add_column_if_missing(&conn, "queued_prompts", "queue_session_id", "TEXT")?;
-        add_column_if_missing(&conn, "queued_prompts", "owner_pid", "INTEGER")?;
-        add_column_if_missing(
-            &conn,
-            "queued_prompts",
-            "preceding_assistant_provider_id",
-            "TEXT",
-        )?;
-        add_column_if_missing(&conn, "queued_prompts", "preceding_assistant_model", "TEXT")?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_turns_visible_seq ON turns(hidden, seq);
-             CREATE INDEX IF NOT EXISTS idx_turns_visible_summary_seq
-                 ON turns(is_summary, hidden, seq);
-             CREATE INDEX IF NOT EXISTS idx_queued_prompts_session_status_seq
-                 ON queued_prompts(queue_session_id, status, seq);",
-        )?;
+        // Back up the database file before applying schema migrations to a
+        // database that already holds data.
+        if super::migrations::current_version(&conn)? < super::migrations::LATEST_VERSION {
+            let has_turns: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_turns {
+                let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+                let _ = std::fs::copy(&db_path, state_dir.join("conversation.db.bak"));
+            }
+        }
+        super::migrations::run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
+    /// Resolves the current session pointer from `app_state`, self-healing a
+    /// missing pointer or dangling session row back to the default session.
+    pub fn resolve_current_session(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let pointer: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = 'current_session'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(session_id) = pointer {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Ok(session_id);
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, persona, name, kind, created_at, updated_at)
+             VALUES (?1, '', ?2, 'user', ?3, ?3)",
+            params![
+                super::migrations::DEFAULT_SESSION_ID,
+                t("Default session", "默认会话"),
+                now
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES ('current_session', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![super::migrations::DEFAULT_SESSION_ID],
+        )?;
+        Ok(super::migrations::DEFAULT_SESSION_ID.to_string())
+    }
+
+    /// Persists the current-session pointer. The target session must exist.
+    pub fn set_current_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            bail!("session not found: {session_id}");
+        }
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES ('current_session', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Claims persona-less sessions (schema-v2 migrated rows) for the given
+    /// persona scope. Called once at daemon startup with the active persona.
+    pub fn adopt_sessions_for_persona(&self, persona: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET persona = ?1 WHERE persona = ''",
+            params![persona],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_record(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE session_id = ?1"),
+                params![session_id],
+                session_record_from_row,
+            )
+            .optional()?)
+    }
+
+    /// User-facing sessions of a persona, most recently updated first.
+    /// Subagent sessions (`kind != 'user'`) are excluded.
+    pub fn list_sessions(
+        &self,
+        persona: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionOverview>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS},
+                    (SELECT count(*) FROM turns
+                      WHERE turns.session_id = sessions.session_id
+                        AND hidden = 0 AND is_summary = 0) AS turn_count,
+                    (SELECT user_content FROM turns
+                      WHERE turns.session_id = sessions.session_id
+                        AND hidden = 0 AND is_summary = 0
+                      ORDER BY seq DESC LIMIT 1) AS last_user_content
+             FROM sessions
+             WHERE persona = ?1 AND kind = 'user' AND (?2 OR archived = 0)
+             ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map(params![persona, include_archived], |row| {
+            Ok(SessionOverview {
+                record: session_record_from_row(row)?,
+                turn_count: row.get("turn_count")?,
+                last_user_content: row.get("last_user_content")?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn create_session(
+        &self,
+        persona: &str,
+        name: &str,
+        kind: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<SessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let session_id = format!(
+            "sess_{}_{:08x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            rand::random::<u32>()
+        );
+        conn.execute(
+            "INSERT INTO sessions (session_id, persona, name, kind, parent_session_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![session_id, persona, name, kind, parent_session_id, now],
+        )?;
+        drop(conn);
+        Ok(self
+            .session_record(&session_id)?
+            .expect("session row just inserted"))
+    }
+
+    pub fn rename_session(&self, session_id: &str, name: &str) -> Result<()> {
+        self.update_session_field(session_id, "name", Some(name))
+    }
+
+    pub fn set_session_workspace(&self, session_id: &str, workspace: Option<&str>) -> Result<()> {
+        self.update_session_field(session_id, "workspace", workspace)
+    }
+
+    pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE sessions SET archived = ?2, updated_at = ?3 WHERE session_id = ?1",
+            params![session_id, archived, Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
+    /// Deletes the session row; turns, queued prompts, loaded items, and
+    /// (via turns) images and question exchanges are removed by FK cascade.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        if deleted == 0 {
+            bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
+    pub fn touch_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE session_id = ?1",
+            params![session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_session_by_name(
+        &self,
+        persona: &str,
+        name: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions
+                     WHERE persona = ?1 AND kind = 'user' AND name = ?2 COLLATE NOCASE
+                     ORDER BY archived ASC, updated_at DESC LIMIT 1"
+                ),
+                params![persona, name],
+                session_record_from_row,
+            )
+            .optional()?)
+    }
+
+    fn update_session_field(
+        &self,
+        session_id: &str,
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            &format!("UPDATE sessions SET {field} = ?2, updated_at = ?3 WHERE session_id = ?1"),
+            params![session_id, value, Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
     pub fn start_turn(
         &self,
+        session_id: &str,
         turn_id: &str,
         user_content: &str,
         owner_pid: u32,
         queue_session_id: &str,
+        workspace: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let seq = self.next_seq_locked(&conn)?;
+        let seq = self.next_seq_locked(&conn, session_id)?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status, owner_pid, queue_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, status, owner_pid, queue_session_id, workspace)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9)",
             params![
                 turn_id,
+                session_id,
                 seq,
                 user_content,
                 now,
                 PENDING_PLACEHOLDER,
                 owner_pid as i64,
-                queue_session_id
+                queue_session_id,
+                workspace
             ],
         )?;
         Ok(())
@@ -423,6 +582,7 @@ impl ConversationDb {
 
     pub fn enqueue_prompt(
         &self,
+        session_id: &str,
         prompt_id: &str,
         content: &str,
         display_content: &str,
@@ -435,10 +595,11 @@ impl ConversationDb {
         let attachments_json = serde_json::to_string(attachments)?;
         conn.execute(
             "INSERT INTO queued_prompts
-                (prompt_id, content, display_content, attachments, status, submitted_at,
+                (session_id, prompt_id, content, display_content, attachments, status, submitted_at,
                  queue_session_id, owner_pid)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
             params![
+                session_id,
                 prompt_id,
                 content,
                 display_content,
@@ -459,16 +620,20 @@ impl ConversationDb {
         })
     }
 
-    pub fn load_queued_prompts(&self, queue_session_id: &str) -> Result<Vec<QueuedPrompt>> {
+    pub fn load_queued_prompts(
+        &self,
+        session_id: &str,
+        queue_session_id: &str,
+    ) -> Result<Vec<QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT prompt_id, seq, content, display_content, attachments, submitted_at
              FROM queued_prompts
-             WHERE status = 'queued' AND queue_session_id = ?1
+             WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2
              ORDER BY seq ASC",
         )?;
         let rows = stmt
-            .query_map(params![queue_session_id], |row| {
+            .query_map(params![session_id, queue_session_id], |row| {
                 let attachments_json: String = row.get(4)?;
                 let attachments = serde_json::from_str(&attachments_json).unwrap_or_default();
                 Ok(QueuedPrompt {
@@ -486,6 +651,7 @@ impl ConversationDb {
 
     pub fn consume_queued_prompts(
         &self,
+        session_id: &str,
         turn_id: &str,
         prompts: &[(String, String)],
         preceding_assistant_content: Option<&str>,
@@ -522,7 +688,8 @@ impl ConversationDb {
                       preceding_assistant_reasoning = ?5,
                       preceding_assistant_provider_id = ?6,
                       preceding_assistant_model = ?7
-                   WHERE prompt_id = ?8 AND status = 'queued' AND queue_session_id = ?9",
+                   WHERE prompt_id = ?8 AND status = 'queued' AND session_id = ?9
+                     AND queue_session_id = ?10",
                 params![
                     consumed_at,
                     turn_id,
@@ -532,6 +699,7 @@ impl ConversationDb {
                     preceding_assistant_provider_id,
                     preceding_assistant_model,
                     prompt_id,
+                    session_id,
                     queue_session_id
                 ],
             )?;
@@ -543,21 +711,31 @@ impl ConversationDb {
         Ok(())
     }
 
-    pub fn discard_queued_prompts(&self, queue_session_id: &str) -> Result<usize> {
+    pub fn discard_queued_prompts(
+        &self,
+        session_id: &str,
+        queue_session_id: &str,
+    ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
             "DELETE FROM queued_prompts
-             WHERE status = 'queued' AND queue_session_id = ?1",
-            params![queue_session_id],
+             WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2",
+            params![session_id, queue_session_id],
         )?)
     }
 
-    pub fn remove_queued_prompt(&self, prompt_id: &str, queue_session_id: &str) -> Result<bool> {
+    pub fn remove_queued_prompt(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        queue_session_id: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
             "DELETE FROM queued_prompts
-             WHERE prompt_id = ?1 AND status = 'queued' AND queue_session_id = ?2",
-            params![prompt_id, queue_session_id],
+             WHERE prompt_id = ?1 AND status = 'queued' AND session_id = ?2
+               AND queue_session_id = ?3",
+            params![prompt_id, session_id, queue_session_id],
         )? == 1)
     }
 
@@ -612,33 +790,41 @@ impl ConversationDb {
 
     pub fn load_session_loaded_items(
         &self,
+        session_id: &str,
         kind: &str,
     ) -> Result<std::collections::BTreeSet<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT name FROM session_loaded_items WHERE kind = ?1 ORDER BY name ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT name FROM session_loaded_items
+             WHERE session_id = ?1 AND kind = ?2 ORDER BY name ASC",
+        )?;
         let items = stmt
-            .query_map(params![kind], |row| row.get::<_, String>(0))?
+            .query_map(params![session_id, kind], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
         Ok(items)
     }
 
     pub fn load_session_loaded_items_with_sources(
         &self,
+        session_id: &str,
         kind: &str,
     ) -> Result<Vec<(String, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, source_turn_id FROM session_loaded_items WHERE kind = ?1 ORDER BY name ASC",
+            "SELECT name, source_turn_id FROM session_loaded_items
+             WHERE session_id = ?1 AND kind = ?2 ORDER BY name ASC",
         )?;
         let items = stmt
-            .query_map(params![kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![session_id, kind], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(items)
     }
 
     pub fn add_session_loaded_items(
         &self,
+        session_id: &str,
         kind: &str,
         names: &[String],
         source_turn_id: Option<&str>,
@@ -652,93 +838,101 @@ impl ConversationDb {
             .filter(|name| !name.is_empty())
         {
             affected += conn.execute(
-                "INSERT INTO session_loaded_items (kind, name, source_turn_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)
-                 ON CONFLICT(kind, name) DO UPDATE SET
+                "INSERT INTO session_loaded_items (session_id, kind, name, source_turn_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(session_id, kind, name) DO UPDATE SET
                     source_turn_id = COALESCE(excluded.source_turn_id, session_loaded_items.source_turn_id),
                     updated_at = excluded.updated_at",
-                params![kind, name, source_turn_id, now],
+                params![session_id, kind, name, source_turn_id, now],
             )?;
         }
         Ok(affected)
     }
 
-    pub fn load_turns(&self) -> Result<Vec<Turn>> {
+    pub fn load_turns(&self, session_id: &str) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns ORDER BY seq ASC",
+             FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
-            .query_map([], map_turn_row)?
+            .query_map(params![session_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
     #[allow(dead_code)]
-    pub fn load_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
+    pub fn load_turns_excluding(&self, session_id: &str, exclude_turn_id: &str) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns WHERE turn_id != ?1 ORDER BY seq ASC",
+             FROM turns WHERE session_id = ?1 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
-            .query_map(params![exclude_turn_id], map_turn_row)?
+            .query_map(params![session_id, exclude_turn_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
     #[allow(dead_code)]
-    pub fn load_turns_for_context(&self) -> Result<Vec<Turn>> {
-        self.load_turns()
+    pub fn load_turns_for_context(&self, session_id: &str) -> Result<Vec<Turn>> {
+        self.load_turns(session_id)
     }
 
-    pub fn load_visible_turns(&self) -> Result<Vec<Turn>> {
+    pub fn load_visible_turns(&self, session_id: &str) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns WHERE hidden = 0 ORDER BY seq ASC",
+             FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
-            .query_map([], map_turn_row)?
+            .query_map(params![session_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
-    pub fn load_visible_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
+    pub fn load_visible_turns_excluding(
+        &self,
+        session_id: &str,
+        exclude_turn_id: &str,
+    ) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns WHERE hidden = 0 AND turn_id != ?1 ORDER BY seq ASC",
+             FROM turns WHERE session_id = ?1 AND hidden = 0 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
-            .query_map(params![exclude_turn_id], map_turn_row)?
+            .query_map(params![session_id, exclude_turn_id], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
     #[allow(dead_code)]
-    pub fn hide_turns_before_seq(&self, seq: i64) -> Result<usize> {
+    pub fn hide_turns_before_seq(&self, session_id: &str, seq: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let affected = conn.execute("UPDATE turns SET hidden = 1 WHERE seq <= ?1", params![seq])?;
+        let affected = conn.execute(
+            "UPDATE turns SET hidden = 1 WHERE session_id = ?1 AND seq <= ?2",
+            params![session_id, seq],
+        )?;
         Ok(affected)
     }
 
     #[allow(dead_code)]
     pub fn insert_summary_turn(
         &self,
+        session_id: &str,
         summary: &str,
         token_total: Option<u64>,
         token_usage_estimated: bool,
@@ -752,54 +946,61 @@ impl ConversationDb {
                 .unwrap_or(0),
             rand::random::<u16>()
         );
-        let seq = self.next_seq_locked(&conn)?;
+        let seq = self.next_seq_locked(&conn, session_id)?;
         let now = Utc::now().to_rfc3339();
         let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         conn.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', '[]', 0, 1, ?7, ?8)",
-            params![turn_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated],
         )?;
         Ok(())
     }
 
-    pub fn load_last_summary(&self) -> Result<Option<Turn>> {
+    pub fn load_last_summary(&self, session_id: &str) -> Result<Option<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns WHERE is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
+             FROM turns WHERE session_id = ?1 AND is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
         )?;
-        let turn = stmt.query_map([], map_turn_row)?.next().transpose()?;
+        let turn = stmt
+            .query_map(params![session_id], map_turn_row)?
+            .next()
+            .transpose()?;
         Ok(turn)
     }
 
     #[allow(dead_code)]
-    pub fn count_turns(&self) -> Result<i64> {
+    pub fn count_turns(&self, session_id: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
         Ok(count)
     }
 
     #[allow(dead_code)]
-    pub fn total_chars(&self) -> Result<usize> {
-        let turns = self.load_turns()?;
+    pub fn total_chars(&self, session_id: &str) -> Result<usize> {
+        let turns = self.load_turns(session_id)?;
         Ok(turns.iter().map(|t| turn_chars(t)).sum())
     }
 
     #[allow(dead_code)]
-    pub fn trim_oldest_turns(&self, count: usize) -> Result<Vec<Turn>> {
+    pub fn trim_oldest_turns(&self, session_id: &str, count: usize) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
-             FROM turns WHERE is_summary = 0 ORDER BY seq ASC LIMIT ?1",
+             FROM turns WHERE session_id = ?1 AND is_summary = 0 ORDER BY seq ASC LIMIT ?2",
         )?;
         let mut to_remove: Vec<Turn> = stmt
-            .query_map(params![count as i64], map_turn_row)?
+            .query_map(params![session_id, count as i64], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         attach_turn_children_locked(&conn, &mut to_remove)?;
@@ -812,30 +1013,35 @@ impl ConversationDb {
         Ok(to_remove)
     }
 
-    pub fn oldest_evictable_visible_turns(&self, count: usize) -> Result<Vec<Turn>> {
+    pub fn oldest_evictable_visible_turns(
+        &self,
+        session_id: &str,
+        count: usize,
+    ) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
                     token_total, token_usage_estimated
              FROM turns
-             WHERE hidden = 0 AND is_summary = 0 AND status != 'running'
-             ORDER BY seq ASC LIMIT ?1",
+             WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0 AND status != 'running'
+             ORDER BY seq ASC LIMIT ?2",
         )?;
         let count = i64::try_from(count).unwrap_or(i64::MAX);
         let mut turns = stmt
-            .query_map(params![count], map_turn_row)?
+            .query_map(params![session_id, count], map_turn_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         attach_turn_children_locked(&conn, &mut turns)?;
         Ok(turns)
     }
 
-    pub fn delete_visible_turns(&self, turn_ids: &[String]) -> Result<usize> {
-        self.delete_visible_turns_checked(turn_ids, None)
+    pub fn delete_visible_turns(&self, session_id: &str, turn_ids: &[String]) -> Result<usize> {
+        self.delete_visible_turns_checked(session_id, turn_ids, None)
     }
 
     pub fn delete_visible_turns_checked(
         &self,
+        session_id: &str,
         turn_ids: &[String],
         expected_loaded_tools: Option<&[(String, Option<String>)]>,
     ) -> Result<usize> {
@@ -844,14 +1050,15 @@ impl ConversationDb {
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        verify_loaded_tool_sources(&tx, expected_loaded_tools)?;
-        let affected = delete_visible_turns_in_transaction(&tx, turn_ids)?;
+        verify_loaded_tool_sources(&tx, session_id, expected_loaded_tools)?;
+        let affected = delete_visible_turns_in_transaction(&tx, session_id, turn_ids)?;
         tx.commit()?;
         Ok(affected)
     }
 
     pub fn archive_and_delete_visible_turns(
         &self,
+        session_id: &str,
         archive_db: &Path,
         turns: &[EvictedTurn],
         turn_ids: &[String],
@@ -874,7 +1081,7 @@ impl ConversationDb {
         );
         let operation = (|| -> Result<usize> {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            verify_loaded_tool_sources(&tx, expected_loaded_tools)?;
+            verify_loaded_tool_sources(&tx, session_id, expected_loaded_tools)?;
             let created_at = Utc::now().to_rfc3339();
             for turn in turns {
                 tx.execute(
@@ -888,7 +1095,7 @@ impl ConversationDb {
                     ],
                 )?;
             }
-            let affected = delete_visible_turns_in_transaction(&tx, turn_ids)?;
+            let affected = delete_visible_turns_in_transaction(&tx, session_id, turn_ids)?;
             tx.commit()?;
             Ok(affected)
         })();
@@ -905,6 +1112,7 @@ impl ConversationDb {
 
     pub fn replace_visible_with_summary(
         &self,
+        session_id: &str,
         last_seq: i64,
         visible_turn_ids: &[String],
         summary: &str,
@@ -920,10 +1128,10 @@ impl ConversationDb {
         let current_turn_ids = {
             let mut stmt = tx.prepare(
                 "SELECT turn_id FROM turns
-                 WHERE hidden = 0 ORDER BY seq ASC",
+                 WHERE session_id = ?1 AND hidden = 0 ORDER BY seq ASC",
             )?;
             let turn_ids = stmt
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map(params![session_id], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             turn_ids
         };
@@ -932,13 +1140,13 @@ impl ConversationDb {
         }
         let parent_summary_seq: Option<i64> = tx.query_row(
             "SELECT MAX(seq) FROM turns
-                 WHERE hidden = 0 AND is_summary = 1 AND seq <= ?1",
-            params![last_seq],
+                 WHERE session_id = ?1 AND hidden = 0 AND is_summary = 1 AND seq <= ?2",
+            params![session_id, last_seq],
             |row| row.get(0),
         )?;
         let hidden = tx.execute(
-            "UPDATE turns SET hidden = 1 WHERE hidden = 0 AND seq <= ?1",
-            params![last_seq],
+            "UPDATE turns SET hidden = 1 WHERE session_id = ?1 AND hidden = 0 AND seq <= ?2",
+            params![session_id, last_seq],
         )?;
         if hidden == 0 {
             bail!("conversation changed before compact could be saved");
@@ -952,42 +1160,53 @@ impl ConversationDb {
                 .unwrap_or(0),
             rand::random::<u16>()
         );
-        let seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM turns", [], |row| {
-            row.get(0)
-        })?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
         let now = Utc::now().to_rfc3339();
         let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         tx.execute(
-            "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', '[]', 0, 1, ?7, ?8, 1, ?9)",
-            params![turn_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn reset(&self) -> Result<()> {
+    pub fn reset(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM queued_prompts", [])?;
-        conn.execute("DELETE FROM turns", [])?;
-        conn.execute("DELETE FROM session_loaded_items", [])?;
+        conn.execute(
+            "DELETE FROM queued_prompts WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        conn.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id])?;
+        conn.execute(
+            "DELETE FROM session_loaded_items WHERE session_id = ?1",
+            params![session_id],
+        )?;
         Ok(())
     }
 
-    pub fn reset_history(&self) -> Result<()> {
+    pub fn reset_history(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM turns", [])?;
-        conn.execute("DELETE FROM session_loaded_items", [])?;
+        conn.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id])?;
+        conn.execute(
+            "DELETE FROM session_loaded_items WHERE session_id = ?1",
+            params![session_id],
+        )?;
         Ok(())
     }
 
-    pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
+    pub fn undo_last_turn(&self, session_id: &str) -> Result<(usize, Option<String>)> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let running: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM turns WHERE hidden = 0 AND status = 'running'",
-            [],
+            "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND hidden = 0 AND status = 'running'",
+            params![session_id],
             |row| row.get(0),
         )?;
         if running > 0 {
@@ -998,8 +1217,8 @@ impl ConversationDb {
             .query_row(
                 "SELECT turn_id, seq, user_content, is_summary,
                         compact_reversible, compact_parent_summary_seq
-                 FROM turns WHERE hidden = 0 ORDER BY seq DESC LIMIT 1",
-                [],
+                 FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -1026,15 +1245,15 @@ impl ConversationDb {
                 let restorable: i64 = match parent_summary_seq {
                     Some(previous_seq) => tx.query_row(
                         "SELECT COUNT(*) FROM turns
-                         WHERE hidden = 1 AND seq < ?1
-                           AND (seq = ?2 OR (is_summary = 0 AND seq > ?2))",
-                        params![summary_seq, previous_seq],
+                         WHERE session_id = ?1 AND hidden = 1 AND seq < ?2
+                           AND (seq = ?3 OR (is_summary = 0 AND seq > ?3))",
+                        params![session_id, summary_seq, previous_seq],
                         |row| row.get(0),
                     )?,
                     None => tx.query_row(
                         "SELECT COUNT(*) FROM turns
-                         WHERE hidden = 1 AND is_summary = 0 AND seq < ?1",
-                        params![summary_seq],
+                         WHERE session_id = ?1 AND hidden = 1 AND is_summary = 0 AND seq < ?2",
+                        params![session_id, summary_seq],
                         |row| row.get(0),
                     )?,
                 };
@@ -1048,16 +1267,16 @@ impl ConversationDb {
                     Some(previous_seq) => {
                         tx.execute(
                             "UPDATE turns SET hidden = 0
-                             WHERE hidden = 1 AND seq < ?1
-                               AND (seq = ?2 OR (is_summary = 0 AND seq > ?2))",
-                            params![summary_seq, previous_seq],
+                             WHERE session_id = ?1 AND hidden = 1 AND seq < ?2
+                               AND (seq = ?3 OR (is_summary = 0 AND seq > ?3))",
+                            params![session_id, summary_seq, previous_seq],
                         )?;
                     }
                     None => {
                         tx.execute(
                             "UPDATE turns SET hidden = 0
-                             WHERE hidden = 1 AND is_summary = 0 AND seq < ?1",
-                            params![summary_seq],
+                             WHERE session_id = ?1 AND hidden = 1 AND is_summary = 0 AND seq < ?2",
+                            params![session_id, summary_seq],
                         )?;
                     }
                 }
@@ -1069,7 +1288,17 @@ impl ConversationDb {
     }
 
     #[allow(dead_code)]
-    pub fn has_running_turns(&self) -> Result<bool> {
+    pub fn has_running_turns(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND status = 'running'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn has_any_running_turns(&self) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM turns WHERE status = 'running'",
@@ -1081,6 +1310,7 @@ impl ConversationDb {
 
     pub fn running_turn_queue_target(
         &self,
+        session_id: &str,
     ) -> Result<Option<(String, Option<String>, Option<u32>)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -1096,10 +1326,10 @@ impl ConversationDb {
                     ),
                     turns.owner_pid
                FROM turns
-              WHERE turns.status = 'running'
+              WHERE turns.session_id = ?1 AND turns.status = 'running'
               ORDER BY turns.seq DESC
               LIMIT 1",
-            [],
+            params![session_id],
             |row| {
                 let owner_pid = row
                     .get::<_, Option<i64>>(2)?
@@ -1112,23 +1342,32 @@ impl ConversationDb {
     }
 
     #[allow(dead_code)]
-    pub fn running_turn_summaries(&self) -> Result<Vec<String>> {
+    pub fn running_turn_summaries(&self, session_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT user_content FROM turns WHERE status = 'running' ORDER BY seq ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT user_content FROM turns
+             WHERE session_id = ?1 AND status = 'running' ORDER BY seq ASC",
+        )?;
         let summaries = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(summaries)
     }
 
-    pub fn running_turn_summaries_excluding(&self, exclude_turn_id: &str) -> Result<Vec<String>> {
+    pub fn running_turn_summaries_excluding(
+        &self,
+        session_id: &str,
+        exclude_turn_id: &str,
+    ) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_content FROM turns WHERE status = 'running' AND turn_id != ?1 ORDER BY seq ASC",
+            "SELECT user_content FROM turns
+             WHERE session_id = ?1 AND status = 'running' AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let summaries = stmt
-            .query_map(params![exclude_turn_id], |row| row.get::<_, String>(0))?
+            .query_map(params![session_id, exclude_turn_id], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(summaries)
     }
@@ -1176,20 +1415,21 @@ impl ConversationDb {
         Ok(affected)
     }
 
-    fn next_seq_locked(&self, conn: &Connection) -> Result<i64> {
-        let max_seq: i64 =
-            conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM turns", [], |row| {
-                row.get(0)
-            })?;
-        Ok(max_seq + 1)
+    fn next_seq_locked(&self, conn: &Connection, session_id: &str) -> Result<i64> {
+        let next_seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(next_seq)
     }
 
     #[allow(dead_code)]
-    pub fn migrate_from_jsonl(&self, jsonl_path: &Path) -> Result<usize> {
+    pub fn migrate_from_jsonl(&self, session_id: &str, jsonl_path: &Path) -> Result<usize> {
         if !jsonl_path.exists() {
             return Ok(0);
         }
-        let turns = self.load_turns()?;
+        let turns = self.load_turns(session_id)?;
         if !turns.is_empty() {
             return Ok(0);
         }
@@ -1221,11 +1461,11 @@ impl ConversationDb {
                 if let Some((prev_ts, prev_content)) = pending_user.take() {
                     let turn_id = format!("migrated_{}", migrated);
                     let conn = self.conn.lock().unwrap();
-                    let seq = self.next_seq_locked(&conn)?;
+                    let seq = self.next_seq_locked(&conn, session_id)?;
                     conn.execute(
-                        "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'completed')",
-                        params![turn_id, seq, prev_content, prev_ts, "(migrated without reply)"],
+                        "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, status)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed')",
+                        params![turn_id, session_id, seq, prev_content, prev_ts, "(migrated without reply)"],
                     )?;
                     drop(conn);
                     migrated += 1;
@@ -1235,13 +1475,13 @@ impl ConversationDb {
                 if let Some((user_ts, user_content)) = pending_user.take() {
                     let turn_id = format!("migrated_{}", migrated);
                     let conn = self.conn.lock().unwrap();
-                    let seq = self.next_seq_locked(&conn)?;
+                    let seq = self.next_seq_locked(&conn, session_id)?;
                     let now = Utc::now().to_rfc3339();
                     conn.execute(
-                        "INSERT INTO turns (turn_id, seq, user_content, user_timestamp,
+                        "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp,
                          assistant_content, assistant_reasoning, assistant_timestamp, status)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed')",
-                        params![turn_id, seq, user_content, user_ts, content, reasoning, now],
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed')",
+                        params![turn_id, session_id, seq, user_content, user_ts, content, reasoning, now],
                     )?;
                     drop(conn);
                     migrated += 1;
@@ -1251,12 +1491,13 @@ impl ConversationDb {
         if let Some((user_ts, user_content)) = pending_user {
             let turn_id = format!("migrated_{}", migrated);
             let conn = self.conn.lock().unwrap();
-            let seq = self.next_seq_locked(&conn)?;
+            let seq = self.next_seq_locked(&conn, session_id)?;
             conn.execute(
-                "INSERT INTO turns (turn_id, seq, user_content, user_timestamp, assistant_content, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'interrupted')",
+                "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'interrupted')",
                 params![
                     turn_id,
+                    session_id,
                     seq,
                     user_content,
                     user_ts,
@@ -1270,13 +1511,18 @@ impl ConversationDb {
     }
 }
 
-fn delete_visible_turns_in_transaction(tx: &Transaction<'_>, turn_ids: &[String]) -> Result<usize> {
+fn delete_visible_turns_in_transaction(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    turn_ids: &[String],
+) -> Result<usize> {
     let mut affected = 0usize;
     for turn_id in turn_ids {
         let deleted = tx.execute(
             "DELETE FROM turns
-             WHERE turn_id = ?1 AND hidden = 0 AND is_summary = 0 AND status != 'running'",
-            params![turn_id],
+             WHERE turn_id = ?1 AND session_id = ?2 AND hidden = 0 AND is_summary = 0
+               AND status != 'running'",
+            params![turn_id, session_id],
         )?;
         if deleted != 1 {
             bail!(
@@ -1288,8 +1534,9 @@ fn delete_visible_turns_in_transaction(tx: &Transaction<'_>, turn_ids: &[String]
             );
         }
         tx.execute(
-            "DELETE FROM session_loaded_items WHERE source_turn_id = ?1",
-            params![turn_id],
+            "DELETE FROM session_loaded_items
+             WHERE session_id = ?1 AND source_turn_id = ?2",
+            params![session_id, turn_id],
         )?;
         affected += deleted;
     }
@@ -1298,6 +1545,7 @@ fn delete_visible_turns_in_transaction(tx: &Transaction<'_>, turn_ids: &[String]
 
 fn verify_loaded_tool_sources(
     tx: &Transaction<'_>,
+    session_id: &str,
     expected: Option<&[(String, Option<String>)]>,
 ) -> Result<()> {
     let Some(expected) = expected else {
@@ -1306,10 +1554,10 @@ fn verify_loaded_tool_sources(
     let current = {
         let mut stmt = tx.prepare(
             "SELECT name, source_turn_id FROM session_loaded_items
-             WHERE kind = 'tool' ORDER BY name ASC",
+             WHERE session_id = ?1 AND kind = 'tool' ORDER BY name ASC",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<(String, Option<String>)>, _>>()?;
         rows
     };
@@ -1507,22 +1755,3 @@ fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> 
     Ok(())
 }
 
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(());
-        }
-    }
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-        [],
-    )?;
-    Ok(())
-}

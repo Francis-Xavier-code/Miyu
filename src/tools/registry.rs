@@ -427,13 +427,18 @@ impl ToolRegistry {
         tools
     }
 
+    /// Expands requested load targets. Individual problem targets never fail
+    /// the whole request: they are reported in the returned `skipped` list so
+    /// the valid remainder still loads (a model asking for an always-loaded
+    /// tool alongside a group must not lose the group).
     pub(crate) fn expand_load_targets(
         &self,
         requested: &[String],
         loaded: &BTreeSet<String>,
-    ) -> Result<(Vec<String>, Vec<String>)> {
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut loaded_targets = BTreeSet::new();
         let mut loaded_tools = BTreeSet::new();
+        let mut skipped = Vec::new();
         for target in requested {
             let target = target.trim();
             if target.is_empty() {
@@ -442,11 +447,13 @@ impl ToolRegistry {
             if let Some(group) = target.strip_prefix("group:") {
                 let group = group.trim();
                 if group.is_empty() {
-                    bail!("group target is missing a group name");
+                    skipped.push("group target is missing a group name".to_string());
+                    continue;
                 }
                 let group_tools = self.group_loadable_tool_names(group, loaded);
                 if group_tools.is_empty() {
-                    bail!("unknown or already-loaded tool group: {group}");
+                    skipped.push(format!("group:{group}: unknown or already fully loaded"));
+                    continue;
                 }
                 loaded_targets.insert(format!("group:{group}"));
                 loaded_tools.extend(group_tools);
@@ -454,25 +461,31 @@ impl ToolRegistry {
             }
 
             let Some(tool) = self.tools.get(target) else {
-                bail!("unknown tool or script: {target}");
+                skipped.push(format!("{target}: unknown tool or script"));
+                continue;
             };
             if tool.name == "load_tools" || tool.always_loaded {
-                bail!(
-                    "tool cannot be loaded with load_tools: {target}. Only names listed in available_load_targets can be loaded."
-                );
+                skipped.push(format!(
+                    "{target}: already available (always loaded); no need to load it"
+                ));
+                continue;
             }
             if tool.load_policy == LoadPolicy::Hidden {
-                bail!("tool is hidden from load_tools: {target}");
+                skipped.push(format!("{target}: not loadable via load_tools"));
+                continue;
             }
-            if !loaded.contains(&tool.name) {
+            if loaded.contains(&tool.name) {
+                skipped.push(format!("{target}: already loaded"));
+            } else {
                 loaded_targets.insert(tool.name.clone());
                 loaded_tools.insert(tool.name.clone());
             }
         }
-        Ok((
+        (
             loaded_targets.into_iter().collect(),
             loaded_tools.into_iter().collect(),
-        ))
+            skipped,
+        )
     }
 
     fn group_loadable_tool_names(&self, group: &str, loaded: &BTreeSet<String>) -> Vec<String> {

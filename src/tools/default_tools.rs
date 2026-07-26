@@ -387,7 +387,7 @@ fn trash_path_with(
 }
 
 async fn glob_files(args: Value) -> Result<String> {
-    let path = optional_path(&args).unwrap_or(std::env::current_dir()?);
+    let path = optional_path(&args).unwrap_or_else(super::workspace::effective_workdir);
     let search_path = prepare_search_path(&path)?;
     let pattern = required(&args, "pattern")?;
     let max_results = max_results(&args);
@@ -410,7 +410,7 @@ async fn glob_files(args: Value) -> Result<String> {
 }
 
 async fn grep_text(args: Value) -> Result<String> {
-    let path = optional_path(&args).unwrap_or(std::env::current_dir()?);
+    let path = optional_path(&args).unwrap_or_else(super::workspace::effective_workdir);
     let is_file = path.is_file();
     let search_root = if is_file {
         path.parent()
@@ -484,6 +484,9 @@ async fn execute_command(command: &str, timeout: u64, progress: ToolProgress) ->
     command_process
         .arg("-lc")
         .arg(command)
+        // Explicit cwd: shell commands must run in the turn workspace, not
+        // whatever the daemon process cwd happens to be.
+        .current_dir(super::workspace::effective_workdir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -824,7 +827,7 @@ fn resolve_existing_path_without_following_leaf(path: &Path) -> Result<PathBuf> 
 }
 
 fn ensure_safe_trash_target(path: &Path) -> Result<()> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
+    let cwd = super::workspace::effective_workdir().canonicalize()?;
     let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     let dangerous = [
         Path::new("/"),
@@ -957,9 +960,7 @@ fn expand_path(value: &str) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        super::workspace::effective_workdir().join(path)
     }
 }
 

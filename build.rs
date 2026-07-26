@@ -13,6 +13,18 @@ fn main() {
     println!("cargo:rerun-if-changed=src/prompts/plan.md");
     println!("cargo:rerun-if-changed=src/prompts/chat.md");
     println!("cargo:rerun-if-changed=assets/o200k_base.tiktoken");
+    // Rerun on any source or frontend change so MIYU_BUILD_ID uniquely
+    // identifies a build; the CLI uses it to detect (and restart) a daemon
+    // left running from an older build.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=web");
+    println!(
+        "cargo:rustc-env=MIYU_BUILD_ID={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
 
     let prompt = fs::read("src/prompts/miyu.md").expect("read src/prompts/miyu.md");
     let encoded = prompt

@@ -9,6 +9,8 @@ struct UsageState {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    #[serde(default)]
+    conversation_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,6 +24,7 @@ pub struct UsageSnapshot {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub conversation_tokens: u64,
     pub last_usage: Option<Usage>,
     pub last_conversation_usage: Option<Usage>,
 }
@@ -37,6 +40,7 @@ impl From<UsageState> for UsageSnapshot {
             prompt_tokens: state.prompt_tokens,
             completion_tokens: state.completion_tokens,
             total_tokens: state.total_tokens,
+            conversation_tokens: state.conversation_tokens,
             last_usage: state.last_usage,
             last_conversation_usage,
         }
@@ -62,6 +66,7 @@ fn add_usage_with_scope(path: &Path, usage: &Usage, is_conversation: bool) -> Re
     state.prompt_tokens += usage.prompt_tokens;
     state.completion_tokens += usage.completion_tokens;
     state.total_tokens += usage.effective_total_tokens();
+    state.conversation_tokens += usage.effective_total_tokens();
     state.last_usage = Some(usage.clone());
     if is_conversation {
         state.last_conversation_usage = Some(usage.clone());
@@ -85,6 +90,19 @@ pub fn clear_last_usage(path: &Path) -> Result<()> {
     }
     let raw = std::fs::read_to_string(path)?;
     let mut state = serde_json::from_str::<UsageState>(&raw).unwrap_or_default();
+    state.last_usage = None;
+    state.last_conversation_usage = None;
+    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&state)?))?;
+    Ok(())
+}
+
+pub fn reset_conversation(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let mut state = serde_json::from_str::<UsageState>(&raw).unwrap_or_default();
+    state.conversation_tokens = 0;
     state.last_usage = None;
     state.last_conversation_usage = None;
     std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&state)?))?;
@@ -170,5 +188,27 @@ mod tests {
 
         let snapshot = snapshot(&path).unwrap();
         assert_eq!(snapshot.total_tokens, 10);
+        assert_eq!(snapshot.conversation_tokens, 10);
+    }
+
+    #[test]
+    fn reset_conversation_preserves_global_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.json");
+        add_usage(
+            &path,
+            &Usage {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                total_tokens: 10,
+            },
+        )
+        .unwrap();
+
+        reset_conversation(&path).unwrap();
+        let snapshot = snapshot(&path).unwrap();
+        assert_eq!(snapshot.total_tokens, 10);
+        assert_eq!(snapshot.conversation_tokens, 0);
+        assert!(snapshot.last_conversation_usage.is_none());
     }
 }

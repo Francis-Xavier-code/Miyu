@@ -1,6 +1,12 @@
-use crate::agent::{Agent, AgentEvent, AgentMode, AgentTurnControl};
+use crate::agent::{
+    archive_and_delete_visible_turns, Agent, AgentEvent, AgentMode, AgentTurnControl,
+};
 use crate::cli::{build_tool_registry, WebArgs};
 use crate::config::{ActiveProviderModelConfig, AppConfig};
+use crate::i18n::text as t;
+use crate::ipc::{
+    self, Command as IpcCommand, Frame as IpcFrame, ImageAttachment, Request as IpcRequest,
+};
 use crate::llm::{ChatResult, ChatStreamKind, OpenAiCompatibleClient, Usage};
 use crate::memory::MemoryStore;
 use crate::paths::MiyuPaths;
@@ -18,7 +24,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -29,17 +35,19 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::future::IntoFuture;
 use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as FilePath, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
+use tokio::task::JoinHandle as TokioJoinHandle;
 
 const JSON_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_CHARS: usize = 20_000;
@@ -61,12 +69,15 @@ const MIYU_WALLPAPER: &[u8] = include_bytes!("../pics/miyuwallpaper.png");
 struct WebState {
     auth: WebAuth,
     boot_id: Arc<str>,
+    web_port: u16,
+    web_public: bool,
     paths: MiyuPaths,
     manager: Arc<Mutex<ManagerState>>,
     state_store: StateStore,
     events: EventHub,
     questions: QuestionBroker,
     actor_tx: mpsc::UnboundedSender<ActorCommand>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -155,27 +166,64 @@ impl WebAuth {
     }
 }
 
+/// A turn currently executing in the daemon.
+struct RunInfo {
+    session_id: Arc<str>,
+    mode: AgentMode,
+    /// Signals cancellation to the turn task; the task selects on the
+    /// paired receiver.
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+impl RunInfo {
+    fn request_cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
 struct ManagerState {
     config: AppConfig,
-    active_run_id: Option<String>,
+    /// Concurrently running turns, keyed by run id. Turns run in parallel —
+    /// including several in the same session (placeholder semantics) — so
+    /// this replaces the old single `active_run_id`.
+    active_runs: HashMap<String, RunInfo>,
     admin_busy: bool,
     context: ContextSnapshot,
+}
+
+impl ManagerState {
+    /// A run currently executing in the given session, if any (most callers
+    /// only need one representative — e.g. the WebUI compat field).
+    fn run_in_session(&self, session_id: &str) -> Option<&String> {
+        self.active_runs
+            .iter()
+            .find(|(_, info)| &*info.session_id == session_id)
+            .map(|(run_id, _)| run_id)
+    }
+
+    fn session_has_runs(&self, session_id: &str) -> bool {
+        self.active_runs
+            .values()
+            .any(|info| &*info.session_id == session_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct ContextSnapshot {
     tokens: u64,
     window: Option<usize>,
+    cumulative_tokens: u64,
 }
 
 enum ActorCommand {
     StartTurn {
         run_id: String,
+        session_id: Arc<str>,
         content: String,
         mode: AgentMode,
-    },
-    Cancel {
-        run_id: String,
+        images: Vec<Option<ImageAttachment>>,
+        cwd: Option<std::path::PathBuf>,
+        cancel: tokio::sync::watch::Receiver<bool>,
     },
     SetModels {
         models: Vec<ActiveProviderModelConfig>,
@@ -188,7 +236,22 @@ enum ActorCommand {
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ResetConversation {
+        all: bool,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
+    },
+    SwitchSession {
+        session_id: String,
+        reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
+    },
+    Undo {
+        reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
+    },
+    Pop {
+        turn_ids: Vec<String>,
+        reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
+    },
+    Compact {
+        reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
     },
     Shutdown,
 }
@@ -780,6 +843,10 @@ struct BootstrapResponse {
     context: ContextSnapshot,
     usage: SafeUsageSnapshot,
     capabilities: Capabilities,
+    sessions: Vec<Value>,
+    current_session_id: String,
+    /// Every turn currently running, across all sessions.
+    runs: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -862,6 +929,7 @@ struct SafeUsageSnapshot {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    conversation_tokens: u64,
     last_usage: Option<Usage>,
     last_conversation_usage: Option<Usage>,
 }
@@ -877,11 +945,14 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let password = resolve_web_password(&args)?;
     AppConfig::init_files(&paths)?;
     let config = AppConfig::load_or_default(&paths)?;
+    crate::models_cache::try_load_active(&paths, &config);
+    crate::models_cache::spawn_background_refresh_active(paths.clone(), config.clone());
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
+    state_store.adopt_sessions_for_persona(&config.active_persona_scope())?;
     let client = OpenAiCompatibleClient::from_config(&config, &paths)?;
     let registry = build_tool_registry(&config, &paths, AgentMode::Normal, true)?;
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         config.clone(),
         &paths,
         state_store.clone(),
@@ -889,24 +960,26 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         registry,
         AgentMode::Normal,
     )?;
+    agent.prepare_for_turn()?;
     let context = ContextSnapshot {
         tokens: agent.effective_context_tokens()?,
         window: agent.context_window(),
+        cumulative_tokens: agent.conversation_usage_tokens()?,
     };
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        args.port,
-    ))
-    .await
-    .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port))?;
+    // Listen on all interfaces so the WebUI is reachable from the LAN;
+    // access URLs for every local address are printed below.
+    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, args.port))
+        .await
+        .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port))?;
     let port = listener.local_addr()?.port();
     let boot_id: Arc<str> = random_id("boot", 18).into();
     let events = EventHub::new();
     let questions = QuestionBroker::new();
     let manager = Arc::new(Mutex::new(ManagerState {
         config: config.clone(),
-        active_run_id: None,
+        active_runs: HashMap::new(),
         admin_busy: false,
         context,
     }));
@@ -919,18 +992,23 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         events.clone(),
         questions.clone(),
     )?;
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
     let state = WebState {
         auth: WebAuth::new(password.as_deref()),
         boot_id,
+        web_port: port,
+        web_public: args.public,
         paths,
         manager,
         state_store,
         events,
         questions,
         actor_tx: actor_tx.clone(),
+        shutdown_tx,
     };
+    let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     let app = router(state);
-    let urls = web_access_urls(port);
+    let urls = ipc::web_access_urls(port);
     for url in &urls {
         println!("Miyu WebUI: {url}");
     }
@@ -948,8 +1026,12 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let serve_result = tokio::select! {
         result = &mut server => result,
         _ = shutdown_signal() => Ok(()),
+        _ = shutdown_rx.recv() => Ok(()),
     };
     let _ = actor_tx.send(ActorCommand::Shutdown);
+    ipc_task.abort();
+    let _ = ipc_task.await;
+    drop(ipc_lease);
     let actor_result = tokio::task::spawn_blocking(move || actor_join.join())
         .await
         .context("joining WebUI actor task")?
@@ -958,10 +1040,909 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     actor_result
 }
 
+struct IpcRunGuard {
+    manager: Arc<Mutex<ManagerState>>,
+    run_id: String,
+    finished: bool,
+}
+
+impl IpcRunGuard {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for IpcRunGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Client disconnected mid-turn: cancel its run.
+            if let Some(info) = self.manager.lock().unwrap().active_runs.get(&self.run_id) {
+                info.request_cancel();
+            }
+        }
+    }
+}
+
+fn start_ipc_server(state: &WebState) -> Result<(crate::ipc::WebCoreLease, TokioJoinHandle<()>)> {
+    let lease = ipc::acquire_web_core(&state.paths)
+        .context("another Miyu core is already running or starting")?;
+    let socket_path = state.paths.ipc_socket();
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding Miyu IPC socket at {}", socket_path.display()))?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+
+    let server_state = state.clone();
+    let permits = Arc::new(Semaphore::new(32));
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(error = %error, "Miyu IPC listener stopped");
+                    break;
+                }
+            };
+            let permit = match permits.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let connection_state = server_state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Err(error) = handle_ipc_connection(connection_state, stream).await {
+                    tracing::debug!(error = %error, "Miyu IPC connection closed with an error");
+                }
+            });
+        }
+    });
+    Ok((lease, task))
+}
+
+async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStream) -> Result<()> {
+    let Some(request) = tokio::time::timeout(
+        Duration::from_secs(5),
+        ipc::receive::<IpcRequest>(&mut stream),
+    )
+    .await
+    .context("timed out waiting for a Miyu IPC request")??
+    else {
+        return Ok(());
+    };
+    if request.version != ipc::PROTOCOL_VERSION {
+        ipc::send(
+            &mut stream,
+            &IpcFrame::Error {
+                message: format!(
+                    "unsupported IPC protocol version {}; expected {}",
+                    request.version,
+                    ipc::PROTOCOL_VERSION
+                ),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match request.command {
+        IpcCommand::Ping => {
+            ipc::send(
+                &mut stream,
+                &IpcFrame::Ready {
+                    pid: std::process::id(),
+                    web_port: state.web_port,
+                    web_public: state.web_public,
+                    build_id: ipc::BUILD_ID.to_string(),
+                },
+            )
+            .await?;
+        }
+        IpcCommand::Shutdown => {
+            ipc::send(&mut stream, &IpcFrame::Ack).await?;
+            let _ = state.shutdown_tx.send(());
+        }
+        IpcCommand::GetStatus => {
+            ipc::send(
+                &mut stream,
+                &IpcFrame::AdminResult {
+                    state: session_state(&state.manager, &state.state_store)?,
+                    data: json!({}),
+                },
+            )
+            .await?;
+        }
+        IpcCommand::ReloadConfig => {
+            let next_config = AppConfig::load_or_default(&state.paths)?;
+            let prompts = read_prompt_documents(&next_config, &state.paths)?;
+            let reset_conversation = {
+                let current = state.manager.lock().unwrap().config.clone();
+                prompt_configuration_changed(&current, &next_config)
+            };
+            reserve_admin(&state.manager).map_err(|error| anyhow::anyhow!(error.message))?;
+            let (reply, receiver) = oneshot::channel();
+            if state
+                .actor_tx
+                .send(ActorCommand::ApplyConfig {
+                    config: next_config,
+                    prompts,
+                    reset_conversation,
+                    reply,
+                })
+                .is_err()
+            {
+                release_admin(&state.manager);
+                anyhow::bail!("Miyu core worker is unavailable");
+            }
+            match receiver.await {
+                Ok(Ok(())) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data: json!({}),
+                        },
+                    )
+                    .await?
+                }
+                Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                }
+                Err(_) => {
+                    release_admin(&state.manager);
+                    anyhow::bail!("Miyu core stopped while reloading configuration");
+                }
+            }
+        }
+        IpcCommand::ResetConversation { all } => {
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            let (reply, receiver) = oneshot::channel();
+            if state
+                .actor_tx
+                .send(ActorCommand::ResetConversation { all, reply })
+                .is_err()
+            {
+                release_admin(&state.manager);
+                anyhow::bail!("Miyu core worker is unavailable");
+            }
+            match receiver.await {
+                Ok(Ok(())) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data: json!({}),
+                        },
+                    )
+                    .await?
+                }
+                Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                }
+                Err(_) => {
+                    release_admin(&state.manager);
+                    anyhow::bail!("Miyu core stopped while resetting the conversation");
+                }
+            }
+        }
+        IpcCommand::Undo => {
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            let (reply, receiver) = oneshot::channel();
+            if state.actor_tx.send(ActorCommand::Undo { reply }).is_err() {
+                release_admin(&state.manager);
+                anyhow::bail!("Miyu core worker is unavailable");
+            }
+            match receiver.await {
+                Ok(Ok(data)) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data,
+                        },
+                    )
+                    .await?
+                }
+                Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                }
+                Err(_) => {
+                    release_admin(&state.manager);
+                    anyhow::bail!("Miyu core stopped while undoing the conversation");
+                }
+            }
+        }
+        IpcCommand::Pop { turn_ids } => {
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            let (reply, receiver) = oneshot::channel();
+            if state
+                .actor_tx
+                .send(ActorCommand::Pop { turn_ids, reply })
+                .is_err()
+            {
+                release_admin(&state.manager);
+                anyhow::bail!("Miyu core worker is unavailable");
+            }
+            match receiver.await {
+                Ok(Ok(data)) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data,
+                        },
+                    )
+                    .await?
+                }
+                Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                }
+                Err(_) => {
+                    release_admin(&state.manager);
+                    anyhow::bail!("Miyu core stopped while popping the conversation");
+                }
+            }
+        }
+        IpcCommand::Compact => {
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            let (reply, receiver) = oneshot::channel();
+            if state
+                .actor_tx
+                .send(ActorCommand::Compact { reply })
+                .is_err()
+            {
+                release_admin(&state.manager);
+                anyhow::bail!("Miyu core worker is unavailable");
+            }
+            match receiver.await {
+                Ok(Ok(data)) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data,
+                        },
+                    )
+                    .await?
+                }
+                Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                }
+                Err(_) => {
+                    release_admin(&state.manager);
+                    anyhow::bail!("Miyu core stopped while compacting the conversation");
+                }
+            }
+        }
+        IpcCommand::StartTurn {
+            content,
+            mode,
+            images,
+            cwd,
+        } => {
+            handle_ipc_turn(&state, &mut stream, content, mode, images, cwd).await?;
+        }
+        IpcCommand::Cancel { run_id } => {
+            let cancelled = {
+                let manager = state.manager.lock().unwrap();
+                manager.active_runs.get(&run_id).map(RunInfo::request_cancel)
+            };
+            if cancelled.is_some() {
+                ipc::send(&mut stream, &IpcFrame::Ack).await?;
+            } else {
+                ipc::send(
+                    &mut stream,
+                    &IpcFrame::Error {
+                        message: "active run not found".to_string(),
+                    },
+                )
+                .await?;
+            }
+        }
+        IpcCommand::AnswerQuestion {
+            question_id,
+            answers,
+        } => match state
+            .questions
+            .answer(&question_id, answers, |run_id, answers| {
+                state.events.publish(
+                    "question.answered",
+                    json!({
+                        "run_id": run_id,
+                        "question_id": question_id,
+                        "answers": answers,
+                    }),
+                );
+            }) {
+            Ok(()) => ipc::send(&mut stream, &IpcFrame::Ack).await?,
+            Err(error) => {
+                ipc::send(
+                    &mut stream,
+                    &IpcFrame::Error {
+                        message: match error {
+                            AnswerFailure::NotFound => "pending question not found".to_string(),
+                            AnswerFailure::Invalid(message) => message,
+                            AnswerFailure::Gone => {
+                                "pending question is no longer active".to_string()
+                            }
+                        },
+                    },
+                )
+                .await?;
+            }
+        },
+        session_command => {
+            match handle_session_command(&state, session_command).await {
+                Ok(data) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state(&state.manager, &state.state_store)?,
+                            data,
+                        },
+                    )
+                    .await?
+                }
+                Err(message) => ipc::send(&mut stream, &IpcFrame::Error { message }).await?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handles the session-management IPC commands. Returns the `AdminResult`
+/// payload on success or a user-facing error message.
+async fn handle_session_command(
+    state: &WebState,
+    command: IpcCommand,
+) -> std::result::Result<Value, String> {
+    let store = &state.state_store;
+    let persona = active_persona_scope(state);
+    match command {
+        IpcCommand::ListSessions { include_archived } => {
+            let current = store.session_id();
+            let sessions = store
+                .list_sessions(&persona, include_archived)
+                .map_err(|error| safe_error_message(&error))?;
+            let sessions: Vec<Value> = sessions
+                .iter()
+                .map(|overview| session_overview_json(overview, &current))
+                .collect();
+            Ok(json!({ "current": &*current, "sessions": sessions }))
+        }
+        IpcCommand::CreateSession { name, switch } => {
+            // No explicit name: leave it empty; the session is auto-named
+            // from the first prompt when its first turn completes.
+            let name = name
+                .map(|name| name.trim().to_string())
+                .unwrap_or_default();
+            let record = store
+                .create_session(&persona, &name, "user", None)
+                .map_err(|error| safe_error_message(&error))?;
+            state.events.publish(
+                "session.created",
+                json!({ "session_id": record.session_id, "name": record.name }),
+            );
+            if switch {
+                switch_session_via_actor(state, record.session_id.clone()).await?;
+            }
+            Ok(json!({ "session": session_record_json(&record) }))
+        }
+        IpcCommand::SwitchSession { target } => {
+            let record = resolve_session_ref(state, &target)?;
+            if record.kind != "user" {
+                return Err(t(
+                    "only user sessions can be switched to",
+                    "只能切换到用户会话",
+                )
+                .to_string());
+            }
+            if record.archived {
+                store
+                    .set_session_archived(&record.session_id, false)
+                    .map_err(|error| safe_error_message(&error))?;
+            }
+            switch_session_via_actor(state, record.session_id.clone()).await?;
+            Ok(json!({ "session": session_record_json(&record) }))
+        }
+        IpcCommand::RenameSession { target, name } => {
+            let record = resolve_session_ref(state, &target)?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(t("session name cannot be empty", "会话名称不能为空").to_string());
+            }
+            store
+                .rename_session(&record.session_id, name)
+                .map_err(|error| safe_error_message(&error))?;
+            state.events.publish(
+                "session.renamed",
+                json!({ "session_id": record.session_id, "name": name }),
+            );
+            Ok(json!({}))
+        }
+        IpcCommand::ArchiveSession { target, archived } => {
+            let record = resolve_session_ref(state, &target)?;
+            if archived
+                && state
+                    .manager
+                    .lock()
+                    .unwrap()
+                    .session_has_runs(&record.session_id)
+            {
+                return Err(t(
+                    "the session has a reply in progress",
+                    "该会话有回复正在进行",
+                )
+                .to_string());
+            }
+            if archived && &*store.session_id() == record.session_id.as_str() {
+                let fallback = fallback_session_id(state, &record.session_id)?;
+                switch_session_via_actor(state, fallback).await?;
+            }
+            store
+                .set_session_archived(&record.session_id, archived)
+                .map_err(|error| safe_error_message(&error))?;
+            state.events.publish(
+                "session.archived",
+                json!({ "session_id": record.session_id, "archived": archived }),
+            );
+            Ok(json!({}))
+        }
+        IpcCommand::DeleteSession { target } => {
+            let record = resolve_session_ref(state, &target)?;
+            if state
+                .manager
+                .lock()
+                .unwrap()
+                .session_has_runs(&record.session_id)
+            {
+                return Err(t(
+                    "the session has a reply in progress",
+                    "该会话有回复正在进行",
+                )
+                .to_string());
+            }
+            if &*store.session_id() == record.session_id.as_str() {
+                let fallback = fallback_session_id(state, &record.session_id)?;
+                switch_session_via_actor(state, fallback).await?;
+            }
+            store
+                .delete_session(&record.session_id)
+                .map_err(|error| safe_error_message(&error))?;
+            state
+                .events
+                .publish("session.deleted", json!({ "session_id": record.session_id }));
+            Ok(json!({}))
+        }
+        IpcCommand::SetWorkspace { target, path } => {
+            let record = resolve_session_ref(state, &target)?;
+            let workspace = match path {
+                Some(path) => {
+                    if !path.is_dir() {
+                        return Err(format!(
+                            "{}: {}",
+                            t("workspace is not a directory", "workspace 不是目录"),
+                            path.display()
+                        ));
+                    }
+                    Some(path.to_string_lossy().into_owned())
+                }
+                None => None,
+            };
+            store
+                .set_session_workspace(&record.session_id, workspace.as_deref())
+                .map_err(|error| safe_error_message(&error))?;
+            state.events.publish(
+                "session.updated",
+                json!({ "session_id": record.session_id, "workspace": workspace }),
+            );
+            Ok(json!({}))
+        }
+        _ => Err("unsupported session command".to_string()),
+    }
+}
+
+fn active_persona_scope(state: &WebState) -> String {
+    state.manager.lock().unwrap().config.active_persona_scope()
+}
+
+fn session_api_error(message: String) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+
+#[derive(Deserialize)]
+struct SessionsQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn list_sessions_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionsQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let data = handle_session_command(
+        &state,
+        IpcCommand::ListSessions {
+            include_archived: query.include_archived,
+        },
+    )
+    .await
+    .map_err(session_api_error)?;
+    Ok(Json(data).into_response())
+}
+
+#[derive(Deserialize)]
+struct CreateSessionRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    switch: bool,
+}
+
+async fn create_session_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSessionRequest>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let data = handle_session_command(
+        &state,
+        IpcCommand::CreateSession {
+            name: request.name,
+            switch: request.switch,
+        },
+    )
+    .await
+    .map_err(session_api_error)?;
+    Ok((StatusCode::CREATED, Json(data)).into_response())
+}
+
+async fn activate_session_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let data = handle_session_command(
+        &state,
+        IpcCommand::SwitchSession {
+            target: ipc::SessionRef::Id { id: session_id },
+        },
+    )
+    .await
+    .map_err(session_api_error)?;
+    Ok(Json(data).into_response())
+}
+
+#[derive(Deserialize)]
+struct UpdateSessionRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    archived: Option<bool>,
+    /// `Some("")` unbinds the workspace; a non-empty value binds it.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+async fn update_session_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let target = || ipc::SessionRef::Id {
+        id: session_id.clone(),
+    };
+    if let Some(name) = request.name {
+        handle_session_command(
+            &state,
+            IpcCommand::RenameSession {
+                target: target(),
+                name,
+            },
+        )
+        .await
+        .map_err(session_api_error)?;
+    }
+    if let Some(archived) = request.archived {
+        handle_session_command(
+            &state,
+            IpcCommand::ArchiveSession {
+                target: target(),
+                archived,
+            },
+        )
+        .await
+        .map_err(session_api_error)?;
+    }
+    if let Some(workspace) = request.workspace {
+        let path = (!workspace.trim().is_empty()).then(|| std::path::PathBuf::from(workspace));
+        handle_session_command(
+            &state,
+            IpcCommand::SetWorkspace {
+                target: target(),
+                path,
+            },
+        )
+        .await
+        .map_err(session_api_error)?;
+    }
+    Ok(Json(json!({})).into_response())
+}
+
+async fn delete_session_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let data = handle_session_command(
+        &state,
+        IpcCommand::DeleteSession {
+            target: ipc::SessionRef::Id { id: session_id },
+        },
+    )
+    .await
+    .map_err(session_api_error)?;
+    Ok(Json(data).into_response())
+}
+
+fn resolve_session_ref(
+    state: &WebState,
+    target: &ipc::SessionRef,
+) -> std::result::Result<crate::state::SessionRecord, String> {
+    let store = &state.state_store;
+    let record = match target {
+        ipc::SessionRef::Current => store
+            .session_record(&store.session_id())
+            .map_err(|error| safe_error_message(&error))?,
+        ipc::SessionRef::Id { id } => store
+            .session_record(id)
+            .map_err(|error| safe_error_message(&error))?,
+        ipc::SessionRef::Name { name } => store
+            .find_session_by_name(&active_persona_scope(state), name)
+            .map_err(|error| safe_error_message(&error))?,
+    };
+    record.ok_or_else(|| t("session not found", "找不到该会话").to_string())
+}
+
+/// Most recently updated other unarchived user session, or a fresh default
+/// session when none is left.
+fn fallback_session_id(
+    state: &WebState,
+    exclude: &str,
+) -> std::result::Result<String, String> {
+    let persona = active_persona_scope(state);
+    let sessions = state
+        .state_store
+        .list_sessions(&persona, false)
+        .map_err(|error| safe_error_message(&error))?;
+    if let Some(overview) = sessions
+        .iter()
+        .find(|overview| overview.record.session_id != exclude)
+    {
+        return Ok(overview.record.session_id.clone());
+    }
+    let record = state
+        .state_store
+        .create_session(&persona, t("Default session", "默认会话"), "user", None)
+        .map_err(|error| safe_error_message(&error))?;
+    state.events.publish(
+        "session.created",
+        json!({ "session_id": record.session_id, "name": record.name }),
+    );
+    Ok(record.session_id)
+}
+
+async fn switch_session_via_actor(
+    state: &WebState,
+    session_id: String,
+) -> std::result::Result<(), String> {
+    reserve_admin_light(&state.manager).map_err(|error| error.message)?;
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::SwitchSession { session_id, reply })
+        .is_err()
+    {
+        release_admin(&state.manager);
+        return Err("Miyu core worker is unavailable".to_string());
+    }
+    match receiver.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => Err(message),
+        Err(_) => {
+            release_admin(&state.manager);
+            Err("Miyu core stopped while switching sessions".to_string())
+        }
+    }
+}
+
+fn session_record_json(record: &crate::state::SessionRecord) -> Value {
+    json!({
+        "session_id": record.session_id,
+        "name": record.name,
+        "kind": record.kind,
+        "workspace": record.workspace,
+        "archived": record.archived,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    })
+}
+
+fn session_overview_json(overview: &crate::state::SessionOverview, current: &str) -> Value {
+    let mut value = session_record_json(&overview.record);
+    value["turn_count"] = json!(overview.turn_count);
+    value["last_user_content"] = json!(overview.last_user_content);
+    value["is_current"] = json!(overview.record.session_id == current);
+    value
+}
+
+async fn handle_ipc_turn(
+    state: &WebState,
+    stream: &mut tokio::net::UnixStream,
+    content: String,
+    mode: String,
+    images: Vec<Option<ImageAttachment>>,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let content = match validate_content(content) {
+        Ok(content) => content,
+        Err(error) => {
+            ipc::send(
+                stream,
+                &IpcFrame::Error {
+                    message: error.message,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mode = match parse_mode(&mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            ipc::send(
+                stream,
+                &IpcFrame::Error {
+                    message: error.message,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    // Turns run in parallel — several may be active at once, including in
+    // the same session (placeholder semantics). The only rejection is a
+    // transient admin mutation window.
+    let run_id = random_id("run", 18);
+    let session_id = state.state_store.session_id();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let busy = {
+        let mut manager = state.manager.lock().unwrap();
+        if manager.admin_busy {
+            true
+        } else {
+            manager.active_runs.insert(
+                run_id.clone(),
+                RunInfo {
+                    session_id: session_id.clone(),
+                    mode,
+                    cancel: cancel_tx,
+                },
+            );
+            false
+        }
+    };
+    if busy {
+        ipc::send(
+            stream,
+            &IpcFrame::Error {
+                message: "Miyu is busy with another operation".to_string(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let after = state.events.latest_id();
+    let mut subscription = state.events.subscribe_after(after);
+    if state
+        .actor_tx
+        .send(ActorCommand::StartTurn {
+            run_id: run_id.clone(),
+            session_id,
+            content,
+            mode,
+            images,
+            cwd,
+            cancel: cancel_rx,
+        })
+        .is_err()
+    {
+        finish_run(&state.manager, &run_id, None);
+        ipc::send(
+            stream,
+            &IpcFrame::Error {
+                message: "Miyu core worker is unavailable".to_string(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut run_guard = IpcRunGuard {
+        manager: state.manager.clone(),
+        run_id: run_id.clone(),
+        finished: false,
+    };
+    ipc::send(
+        stream,
+        &IpcFrame::Accepted {
+            run_id: run_id.clone(),
+        },
+    )
+    .await?;
+
+    let mut last_id = after;
+    loop {
+        let record = if let Some(record) = subscription.pending.pop_front() {
+            record
+        } else {
+            match subscription.receiver.recv().await {
+                Ok(record) => record,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    subscription.pending = state.events.replay_after(last_id);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        };
+        if record.kind == "resync_required" {
+            ipc::send(
+                stream,
+                &IpcFrame::Error {
+                    message: "Miyu core event history was exhausted; the turn was cancelled"
+                        .to_string(),
+                },
+            )
+            .await?;
+            break;
+        }
+        last_id = record.id;
+        let Ok(data) = serde_json::from_str::<Value>(&record.data) else {
+            continue;
+        };
+        if data.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
+            continue;
+        }
+        let terminal = matches!(
+            record.kind.as_str(),
+            "run.completed" | "run.failed" | "run.cancelled"
+        );
+        ipc::send(
+            stream,
+            &IpcFrame::Event {
+                id: record.id,
+                kind: record.kind,
+                data,
+            },
+        )
+        .await?;
+        if terminal {
+            run_guard.finish();
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index_asset))
         .route("/styles.css", get(styles_asset))
+        .route("/theme.css", get(theme_css))
         .route("/app.js", get(app_asset))
         .route("/assets/miyu-logo.png", get(logo_asset))
         .route("/assets/miyuwallpaper.png", get(wallpaper_asset))
@@ -971,6 +1952,18 @@ fn router(state: WebState) -> Router {
         .route("/api/config", get(get_config).put(update_config))
         .route("/api/events", get(events))
         .route("/api/assets/{asset_id}", get(image_asset))
+        .route(
+            "/api/sessions",
+            get(list_sessions_http).post(create_session_http),
+        )
+        .route(
+            "/api/sessions/{session_id}",
+            patch(update_session_http).delete(delete_session_http),
+        )
+        .route(
+            "/api/sessions/{session_id}/activate",
+            post(activate_session_http),
+        )
         .route("/api/turns", post(create_turn))
         .route("/api/queue", post(queue_prompt))
         .route("/api/queue/{prompt_id}", delete(remove_queue_prompt))
@@ -988,6 +1981,17 @@ async fn index_asset() -> Response {
 
 async fn styles_asset() -> Response {
     text_asset(STYLES_CSS, "text/css; charset=utf-8")
+}
+
+/// Optional MD3 token override generated by matugen from the wallpaper.
+/// Read from disk on every request (the file is tiny and regenerated at any
+/// time); 404 when absent so the WebUI falls back to the built-in palette.
+async fn theme_css(State(state): State<WebState>) -> Response {
+    let path = state.paths.config_dir.join("webui-theme.css");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => finish_asset_response(bytes.into_response(), "text/css; charset=utf-8"),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn app_asset() -> Response {
@@ -1011,7 +2015,10 @@ fn binary_asset(content: &'static [u8], content_type: &'static str) -> Response 
 }
 
 fn asset_response(content: &'static [u8], content_type: &'static str) -> Response {
-    let mut response = content.into_response();
+    finish_asset_response(content.into_response(), content_type)
+}
+
+fn finish_asset_response(mut response: Response, content_type: &'static str) -> Response {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -1112,23 +2119,6 @@ fn resolve_web_password(args: &WebArgs) -> Result<Option<String>> {
     Ok(password)
 }
 
-fn web_access_urls(port: u16) -> Vec<String> {
-    let mut addresses = BTreeSet::new();
-    addresses.insert(Ipv4Addr::LOCALHOST);
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            if let if_addrs::IfAddr::V4(address) = interface.addr {
-                if !address.ip.is_unspecified() {
-                    addresses.insert(address.ip);
-                }
-            }
-        }
-    }
-    addresses
-        .into_iter()
-        .map(|address| format!("http://{address}:{port}"))
-        .collect()
-}
 
 async fn health() -> Json<Value> {
     Json(json!({
@@ -1146,11 +2136,24 @@ async fn bootstrap(
         .state_store
         .recover_stale_turns()
         .map_err(ApiError::internal)?;
-    let (config, active_run_id, context) = {
+    let current_session = state.state_store.session_id();
+    let (config, active_run_id, runs, context) = {
         let manager = state.manager.lock().unwrap();
+        let runs: Vec<Value> = manager
+            .active_runs
+            .iter()
+            .map(|(run_id, info)| {
+                json!({
+                    "run_id": run_id,
+                    "session_id": &*info.session_id,
+                    "mode": mode_name(info.mode),
+                })
+            })
+            .collect();
         (
             manager.config.clone(),
-            manager.active_run_id.clone(),
+            manager.run_in_session(&current_session).cloned(),
+            runs,
             manager.context,
         )
     };
@@ -1205,6 +2208,14 @@ async fn bootstrap(
     let running_turn_id = running_target.as_ref().map(|target| target.turn_id.clone());
     let external_queue_available = external_target
         .is_some_and(|target| target.queue_session_id.is_some() && target.owner_pid.is_some());
+    let current_session_id = state.state_store.session_id().to_string();
+    let sessions = state
+        .state_store
+        .list_sessions(&config.active_persona_scope(), false)
+        .map_err(ApiError::internal)?
+        .iter()
+        .map(|overview| session_overview_json(overview, &current_session_id))
+        .collect();
     let mut response = Json(BootstrapResponse {
         version: env!("CARGO_PKG_VERSION"),
         boot_id: state.boot_id.to_string(),
@@ -1219,10 +2230,13 @@ async fn bootstrap(
         context,
         usage,
         capabilities: Capabilities {
-            multi_conversation: false,
+            multi_conversation: true,
             attachments: false,
             queue: true,
         },
+        sessions,
+        current_session_id,
+        runs,
     })
     .into_response();
     response
@@ -1438,6 +2452,7 @@ fn enqueue_running_prompt(
     state: &WebState,
     content: &str,
 ) -> std::result::Result<(Option<String>, Option<String>, SafeQueuedPrompt), ApiError> {
+    let current_session = state.state_store.session_id();
     let active_run_id = {
         let manager = state.manager.lock().unwrap();
         if manager.admin_busy {
@@ -1446,17 +2461,9 @@ fn enqueue_running_prompt(
                 "Miyu is busy with another operation",
             ));
         }
-        manager.active_run_id.clone()
+        manager.run_in_session(&current_session).cloned()
     };
     let prompt_id = random_id("queued", 18);
-    if let Some(run_id) = active_run_id {
-        let prompt = state
-            .state_store
-            .enqueue_prompt(&prompt_id, content, content, &[])
-            .map_err(ApiError::internal)?;
-        return Ok((Some(run_id), None, SafeQueuedPrompt::from(prompt)));
-    }
-
     state
         .state_store
         .recover_stale_turns()
@@ -1481,7 +2488,13 @@ fn enqueue_running_prompt(
         .state_store
         .enqueue_prompt_for_target(&target, &prompt_id, content, content, &[])
         .map_err(ApiError::internal)?;
-    Ok((None, Some(target.turn_id), SafeQueuedPrompt::from(prompt)))
+    // Turns run with per-turn queue identities, so follow-ups always route
+    // via the running turn's recorded queue target.
+    Ok((
+        active_run_id,
+        Some(target.turn_id),
+        SafeQueuedPrompt::from(prompt),
+    ))
 }
 
 fn publish_queued_prompt(
@@ -1527,22 +2540,35 @@ async fn create_turn(
             .into_response());
     }
     let run_id = random_id("run", 18);
+    let session_id = state.state_store.session_id();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     {
         let mut manager = state.manager.lock().unwrap();
-        if manager.active_run_id.is_some() || manager.admin_busy {
+        if manager.admin_busy {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "Miyu is busy with another operation",
             ));
         }
-        manager.active_run_id = Some(run_id.clone());
+        manager.active_runs.insert(
+            run_id.clone(),
+            RunInfo {
+                session_id: session_id.clone(),
+                mode,
+                cancel: cancel_tx,
+            },
+        );
     }
     if state
         .actor_tx
         .send(ActorCommand::StartTurn {
             run_id: run_id.clone(),
+            session_id,
             content,
             mode,
+            images: Vec::new(),
+            cwd: None,
+            cancel: cancel_rx,
         })
         .is_err()
     {
@@ -1584,15 +2610,17 @@ async fn remove_queue_prompt(
             "queued prompt not found",
         ));
     }
-    let run_id = state.manager.lock().unwrap().active_run_id.clone();
-    let target = if run_id.is_none() {
-        state
-            .state_store
-            .running_turn_queue_target()
-            .map_err(ApiError::internal)?
-    } else {
-        None
-    };
+    let current_session = state.state_store.session_id();
+    let run_id = state
+        .manager
+        .lock()
+        .unwrap()
+        .run_in_session(&current_session)
+        .cloned();
+    let target = state
+        .state_store
+        .running_turn_queue_target()
+        .map_err(ApiError::internal)?;
     let removed = match target.as_ref() {
         Some(target) => state
             .state_store
@@ -1626,22 +2654,13 @@ async fn cancel_run(
     Path(run_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
-    let matches_active =
-        state.manager.lock().unwrap().active_run_id.as_deref() == Some(run_id.as_str());
-    if !matches_active {
+    let cancelled = {
+        let manager = state.manager.lock().unwrap();
+        manager.active_runs.get(&run_id).map(RunInfo::request_cancel)
+    };
+    if cancelled.is_none() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "active run not found"));
     }
-    state
-        .actor_tx
-        .send(ActorCommand::Cancel {
-            run_id: run_id.clone(),
-        })
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "agent worker is unavailable",
-            )
-        })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
@@ -1745,12 +2764,21 @@ async fn reset_conversation(
     headers: HeaderMap,
 ) -> std::result::Result<StatusCode, ApiError> {
     require_mutation(&headers, &state)?;
-    require_no_running_turn(&state.state_store)?;
-    reserve_admin(&state.manager)?;
+    if state
+        .state_store
+        .has_running_turns()
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a conversation turn is already running",
+        ));
+    }
+    reserve_admin_for_session(&state.manager, &state.state_store.session_id())?;
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
-        .send(ActorCommand::ResetConversation { reply })
+        .send(ActorCommand::ResetConversation { all: false, reply })
         .is_err()
     {
         release_admin(&state.manager);
@@ -1798,7 +2826,11 @@ fn spawn_actor(
                 .enable_all()
                 .build()
                 .context("building WebUI agent runtime")?;
-            runtime.block_on(actor_loop(
+            // Turns are spawned as local tasks so several can run
+            // concurrently on this thread (they are IO-bound); LocalSet
+            // avoids imposing Send on the agent futures.
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(actor_loop(
                 agent,
                 config,
                 paths,
@@ -1807,7 +2839,7 @@ fn spawn_actor(
                 events,
                 questions,
                 receiver,
-            ));
+            )));
             Ok(())
         })
         .context("starting WebUI agent thread")?;
@@ -1829,28 +2861,55 @@ async fn actor_loop(
         match command {
             ActorCommand::StartTurn {
                 run_id,
+                session_id,
                 content,
                 mode,
+                images,
+                cwd,
+                cancel,
             } => {
-                let keep_running = run_agent_turn(
-                    &mut agent,
-                    &config,
-                    &paths,
-                    &state_store,
-                    &manager,
-                    &events,
-                    &questions,
-                    &mut receiver,
+                // Serial turn-entry maintenance in the scheduler: stale-turn
+                // recovery is owner-pid safe, and the prompt-change reset is
+                // only attempted while this is the sole active run (it wipes
+                // session history and must never race a concurrent turn).
+                let _ = state_store.recover_stale_turns();
+                if manager.lock().unwrap().active_runs.len() <= 1 {
+                    if let Ok(prompt) = config.system_prompt(&paths) {
+                        let _ = state_store
+                            .pinned(&session_id)
+                            .reset_if_prompt_changed(&prompt);
+                    }
+                }
+                let store = state_store.pinned_for_turn(&session_id);
+                // Per-turn workspace: a workspace bound to the session wins,
+                // otherwise the calling client's cwd, otherwise the daemon
+                // process cwd. The resolved path scopes the whole turn task.
+                let workspace = store
+                    .session_record(&session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.workspace.map(std::path::PathBuf::from))
+                    .filter(|path| path.is_dir())
+                    .or_else(|| cwd.filter(|path| path.is_dir()))
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let task = run_turn_task(
+                    config.clone(),
+                    paths.clone(),
+                    store,
+                    state_store.clone(),
+                    manager.clone(),
+                    events.clone(),
+                    questions.clone(),
                     run_id,
+                    session_id,
                     content,
                     mode,
-                )
-                .await;
-                if !keep_running {
-                    break;
-                }
+                    images,
+                    cancel,
+                );
+                tokio::task::spawn_local(crate::tools::workspace::with_workspace(workspace, task));
             }
-            ActorCommand::Cancel { .. } => {}
             ActorCommand::SetModels { models, reply } => {
                 let result = rebuild_for_models(
                     &mut agent,
@@ -1883,7 +2942,7 @@ async fn actor_loop(
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::ResetConversation { reply } => {
+            ActorCommand::ResetConversation { all, reply } => {
                 let result = reset_actor_conversation(
                     &mut agent,
                     &config,
@@ -1891,68 +2950,204 @@ async fn actor_loop(
                     &state_store,
                     &manager,
                     &events,
+                    all,
                 );
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::Shutdown => break,
+            ActorCommand::SwitchSession { session_id, reply } => {
+                let result =
+                    switch_actor_session(&mut agent, &state_store, &manager, &events, &session_id);
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
+            ActorCommand::Shutdown => {
+                // Cancel every running turn, then drain briefly so they can
+                // persist their interrupted state before the runtime drops.
+                for info in manager.lock().unwrap().active_runs.values() {
+                    info.request_cancel();
+                }
+                for _ in 0..100 {
+                    if manager.lock().unwrap().active_runs.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                break;
+            }
+            ActorCommand::Undo { reply } => {
+                let result = (|| -> std::result::Result<Value, AdminFailure> {
+                    let (removed, prompt) = state_store
+                        .undo_last_turn()
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    manager.lock().unwrap().context = current_context(&agent)
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    Ok(json!({ "removed": removed, "prompt": prompt }))
+                })();
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
+            ActorCommand::Pop { turn_ids, reply } => {
+                let result = (|| -> std::result::Result<Value, AdminFailure> {
+                    if turn_ids.is_empty() {
+                        return Ok(json!({ "turns": 0, "archived": false }));
+                    }
+                    let turns = state_store
+                        .oldest_evictable_visible_turns(usize::MAX)
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    let selected = turns
+                        .into_iter()
+                        .filter(|turn| turn_ids.iter().any(|id| id == &turn.turn_id))
+                        .collect::<Vec<_>>();
+                    if selected.len() != turn_ids.len() {
+                        return Err(AdminFailure::Invalid(
+                            "one or more conversation turns are no longer available".to_string(),
+                        ));
+                    }
+                    let memory = MemoryStore::new(&config, &paths);
+                    let memory_config = config.memory_config();
+                    archive_and_delete_visible_turns(&state_store, &memory, &selected)
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    manager.lock().unwrap().context = current_context(&agent)
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    let data = json!({
+                        "turns": selected.len(),
+                        "archived": memory_config.enabled && memory_config.evicted_context_enabled
+                    });
+                    events.publish("conversation.pop", data.clone());
+                    Ok(data)
+                })();
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
+            ActorCommand::Compact { reply } => {
+                let result = (|| async {
+                    let compact = agent
+                        .compact_now(|_| Ok(()))
+                        .await
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    manager.lock().unwrap().context = current_context(&agent)
+                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    Ok::<Value, AdminFailure>(json!({
+                        "compacted": compact.is_some(),
+                        "usage": compact.as_ref().and_then(|result| result.usage.clone()),
+                        "usage_estimated": compact
+                            .as_ref()
+                            .map(|result| result.usage_estimated)
+                            .unwrap_or(false)
+                    }))
+                })()
+                .await;
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+fn trim_process_memory() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_process_memory() {}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_agent_turn(
-    agent: &mut Agent,
-    config: &AppConfig,
-    paths: &MiyuPaths,
-    state_store: &StateStore,
-    manager: &Arc<Mutex<ManagerState>>,
-    events: &EventHub,
-    questions: &QuestionBroker,
-    receiver: &mut mpsc::UnboundedReceiver<ActorCommand>,
+/// Executes one turn as a self-contained task. Multiple turn tasks run
+/// concurrently on the actor's LocalSet — each with its own Agent, a
+/// StateStore pinned to the turn's session, and an independent cancel signal.
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_task(
+    config: AppConfig,
+    paths: MiyuPaths,
+    store: StateStore,
+    base_store: StateStore,
+    manager: Arc<Mutex<ManagerState>>,
+    events: EventHub,
+    questions: QuestionBroker,
     run_id: String,
+    session_id: Arc<str>,
     content: String,
     mode: AgentMode,
-) -> bool {
+    images: Vec<Option<ImageAttachment>>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    let manager = &manager;
+    let events = &events;
+    let questions = &questions;
+    let run_id = run_id.as_str();
     events.publish(
         "run.started",
-        json!({ "run_id": run_id, "mode": mode_name(mode) }),
+        json!({ "run_id": run_id, "session_id": &*session_id, "mode": mode_name(mode) }),
     );
-    let setup = (|| -> Result<AgentTurnControl> {
-        let normal_tools = build_tool_registry(config, paths, AgentMode::Normal, true)?;
-        let plan_tools = build_tool_registry(config, paths, AgentMode::Plan, true)?;
-        let chat_tools = build_tool_registry(config, paths, AgentMode::Chat, true)?;
+    let title_seed: String = content.chars().take(80).collect();
+    let setup = (|| -> Result<(Agent, AgentTurnControl)> {
+        let normal_tools = build_tool_registry(&config, &paths, AgentMode::Normal, true)?;
+        let plan_tools = build_tool_registry(&config, &paths, AgentMode::Plan, true)?;
+        let chat_tools = build_tool_registry(&config, &paths, AgentMode::Chat, true)?;
         let active_tools = match mode {
             AgentMode::Normal => normal_tools.clone(),
             AgentMode::Plan => plan_tools.clone(),
             AgentMode::Chat => chat_tools.clone(),
         };
-        agent.switch_mode(mode, active_tools);
-        agent.prepare_for_turn()?;
-        Ok(AgentTurnControl::new(
+        let client = OpenAiCompatibleClient::from_config(&config, &paths)?;
+        let agent = Agent::new(
+            config.clone(),
+            &paths,
+            store.clone(),
+            client,
+            active_tools,
             mode,
-            normal_tools,
-            plan_tools,
-            chat_tools,
+        )?;
+        Ok((
+            agent,
+            AgentTurnControl::new(mode, normal_tools, plan_tools, chat_tools),
         ))
     })();
-    let control = match setup {
-        Ok(control) => control,
+    let (mut agent, control) = match setup {
+        Ok(setup) => setup,
         Err(error) => {
-            finish_failed_run(manager, events, questions, agent, &run_id, &error);
-            return true;
+            questions.cancel_run(run_id);
+            finish_run(manager, run_id, None);
+            let message = safe_error_message(&error);
+            tracing::error!(run_id, error = %error, "WebUI agent run setup failed");
+            events.publish(
+                "run.failed",
+                json!({ "run_id": run_id, "session_id": &*session_id, "message": message }),
+            );
+            return;
         }
     };
+    // The daemon-wide context snapshot tracks the *current* session; a turn
+    // for another session must not overwrite it.
+    let updates_context = || &*base_store.session_id() == &*session_id;
+    let agent = &mut agent;
 
     let mapper = Arc::new(Mutex::new(RunEventMapper::new(
-        run_id.clone(),
+        run_id.to_string(),
         events.clone(),
         questions.clone(),
-        state_store.clone(),
+        store.clone(),
     )));
     let chat_outcome = {
         let callback_mapper = mapper.clone();
-        let chat = agent.chat_stream_with_control(&content, &[], &control, move |event| {
+        let images = images
+            .into_iter()
+            .map(|image| {
+                image.map(|image| match image {
+                    ImageAttachment::Binary { mime, data } => {
+                        crate::clipboard::PastedImage::Binary(
+                            crate::clipboard::ClipboardImage::new(mime, data),
+                        )
+                    }
+                    ImageAttachment::Path { path } => crate::clipboard::PastedImage::Path(path),
+                })
+            })
+            .collect::<Vec<_>>();
+        let chat = agent.chat_stream_with_control(&content, &images, &control, move |event| {
             callback_mapper.lock().unwrap().handle(event);
             Ok(())
         });
@@ -1961,17 +3156,10 @@ async fn run_agent_turn(
             tokio::select! {
                 biased;
                 result = &mut chat => break TurnOutcome::Finished(result),
-                command = receiver.recv() => {
-                    match active_directive(command, &run_id, manager) {
-                        ActiveDirective::Continue => {}
-                        ActiveDirective::Cancel => {
-                            questions.cancel_run(&run_id);
-                            break TurnOutcome::Cancelled;
-                        }
-                        ActiveDirective::Shutdown => {
-                            questions.cancel_run(&run_id);
-                            break TurnOutcome::Shutdown;
-                        }
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        questions.cancel_run(run_id);
+                        break TurnOutcome::Cancelled;
                     }
                 }
             }
@@ -1980,31 +3168,63 @@ async fn run_agent_turn(
 
     let result = match chat_outcome {
         TurnOutcome::Cancelled => {
-            finish_cancelled_run(manager, events, agent, &run_id);
-            return true;
-        }
-        TurnOutcome::Shutdown => {
-            finish_cancelled_run(manager, events, agent, &run_id);
-            return false;
+            finish_cancelled_run(
+                manager,
+                events,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+            );
+            finish_turn_task(&store, &title_seed, events, false);
+            return;
         }
         TurnOutcome::Finished(Err(error)) if question::is_question_cancelled(&error) => {
-            questions.cancel_run(&run_id);
-            finish_cancelled_run(manager, events, agent, &run_id);
-            return true;
+            questions.cancel_run(run_id);
+            finish_cancelled_run(
+                manager,
+                events,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+            );
+            finish_turn_task(&store, &title_seed, events, false);
+            return;
         }
         TurnOutcome::Finished(Err(error)) => {
-            finish_failed_run(manager, events, questions, agent, &run_id, &error);
-            return true;
+            finish_failed_run(
+                manager,
+                events,
+                questions,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+                &error,
+            );
+            finish_turn_task(&store, &title_seed, events, false);
+            return;
         }
         TurnOutcome::Finished(Ok(result)) => result,
     };
 
-    questions.cancel_run(&run_id);
+    questions.cancel_run(run_id);
     let context_tokens = match agent.effective_context_tokens() {
         Ok(tokens) => tokens,
         Err(error) => {
-            finish_completed_with_context_error(manager, events, agent, &run_id, &result, &error);
-            return true;
+            finish_completed_with_context_error(
+                manager,
+                events,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+                &result,
+                &error,
+            );
+            finish_turn_task(&store, &title_seed, events, true);
+            return;
         }
     };
     let overflow_outcome = {
@@ -2018,11 +3238,9 @@ async fn run_agent_turn(
             tokio::select! {
                 biased;
                 result = &mut overflow => break OverflowOutcome::Finished(result),
-                command = receiver.recv() => {
-                    match active_directive(command, &run_id, manager) {
-                        ActiveDirective::Continue => {}
-                        ActiveDirective::Cancel => break OverflowOutcome::Cancelled,
-                        ActiveDirective::Shutdown => break OverflowOutcome::Shutdown,
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break OverflowOutcome::Cancelled;
                     }
                 }
             }
@@ -2032,92 +3250,69 @@ async fn run_agent_turn(
         OverflowOutcome::Cancelled => {
             let context =
                 current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
-            finish_run(manager, &run_id, Some(context));
-            publish_completed(events, &run_id, &result, context);
-            return true;
-        }
-        OverflowOutcome::Shutdown => {
-            let context =
-                current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
-            finish_run(manager, &run_id, Some(context));
-            publish_completed(events, &run_id, &result, context);
-            return false;
+            finish_run(manager, run_id, updates_context().then_some(context));
+            publish_completed(events, run_id, &session_id, &result, context);
+            finish_turn_task(&store, &title_seed, events, true);
+            return;
         }
         OverflowOutcome::Finished(Err(error)) => {
-            finish_completed_with_context_error(manager, events, agent, &run_id, &result, &error);
-            return true;
+            finish_completed_with_context_error(
+                manager,
+                events,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+                &result,
+                &error,
+            );
+            finish_turn_task(&store, &title_seed, events, true);
+            return;
         }
         OverflowOutcome::Finished(Ok(_)) => {}
     }
     let context = match current_context(agent) {
         Ok(context) => context,
         Err(error) => {
-            finish_completed_with_context_error(manager, events, agent, &run_id, &result, &error);
-            return true;
+            finish_completed_with_context_error(
+                manager,
+                events,
+                agent,
+                run_id,
+                &session_id,
+                updates_context(),
+                &result,
+                &error,
+            );
+            finish_turn_task(&store, &title_seed, events, true);
+            return;
         }
     };
-    finish_run(manager, &run_id, Some(context));
-    publish_completed(events, &run_id, &result, context);
-    true
+    finish_run(manager, run_id, updates_context().then_some(context));
+    publish_completed(events, run_id, &session_id, &result, context);
+    finish_turn_task(&store, &title_seed, events, true);
+}
+
+/// Shared per-turn cleanup: auto-naming, activity timestamp, queue-identity
+/// cleanup, and allocator trimming. `store` is the turn's pinned store, so
+/// session-scoped operations hit the turn's own session.
+fn finish_turn_task(store: &StateStore, title_seed: &str, events: &EventHub, completed: bool) {
+    if completed {
+        maybe_auto_name_session(store, events, title_seed);
+        let _ = store.touch_session(&store.session_id());
+    }
+    let _ = store.discard_queued_prompts();
+    trim_process_memory();
 }
 
 enum TurnOutcome {
     Finished(Result<ChatResult>),
     Cancelled,
-    Shutdown,
 }
 
 enum OverflowOutcome {
     Finished(Result<Option<ChatResult>>),
     Cancelled,
-    Shutdown,
-}
-
-enum ActiveDirective {
-    Continue,
-    Cancel,
-    Shutdown,
-}
-
-fn active_directive(
-    command: Option<ActorCommand>,
-    run_id: &str,
-    manager: &Arc<Mutex<ManagerState>>,
-) -> ActiveDirective {
-    match command {
-        Some(ActorCommand::Cancel { run_id: requested }) if requested == run_id => {
-            ActiveDirective::Cancel
-        }
-        Some(ActorCommand::Cancel { .. }) => ActiveDirective::Continue,
-        Some(ActorCommand::Shutdown) | None => ActiveDirective::Shutdown,
-        Some(ActorCommand::SetModels { reply, .. }) => {
-            release_admin(manager);
-            let _ = reply.send(Err(AdminFailure::Invalid(
-                "the model cannot be changed while a turn is running".to_string(),
-            )));
-            ActiveDirective::Continue
-        }
-        Some(ActorCommand::ApplyConfig { reply, .. }) => {
-            release_admin(manager);
-            let _ = reply.send(Err(AdminFailure::Invalid(
-                "the configuration cannot be changed while a turn is running".to_string(),
-            )));
-            ActiveDirective::Continue
-        }
-        Some(ActorCommand::ResetConversation { reply }) => {
-            release_admin(manager);
-            let _ = reply.send(Err(AdminFailure::Invalid(
-                "the conversation cannot be reset while a turn is running".to_string(),
-            )));
-            ActiveDirective::Continue
-        }
-        Some(ActorCommand::StartTurn {
-            run_id: rejected, ..
-        }) => {
-            finish_run(manager, &rejected, None);
-            ActiveDirective::Continue
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2136,6 +3331,7 @@ fn rebuild_for_models(
     if next_config.active_provider_models == config.active_provider_models {
         return Ok(());
     }
+    crate::models_cache::try_load_active(paths, &next_config);
     let client = OpenAiCompatibleClient::from_config(&next_config, paths)
         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)
@@ -2202,6 +3398,7 @@ fn rebuild_for_config(
     });
 
     let build_agent = || -> Result<Agent> {
+        crate::models_cache::try_load_active(paths, &next_config);
         let client = OpenAiCompatibleClient::from_config(&next_config, paths)?;
         let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)?;
         Agent::new(
@@ -2275,6 +3472,72 @@ fn rebuild_for_config(
     Ok(())
 }
 
+/// Auto-names a still-unnamed session from its first prompt once a turn has
+/// run in it. Explicit names (given at creation or via rename) are never
+/// overwritten.
+fn maybe_auto_name_session(state_store: &StateStore, events: &EventHub, seed: &str) {
+    let session_id = state_store.session_id();
+    let Ok(Some(record)) = state_store.session_record(&session_id) else {
+        return;
+    };
+    if !record.name.trim().is_empty() {
+        return;
+    }
+    let title = session_title_from_prompt(seed);
+    if title.is_empty() {
+        return;
+    }
+    if state_store
+        .rename_session(&record.session_id, &title)
+        .is_ok()
+    {
+        events.publish(
+            "session.renamed",
+            json!({ "session_id": record.session_id, "name": title }),
+        );
+    }
+}
+
+fn session_title_from_prompt(prompt: &str) -> String {
+    let cleaned = prompt
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut title: String = cleaned.chars().take(20).collect();
+    if cleaned.chars().count() > 20 {
+        title.push('…');
+    }
+    title
+}
+
+fn switch_actor_session(
+    agent: &mut Agent,
+    state_store: &StateStore,
+    manager: &Arc<Mutex<ManagerState>>,
+    events: &EventHub,
+    session_id: &str,
+) -> std::result::Result<(), AdminFailure> {
+    // Notes: switching deliberately does not touch updated_at (viewing must
+    // not reorder the session list), and runs no turn-entry maintenance —
+    // switching is allowed while turns are running, so a prompt-change reset
+    // here could wipe a session mid-turn.
+    let switch = || -> Result<ContextSnapshot> {
+        state_store.switch_session(session_id)?;
+        current_context(agent)
+    };
+    let context = switch().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+    manager.lock().unwrap().context = context;
+    events.publish(
+        "session.current_changed",
+        json!({ "session_id": session_id }),
+    );
+    Ok(())
+}
+
 fn reset_actor_conversation(
     agent: &mut Agent,
     config: &AppConfig,
@@ -2282,12 +3545,17 @@ fn reset_actor_conversation(
     state_store: &StateStore,
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
+    all: bool,
 ) -> std::result::Result<(), AdminFailure> {
     let mut reset = || -> Result<ContextSnapshot> {
         state_store.reset_conversation()?;
         let memory = MemoryStore::new(config, paths);
-        memory.clear_evicted_context()?;
-        memory.clear_pending_events()?;
+        if all {
+            memory.reset_all(false)?;
+        } else {
+            memory.clear_evicted_context()?;
+            memory.clear_pending_events()?;
+        }
         tools::clear_aur_review_state(paths)?;
         agent.reset_memory()?;
         agent.prepare_for_turn()?;
@@ -2304,36 +3572,47 @@ fn finish_cancelled_run(
     events: &EventHub,
     agent: &Agent,
     run_id: &str,
+    session_id: &str,
+    updates_context: bool,
 ) {
-    let context = current_context(agent).ok();
+    let context = current_context(agent).ok().filter(|_| updates_context);
     finish_run(manager, run_id, context);
-    events.publish("run.cancelled", json!({ "run_id": run_id }));
+    events.publish(
+        "run.cancelled",
+        json!({ "run_id": run_id, "session_id": session_id }),
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_failed_run(
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
     questions: &QuestionBroker,
     agent: &Agent,
     run_id: &str,
+    session_id: &str,
+    updates_context: bool,
     error: &anyhow::Error,
 ) {
     questions.cancel_run(run_id);
-    let context = current_context(agent).ok();
+    let context = current_context(agent).ok().filter(|_| updates_context);
     finish_run(manager, run_id, context);
     let message = safe_error_message(error);
     tracing::error!(run_id, error = %error, "WebUI agent run failed");
     events.publish(
         "run.failed",
-        json!({ "run_id": run_id, "message": message }),
+        json!({ "run_id": run_id, "session_id": session_id, "message": message }),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_completed_with_context_error(
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
     agent: &Agent,
     run_id: &str,
+    session_id: &str,
+    updates_context: bool,
     result: &ChatResult,
     error: &anyhow::Error,
 ) {
@@ -2341,11 +3620,11 @@ fn finish_completed_with_context_error(
     tracing::error!(run_id, error = %error, "WebUI post-turn context maintenance failed");
     events.publish(
         "context.error",
-        json!({ "run_id": run_id, "message": message }),
+        json!({ "run_id": run_id, "session_id": session_id, "message": message }),
     );
     let context = current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
-    finish_run(manager, run_id, Some(context));
-    publish_completed(events, run_id, result, context);
+    finish_run(manager, run_id, updates_context.then_some(context));
+    publish_completed(events, run_id, session_id, result, context);
 }
 
 fn finish_run(manager: &Arc<Mutex<ManagerState>>, run_id: &str, context: Option<ContextSnapshot>) {
@@ -2353,14 +3632,13 @@ fn finish_run(manager: &Arc<Mutex<ManagerState>>, run_id: &str, context: Option<
     if let Some(context) = context {
         manager.context = context;
     }
-    if manager.active_run_id.as_deref() == Some(run_id) {
-        manager.active_run_id = None;
-    }
+    manager.active_runs.remove(run_id);
 }
 
 fn publish_completed(
     events: &EventHub,
     run_id: &str,
+    session_id: &str,
     result: &ChatResult,
     context: ContextSnapshot,
 ) {
@@ -2368,12 +3646,14 @@ fn publish_completed(
         "run.completed",
         json!({
             "run_id": run_id,
+            "session_id": session_id,
             "usage": result.usage,
             "usage_estimated": result.usage_estimated,
             "provider_id": result.provider_id,
             "model": result.model,
             "context_tokens": context.tokens,
             "context_window": context.window,
+            "cumulative_tokens": context.cumulative_tokens,
         }),
     );
 }
@@ -2382,12 +3662,67 @@ fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
     Ok(ContextSnapshot {
         tokens: agent.effective_context_tokens()?,
         window: agent.context_window(),
+        cumulative_tokens: agent.conversation_usage_tokens()?,
     })
 }
 
+fn session_state(
+    manager: &Arc<Mutex<ManagerState>>,
+    state_store: &StateStore,
+) -> Result<ipc::SessionState> {
+    let context = manager.lock().unwrap().context;
+    let session_id = state_store.session_id();
+    let record = state_store.session_record(&session_id)?;
+    Ok(ipc::SessionState {
+        context_tokens: context.tokens,
+        context_window: context.window,
+        cumulative_tokens: context.cumulative_tokens,
+        session_id: session_id.to_string(),
+        session_name: record
+            .as_ref()
+            .map(|record| record.name.clone())
+            .unwrap_or_default(),
+        workspace: record.and_then(|record| record.workspace),
+    })
+}
+
+/// Global admin reservation (config/model changes): requires that no turn is
+/// running in any session.
 fn reserve_admin(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
-    if manager.active_run_id.is_some() || manager.admin_busy {
+    if !manager.active_runs.is_empty() || manager.admin_busy {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Miyu is busy with another operation",
+        ));
+    }
+    manager.admin_busy = true;
+    Ok(())
+}
+
+/// Per-session admin reservation (reset/undo/pop/compact/delete/archive):
+/// only the target session must be idle; turns in other sessions keep
+/// running.
+fn reserve_admin_for_session(
+    manager: &Arc<Mutex<ManagerState>>,
+    session_id: &str,
+) -> std::result::Result<(), ApiError> {
+    let mut manager = manager.lock().unwrap();
+    if manager.admin_busy || manager.session_has_runs(session_id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Miyu is busy with another operation",
+        ));
+    }
+    manager.admin_busy = true;
+    Ok(())
+}
+
+/// Light admin reservation (session switching): serializes against other
+/// admin operations but is allowed while turns are running.
+fn reserve_admin_light(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
+    let mut manager = manager.lock().unwrap();
+    if manager.admin_busy {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "Miyu is busy with another operation",
@@ -2399,7 +3734,7 @@ fn reserve_admin(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), 
 
 fn require_no_running_turn(state_store: &StateStore) -> std::result::Result<(), ApiError> {
     if state_store
-        .has_running_turns()
+        .has_any_running_turns()
         .map_err(ApiError::internal)?
     {
         Err(ApiError::new(
@@ -3179,6 +4514,7 @@ impl From<UsageSnapshot> for SafeUsageSnapshot {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
+            conversation_tokens: usage.conversation_tokens,
             last_usage: usage.last_usage,
             last_conversation_usage: usage.last_conversation_usage,
         }
@@ -3413,7 +4749,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     #[cfg(target_os = "linux")]
     let mut command = {
         let mut command = Command::new("xdg-open");
@@ -3445,12 +4781,63 @@ fn open_browser(url: &str) {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_browser(_url: &str) {}
+pub(crate) fn open_browser(_url: &str) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::question::{QuestionOption, QuestionPrompt};
+
+    fn manager_with_run(
+        run_id: &str,
+    ) -> (
+        Arc<Mutex<ManagerState>>,
+        tokio::sync::watch::Receiver<bool>,
+    ) {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let manager = Arc::new(Mutex::new(ManagerState {
+            config: AppConfig::default(),
+            active_runs: HashMap::from([(
+                run_id.to_string(),
+                RunInfo {
+                    session_id: "default".into(),
+                    mode: AgentMode::Normal,
+                    cancel: cancel_tx,
+                },
+            )]),
+            admin_busy: false,
+            context: ContextSnapshot {
+                tokens: 0,
+                window: None,
+                cumulative_tokens: 0,
+            },
+        }));
+        (manager, cancel_rx)
+    }
+
+    #[test]
+    fn dropped_ipc_turn_cancels_its_core_run() {
+        let (manager, cancel_rx) = manager_with_run("run_test");
+        drop(IpcRunGuard {
+            manager,
+            run_id: "run_test".to_string(),
+            finished: false,
+        });
+        assert!(*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn completed_ipc_turn_does_not_send_a_late_cancel() {
+        let (manager, cancel_rx) = manager_with_run("run_test");
+        let mut guard = IpcRunGuard {
+            manager,
+            run_id: "run_test".to_string(),
+            finished: false,
+        };
+        guard.finish();
+        drop(guard);
+        assert!(!*cancel_rx.borrow());
+    }
 
     #[test]
     fn assistant_sentinels_are_never_exposed() {
@@ -3582,6 +4969,7 @@ mod tests {
             ContextSnapshot {
                 tokens: 0,
                 window: None,
+                cumulative_tokens: 0,
             },
             &paths,
         )

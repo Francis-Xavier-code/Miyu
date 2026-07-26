@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod agent;
 mod alarm;
 mod cli;
@@ -7,6 +9,7 @@ mod config_tui;
 mod default_kb;
 mod default_models;
 mod i18n;
+mod ipc;
 mod llm;
 mod logging;
 mod memory;
@@ -25,7 +28,7 @@ mod web;
 
 use anyhow::Result;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
         eprintln!("{}: {error:#}", i18n::text("error", "错误"));

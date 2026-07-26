@@ -3,7 +3,10 @@ use crate::agent::{
 };
 use crate::config::{ActiveProviderModelConfig, AppConfig};
 use crate::i18n::{is_zh, text as t};
-use crate::llm::{ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions};
+use crate::ipc::{self, Command as IpcCommand, Frame as IpcFrame, Request as IpcRequest};
+use crate::llm::{
+    ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions, Usage,
+};
 use crate::memory::MemoryStore;
 use crate::paths::MiyuPaths;
 use crate::render;
@@ -127,6 +130,10 @@ impl ReplFooterStatus {
 
     fn update_context_window(&mut self, context_window: Option<usize>) {
         self.token_usage.context_window = context_window;
+    }
+
+    fn update_cumulative_tokens(&mut self, cumulative_tokens: u64) {
+        self.token_usage.cumulative_tokens = (cumulative_tokens > 0).then_some(cumulative_tokens);
     }
 
     fn reset_token_usage(&mut self, session_tokens: u64, context_window: Option<usize>) {
@@ -510,6 +517,28 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Clear current conversation history",
             "清空当前会话历史",
         ),
+        (
+            "new",
+            "Create a new session and switch to it",
+            "创建新会话并切换过去",
+        ),
+        (
+            "session",
+            "List sessions, or switch to one",
+            "列出会话，或切换到指定会话",
+        ),
+        ("rename", "Rename the current session", "重命名当前会话"),
+        ("archive", "Archive the current session", "归档当前会话"),
+        (
+            "delete",
+            "Delete a session (current by default)",
+            "删除会话（默认当前会话）",
+        ),
+        (
+            "workspace",
+            "Show, bind, or unbind the session workspace",
+            "查看、绑定或解绑会话工作目录",
+        ),
         ("web", "Start the local Miyu WebUI", "启动本地 Miyu WebUI"),
     ];
     for (name, en, zh) in descriptions {
@@ -733,6 +762,10 @@ pub enum Command {
     AlarmWorker(AlarmWorkerArgs),
     #[command(name = "__tool", hide = true)]
     Tool(ToolArgs),
+    /// Internal: run as the Miyu daemon (spawned by the CLI via
+    /// `current_exe`, replacing the former separate `miyud` binary).
+    #[command(name = "__daemon", hide = true)]
+    Daemon(WebArgs),
     Ask(MessageArgs),
     Init,
     Paths,
@@ -750,7 +783,33 @@ pub enum Command {
     Memory(MemoryArgs),
     Skills(SkillsArgs),
     Reset(ResetArgs),
+    New(SessionNameArgs),
+    Session(SessionTargetArgs),
+    Rename(SessionRenameArgs),
+    Archive,
+    Delete(SessionTargetArgs),
+    Workspace(WorkspaceArgs),
     Web(WebArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionNameArgs {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionTargetArgs {
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRenameArgs {
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceArgs {
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -777,6 +836,15 @@ pub struct WebArgs {
 
     #[arg(long, value_name = "PATH", conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
+
+    #[arg(long, conflicts_with = "status")]
+    pub stop: bool,
+
+    #[arg(long, conflicts_with = "stop")]
+    pub status: bool,
+
+    #[arg(long)]
+    pub public: bool,
 }
 
 impl std::fmt::Debug for WebArgs {
@@ -787,6 +855,9 @@ impl std::fmt::Debug for WebArgs {
             .field("no_open", &self.no_open)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("password_file", &self.password_file)
+            .field("stop", &self.stop)
+            .field("status", &self.status)
+            .field("public", &self.public)
             .finish()
     }
 }
@@ -1017,9 +1088,6 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         AgentMode::Normal
     };
 
-    crate::models_cache::try_load(&paths);
-    crate::models_cache::spawn_background_refresh(paths.clone());
-
     if cli.shell_intercept {
         let shell_name = cli.shell.as_deref().unwrap_or("fish");
         let message = shell_message_from_input(cli.stdin, cli.message)?;
@@ -1042,6 +1110,11 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
 
     match cli.command {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
+        Some(Command::Daemon(mut args)) => {
+            args.no_open = true;
+            let _logging_guard = crate::logging::init(&paths, cli.debug).ok();
+            crate::web::run(paths, args).await
+        }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
             run_chat_with_options(&paths, join_message(args.message), None, cli.stdout, mode).await
@@ -1051,21 +1124,57 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
             paths.print();
             Ok(())
         }
-        Some(Command::Config(args)) => run_config(&paths, args).await,
-        Some(Command::Models(args)) => run_models(&paths, args),
-        Some(Command::Variant(args)) => run_variant(&paths, args),
+        Some(Command::Config(args)) => {
+            run_config(&paths, args).await?;
+            reload_daemon_if_running(&paths).await
+        }
+        Some(Command::Models(args)) => {
+            initialize_models_cache(&paths);
+            run_models(&paths, args)?;
+            reload_daemon_if_running(&paths).await
+        }
+        Some(Command::Variant(args)) => {
+            initialize_models_cache(&paths);
+            run_variant(&paths, args)?;
+            reload_daemon_if_running(&paths).await
+        }
         Some(Command::FishInit) => shell::fish::install(&paths),
         Some(Command::BashInit) => shell::bash::install(&paths),
         Some(Command::ZshInit) => shell::zsh::install(&paths),
         Some(Command::RemoveShellHook) => remove_shell_hooks(&paths),
         Some(Command::History(args)) => run_history(&paths, args),
-        Some(Command::Pop(args)) => run_pop(&paths, args),
+        Some(Command::Pop(args)) => {
+            if ipc::daemon_info(&paths).await.is_some() {
+                run_pop_via_daemon(&paths, args).await
+            } else {
+                run_pop(&paths, args)
+            }
+        }
         Some(Command::Kb(args)) => run_kb(&paths, args).await,
         Some(Command::UpdateDefaultKb) => run_update_default_kb(&paths).await,
         Some(Command::Memory(args)) => run_memory(&paths, args),
         Some(Command::Skills(args)) => run_skills(&paths, args),
-        Some(Command::Reset(args)) => run_reset(&paths, args.scope.as_deref()),
-        Some(Command::Web(args)) => crate::web::run(paths, args).await,
+        Some(Command::Reset(args)) => {
+            let all = match args.scope.as_deref() {
+                None => false,
+                Some("all") => true,
+                Some(scope) => bail!("{}: {scope}", t("unknown reset scope", "未知 reset 范围")),
+            };
+            if ipc::daemon_info(&paths).await.is_some() {
+                send_ipc_admin(&paths, IpcCommand::ResetConversation { all }).await?;
+                print_reset_message(all);
+            } else {
+                run_reset(&paths, args.scope.as_deref())?;
+            }
+            Ok(())
+        }
+        Some(Command::New(args)) => run_session_new(&paths, args).await,
+        Some(Command::Session(args)) => run_session_command(&paths, args).await,
+        Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
+        Some(Command::Archive) => run_session_archive(&paths).await,
+        Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
+        Some(Command::Workspace(args)) => run_workspace_command(&paths, args).await,
+        Some(Command::Web(args)) => run_web_daemon(&paths, args).await,
         None => {
             let message = join_message(cli.message);
             if message.is_empty() && io::stdin().is_terminal() {
@@ -1076,6 +1185,141 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
     }
 }
+
+fn initialize_models_cache(paths: &MiyuPaths) {
+    crate::models_cache::try_load(paths);
+    crate::models_cache::spawn_background_refresh(paths.clone());
+    if let Ok(config) = AppConfig::load_or_default(paths) {
+        crate::models_cache::spawn_provider_api_refresh(config.providers);
+    }
+}
+
+async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
+    if args.status {
+        if let Some(info) = ipc::daemon_info(paths).await {
+            println!(
+                "Miyu daemon: running (pid {}, WebUI {})",
+                info.pid,
+                ipc::web_access_urls(info.web_port).join(" ")
+            );
+        } else {
+            println!("Miyu daemon: stopped");
+        }
+        return Ok(());
+    }
+    if args.stop {
+        if ipc::daemon_info(paths).await.is_some() {
+            send_ipc_command(paths, IpcCommand::Shutdown).await?;
+            ipc::wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
+            println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
+        } else {
+            println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
+        }
+        return Ok(());
+    }
+    if args.public && args.password.is_none() && args.password_file.is_none() {
+        bail!(
+            "{}",
+            t(
+                "--public requires --password or --password-file",
+                "--public 必须同时使用 --password 或 --password-file"
+            )
+        );
+    }
+    if let Some(info) = ipc::daemon_info(paths).await {
+        if args.password.is_some() || args.password_file.is_some() {
+            bail!(
+                "{}",
+                t(
+                    "the running Miyu daemon already owns Web authentication; restart it to change the password",
+                    "当前 Miyu daemon 已接管 Web 认证；如需修改密码请先重启 daemon"
+                )
+            );
+        }
+        for url in ipc::web_access_urls(info.web_port) {
+            println!("Miyu WebUI: {url}");
+        }
+        if !args.no_open {
+            open_browser(&format!("http://127.0.0.1:{}", info.web_port));
+        }
+        return Ok(());
+    }
+
+    if args.password.as_deref() == Some("") {
+        args.password = Some(rpassword::prompt_password(t(
+            "WebUI password: ",
+            "WebUI 密码：",
+        ))?);
+    }
+    let mut daemon_args = vec![
+        OsString::from("--port"),
+        OsString::from(args.port.to_string()),
+        OsString::from("--no-open"),
+    ];
+    if args.public {
+        daemon_args.push(OsString::from("--public"));
+    }
+    if let Some(password) = args.password.as_deref() {
+        daemon_args.push(OsString::from(format!("--password={password}")));
+    }
+    if let Some(path) = args.password_file.as_ref() {
+        daemon_args.push(OsString::from("--password-file"));
+        daemon_args.push(path.as_os_str().to_owned());
+    }
+    let info = ipc::ensure_daemon(paths, &daemon_args).await?;
+    for url in ipc::web_access_urls(info.web_port) {
+        println!("Miyu WebUI: {url}");
+    }
+    if !args.no_open {
+        open_browser(&format!("http://127.0.0.1:{}", info.web_port));
+    }
+    Ok(())
+}
+
+async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
+    if ipc::daemon_info(paths).await.is_some() {
+        send_ipc_command(paths, IpcCommand::ReloadConfig).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_browser(url: &str) {
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(url);
+    spawn_detached_helper(command);
+}
+
+#[cfg(target_os = "macos")]
+fn open_browser(url: &str) {
+    let mut command = std::process::Command::new("open");
+    command.arg(url);
+    spawn_detached_helper(command);
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser(url: &str) {
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/C", "start", "", url]);
+    spawn_detached_helper(command);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn spawn_detached_helper(mut command: std::process::Command) {
+    if let Ok(mut child) = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn open_browser(_url: &str) {}
 
 async fn run_tool(paths: &MiyuPaths, mode: AgentMode, args: ToolArgs) -> Result<()> {
     let config = AppConfig::load_or_default(paths)?;
@@ -1370,6 +1614,69 @@ fn run_pop(paths: &MiyuPaths, args: PopArgs) -> Result<()> {
     state.recover_stale_turns()?;
     if let Some(outcome) = execute_pop(paths, &config, &state, args.count)? {
         print_pop_outcome(outcome);
+    }
+    Ok(())
+}
+
+/// Pop while the daemon owns the core: candidates are selected locally
+/// (read-only), but the mutation goes through IPC so the daemon stays the
+/// single writer.
+async fn run_pop_via_daemon(paths: &MiyuPaths, args: PopArgs) -> Result<()> {
+    let state = StateStore::new(paths)?;
+    let turn_ids: Vec<String> = match args.count {
+        Some(count) => {
+            validate_pop_count(count)?;
+            state
+                .oldest_evictable_visible_turns(count)?
+                .into_iter()
+                .map(|turn| turn.turn_id)
+                .collect()
+        }
+        None => {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                bail!(
+                    "{}",
+                    t(
+                        "interactive pop requires a terminal; use `miyu pop <count>`",
+                        "交互 pop 需要终端；请使用 `miyu pop <数量>`",
+                    )
+                );
+            }
+            let limit = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+            let candidates = state.oldest_evictable_visible_turns(limit)?;
+            if candidates.is_empty() {
+                print_nothing_to_pop();
+                return Ok(());
+            }
+            let Some(selected) = inline_pop_select(&candidates)? else {
+                return Ok(());
+            };
+            candidates
+                .into_iter()
+                .zip(selected)
+                .filter_map(|(turn, selected)| selected.then_some(turn.turn_id))
+                .collect()
+        }
+    };
+    if turn_ids.is_empty() {
+        print_nothing_to_pop();
+        return Ok(());
+    }
+    let (_, data) = send_ipc_admin(paths, IpcCommand::Pop { turn_ids }).await?;
+    let turns = data
+        .get("turns")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if turns > 0 {
+        print_pop_outcome(PopOutcome {
+            turns: turns as usize,
+            archived: data
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    } else {
+        print_nothing_to_pop();
     }
     Ok(())
 }
@@ -2080,6 +2387,171 @@ fn inline_fuzzy_lines(item_count: usize) -> u16 {
     ((item_count.min(10) + 2) as u16).max(3)
 }
 
+/// In-place single-choice fuzzy picker; same environment and screen handling
+/// as `inline_pop_select` (editor suspended, cooked mode on entry). `lines`
+/// are the rendered rows and `search` the parallel fuzzy-match texts.
+/// Returns the selected index, or `None` when cancelled.
+fn inline_single_select(title: &str, lines: &[String], search: &[String]) -> Result<Option<usize>> {
+    let menu_lines = inline_fuzzy_lines(lines.len());
+    reserve_inline_fuzzy_space(menu_lines)?;
+    let mut session = InlineRawMode::start()?;
+    let matcher = SkimMatcherV2::default();
+    let mut query = String::new();
+    let mut selected = 0usize;
+    let mut scroll = 0usize;
+    let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
+    let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
+    loop {
+        let matches = fuzzy_matches(&matcher, search, &query);
+        if selected >= matches.len() {
+            selected = matches.len().saturating_sub(1);
+        }
+        let visible = matches.len().min(menu_lines.saturating_sub(2) as usize);
+        scroll = inline_fuzzy_scroll(selected, scroll, visible);
+        draw_inline_single(
+            &mut session.stdout,
+            anchor_y,
+            menu_lines,
+            title,
+            &query,
+            lines,
+            &matches,
+            selected,
+            scroll,
+        )?;
+        if let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = event::read()?
+        {
+            match code {
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Esc => {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Enter => {
+                    let choice = matches.get(selected).map(|(_, index)| *index);
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(choice);
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(matches.len().saturating_sub(1));
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                    scroll = 0;
+                }
+                KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(ch);
+                    selected = 0;
+                    scroll = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_inline_single(
+    stdout: &mut io::Stdout,
+    anchor_y: u16,
+    menu_lines: u16,
+    title: &str,
+    query: &str,
+    lines: &[String],
+    matches: &[(i64, usize)],
+    selected: usize,
+    scroll: usize,
+) -> Result<()> {
+    let (cols, _) = terminal::size().unwrap_or((80, 24));
+    let bar = inline_fuzzy_bar();
+    let width = (cols as usize).saturating_sub(visible_width(&bar)).max(1);
+    let visible = matches.len().min(menu_lines.saturating_sub(2) as usize);
+    queue!(stdout, Hide)?;
+    for row in 0..menu_lines {
+        queue!(
+            stdout,
+            MoveTo(0, anchor_y + row),
+            Clear(ClearType::CurrentLine)
+        )?;
+    }
+    queue!(
+        stdout,
+        MoveTo(0, anchor_y),
+        Print(&bar),
+        Print(inline_single_header(title, query, width)),
+    )?;
+    if matches.is_empty() {
+        queue!(
+            stdout,
+            MoveTo(0, anchor_y + 1),
+            Print(&bar),
+            Print(format!("\x1b[2m{}\x1b[0m", t("no matches", "没有匹配项")))
+        )?;
+    } else {
+        for (row, (_, item_index)) in matches.iter().skip(scroll).take(visible).enumerate() {
+            queue!(
+                stdout,
+                MoveTo(0, anchor_y + row as u16 + 1),
+                Print(&bar),
+                Print(inline_single_item_line(
+                    lines[*item_index].as_str(),
+                    scroll + row == selected,
+                    width
+                ))
+            )?;
+        }
+    }
+    queue!(
+        stdout,
+        MoveTo(0, anchor_y + menu_lines.saturating_sub(1)),
+        Print(&bar),
+        Print(inline_single_help_line(width))
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn inline_single_header(title: &str, query: &str, width: usize) -> String {
+    let line = if query.trim().is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} · {}", query.trim())
+    };
+    format!("\x1b[1m{}\x1b[0m", truncate_visible_width(&line, width))
+}
+
+fn inline_single_item_line(item: &str, selected: bool, width: usize) -> String {
+    let line = if selected {
+        format!("› {item}")
+    } else {
+        format!("  {item}")
+    };
+    let line = truncate_visible_width(&line, width);
+    if selected {
+        format!(
+            "\x1b[1m\x1b[35m›\x1b[0m\x1b[1m{}\x1b[0m",
+            line.strip_prefix('›').unwrap_or(&line)
+        )
+    } else {
+        format!("\x1b[2m{line}\x1b[0m")
+    }
+}
+
+fn inline_single_help_line(width: usize) -> String {
+    let line = t(
+        "type search · j/k move · Enter select · Esc cancel",
+        "输入搜索 · j/k 移动 · Enter 选择 · Esc 取消",
+    );
+    format!("\x1b[2m{}\x1b[0m", truncate_visible_width(line, width))
+}
+
 fn truncate_display(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -2375,6 +2847,25 @@ async fn run_chat_with_images(
     message: String,
     pasted_images: Vec<Option<crate::clipboard::PastedImage>>,
 ) -> Result<()> {
+    if !direct_mode_requested() {
+        match try_run_remote_chat(
+            paths,
+            None,
+            &message,
+            None,
+            false,
+            AgentMode::Normal,
+            &pasted_images,
+        )
+        .await
+        {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let _core_lease = ipc::acquire_direct_core(paths)?;
+    initialize_models_cache(paths);
     AppConfig::init_files(paths)?;
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
@@ -2401,6 +2892,7 @@ async fn run_chat_with_images(
         registry,
         AgentMode::Normal,
     )?;
+    agent.prepare_for_turn()?;
     let mut renderer = render::StreamRenderer::new(
         reasoning_mode,
         tool_call_mode,
@@ -2488,19 +2980,54 @@ async fn append_stdin_if_piped(message: String) -> String {
     if io::stdin().is_terminal() {
         return message;
     }
-    let read_result = tokio::time::timeout(
-        std::time::Duration::from_secs(STDIN_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(|| {
-            let mut buf = String::new();
-            let mut stdin = std::io::stdin().lock();
-            let mut limited = (&mut stdin).take(STDIN_MAX_CHARS as u64);
-            limited.read_to_string(&mut buf).map(|_| buf)
-        }),
-    )
+    // The reader thread bounds itself with poll() deadlines instead of being
+    // abandoned by an outer timeout: a thread stuck in a blocking read(0)
+    // would make the tokio runtime hang forever on shutdown (the process
+    // then never exits when stdin is a never-closing pipe).
+    let read_result = tokio::task::spawn_blocking(|| -> std::io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let stdin = std::io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut buf: Vec<u8> = Vec::new();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(STDIN_TIMEOUT_SECS);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || buf.len() >= STDIN_MAX_CHARS {
+                break;
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if ready <= 0 {
+                break;
+            }
+            let mut chunk = [0u8; 8192];
+            let count =
+                unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if count < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if count == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..count as usize]);
+        }
+        buf.truncate(STDIN_MAX_CHARS);
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })
     .await;
 
     let stdin_content = match read_result {
-        Ok(Ok(Ok(content))) if !content.trim().is_empty() => content.trim().to_string(),
+        Ok(Ok(content)) if !content.trim().is_empty() => content.trim().to_string(),
         _ => return message,
     };
 
@@ -2522,6 +3049,15 @@ async fn run_chat_with_options(
     if message.is_empty() {
         return run_repl(paths, mode).await;
     }
+    if !direct_mode_requested() {
+        match try_run_remote_chat(paths, None, &message, show_reasoning, plain, mode, &[]).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let _core_lease = ipc::acquire_direct_core(paths)?;
+    initialize_models_cache(paths);
     AppConfig::init_files(paths)?;
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
@@ -2545,6 +3081,7 @@ async fn run_chat_with_options(
     let show_mixed_model_endpoint = show_mixed_model_endpoint(&config, false);
     let display_config = config.clone();
     let mut agent = Agent::new(config, paths, state.clone(), client, registry, mode)?;
+    agent.prepare_for_turn()?;
     let mut renderer = render::StreamRenderer::new(
         reasoning_mode,
         tool_call_mode,
@@ -2591,6 +3128,1041 @@ async fn run_chat_with_options(
         )?;
     }
     Ok(())
+}
+
+struct RemoteTurnSummary {
+    result: ChatResult,
+    context_tokens: u64,
+    context_window: Option<usize>,
+    cumulative_tokens: u64,
+}
+
+/// Marker error for a remote turn interrupted by the user (Ctrl+C) or a
+/// cancel from another client. The REPL catches it and returns to the prompt
+/// instead of exiting; one-shot mode surfaces it as a normal error message.
+#[derive(Debug)]
+struct RemoteTurnCancelled;
+
+impl std::fmt::Display for RemoteTurnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(t("cancelled", "已取消"))
+    }
+}
+
+impl std::error::Error for RemoteTurnCancelled {}
+
+fn is_remote_turn_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RemoteTurnCancelled>().is_some()
+}
+
+async fn try_run_remote_chat(
+    paths: &MiyuPaths,
+    mut live: Option<&mut LiveReplTail>,
+    message: &str,
+    show_reasoning: Option<bool>,
+    plain: bool,
+    mode: AgentMode,
+    images: &[Option<crate::clipboard::PastedImage>],
+) -> Result<Option<RemoteTurnSummary>> {
+    let mut stream = if direct_mode_requested() {
+        match ipc::connect(&paths.ipc_socket()).await {
+            Ok(stream) => stream,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        // ensure_daemon also restarts a daemon left over from an older
+        // build, so a rebuilt CLI never talks to stale daemon code.
+        ipc::ensure_daemon(paths, &[]).await?;
+        ipc::connect(&paths.ipc_socket()).await?
+    };
+    // Turns run in parallel daemon-side: a running turn in this session does
+    // not block a new one (the old multi-process placeholder semantics).
+    let state_probe = StateStore::new(paths)?;
+    ipc::send(
+        &mut stream,
+        &IpcRequest::new(IpcCommand::StartTurn {
+            content: message.to_string(),
+            mode: ipc_mode_name(mode).to_string(),
+            images: ipc_images(images),
+            cwd: std::env::current_dir().ok(),
+        }),
+    )
+    .await?;
+    let Some(first) = ipc::receive::<IpcFrame>(&mut stream).await? else {
+        bail!("Miyu core closed the connection before accepting the turn");
+    };
+    let run_id = match first {
+        IpcFrame::Accepted { run_id } => run_id,
+        IpcFrame::Error { message } => bail!("{message}"),
+        _ => bail!("Miyu core returned an invalid response"),
+    };
+
+    let config = AppConfig::load_or_default(paths)?;
+    let reasoning_mode = if show_reasoning == Some(false) {
+        render::ReasoningDisplayMode::Hidden
+    } else {
+        render::ReasoningDisplayMode::from_config(&config.display.reasoning)
+    };
+    let tool_call_mode = if plain {
+        render::ToolCallDisplayMode::Hidden
+    } else {
+        render::ToolCallDisplayMode::from_config(&config.display.tool_calls)
+    };
+    let mut renderer = render::StreamRenderer::new(
+        reasoning_mode,
+        tool_call_mode,
+        plain,
+        config.display.readable_tool_names,
+        config.display.command_output_lines,
+    );
+    let queue_state = Some(state_probe);
+    if let Some(live) = live.as_deref_mut() {
+        renderer.use_external_cursor_control();
+        renderer.use_buffered_output();
+        live.external_output_active = false;
+        if !live.rendered {
+            live.resume_at(live.output_cursor)?;
+        }
+    }
+    // Keep the terminal in raw mode during the turn so the editor stays
+    // interactive: typed input is queued for the running turn, mirroring the
+    // direct REPL's input pump.
+    let mut raw = match live.as_deref_mut() {
+        Some(live) => Some(if std::mem::take(&mut live.raw_mode_handoff) {
+            LiveRawMode::adopt()
+        } else {
+            LiveRawMode::start()?
+        }),
+        None => None,
+    };
+    renderer.start_waiting()?;
+    if let Some(live) = live.as_deref_mut() {
+        live.apply_renderer_frame(&mut renderer)?;
+    }
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut spinner_tick = tokio::time::interval(Duration::from_millis(33));
+    spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spinner_tick.tick().await;
+    let mut input_tick = tokio::time::interval(Duration::from_millis(16));
+    input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    input_tick.tick().await;
+    let completion = loop {
+        // The receive future must survive across select iterations: dropping
+        // it after it consumed the 4-byte length prefix (but before the
+        // payload arrived) would desynchronize the frame stream.
+        let recv = ipc::receive::<IpcFrame>(&mut stream);
+        tokio::pin!(recv);
+        let frame = loop {
+            tokio::select! {
+                biased;
+                _ = input_tick.tick(), if live.is_some() => {
+                    if !event::poll(Duration::ZERO)? {
+                        continue;
+                    }
+                    let event = event::read()?;
+                    let Some(live_tail) = live.as_deref_mut() else {
+                        continue;
+                    };
+                    if matches!(
+                        &event,
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Enter,
+                            kind,
+                            ..
+                        }) if *kind != KeyEventKind::Release
+                    ) && live_tail.editor.input.trim_start().starts_with('/')
+                    {
+                        if live_tail.external_output_active {
+                            continue;
+                        }
+                        renderer.write_system_message(t(
+                            "REPL commands are available after the current reply finishes",
+                            "当前回复结束后才能执行 REPL 命令",
+                        ))?;
+                        // write_system_message tears down the wait spinner;
+                        // restart it so progress keeps rendering.
+                        renderer.start_waiting()?;
+                        live_tail.apply_renderer_frame(&mut renderer)?;
+                        continue;
+                    }
+                    match live_tail.editor.handle_event(event, paths, true)? {
+                        LiveEditorAction::None => {}
+                        LiveEditorAction::Redraw if !live_tail.external_output_active => {
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                                live_tail.redraw()
+                            })?
+                        }
+                        LiveEditorAction::ClearScreen if !live_tail.external_output_active => {
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                                live_tail.clear_screen()
+                            })?
+                        }
+                        LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
+                        LiveEditorAction::EmptySubmit => {}
+                        LiveEditorAction::Submit(submission) => {
+                            let queue_state = queue_state
+                                .as_ref()
+                                .expect("queue state exists when live REPL is attached");
+                            match persist_remote_queued_submission(queue_state, &submission) {
+                                Ok(prompt) => {
+                                    live_tail.editor.record_history(&submission.content);
+                                    if live_tail.external_output_active {
+                                        live_tail.append_queued(prompt);
+                                    } else {
+                                        synchronized_terminal_update(
+                                            CursorAfterUpdate::Preserve,
+                                            || live_tail.enqueue(prompt),
+                                        )?;
+                                    }
+                                }
+                                Err(_) => {
+                                    live_tail.editor.input =
+                                        submission.display_content.clone();
+                                    live_tail.editor.cursor =
+                                        live_tail.editor.input.chars().count();
+                                    renderer.write_system_message(t(
+                                        "could not queue the message; the reply may have just finished",
+                                        "无法排队消息；当前回复可能刚刚结束",
+                                    ))?;
+                                    live_tail.apply_renderer_frame(&mut renderer)?;
+                                }
+                            }
+                        }
+                        LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                            let _ = send_ipc_command(
+                                paths,
+                                IpcCommand::Cancel { run_id: run_id.clone() },
+                            )
+                            .await;
+                        }
+                    }
+                },
+                frame = &mut recv => break frame?,
+                _ = spinner_tick.tick() => {
+                    renderer.tick_spinner()?;
+                    if let Some(live) = live.as_deref_mut() {
+                        live.apply_renderer_frame(&mut renderer)?;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = send_ipc_command(
+                        paths,
+                        IpcCommand::Cancel { run_id: run_id.clone() },
+                    ).await;
+                    renderer.finish()?;
+                    if let Some(live) = live.as_deref_mut() {
+                        live.apply_renderer_frame(&mut renderer)?;
+                    }
+                    return Err(anyhow::Error::new(RemoteTurnCancelled));
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            renderer.finish()?;
+            if let Some(live) = live.as_deref_mut() {
+                live.apply_renderer_frame(&mut renderer)?;
+            }
+            bail!("Miyu core disconnected during the turn");
+        };
+        let IpcFrame::Event { kind, data, .. } = frame else {
+            if let IpcFrame::Error { message } = frame {
+                renderer.finish()?;
+                if let Some(live) = live.as_deref_mut() {
+                    live.apply_renderer_frame(&mut renderer)?;
+                }
+                bail!("{message}");
+            }
+            continue;
+        };
+        match kind.as_str() {
+            "assistant.delta" => {
+                let delta = ipc_text(&data, "delta");
+                content.push_str(delta);
+                handle_agent_event(
+                    &mut renderer,
+                    AgentEvent::Chunk(ChatStreamChunk {
+                        kind: crate::llm::ChatStreamKind::Content,
+                        text: delta.to_string(),
+                    }),
+                )?;
+            }
+            "reasoning.delta" => {
+                let delta = ipc_text(&data, "delta");
+                reasoning.push_str(delta);
+                handle_agent_event(
+                    &mut renderer,
+                    AgentEvent::Chunk(ChatStreamChunk {
+                        kind: crate::llm::ChatStreamKind::Reasoning,
+                        text: delta.to_string(),
+                    }),
+                )?;
+            }
+            "reasoning.start" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ReasoningStart {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.reset" => {
+                reasoning.clear();
+                handle_agent_event(
+                    &mut renderer,
+                    AgentEvent::ReasoningReset {
+                        received_at: Instant::now(),
+                    },
+                )?;
+            }
+            "reasoning.part_start" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ReasoningPartStart {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.part_end" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ReasoningPartEnd {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.title" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ReasoningTitle(ipc_text(&data, "title").to_string()),
+            )?,
+            "tool.started" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ToolCall {
+                    name: ipc_text(&data, "name").to_string(),
+                    arguments: ipc_text(&data, "arguments").to_string(),
+                },
+            )?,
+            "tool.progress" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ToolProgress {
+                    name: ipc_text(&data, "name").to_string(),
+                    message: ipc_text(&data, "message").to_string(),
+                },
+            )?,
+            "tool.output" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::CommandOutput {
+                    name: ipc_text(&data, "name").to_string(),
+                    stream: if ipc_text(&data, "stream") == "stderr" {
+                        tools::CommandOutputStream::Stderr
+                    } else {
+                        tools::CommandOutputStream::Stdout
+                    },
+                    chunk: ipc_text(&data, "output").as_bytes().to_vec(),
+                },
+            )?,
+            "tool.finished" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ToolResult {
+                    name: ipc_text(&data, "name").to_string(),
+                    ok: data
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    output: ipc_text(&data, "output").to_string(),
+                },
+            )?,
+            "question.requested" => {
+                renderer.prepare_for_external_output()?;
+                if let Some(live) = live.as_deref_mut() {
+                    live.apply_renderer_frame(&mut renderer)?;
+                    synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+                }
+                let request = crate::question::QuestionRequest {
+                    questions: serde_json::from_value(
+                        data.get("questions").cloned().unwrap_or_default(),
+                    )?,
+                };
+                match crate::question_tui::ask(&request)? {
+                    crate::question::QuestionResponse::Answered(answers) => {
+                        send_ipc_command(
+                            paths,
+                            IpcCommand::AnswerQuestion {
+                                question_id: ipc_text(&data, "question_id").to_string(),
+                                answers,
+                            },
+                        )
+                        .await?;
+                        renderer.start_waiting()?;
+                    }
+                    crate::question::QuestionResponse::Cancelled
+                    | crate::question::QuestionResponse::Unavailable(_) => {
+                        let _ = send_ipc_command(
+                            paths,
+                            IpcCommand::Cancel {
+                                run_id: run_id.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                if let Some(live) = live.as_deref_mut() {
+                    live.external_output_active = false;
+                    live.output_cursor = cursor::position()?;
+                    live.resume_at(live.output_cursor)?;
+                }
+            }
+            "queue.consumed" => {
+                if let Some(live) = live.as_deref_mut() {
+                    let prompt_ids: Vec<String> = data
+                        .get("prompt_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let consumed_mode = match ipc_text(&data, "mode") {
+                        "plan" => AgentMode::Plan,
+                        "chat" => AgentMode::Chat,
+                        _ => AgentMode::Normal,
+                    };
+                    renderer.prepare_for_external_output()?;
+                    live.apply_renderer_frame(&mut renderer)?;
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                        live.suspend()?;
+                        live.consume_queued(&prompt_ids, consumed_mode)
+                    })?;
+                }
+            }
+            "context.compact_start" => handle_agent_event(&mut renderer, AgentEvent::CompactStart)?,
+            "context.compact_delta" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::CompactChunk(ChatStreamChunk {
+                    kind: crate::llm::ChatStreamKind::Content,
+                    text: ipc_text(&data, "delta").to_string(),
+                }),
+            )?,
+            "context.compact_end" => handle_agent_event(&mut renderer, AgentEvent::CompactEnd)?,
+            "context.pop_start" => handle_agent_event(&mut renderer, AgentEvent::PopStart)?,
+            "context.pop_end" => handle_agent_event(&mut renderer, AgentEvent::PopEnd)?,
+            "run.completed" => break data,
+            "run.failed" => {
+                renderer.finish()?;
+                if let Some(live) = live.as_deref_mut() {
+                    live.apply_renderer_frame(&mut renderer)?;
+                }
+                bail!("{}", ipc_text(&data, "message"));
+            }
+            "run.cancelled" => {
+                renderer.finish()?;
+                if let Some(live) = live.as_deref_mut() {
+                    live.apply_renderer_frame(&mut renderer)?;
+                }
+                return Err(anyhow::Error::new(RemoteTurnCancelled));
+            }
+            _ => {}
+        }
+        if let Some(live) = live.as_deref_mut() {
+            live.apply_renderer_frame(&mut renderer)?;
+        }
+    };
+    renderer.finish()?;
+    if let Some(live) = live {
+        live.apply_renderer_frame(&mut renderer)?;
+        if let Some(raw) = raw.as_mut() {
+            raw.handoff();
+            live.raw_mode_handoff = true;
+        }
+    }
+
+    let result = ChatResult {
+        content,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        usage: completion
+            .get("usage")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value::<Usage>)
+            .transpose()?,
+        usage_estimated: completion
+            .get("usage_estimated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        tool_calls: Vec::new(),
+        provider_id: completion
+            .get("provider_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        model: completion
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    };
+    print_mixed_model_endpoint(show_mixed_model_endpoint(&config, false), &result, None);
+    let context_tokens = completion
+        .get("context_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let context_window = completion
+        .get("context_window")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let cumulative_tokens = completion
+        .get("cumulative_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    print_chat_token_usage(
+        &result,
+        config.display.show_token_usage && !plain,
+        context_tokens,
+        context_window,
+        result.usage.as_ref().map(render::usage_total),
+    )?;
+    Ok(Some(RemoteTurnSummary {
+        result,
+        context_tokens,
+        context_window,
+        cumulative_tokens,
+    }))
+}
+
+async fn send_ipc_command(paths: &MiyuPaths, command: IpcCommand) -> Result<()> {
+    let mut stream = ipc::connect(&paths.ipc_socket()).await?;
+    ipc::send(&mut stream, &IpcRequest::new(command)).await?;
+    match ipc::receive::<IpcFrame>(&mut stream).await? {
+        Some(IpcFrame::Ack) | Some(IpcFrame::Ready { .. }) | Some(IpcFrame::AdminResult { .. }) => {
+            Ok(())
+        }
+        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        _ => bail!("Miyu core returned an invalid response"),
+    }
+}
+
+/// Refreshes REPL-local state after the daemon switched to another session:
+/// input history, queue tray, and the footer's token accounting.
+/// Writes one line of REPL feedback through the live tail so the output
+/// cursor stays in sync; never use bare `println!` inside the remote REPL.
+fn repl_note(live: &mut LiveReplTail, text: &str) -> Result<()> {
+    live.apply_output_frame(format!("{text}\n").as_bytes())
+}
+
+/// Remote-REPL text equivalent of `print_pop_outcome` (which stays
+/// println-based for the direct REPL and one-shot `miyu pop`).
+fn repl_pop_outcome_text(outcome: PopOutcome) -> String {
+    let message = if is_zh() {
+        if outcome.archived {
+            format!("已弹出 {} 轮 · 已归档", outcome.turns)
+        } else {
+            format!(
+                "已弹出 {} 轮 · 未归档（弹出上下文归档已关闭）",
+                outcome.turns
+            )
+        }
+    } else {
+        let turns = if outcome.turns == 1 { "turn" } else { "turns" };
+        if outcome.archived {
+            format!("popped {} {turns} · archived", outcome.turns)
+        } else {
+            format!(
+                "popped {} {turns} · not archived (evicted-context archiving is disabled)",
+                outcome.turns
+            )
+        }
+    };
+    format!("\x1b[2m{message}\x1b[0m\n")
+}
+
+/// Remote-REPL text equivalent of `print_nothing_to_pop`.
+fn repl_nothing_to_pop_text() -> String {
+    format!(
+        "\x1b[2m{}\x1b[0m\n",
+        t(
+            "no conversation turns are available to pop",
+            "没有可弹出的上下文轮次"
+        )
+    )
+}
+
+/// Client-side display fallback for sessions the server has not named yet.
+fn display_session_name(name: &str) -> &str {
+    if name.trim().is_empty() {
+        t("New session", "新会话")
+    } else {
+        name
+    }
+}
+
+fn apply_session_switch(
+    paths: &MiyuPaths,
+    state: &ipc::SessionState,
+    history: &mut Vec<String>,
+    live_repl: &mut LiveReplTail,
+    footer: &mut ReplFooterStatus,
+    cumulative_tokens: &mut u64,
+) -> Result<()> {
+    let store = StateStore::new(paths)?;
+    *history = load_repl_input_history(&store)?;
+    live_repl.editor.history = history.clone();
+    live_repl.editor.history_index = live_repl.editor.history.len();
+    live_repl.editor.history_clean_index = None;
+    live_repl.editor.input.clear();
+    live_repl.editor.cursor = 0;
+    repl_note(
+        live_repl,
+        &format!(
+            "\x1b[2m{}: {}\x1b[0m\n",
+            t("switched to session", "已切换到会话"),
+            display_session_name(&state.session_name)
+        ),
+    )?;
+    synchronized_terminal_update(CursorAfterUpdate::Shown, || live_repl.reload_queue(&store))?;
+    *cumulative_tokens = state.cumulative_tokens;
+    footer.reset_token_usage(state.context_tokens, state.context_window);
+    Ok(())
+}
+
+/// One row of the daemon's session list, parsed from `ListSessions` JSON.
+struct SessionListEntry {
+    id: String,
+    name: String,
+    is_current: bool,
+    turns: u64,
+    snippet: String,
+    workspace: Option<String>,
+}
+
+fn session_list_entries(data: &serde_json::Value) -> Vec<SessionListEntry> {
+    data.get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .map(|sessions| sessions.iter().map(session_list_entry).collect())
+        .unwrap_or_default()
+}
+
+fn session_list_entry(session: &serde_json::Value) -> SessionListEntry {
+    let text = |key: &str| {
+        session
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    SessionListEntry {
+        id: text("session_id").unwrap_or_default(),
+        name: text("name").unwrap_or_default(),
+        is_current: session
+            .get("is_current")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        turns: session
+            .get("turn_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        snippet: text("last_user_content")
+            .map(|content| {
+                let cleaned = content.trim().replace(['\n', '\r'], " ");
+                let truncated: String = cleaned.chars().take(24).collect();
+                if cleaned.chars().count() > 24 {
+                    format!("{truncated}…")
+                } else {
+                    truncated
+                }
+            })
+            .unwrap_or_default(),
+        workspace: text("workspace"),
+    }
+}
+
+/// Maps a user-facing 1-based session number to a session id ref.
+fn session_ref_from_index(
+    entries: &[SessionListEntry],
+    index: usize,
+) -> Option<crate::ipc::SessionRef> {
+    index
+        .checked_sub(1)
+        .and_then(|index| entries.get(index))
+        .map(|entry| crate::ipc::SessionRef::Id {
+            id: entry.id.clone(),
+        })
+}
+
+fn session_select_line(entry: &SessionListEntry) -> String {
+    let marker = if entry.is_current { "* " } else { "  " };
+    let mut line = format!(
+        "{marker}{}  {} {}",
+        display_session_name(&entry.name),
+        entry.turns,
+        t("turns", "轮")
+    );
+    if !entry.snippet.is_empty() {
+        line.push_str("  ");
+        line.push_str(&entry.snippet);
+    }
+    if let Some(workspace) = &entry.workspace {
+        line.push_str(&format!("  [{workspace}]"));
+    }
+    line
+}
+
+fn session_select_search(entry: &SessionListEntry) -> String {
+    format!(
+        "{} {} {}",
+        display_session_name(&entry.name),
+        entry.snippet,
+        entry.workspace.as_deref().unwrap_or_default()
+    )
+}
+
+/// Resolves a user-typed `/session` / `/delete` argument into a session ref:
+/// a number picks from the visible session list, anything else is a name.
+async fn resolve_repl_session_target(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+    arg: &str,
+) -> Result<Option<crate::ipc::SessionRef>> {
+    if let Ok(index) = arg.parse::<usize>() {
+        let Some((_, data)) = repl_ipc_admin(
+            paths,
+            live,
+            IpcCommand::ListSessions {
+                include_archived: false,
+            },
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let entries = session_list_entries(&data);
+        let Some(target) = session_ref_from_index(&entries, index) else {
+            repl_note(
+                live,
+                &format!(
+                    "\x1b[2m{}: {index}\x1b[0m\n",
+                    t("no session with this number", "没有这个编号的会话")
+                ),
+            )?;
+            return Ok(None);
+        };
+        Ok(Some(target))
+    } else {
+        Ok(Some(crate::ipc::SessionRef::Name {
+            name: arg.to_string(),
+        }))
+    }
+}
+
+fn print_session_list(data: &serde_json::Value) {
+    let entries = session_list_entries(data);
+    if entries.is_empty() {
+        println!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话"));
+        return;
+    }
+    println!("{}", t("sessions:", "会话列表:"));
+    for (index, entry) in entries.iter().enumerate() {
+        let name = display_session_name(&entry.name);
+        let turns = entry.turns;
+        let snippet = entry.snippet.as_str();
+        let workspace = entry
+            .workspace
+            .as_deref()
+            .map(|workspace| format!("  [{workspace}]"))
+            .unwrap_or_default();
+        let marker = if entry.is_current { "*" } else { " " };
+        let turns_label = t("turns", "轮");
+        println!("{marker}{:>3}. {name}  \x1b[2m{turns} {turns_label}  {snippet}{workspace}\x1b[0m", index + 1);
+    }
+    println!();
+}
+
+fn confirm_inline(live: &mut LiveReplTail, prompt: &str) -> Result<bool> {
+    live.apply_output_frame(format!("{prompt} [y/N] ").as_bytes())?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn confirm_stdin(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+/// Sends an admin command from inside the REPL loop, printing failures (core
+/// busy, core restarting, …) through the live tail instead of propagating
+/// them so the REPL survives.
+async fn repl_ipc_admin(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+    command: IpcCommand,
+) -> Result<Option<(ipc::SessionState, serde_json::Value)>> {
+    match send_ipc_admin(paths, command).await {
+        Ok(result) => Ok(Some(result)),
+        Err(err) => {
+            repl_note(
+                live,
+                &format!("\x1b[31m{}: {err}\x1b[0m\n", t("error", "错误")),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+/// Ensures the daemon is running, then sends one admin command; used by the
+/// one-shot session subcommands (`miyu new/session/rename/...`).
+async fn session_admin(
+    paths: &MiyuPaths,
+    command: IpcCommand,
+) -> Result<(ipc::SessionState, serde_json::Value)> {
+    if ipc::daemon_info(paths).await.is_none() {
+        ipc::ensure_daemon(paths, &[]).await?;
+    }
+    send_ipc_admin(paths, command).await
+}
+
+/// Resolves a `miyu session/delete` target argument outside the REPL:
+/// numbers index into the visible session list, anything else is a name.
+async fn resolve_cli_session_target(
+    paths: &MiyuPaths,
+    arg: &str,
+) -> Result<crate::ipc::SessionRef> {
+    if let Ok(index) = arg.parse::<usize>() {
+        let (_, data) = session_admin(
+            paths,
+            IpcCommand::ListSessions {
+                include_archived: false,
+            },
+        )
+        .await?;
+        let entries = session_list_entries(&data);
+        return session_ref_from_index(&entries, index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: {index}",
+                t("no session with this number", "没有这个编号的会话")
+            )
+        });
+    }
+    Ok(crate::ipc::SessionRef::Name {
+        name: arg.to_string(),
+    })
+}
+
+async fn run_session_new(paths: &MiyuPaths, args: SessionNameArgs) -> Result<()> {
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let (state, _) = session_admin(paths, IpcCommand::CreateSession { name, switch: true }).await?;
+    println!(
+        "{}: {}",
+        t("created and switched to session", "已创建并切换到会话"),
+        display_session_name(&state.session_name)
+    );
+    Ok(())
+}
+
+async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
+    let Some(arg) = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+    else {
+        let (_, data) = session_admin(
+            paths,
+            IpcCommand::ListSessions {
+                include_archived: false,
+            },
+        )
+        .await?;
+        print_session_list(&data);
+        return Ok(());
+    };
+    let target = resolve_cli_session_target(paths, arg).await?;
+    let (state, _) = session_admin(paths, IpcCommand::SwitchSession { target }).await?;
+    println!(
+        "{}: {}",
+        t("switched to session", "已切换到会话"),
+        display_session_name(&state.session_name)
+    );
+    Ok(())
+}
+
+async fn run_session_rename(paths: &MiyuPaths, args: SessionRenameArgs) -> Result<()> {
+    let name = args.name.trim().to_string();
+    if name.is_empty() {
+        bail!("{}", t("usage: miyu rename <name>", "用法：miyu rename <新名称>"));
+    }
+    session_admin(
+        paths,
+        IpcCommand::RenameSession {
+            target: crate::ipc::SessionRef::Current,
+            name: name.clone(),
+        },
+    )
+    .await?;
+    println!("{}: {name}", t("session renamed", "会话已重命名"));
+    Ok(())
+}
+
+async fn run_session_archive(paths: &MiyuPaths) -> Result<()> {
+    let (state, _) = session_admin(
+        paths,
+        IpcCommand::ArchiveSession {
+            target: crate::ipc::SessionRef::Current,
+            archived: true,
+        },
+    )
+    .await?;
+    println!("{}", t("session archived", "当前会话已归档"));
+    println!(
+        "{}: {}",
+        t("switched to session", "已切换到会话"),
+        display_session_name(&state.session_name)
+    );
+    Ok(())
+}
+
+async fn run_session_delete(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
+    let target = match args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+    {
+        Some(arg) => resolve_cli_session_target(paths, arg).await?,
+        None => crate::ipc::SessionRef::Current,
+    };
+    if !confirm_stdin(t(
+        "delete this session and all of its history?",
+        "确认删除该会话及其全部历史？",
+    ))? {
+        println!("{}", t("cancelled", "已取消"));
+        return Ok(());
+    }
+    let (state, _) = session_admin(paths, IpcCommand::DeleteSession { target }).await?;
+    println!("{}", t("session deleted", "会话已删除"));
+    println!(
+        "{}: {}",
+        t("switched to session", "已切换到会话"),
+        display_session_name(&state.session_name)
+    );
+    Ok(())
+}
+
+async fn run_workspace_command(paths: &MiyuPaths, args: WorkspaceArgs) -> Result<()> {
+    let Some(arg) = args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+    else {
+        let (state, _) = session_admin(paths, IpcCommand::GetStatus).await?;
+        match state.workspace {
+            Some(workspace) => {
+                println!("{}: {workspace}", t("session workspace", "会话工作目录"));
+            }
+            None => println!(
+                "{}",
+                t(
+                    "no workspace bound; using the client working directory",
+                    "未绑定工作目录；使用客户端当前目录"
+                )
+            ),
+        }
+        return Ok(());
+    };
+    if arg.eq_ignore_ascii_case("clear") {
+        session_admin(
+            paths,
+            IpcCommand::SetWorkspace {
+                target: crate::ipc::SessionRef::Current,
+                path: None,
+            },
+        )
+        .await?;
+        println!("{}", t("workspace unbound", "已解绑工作目录"));
+        return Ok(());
+    }
+    let path = std::fs::canonicalize(expand_tilde(arg)).map_err(|error| {
+        anyhow::anyhow!(
+            "{}: {arg} ({error})",
+            t("invalid workspace path", "无效的工作目录路径")
+        )
+    })?;
+    session_admin(
+        paths,
+        IpcCommand::SetWorkspace {
+            target: crate::ipc::SessionRef::Current,
+            path: Some(path.clone()),
+        },
+    )
+    .await?;
+    println!(
+        "{}: {}",
+        t("workspace bound", "已绑定工作目录"),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Expands a leading `~` or `~/…` to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        if path == "~" {
+            return PathBuf::from(home);
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+async fn send_ipc_admin(
+    paths: &MiyuPaths,
+    command: IpcCommand,
+) -> Result<(ipc::SessionState, serde_json::Value)> {
+    let mut stream = ipc::connect(&paths.ipc_socket()).await?;
+    ipc::send(&mut stream, &IpcRequest::new(command)).await?;
+    match ipc::receive::<IpcFrame>(&mut stream).await? {
+        Some(IpcFrame::AdminResult { state, data }) => Ok((state, data)),
+        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        _ => bail!("Miyu core returned an invalid admin response"),
+    }
+}
+
+fn ipc_text<'a>(data: &'a serde_json::Value, key: &str) -> &'a str {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn ipc_mode_name(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Normal => "normal",
+        AgentMode::Plan => "plan",
+        AgentMode::Chat => "chat",
+    }
+}
+
+fn ipc_images(
+    images: &[Option<crate::clipboard::PastedImage>],
+) -> Vec<Option<crate::ipc::ImageAttachment>> {
+    images
+        .iter()
+        .map(|image| {
+            image.as_ref().map(|image| match image {
+                crate::clipboard::PastedImage::Binary(image) => {
+                    crate::ipc::ImageAttachment::Binary {
+                        mime: image.mime.clone(),
+                        data: image.data.clone(),
+                    }
+                }
+                crate::clipboard::PastedImage::Path(path) => {
+                    crate::ipc::ImageAttachment::Path { path: path.clone() }
+                }
+            })
+        })
+        .collect()
 }
 
 fn print_chat_token_usage(
@@ -2801,6 +4373,698 @@ fn print_variant_updated() {
 }
 
 async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
+    if direct_mode_requested() {
+        run_direct_repl(paths, initial_mode).await
+    } else {
+        run_remote_repl(paths, initial_mode).await
+    }
+}
+
+async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
+    let _cursor_restore = ReplCursorRestore;
+    initialize_models_cache(paths);
+    ipc::ensure_daemon(paths, &[]).await?;
+    let mut config = AppConfig::load_or_default(paths)?;
+    let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
+    let history_state = StateStore::new(paths)?;
+    let mut history = load_repl_input_history(&history_state)?;
+    drop(history_state);
+    let mut cumulative_tokens = daemon_state.cumulative_tokens;
+    let mut footer = ReplFooterStatus::from_config(
+        &config,
+        daemon_state.context_tokens,
+        (cumulative_tokens > 0).then_some(cumulative_tokens),
+    );
+    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+    let thinking_summary = client.thinking_variant_summary();
+    footer.update_thinking_variant(thinking_summary.as_deref());
+    footer.update_context_window(daemon_state.context_window);
+    let mut live_repl = LiveReplTail::new(mode, history.clone(), Vec::new(), footer.clone())?;
+
+    loop {
+        live_repl.set_footer(footer.clone());
+        let Some((next_mode, input, images)) = read_live_repl_input(&mut live_repl, paths)? else {
+            break;
+        };
+        mode = next_mode;
+        let input = input.trim();
+        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+            break;
+        }
+        let (slash_command, command_args) = match parse_repl_input(input) {
+            ReplInput::Chat => (None, ""),
+            ReplInput::Slash(command, args) => (Some(command), args),
+            ReplInput::UnknownSlash(name) => {
+                repl_note(
+                    &mut live_repl,
+                    &format!(
+                        "\x1b[2m{}: {name}\x1b[0m\n",
+                        t("unknown command; try /help", "未知命令，可用 /help 查看")
+                    ),
+                )?;
+                continue;
+            }
+        };
+        if let Some(command) = slash_command {
+            let spec = repl_command_spec(command);
+            if spec.arg_hint.is_empty() && !command_args.trim().is_empty() {
+                repl_note(
+                    &mut live_repl,
+                    &format!(
+                        "\x1b[2m{}: {}\x1b[0m\n",
+                        t("this command takes no arguments", "该命令不接受参数"),
+                        spec.name
+                    ),
+                )?;
+                continue;
+            }
+            match command {
+                ReplSlashCommand::Exit => break,
+                ReplSlashCommand::Help => print_repl_help(),
+                ReplSlashCommand::History => run_history(
+                    paths,
+                    HistoryArgs {
+                        limit: 20,
+                        raw: false,
+                        no_thinking: false,
+                    },
+                )?,
+                ReplSlashCommand::Clear => {
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                        live_repl.clear_screen()
+                    })?;
+                }
+                ReplSlashCommand::New => {
+                    let name = command_args.trim();
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::CreateSession {
+                            name: (!name.is_empty()).then(|| name.to_string()),
+                            switch: true,
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    apply_session_switch(
+                        paths,
+                        &state,
+                        &mut history,
+                        &mut live_repl,
+                        &mut footer,
+                        &mut cumulative_tokens,
+                    )?;
+                }
+                ReplSlashCommand::Session => {
+                    let arg = command_args.trim();
+                    let target = if arg.is_empty() {
+                        let Some((_, data)) = repl_ipc_admin(
+                            paths,
+                            &mut live_repl,
+                            IpcCommand::ListSessions {
+                                include_archived: false,
+                            },
+                        )
+                        .await?
+                        else {
+                            continue;
+                        };
+                        let entries = session_list_entries(&data);
+                        if entries.is_empty() {
+                            repl_note(
+                                &mut live_repl,
+                                &format!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话")),
+                            )?;
+                            continue;
+                        }
+                        let lines = entries
+                            .iter()
+                            .map(session_select_line)
+                            .collect::<Vec<_>>();
+                        let search = entries
+                            .iter()
+                            .map(session_select_search)
+                            .collect::<Vec<_>>();
+                        let Some(index) = inline_single_select(
+                            t("Select session", "选择会话"),
+                            &lines,
+                            &search,
+                        )?
+                        else {
+                            continue;
+                        };
+                        crate::ipc::SessionRef::Id {
+                            id: entries[index].id.clone(),
+                        }
+                    } else {
+                        match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
+                            Some(target) => target,
+                            None => continue,
+                        }
+                    };
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::SwitchSession { target },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    apply_session_switch(
+                        paths,
+                        &state,
+                        &mut history,
+                        &mut live_repl,
+                        &mut footer,
+                        &mut cumulative_tokens,
+                    )?;
+                }
+                ReplSlashCommand::Rename => {
+                    let name = command_args.trim().to_string();
+                    if name.is_empty() {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}\x1b[0m\n",
+                                t("usage: /rename <name>", "用法：/rename <新名称>")
+                            ),
+                        )?;
+                        continue;
+                    }
+                    if repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::RenameSession {
+                            target: crate::ipc::SessionRef::Current,
+                            name: name.clone(),
+                        },
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}: {name}\x1b[0m\n",
+                                t("session renamed", "会话已重命名")
+                            ),
+                        )?;
+                    }
+                }
+                ReplSlashCommand::Archive => {
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::ArchiveSession {
+                            target: crate::ipc::SessionRef::Current,
+                            archived: true,
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    repl_note(
+                        &mut live_repl,
+                        &format!(
+                            "\x1b[2m{}\x1b[0m",
+                            t("session archived", "当前会话已归档")
+                        ),
+                    )?;
+                    apply_session_switch(
+                        paths,
+                        &state,
+                        &mut history,
+                        &mut live_repl,
+                        &mut footer,
+                        &mut cumulative_tokens,
+                    )?;
+                }
+                ReplSlashCommand::Delete => {
+                    let arg = command_args.trim();
+                    let target = if arg.is_empty() {
+                        crate::ipc::SessionRef::Current
+                    } else {
+                        match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
+                            Some(target) => target,
+                            None => continue,
+                        }
+                    };
+                    if !confirm_inline(
+                        &mut live_repl,
+                        t(
+                            "delete this session and all of its history?",
+                            "确认删除该会话及其全部历史？",
+                        ),
+                    )? {
+                        repl_note(
+                            &mut live_repl,
+                            &format!("\x1b[2m{}\x1b[0m\n", t("cancelled", "已取消")),
+                        )?;
+                        continue;
+                    }
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::DeleteSession { target },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    repl_note(
+                        &mut live_repl,
+                        &format!("\x1b[2m{}\x1b[0m", t("session deleted", "会话已删除")),
+                    )?;
+                    apply_session_switch(
+                        paths,
+                        &state,
+                        &mut history,
+                        &mut live_repl,
+                        &mut footer,
+                        &mut cumulative_tokens,
+                    )?;
+                }
+                ReplSlashCommand::Workspace => {
+                    let arg = command_args.trim();
+                    if arg.is_empty() {
+                        let Some((state, _)) =
+                            repl_ipc_admin(paths, &mut live_repl, IpcCommand::GetStatus).await?
+                        else {
+                            continue;
+                        };
+                        let note = match state.workspace {
+                            Some(workspace) => format!(
+                                "\x1b[2m{}: {workspace}\x1b[0m\n",
+                                t("session workspace", "会话工作目录")
+                            ),
+                            None => format!(
+                                "\x1b[2m{}\x1b[0m\n",
+                                t(
+                                    "no workspace bound; using the client working directory",
+                                    "未绑定工作目录；使用客户端当前目录"
+                                )
+                            ),
+                        };
+                        repl_note(&mut live_repl, &note)?;
+                        continue;
+                    }
+                    if arg.eq_ignore_ascii_case("clear") {
+                        if repl_ipc_admin(
+                            paths,
+                            &mut live_repl,
+                            IpcCommand::SetWorkspace {
+                                target: crate::ipc::SessionRef::Current,
+                                path: None,
+                            },
+                        )
+                        .await?
+                        .is_some()
+                        {
+                            repl_note(
+                                &mut live_repl,
+                                &format!(
+                                    "\x1b[2m{}\x1b[0m\n",
+                                    t("workspace unbound", "已解绑工作目录")
+                                ),
+                            )?;
+                        }
+                        continue;
+                    }
+                    let path = match std::fs::canonicalize(expand_tilde(arg)) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            repl_note(
+                                &mut live_repl,
+                                &format!(
+                                    "\x1b[31m{}: {arg} ({error})\x1b[0m\n",
+                                    t("invalid workspace path", "无效的工作目录路径")
+                                ),
+                            )?;
+                            continue;
+                        }
+                    };
+                    if repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::SetWorkspace {
+                            target: crate::ipc::SessionRef::Current,
+                            path: Some(path.clone()),
+                        },
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}: {}\x1b[0m\n",
+                                t("workspace bound", "已绑定工作目录"),
+                                path.display()
+                            ),
+                        )?;
+                    }
+                }
+                ReplSlashCommand::Models => {
+                    run_models(paths, ModelsArgs { index: None })?;
+                    let Some((state, _)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await?
+                    else {
+                        continue;
+                    };
+                    config = AppConfig::load(paths)?;
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer = ReplFooterStatus::from_config(
+                        &config,
+                        state.context_tokens,
+                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                    );
+                    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+                    let thinking_summary = client.thinking_variant_summary();
+                    footer.update_thinking_variant(thinking_summary.as_deref());
+                    footer.update_context_window(state.context_window);
+                    repl_note(
+                        &mut live_repl,
+                        &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
+                    )?;
+                }
+                ReplSlashCommand::Config => {
+                    crate::config_tui::run(paths)?;
+                    let Some((state, _)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await?
+                    else {
+                        continue;
+                    };
+                    let refreshed = AppConfig::load(paths)?;
+                    config = refreshed;
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer = ReplFooterStatus::from_config(
+                        &config,
+                        state.context_tokens,
+                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                    );
+                    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+                    let thinking_summary = client.thinking_variant_summary();
+                    footer.update_thinking_variant(thinking_summary.as_deref());
+                    footer.update_context_window(state.context_window);
+                    repl_note(
+                        &mut live_repl,
+                        &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
+                    )?;
+                }
+                ReplSlashCommand::Variant => {
+                    if !crate::models_cache::is_loaded() {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "{}\n",
+                                t(
+                                    "model metadata is still loading; try /variant again shortly",
+                                    "模型元数据仍在加载，请稍后重试 /variant"
+                                )
+                            ),
+                        )?;
+                        continue;
+                    }
+                    let selected = command_args.trim();
+                    let mut client = OpenAiCompatibleClient::from_config(&config, paths)?;
+                    match execute_variant(
+                        paths,
+                        &mut client,
+                        (!selected.is_empty()).then_some(selected),
+                        "/variant",
+                    )? {
+                        VariantOutcome::Updated => {
+                            let Some((state, _)) =
+                                repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig)
+                                    .await?
+                            else {
+                                continue;
+                            };
+                            config = AppConfig::load(paths)?;
+                            cumulative_tokens = state.cumulative_tokens;
+                            footer = ReplFooterStatus::from_config(
+                                &config,
+                                state.context_tokens,
+                                (cumulative_tokens > 0).then_some(cumulative_tokens),
+                            );
+                            let thinking_summary = client.thinking_variant_summary();
+                            footer.update_thinking_variant(thinking_summary.as_deref());
+                            footer.update_context_window(state.context_window);
+                            repl_note(
+                                &mut live_repl,
+                                &format!(
+                                    "{}\n",
+                                    t("thinking variants updated", "已更新思考档位")
+                                ),
+                            )?;
+                        }
+                        VariantOutcome::Cancelled => {}
+                        VariantOutcome::Rejected(message) => {
+                            repl_note(&mut live_repl, &format!("\x1b[31m{message}\x1b[0m"))?;
+                        }
+                    }
+                }
+                ReplSlashCommand::Undo => {
+                    let Some((state, data)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Undo).await?
+                    else {
+                        continue;
+                    };
+                    let removed = data
+                        .get("removed")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    repl_note(
+                        &mut live_repl,
+                        &format!("{}: {removed}\n", t("undone messages", "已撤销消息数")),
+                    )?;
+                    if let Some(prompt) = data.get("prompt").and_then(serde_json::Value::as_str) {
+                        live_repl.editor.input = prompt.to_string();
+                        live_repl.editor.cursor = live_repl.editor.input.chars().count();
+                        live_repl.editor.history_clean_index = None;
+                    }
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer.update_session_tokens(state.context_tokens);
+                    footer.update_context_window(state.context_window);
+                    footer.update_cumulative_tokens(cumulative_tokens);
+                }
+                ReplSlashCommand::Pop => {
+                    let count = match parse_repl_pop_count(command_args) {
+                        Ok(count) => count,
+                        Err(err) => {
+                            repl_note(
+                                &mut live_repl,
+                                &format!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误")),
+                            )?;
+                            continue;
+                        }
+                    };
+                    let state_store = StateStore::new(paths)?;
+                    state_store.recover_stale_turns()?;
+                    let candidates =
+                        state_store.oldest_evictable_visible_turns(count.unwrap_or(usize::MAX))?;
+                    let turn_ids = if count.is_some() {
+                        candidates.into_iter().map(|turn| turn.turn_id).collect()
+                    } else {
+                        let all = state_store.oldest_evictable_visible_turns(usize::MAX)?;
+                        if all.is_empty() {
+                            repl_note(&mut live_repl, &repl_nothing_to_pop_text())?;
+                            continue;
+                        }
+                        let Some(selected) = inline_pop_select(&all)? else {
+                            continue;
+                        };
+                        all.into_iter()
+                            .zip(selected)
+                            .filter_map(|(turn, selected)| selected.then_some(turn.turn_id))
+                            .collect()
+                    };
+                    let Some((state, data)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Pop { turn_ids }).await?
+                    else {
+                        continue;
+                    };
+                    let turns = data
+                        .get("turns")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    if turns > 0 {
+                        let outcome = PopOutcome {
+                            turns: turns as usize,
+                            archived: data
+                                .get("archived")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        };
+                        repl_note(&mut live_repl, &repl_pop_outcome_text(outcome))?;
+                    } else {
+                        repl_note(&mut live_repl, &repl_nothing_to_pop_text())?;
+                    }
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer.update_session_tokens(state.context_tokens);
+                    footer.update_context_window(state.context_window);
+                    footer.update_cumulative_tokens(cumulative_tokens);
+                }
+                ReplSlashCommand::Compact => {
+                    repl_note(
+                        &mut live_repl,
+                        &format!(
+                            "\x1b[2m{}\x1b[0m",
+                            t("compacting context…", "正在压缩上下文…")
+                        ),
+                    )?;
+                    let Some((state, data)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Compact).await?
+                    else {
+                        continue;
+                    };
+                    if let Some(usage) = data
+                        .get("usage")
+                        .cloned()
+                        .filter(|value| !value.is_null())
+                        .map(serde_json::from_value::<Usage>)
+                        .transpose()?
+                    {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}\x1b[0m\n",
+                                t("context compacted", "上下文已压缩")
+                            ),
+                        )?;
+                        let result = ChatResult {
+                            content: String::new(),
+                            reasoning: None,
+                            usage: Some(usage),
+                            usage_estimated: data
+                                .get("usage_estimated")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                            tool_calls: Vec::new(),
+                            provider_id: None,
+                            model: None,
+                        };
+                        print_chat_token_usage(
+                            &result,
+                            config.display.show_token_usage,
+                            state.context_tokens,
+                            state.context_window,
+                            Some(state.cumulative_tokens),
+                        )?;
+                    } else {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}\x1b[0m\n",
+                                t("nothing to compact", "没有可压缩的上下文")
+                            ),
+                        )?;
+                    }
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer.update_session_tokens(state.context_tokens);
+                    footer.update_context_window(state.context_window);
+                    footer.update_cumulative_tokens(cumulative_tokens);
+                }
+                ReplSlashCommand::Reset => {
+                    let scope = command_args.trim();
+                    let all = if scope.is_empty() {
+                        false
+                    } else if scope.eq_ignore_ascii_case("all") {
+                        true
+                    } else {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[2m{}: {scope}\x1b[0m\n",
+                                t("unknown reset scope", "未知 reset 范围")
+                            ),
+                        )?;
+                        continue;
+                    };
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::ResetConversation { all },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    history.clear();
+                    live_repl.editor.history.clear();
+                    live_repl.editor.history_index = 0;
+                    live_repl.editor.input.clear();
+                    live_repl.editor.cursor = 0;
+                    footer.reset_token_usage(state.context_tokens, state.context_window);
+                    let note = if all {
+                        format!(
+                            "\x1b[2m{}\x1b[0m\n",
+                            t(
+                                "cleared current conversation history and all memory",
+                                "已清空当前会话历史与全部记忆"
+                            )
+                        )
+                    } else {
+                        format!(
+                            "\x1b[2m{}\x1b[0m\n",
+                            t("cleared current conversation history", "已清空当前会话历史")
+                        )
+                    };
+                    repl_note(&mut live_repl, &note)?;
+                }
+            }
+            continue;
+        }
+        if input.is_empty() {
+            continue;
+        }
+        history.push(input.to_string());
+        match try_run_remote_chat(paths, Some(&mut live_repl), input, None, false, mode, &images)
+            .await
+        {
+            Ok(Some(summary)) => {
+                cumulative_tokens = summary.cumulative_tokens;
+                footer.update_token_usage(
+                    &summary.result,
+                    summary.context_tokens,
+                    summary.context_window,
+                    Some(cumulative_tokens),
+                );
+            }
+            Ok(None) => bail!(
+                "{}",
+                t(
+                    "the Miyu Web core stopped; start the REPL again to use direct mode",
+                    "Miyu Web 核心已停止；请重新启动 REPL 以使用直连模式"
+                )
+            ),
+            Err(err)
+                if is_remote_turn_cancelled(&err)
+                    || crate::question::is_question_cancelled(&err) =>
+            {
+                let frame = format!("\x1b[2m{}\x1b[0m\n\n", t("cancelled", "已取消"));
+                live_repl.apply_output_frame(frame.as_bytes())?;
+            }
+            Err(err) => {
+                let frame = format!("\x1b[31m{}: {err}\x1b[0m\n\n", t("error", "错误"));
+                live_repl.apply_output_frame(frame.as_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn direct_mode_requested() -> bool {
+    std::env::var_os("MIYU_DIRECT").is_some_and(|value| value != "0")
+}
+
+async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
+    let _core_lease = ipc::acquire_direct_core(paths)?;
+    initialize_models_cache(paths);
     let _cursor_restore = ReplCursorRestore;
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
@@ -2828,6 +5092,7 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
         initial_registry,
         mode,
     )?;
+    agent.prepare_for_turn()?;
     let mut footer =
         ReplFooterStatus::from_config(&config, agent.effective_context_tokens()?, None);
     let thinking_summary = client.thinking_variant_summary();
@@ -3699,48 +5964,19 @@ fn load_repl_input_history(state: &StateStore) -> Result<Vec<String>> {
 
 fn print_repl_help() {
     println!("{}", t("commands:", "命令:"));
-    println!(
-        "  /models     {}",
-        t("quickly switch model", "快速切换模型")
-    );
-    println!(
-        "  /config     {}",
-        t("open configuration UI", "打开配置界面")
-    );
-    println!(
-        "  /variant [name] {}",
-        t("view or switch thinking level", "查看或切换思考档位")
-    );
-    println!(
-        "  /undo       {}",
-        t(
-            "undo the last turn or context compaction",
-            "撤销上一轮或上下文压缩"
-        )
-    );
-    println!(
-        "  /pop [count] {}",
-        t(
-            "pop selected turns or the oldest count from active context",
-            "从当前上下文弹出所选轮次或最旧的指定轮数"
-        )
-    );
-    println!(
-        "  /compact   {}",
-        t(
-            "compact current conversation context now",
-            "立即压缩当前会话上下文"
-        )
-    );
-    println!(
-        "  /reset [all] {}",
-        t(
-            "clear current conversation history; all also clears memory",
-            "清空当前会话历史；all 同时清空记忆"
-        )
-    );
-    println!("  /help       {}", t("show this help", "显示此帮助"));
-    println!("  /exit       {}", t("leave REPL", "退出 REPL"));
+    let width = REPL_COMMAND_TABLE
+        .iter()
+        .map(|spec| spec.name.len() + if spec.arg_hint.is_empty() { 0 } else { spec.arg_hint.len() + 1 })
+        .max()
+        .unwrap_or(0);
+    for spec in REPL_COMMAND_TABLE {
+        let invocation = if spec.arg_hint.is_empty() {
+            spec.name.to_string()
+        } else {
+            format!("{} {}", spec.name, spec.arg_hint)
+        };
+        println!("  {invocation:<width$}  {}", t(spec.help_en, spec.help_zh));
+    }
     println!("{}", t("keys:", "快捷键:"));
     println!(
         "  Tab         {}",
@@ -4954,6 +7190,32 @@ fn persist_queued_submission(
     )
 }
 
+/// Queues a submission for the turn currently running in the daemon, using
+/// the cross-process queue target so the daemon consumes it mid-turn.
+fn persist_remote_queued_submission(
+    state: &StateStore,
+    submission: &LiveSubmission,
+) -> Result<QueuedPrompt> {
+    let target = state
+        .running_turn_queue_target()?
+        .ok_or_else(|| anyhow::anyhow!("no running turn to queue for"))?;
+    let prompt_id = format!(
+        "queued_{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        rand::random::<u16>()
+    );
+    state.enqueue_prompt_for_target(
+        &target,
+        &prompt_id,
+        &submission.content,
+        &submission.display_content,
+        &queued_prompt_attachments(&submission.images),
+    )
+}
+
 struct LiveRawMode {
     show_cursor_on_drop: bool,
     restore_terminal_on_drop: bool,
@@ -5227,6 +7489,9 @@ async fn run_live_agent_turn(
                             "REPL commands are available after the current reply finishes",
                             "当前回复结束后才能执行 REPL 命令",
                         ))?;
+                        // write_system_message tears down the wait spinner;
+                        // restart it so progress keeps rendering.
+                        renderer.start_waiting()?;
                         live.apply_renderer_frame(&mut renderer)?;
                         continue;
                     }
@@ -6635,10 +8900,200 @@ fn colorize_repl_placeholders(line: &str) -> String {
     result
 }
 
-fn repl_commands() -> [&'static str; 9] {
-    [
-        "/models", "/config", "/variant", "/undo", "/pop", "/compact", "/reset", "/help", "/exit",
-    ]
+/// Identity of a REPL slash command, dispatched via `parse_repl_input`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplSlashCommand {
+    New,
+    Session,
+    Rename,
+    Archive,
+    Delete,
+    Workspace,
+    Models,
+    Config,
+    Variant,
+    Undo,
+    Pop,
+    Compact,
+    Reset,
+    History,
+    Clear,
+    Help,
+    Exit,
+}
+
+struct ReplCommandSpec {
+    name: &'static str,
+    command: ReplSlashCommand,
+    /// Argument hint rendered in /help, e.g. "[count]"; empty when the
+    /// command takes no arguments (enforced at dispatch).
+    arg_hint: &'static str,
+    help_en: &'static str,
+    help_zh: &'static str,
+}
+
+/// Single source of truth for REPL slash commands: drives Tab completion,
+/// prefix resolution, /help output, and dispatch in the REPL loop.
+const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
+    ReplCommandSpec {
+        name: "/new",
+        command: ReplSlashCommand::New,
+        arg_hint: "[name]",
+        help_en: "create a new session and switch to it",
+        help_zh: "创建新会话并切换过去",
+    },
+    ReplCommandSpec {
+        name: "/session",
+        command: ReplSlashCommand::Session,
+        arg_hint: "[name|index]",
+        help_en: "list sessions, or switch to one",
+        help_zh: "列出会话，或切换到指定会话",
+    },
+    ReplCommandSpec {
+        name: "/rename",
+        command: ReplSlashCommand::Rename,
+        arg_hint: "<name>",
+        help_en: "rename the current session",
+        help_zh: "重命名当前会话",
+    },
+    ReplCommandSpec {
+        name: "/archive",
+        command: ReplSlashCommand::Archive,
+        arg_hint: "",
+        help_en: "archive the current session",
+        help_zh: "归档当前会话",
+    },
+    ReplCommandSpec {
+        name: "/delete",
+        command: ReplSlashCommand::Delete,
+        arg_hint: "[name|index]",
+        help_en: "delete a session (current by default)",
+        help_zh: "删除会话（默认当前会话）",
+    },
+    ReplCommandSpec {
+        name: "/workspace",
+        command: ReplSlashCommand::Workspace,
+        arg_hint: "[path|clear]",
+        help_en: "show, bind, or unbind the session workspace",
+        help_zh: "查看、绑定或解绑会话工作目录",
+    },
+    ReplCommandSpec {
+        name: "/models",
+        command: ReplSlashCommand::Models,
+        arg_hint: "",
+        help_en: "quickly switch model",
+        help_zh: "快速切换模型",
+    },
+    ReplCommandSpec {
+        name: "/config",
+        command: ReplSlashCommand::Config,
+        arg_hint: "",
+        help_en: "open configuration UI",
+        help_zh: "打开配置界面",
+    },
+    ReplCommandSpec {
+        name: "/variant",
+        command: ReplSlashCommand::Variant,
+        arg_hint: "[name]",
+        help_en: "view or switch thinking level",
+        help_zh: "查看或切换思考档位",
+    },
+    ReplCommandSpec {
+        name: "/undo",
+        command: ReplSlashCommand::Undo,
+        arg_hint: "",
+        help_en: "undo the last turn or context compaction",
+        help_zh: "撤销上一轮或上下文压缩",
+    },
+    ReplCommandSpec {
+        name: "/pop",
+        command: ReplSlashCommand::Pop,
+        arg_hint: "[count]",
+        help_en: "pop selected turns or the oldest count from active context",
+        help_zh: "从当前上下文弹出所选轮次或最旧的指定轮数",
+    },
+    ReplCommandSpec {
+        name: "/compact",
+        command: ReplSlashCommand::Compact,
+        arg_hint: "",
+        help_en: "compact current conversation context now",
+        help_zh: "立即压缩当前会话上下文",
+    },
+    ReplCommandSpec {
+        name: "/reset",
+        command: ReplSlashCommand::Reset,
+        arg_hint: "[all]",
+        help_en: "clear current conversation history; all also clears memory",
+        help_zh: "清空当前会话历史；all 同时清空记忆",
+    },
+    ReplCommandSpec {
+        name: "/history",
+        command: ReplSlashCommand::History,
+        arg_hint: "",
+        help_en: "show recent conversation history",
+        help_zh: "显示最近的会话历史",
+    },
+    ReplCommandSpec {
+        name: "/clear",
+        command: ReplSlashCommand::Clear,
+        arg_hint: "",
+        help_en: "clear the screen",
+        help_zh: "清屏",
+    },
+    ReplCommandSpec {
+        name: "/help",
+        command: ReplSlashCommand::Help,
+        arg_hint: "",
+        help_en: "show this help",
+        help_zh: "显示此帮助",
+    },
+    ReplCommandSpec {
+        name: "/exit",
+        command: ReplSlashCommand::Exit,
+        arg_hint: "",
+        help_en: "leave REPL",
+        help_zh: "退出 REPL",
+    },
+];
+
+fn repl_command_spec(command: ReplSlashCommand) -> &'static ReplCommandSpec {
+    REPL_COMMAND_TABLE
+        .iter()
+        .find(|spec| spec.command == command)
+        .expect("every ReplSlashCommand has a table entry")
+}
+
+/// Parsed REPL input: plain chat, a resolved slash command with its argument
+/// string, or an unknown/ambiguous slash command.
+enum ReplInput<'a> {
+    Chat,
+    Slash(ReplSlashCommand, &'a str),
+    UnknownSlash(&'a str),
+}
+
+fn parse_repl_input(input: &str) -> ReplInput<'_> {
+    if !input.starts_with('/') {
+        return ReplInput::Chat;
+    }
+    let (name, args) = split_repl_command(input);
+    let lowered = name.to_ascii_lowercase();
+    if let Some(spec) = REPL_COMMAND_TABLE
+        .iter()
+        .find(|spec| spec.name == lowered)
+    {
+        return ReplInput::Slash(spec.command, args);
+    }
+    let mut matches = REPL_COMMAND_TABLE
+        .iter()
+        .filter(|spec| spec.name.starts_with(&lowered));
+    match (matches.next(), matches.next()) {
+        (Some(spec), None) => ReplInput::Slash(spec.command, args),
+        _ => ReplInput::UnknownSlash(name),
+    }
+}
+
+fn repl_commands() -> Vec<&'static str> {
+    REPL_COMMAND_TABLE.iter().map(|spec| spec.name).collect()
 }
 
 fn repl_command_suggestions(input: &str) -> Vec<&'static str> {
@@ -6851,7 +9306,22 @@ mod repl_input_tests {
                 no_open: true,
                 password: None,
                 password_file: None,
+                stop: false,
+                status: false,
+                public: false,
             }))
+        ));
+
+        let cli = parse_args(["miyu", "web", "--status"].map(OsString::from).to_vec()).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs { status: true, .. }))
+        ));
+
+        let cli = parse_args(["miyu", "web", "--stop"].map(OsString::from).to_vec()).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs { stop: true, .. }))
         ));
 
         let cli = parse_args(["miyu", "web"].map(OsString::from).to_vec()).unwrap();
@@ -6862,6 +9332,9 @@ mod repl_input_tests {
                 no_open: false,
                 password: None,
                 password_file: None,
+                stop: false,
+                status: false,
+                public: false,
             }))
         ));
 
@@ -7556,7 +10029,7 @@ mod repl_input_tests {
     fn command_suggestions_are_prefixed_and_truncated() {
         let suggestions = repl_command_suggestions("/");
         let line = repl_command_suggestions_line(&suggestions, 24);
-        assert!(line.starts_with("/models"));
+        assert!(line.starts_with("/new"));
         assert!(visible_width(&line) <= 24);
 
         let line = repl_command_suggestions_line(&["/compact"], 40);
@@ -7608,6 +10081,47 @@ mod repl_input_tests {
         assert_eq!(resolve_repl_command("/compa"), "/compact");
         assert_eq!(resolve_repl_command("/co"), "/co");
         assert_eq!(resolve_repl_command("hello"), "hello");
+    }
+
+    #[test]
+    fn parse_repl_input_dispatches_by_table() {
+        assert!(matches!(parse_repl_input("hello"), ReplInput::Chat));
+        assert!(matches!(
+            parse_repl_input("/models"),
+            ReplInput::Slash(ReplSlashCommand::Models, "")
+        ));
+        // Unique prefix resolves.
+        assert!(matches!(
+            parse_repl_input("/compa"),
+            ReplInput::Slash(ReplSlashCommand::Compact, "")
+        ));
+        // Exact match wins over ambiguous prefixes of longer names.
+        assert!(matches!(
+            parse_repl_input("/reset all"),
+            ReplInput::Slash(ReplSlashCommand::Reset, "all")
+        ));
+        // Case-insensitive.
+        assert!(matches!(
+            parse_repl_input("/POP 3"),
+            ReplInput::Slash(ReplSlashCommand::Pop, "3")
+        ));
+        // Ambiguous prefix stays unknown.
+        assert!(matches!(
+            parse_repl_input("/co"),
+            ReplInput::UnknownSlash("/co")
+        ));
+        assert!(matches!(
+            parse_repl_input("/nope"),
+            ReplInput::UnknownSlash("/nope")
+        ));
+    }
+
+    #[test]
+    fn every_repl_slash_command_has_a_table_entry() {
+        // repl_command_spec panics on a missing entry; touch every variant.
+        for spec in REPL_COMMAND_TABLE {
+            assert_eq!(repl_command_spec(spec.command).command, spec.command);
+        }
     }
 
     #[test]
@@ -8052,6 +10566,11 @@ fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
         memory.clear_pending_events()?;
     }
     tools::clear_aur_review_state(paths)?;
+    print_reset_message(all);
+    Ok(())
+}
+
+fn print_reset_message(all: bool) {
     let message = if all {
         t(
             "cleared current conversation history and all memory",
@@ -8061,7 +10580,6 @@ fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
         t("cleared current conversation history", "已清空当前会话历史")
     };
     println!("\x1b[2m{message}\x1b[0m\n");
-    Ok(())
 }
 
 fn join_message(parts: Vec<String>) -> String {

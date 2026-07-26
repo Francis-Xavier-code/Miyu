@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 type Rank = u32;
-type RankMap = FxHashMap<Box<[u8]>, Rank>;
+type RankMap = FxHashMap<&'static [u8], Rank>;
 const MAX_NUM_THREADS: usize = 128;
 const O200K_PATTERN: &str = concat!(
     r#"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"#,
@@ -50,7 +50,7 @@ impl CoreBpeCounter {
             cursor += 2;
             let end = cursor + len;
             ensure!(end <= data.len(), "truncated o200k token payload");
-            encoder.insert(Box::<[u8]>::from(&data[cursor..end]), rank);
+            encoder.insert(&data[cursor..end], rank);
             cursor = end;
             rank += 1;
         }

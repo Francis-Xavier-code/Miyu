@@ -52,17 +52,31 @@ pub(super) fn execute(args: Value, registry: &ToolRegistry) -> Result<String> {
         .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    let (loaded_targets, loaded_tools) =
-        registry.expand_load_targets(&requested, &BTreeSet::new())?;
+    let (loaded_targets, loaded_tools, skipped) =
+        registry.expand_load_targets(&requested, &BTreeSet::new());
 
     if loaded_tools.is_empty() {
-        bail!("names must contain at least one loadable tool, script, or group");
+        let already_available = skipped
+            .iter()
+            .any(|note| note.contains("already available") || note.contains("already loaded"));
+        if !already_available {
+            bail!(
+                "no loadable tool, script, or group in names. {}",
+                skipped.join("; ")
+            );
+        }
     }
 
+    let note = if loaded_tools.is_empty() {
+        "nothing to load; every requested tool is already available"
+    } else {
+        "loaded"
+    };
     Ok(serde_json::to_string_pretty(&json!({
         "loaded_targets": loaded_targets,
         "loaded_tools": loaded_tools,
-        "note": "loaded"
+        "skipped": skipped,
+        "note": note,
     }))?)
 }
 
@@ -157,6 +171,59 @@ mod tests {
             .unwrap();
         assert!(output.contains("lazy_script"));
         assert!(output.contains("\"loaded_tools\""));
+    }
+
+    #[tokio::test]
+    async fn always_loaded_names_do_not_fail_the_whole_request() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        registry.register(
+            ToolSpec::new(
+                "web_search",
+                "Always-on web search",
+                json!({"type":"object","properties":{}}),
+                |_| async { Ok(String::new()) },
+            )
+            .with_always_loaded(true),
+        );
+        registry.register(
+            ToolSpec::new(
+                "protondb_query",
+                "Query ProtonDB compatibility",
+                json!({"type":"object","properties":{}}),
+                |_| async { Ok(String::new()) },
+            )
+            .with_always_loaded(false)
+            .with_load_policy(LoadPolicy::Group)
+            .with_groups(vec!["gaming".to_string()]),
+        );
+
+        // Mixing an always-loaded tool with a valid group must still load
+        // the group and merely note the redundant name.
+        let output = registry
+            .call("load_tools", r#"{"names":["group:gaming","web_search"]}"#)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["loaded_tools"][0], "protondb_query");
+        assert!(value["skipped"][0]
+            .as_str()
+            .unwrap()
+            .contains("already available"));
+
+        // Only-already-available requests succeed with an explanatory note.
+        let output = registry
+            .call("load_tools", r#"{"names":["web_search"]}"#)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["note"], "nothing to load; every requested tool is already available");
+
+        // Entirely unknown names still error so the model can correct itself.
+        assert!(registry
+            .call("load_tools", r#"{"names":["no_such_tool"]}"#)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

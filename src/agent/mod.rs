@@ -283,11 +283,11 @@ impl Agent {
         tools: ToolRegistry,
         mode: AgentMode,
     ) -> Result<Self> {
+        // Construction is side-effect free (aside from idempotent memory
+        // init) so concurrent turns can each build their own Agent; startup
+        // maintenance (prompt-change reset, stale-turn recovery) lives in
+        // `prepare_for_turn`.
         let base_system_prompt = config.system_prompt(paths)?;
-        if matches!(mode, AgentMode::Normal | AgentMode::Chat) {
-            state.reset_if_prompt_changed(&base_system_prompt)?;
-            state.recover_stale_turns()?;
-        }
         let system_prompt = with_mode_reminder(base_system_prompt, mode);
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
@@ -321,6 +321,16 @@ impl Agent {
         Ok(())
     }
 
+    /// Rebuilds the system prompt for the current mode without running
+    /// turn-entry maintenance. Used for mid-turn mode switches, where
+    /// `reset_if_prompt_changed` must never fire (it would wipe the very
+    /// turn that is running).
+    fn refresh_system_prompt(&mut self) -> Result<()> {
+        let base_system_prompt = self.config.system_prompt(&self.paths)?;
+        self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
+        Ok(())
+    }
+
     pub fn mode(&self) -> AgentMode {
         self.mode
     }
@@ -337,6 +347,10 @@ impl Agent {
             tokens = tokens.saturating_add(self.tool_definition_tokens(&loaded_tools) as u64);
         }
         Ok(tokens)
+    }
+
+    pub fn conversation_usage_tokens(&self) -> Result<u64> {
+        Ok(self.state.usage_snapshot()?.conversation_tokens)
     }
 
     fn tool_definition_tokens(&self, loaded_tools: &BTreeSet<String>) -> usize {
@@ -371,7 +385,7 @@ impl Agent {
         let mode = control.mode();
         if self.mode != mode {
             self.switch_mode(mode, control.tools(mode));
-            self.prepare_for_turn()?;
+            self.refresh_system_prompt()?;
         }
         replace_request_mode_context(messages, &self.system_prompt, mode);
 
@@ -2402,9 +2416,9 @@ fn parse_reasoning_title_chunks<'a>(
 }
 
 fn runtime_context(mode: AgentMode) -> String {
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let cwd = crate::tools::workspace::effective_workdir()
+        .display()
+        .to_string();
     if mode == AgentMode::Chat {
         format!(
             "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",

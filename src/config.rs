@@ -1,6 +1,6 @@
 use crate::default_models::{
-    OPENCODE_DEFAULT_CHAT_MODEL, OPENCODE_DEFAULT_CONTEXT_WINDOW, OPENCODE_DEFAULT_VISION_MODEL,
-    OPENCODE_PROVIDER_ID, OPENCODE_ZEN_BASE_URL,
+    OPENCODE_DEFAULT_CHAT_MODEL, OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID,
+    OPENCODE_ZEN_BASE_URL,
 };
 use crate::paths::MiyuPaths;
 use crate::prompts::default_system_prompt;
@@ -215,6 +215,8 @@ pub struct ContextConfig {
     pub trim_batch_ratio: f32,
     #[serde(default = "default_on_overflow")]
     pub on_overflow: String,
+    #[serde(default = "default_context_window")]
+    pub default_context_window: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,17 +919,13 @@ impl Default for ContextConfig {
             trim_at_ratio: default_trim_at_ratio(),
             trim_batch_ratio: default_trim_batch_ratio(),
             on_overflow: default_on_overflow(),
+            default_context_window: default_context_window(),
         }
     }
 }
 
 impl ProviderConfig {
     pub fn default_opencodezen() -> Self {
-        let mut model_context_window = HashMap::new();
-        model_context_window.insert(
-            OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
-            OPENCODE_DEFAULT_CONTEXT_WINDOW,
-        );
         Self {
             id: OPENCODE_PROVIDER_ID.to_string(),
             display_name: "opencode Zen".to_string(),
@@ -935,7 +933,7 @@ impl ProviderConfig {
             protocol: default_provider_protocol(),
             api_key: None,
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
-            model_context_window,
+            model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
             default_model: OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
             timeout_seconds: default_timeout(),
@@ -1758,12 +1756,12 @@ impl AppConfig {
         {
             return Ok(Some(window));
         }
-        if provider.id == OPENCODE_PROVIDER_ID && model == OPENCODE_DEFAULT_CHAT_MODEL {
-            return Ok(Some(OPENCODE_DEFAULT_CONTEXT_WINDOW));
-        }
         Ok(crate::models_cache::context_window(provider_id, model)
             .map(|w| w as usize)
-            .or_else(|| default_context_window_for_provider_model(provider, model)))
+            .or_else(|| {
+                (self.context.default_context_window > 0)
+                    .then_some(self.context.default_context_window)
+            }))
     }
 
     pub fn system_prompt(&self, paths: &MiyuPaths) -> Result<String> {
@@ -1841,6 +1839,12 @@ impl AppConfig {
             .skills_dir
             .join("personas")
             .join(persona_scope_name(persona))
+    }
+
+    /// Sanitized scope name of the active persona; also the namespace key for
+    /// sessions and per-persona state directories.
+    pub fn active_persona_scope(&self) -> String {
+        persona_scope_name(self.prompt.active_persona.trim())
     }
 
     pub fn active_persona_memory_data_dir(&self, paths: &MiyuPaths) -> PathBuf {
@@ -2002,28 +2006,12 @@ fn default_anthropic_max_tokens() -> u32 {
     4096
 }
 
-fn is_default_anthropic_max_tokens(value: &u32) -> bool {
-    *value == default_anthropic_max_tokens()
+fn default_context_window() -> usize {
+    168_000
 }
 
-fn default_context_window_for_provider_model(
-    provider: &ProviderConfig,
-    model: &str,
-) -> Option<usize> {
-    let provider_id = provider.id.to_ascii_lowercase();
-    let display_name = provider.display_name.to_ascii_lowercase();
-    let base_url = provider.base_url.to_ascii_lowercase();
-    let model = model.to_ascii_lowercase();
-    let is_anthropic = provider_id == "anthropic"
-        || provider_id.contains("anthropic")
-        || display_name.contains("anthropic")
-        || base_url.contains("api.anthropic.com")
-        || base_url.contains("anthropic.com/v1");
-
-    if is_anthropic && model.starts_with("claude-") {
-        return Some(200_000);
-    }
-    None
+fn is_default_anthropic_max_tokens(value: &u32) -> bool {
+    *value == default_anthropic_max_tokens()
 }
 
 fn default_provider_protocol() -> String {
@@ -2500,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_provider_uses_family_context_window_fallback() {
+    fn default_anthropic_provider_uses_the_global_context_window_default() {
         let mut config = AppConfig::default();
         config.active_provider = "anthropic".to_string();
         let provider = config
@@ -2511,11 +2499,11 @@ mod tests {
         provider.models = vec!["claude-sonnet-4-5".to_string()];
         provider.default_model = "claude-sonnet-4-5".to_string();
 
-        assert_eq!(config.active_context_window().unwrap(), Some(200_000));
+        assert_eq!(config.active_context_window().unwrap(), Some(168_000));
     }
 
     #[test]
-    fn mixed_context_window_requires_every_active_model() {
+    fn mixed_context_window_uses_the_global_default_when_model_metadata_is_missing() {
         let mut config = AppConfig::default();
         let provider = &mut config.providers[0];
         let provider_id = provider.id.clone();
@@ -2538,7 +2526,7 @@ mod tests {
             },
         ]);
 
-        assert_eq!(config.active_context_window().unwrap(), None);
+        assert_eq!(config.active_context_window().unwrap(), Some(168_000));
         config.providers[0]
             .model_context_window
             .insert("miyu-unknown-window-model".to_string(), 128_000);

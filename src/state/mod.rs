@@ -1,4 +1,5 @@
 mod conversation_db;
+mod migrations;
 mod usage;
 
 use crate::llm::Usage;
@@ -15,7 +16,8 @@ use std::sync::Arc;
 #[allow(unused_imports)]
 pub use conversation_db::{
     interrupted_text, pending_placeholder, ConversationDb, ImageAsset, ImageAssetData,
-    QueuedPrompt, QueuedPromptAttachment, Turn, TurnFollowup, TurnStatus,
+    QueuedPrompt, QueuedPromptAttachment, SessionOverview, SessionRecord, Turn, TurnFollowup,
+    TurnStatus,
 };
 pub use usage::UsageSnapshot;
 
@@ -30,6 +32,9 @@ pub struct RunningTurnQueueTarget {
 pub struct StateStore {
     state_dir: PathBuf,
     conv_db: Arc<ConversationDb>,
+    /// Active session. Shared across clones and swappable at runtime so a
+    /// long-lived daemon switches every holder atomically.
+    session_id: Arc<std::sync::RwLock<Arc<str>>>,
     queue_session_id: Arc<str>,
     queue_owner_pid: u32,
 }
@@ -38,6 +43,9 @@ impl StateStore {
     pub fn new(paths: &MiyuPaths) -> Result<Self> {
         let state_dir = paths.state_dir.clone();
         let conv_db = Arc::new(ConversationDb::open(&state_dir)?);
+        let session_id = Arc::new(std::sync::RwLock::new(Arc::<str>::from(
+            conv_db.resolve_current_session()?,
+        )));
         let queue_owner_pid = std::process::id();
         let queue_session_id: Arc<str> = format!(
             "queue_{}_{}_{}",
@@ -53,15 +61,132 @@ impl StateStore {
         Ok(Self {
             state_dir,
             conv_db,
+            session_id,
             queue_session_id,
             queue_owner_pid,
         })
     }
 
+    pub fn session_id(&self) -> Arc<str> {
+        self.session_id.read().unwrap().clone()
+    }
+
+    fn session(&self) -> Arc<str> {
+        self.session_id.read().unwrap().clone()
+    }
+
+    /// Points this store (and every clone sharing it) at another session.
+    /// The caller is responsible for persisting the current-session pointer.
+    pub fn adopt_session(&self, session_id: &str) {
+        *self.session_id.write().unwrap() = session_id.into();
+    }
+
+    /// A clone pinned to the given session: it shares the database but holds
+    /// its own session pointer, unaffected by later `switch_session` /
+    /// `adopt_session` calls on other clones. Used by concurrently running
+    /// turns so each keeps writing to the session it started in.
+    pub fn pinned(&self, session_id: &str) -> Self {
+        Self {
+            state_dir: self.state_dir.clone(),
+            conv_db: self.conv_db.clone(),
+            session_id: Arc::new(std::sync::RwLock::new(session_id.into())),
+            queue_session_id: self.queue_session_id.clone(),
+            queue_owner_pid: self.queue_owner_pid,
+        }
+    }
+
+    /// Like [`pinned`], but with a fresh queue identity so concurrently
+    /// running turns in the same session never consume each other's queued
+    /// follow-up prompts. Callers should `discard_queued_prompts()` when the
+    /// turn finishes.
+    pub fn pinned_for_turn(&self, session_id: &str) -> Self {
+        let mut store = self.pinned(session_id);
+        store.queue_session_id = format!(
+            "queue_{}_{}_{}",
+            store.queue_owner_pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+            rand::random::<u64>()
+        )
+        .into();
+        store
+    }
+
+    /// Whether any session has a running turn (global admin guard).
+    pub fn has_any_running_turns(&self) -> Result<bool> {
+        self.conv_db.has_any_running_turns()
+    }
+
+    /// Switches the active session and persists the current-session pointer.
+    pub fn switch_session(&self, session_id: &str) -> Result<()> {
+        self.conv_db.set_current_session(session_id)?;
+        self.adopt_session(session_id);
+        Ok(())
+    }
+
+    /// Claims persona-less sessions (schema-v2 migrated rows) for the active
+    /// persona scope.
+    pub fn adopt_sessions_for_persona(&self, persona: &str) -> Result<()> {
+        self.conv_db.adopt_sessions_for_persona(persona)
+    }
+
+    pub fn session_record(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        self.conv_db.session_record(session_id)
+    }
+
+    pub fn list_sessions(
+        &self,
+        persona: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionOverview>> {
+        self.conv_db.list_sessions(persona, include_archived)
+    }
+
+    pub fn create_session(
+        &self,
+        persona: &str,
+        name: &str,
+        kind: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<SessionRecord> {
+        self.conv_db
+            .create_session(persona, name, kind, parent_session_id)
+    }
+
+    pub fn rename_session(&self, session_id: &str, name: &str) -> Result<()> {
+        self.conv_db.rename_session(session_id, name)
+    }
+
+    pub fn set_session_workspace(&self, session_id: &str, workspace: Option<&str>) -> Result<()> {
+        self.conv_db.set_session_workspace(session_id, workspace)
+    }
+
+    pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        self.conv_db.set_session_archived(session_id, archived)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.conv_db.delete_session(session_id)
+    }
+
+    pub fn touch_session(&self, session_id: &str) -> Result<()> {
+        self.conv_db.touch_session(session_id)
+    }
+
+    pub fn find_session_by_name(
+        &self,
+        persona: &str,
+        name: &str,
+    ) -> Result<Option<SessionRecord>> {
+        self.conv_db.find_session_by_name(persona, name)
+    }
+
     pub fn init_files(&self) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
         if !self.usage_file().exists() {
-            std::fs::write(self.usage_file(), "{\n  \"requests\": 0,\n  \"prompt_tokens\": 0,\n  \"completion_tokens\": 0,\n  \"total_tokens\": 0\n}\n")?;
+            std::fs::write(self.usage_file(), "{\n  \"requests\": 0,\n  \"prompt_tokens\": 0,\n  \"completion_tokens\": 0,\n  \"total_tokens\": 0,\n  \"conversation_tokens\": 0\n}\n")?;
         }
         if !self.profile_file().exists() {
             std::fs::write(self.profile_file(), "# Miyu Profile\n\n")?;
@@ -75,7 +200,7 @@ impl StateStore {
         let file = self.prompt_fingerprint_file();
         let previous = std::fs::read_to_string(&file).unwrap_or_default();
         if previous.trim() != fingerprint {
-            self.conv_db.reset_history()?;
+            self.conv_db.reset_history(&self.session())?;
             self.clear_last_usage()?;
             std::fs::write(file, format!("{fingerprint}\n"))?;
         }
@@ -88,8 +213,18 @@ impl StateStore {
     }
 
     pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
-        self.conv_db
-            .start_turn(turn_id, user_content, owner_pid, &self.queue_session_id)
+        // Record the ambient turn workspace (if any) so the turn row captures
+        // where its tools operated; NULL outside a turn workspace scope.
+        let workspace = crate::tools::workspace::try_workspace()
+            .map(|path| path.display().to_string());
+        self.conv_db.start_turn(
+            &self.session(),
+            turn_id,
+            user_content,
+            owner_pid,
+            &self.queue_session_id,
+            workspace.as_deref(),
+        )
     }
 
     #[allow(dead_code)]
@@ -222,6 +357,7 @@ impl StateStore {
         attachments: &[QueuedPromptAttachment],
     ) -> Result<QueuedPrompt> {
         self.conv_db.enqueue_prompt(
+            &self.session(),
             prompt_id,
             content,
             display_content,
@@ -232,7 +368,7 @@ impl StateStore {
     }
 
     pub fn running_turn_queue_target(&self) -> Result<Option<RunningTurnQueueTarget>> {
-        Ok(self.conv_db.running_turn_queue_target()?.map(
+        Ok(self.conv_db.running_turn_queue_target(&self.session())?.map(
             |(turn_id, queue_session_id, owner_pid)| RunningTurnQueueTarget {
                 turn_id,
                 queue_session_id,
@@ -257,6 +393,7 @@ impl StateStore {
             .owner_pid
             .context("running turn does not expose an owner process")?;
         self.conv_db.enqueue_prompt(
+            &self.session(),
             prompt_id,
             content,
             display_content,
@@ -273,7 +410,8 @@ impl StateStore {
         let Some(queue_session_id) = target.queue_session_id.as_deref() else {
             return Ok(Vec::new());
         };
-        self.conv_db.load_queued_prompts(queue_session_id)
+        self.conv_db
+            .load_queued_prompts(&self.session(), queue_session_id)
     }
 
     pub fn remove_queued_prompt_for_target(
@@ -285,11 +423,12 @@ impl StateStore {
             return Ok(false);
         };
         self.conv_db
-            .remove_queued_prompt(prompt_id, queue_session_id)
+            .remove_queued_prompt(&self.session(), prompt_id, queue_session_id)
     }
 
     pub fn load_queued_prompts(&self) -> Result<Vec<QueuedPrompt>> {
-        self.conv_db.load_queued_prompts(&self.queue_session_id)
+        self.conv_db
+            .load_queued_prompts(&self.session(), &self.queue_session_id)
     }
 
     #[cfg(test)]
@@ -301,6 +440,7 @@ impl StateStore {
         preceding_assistant_reasoning: Option<&str>,
     ) -> Result<()> {
         self.conv_db.consume_queued_prompts(
+            &self.session(),
             turn_id,
             prompts,
             preceding_assistant_content,
@@ -321,6 +461,7 @@ impl StateStore {
         preceding_assistant_model: Option<&str>,
     ) -> Result<()> {
         self.conv_db.consume_queued_prompts(
+            &self.session(),
             turn_id,
             prompts,
             preceding_assistant_content,
@@ -332,20 +473,23 @@ impl StateStore {
     }
 
     pub fn discard_queued_prompts(&self) -> Result<usize> {
-        self.conv_db.discard_queued_prompts(&self.queue_session_id)
+        self.conv_db
+            .discard_queued_prompts(&self.session(), &self.queue_session_id)
     }
 
     pub fn remove_queued_prompt(&self, prompt_id: &str) -> Result<bool> {
         self.conv_db
-            .remove_queued_prompt(prompt_id, &self.queue_session_id)
+            .remove_queued_prompt(&self.session(), prompt_id, &self.queue_session_id)
     }
 
     pub fn load_session_loaded_tools(&self) -> Result<BTreeSet<String>> {
-        self.conv_db.load_session_loaded_items("tool")
+        self.conv_db
+            .load_session_loaded_items(&self.session(), "tool")
     }
 
     pub fn load_session_loaded_tools_with_sources(&self) -> Result<Vec<(String, Option<String>)>> {
-        self.conv_db.load_session_loaded_items_with_sources("tool")
+        self.conv_db
+            .load_session_loaded_items_with_sources(&self.session(), "tool")
     }
 
     pub fn add_session_loaded_tools(
@@ -354,7 +498,7 @@ impl StateStore {
         source_turn_id: Option<&str>,
     ) -> Result<()> {
         self.conv_db
-            .add_session_loaded_items("tool", names, source_turn_id)?;
+            .add_session_loaded_items(&self.session(), "tool", names, source_turn_id)?;
         Ok(())
     }
 
@@ -364,7 +508,7 @@ impl StateStore {
         source_turn_id: Option<&str>,
     ) -> Result<()> {
         self.conv_db
-            .add_session_loaded_items("target", names, source_turn_id)?;
+            .add_session_loaded_items(&self.session(), "target", names, source_turn_id)?;
         Ok(())
     }
 
@@ -375,7 +519,7 @@ impl StateStore {
     pub fn history(&self, limit: usize) -> Result<Vec<StoredConversationEntry>> {
         let turns = self
             .conv_db
-            .load_turns()?
+            .load_turns(&self.session())?
             .into_iter()
             .filter(|turn| !turn.is_summary)
             .collect();
@@ -387,7 +531,7 @@ impl StateStore {
     pub fn load_conversation(&self) -> Result<Vec<StoredConversationEntry>> {
         let turns = self
             .conv_db
-            .load_turns()?
+            .load_turns(&self.session())?
             .into_iter()
             .filter(|turn| !turn.is_summary)
             .collect();
@@ -396,25 +540,27 @@ impl StateStore {
 
     #[allow(dead_code)]
     pub fn load_turns(&self) -> Result<Vec<Turn>> {
-        self.conv_db.load_turns()
+        self.conv_db.load_turns(&self.session())
     }
 
     #[allow(dead_code)]
     pub fn load_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
-        self.conv_db.load_turns_excluding(exclude_turn_id)
+        self.conv_db
+            .load_turns_excluding(&self.session(), exclude_turn_id)
     }
 
     pub fn load_visible_turns(&self) -> Result<Vec<Turn>> {
-        self.conv_db.load_visible_turns()
+        self.conv_db.load_visible_turns(&self.session())
     }
 
     pub fn load_visible_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
-        self.conv_db.load_visible_turns_excluding(exclude_turn_id)
+        self.conv_db
+            .load_visible_turns_excluding(&self.session(), exclude_turn_id)
     }
 
     #[allow(dead_code)]
     pub fn hide_turns_before_seq(&self, seq: i64) -> Result<usize> {
-        self.conv_db.hide_turns_before_seq(seq)
+        self.conv_db.hide_turns_before_seq(&self.session(), seq)
     }
 
     #[allow(dead_code)]
@@ -424,12 +570,16 @@ impl StateStore {
         token_total: Option<u64>,
         token_usage_estimated: bool,
     ) -> Result<()> {
-        self.conv_db
-            .insert_summary_turn(summary, token_total, token_usage_estimated)
+        self.conv_db.insert_summary_turn(
+            &self.session(),
+            summary,
+            token_total,
+            token_usage_estimated,
+        )
     }
 
     pub fn load_last_summary(&self) -> Result<Option<Turn>> {
-        self.conv_db.load_last_summary()
+        self.conv_db.load_last_summary(&self.session())
     }
 
     pub fn replace_visible_with_summary(
@@ -441,6 +591,7 @@ impl StateStore {
         token_usage_estimated: bool,
     ) -> Result<()> {
         self.conv_db.replace_visible_with_summary(
+            &self.session(),
             last_seq,
             visible_turn_ids,
             summary,
@@ -450,11 +601,12 @@ impl StateStore {
     }
 
     pub fn oldest_evictable_visible_turns(&self, count: usize) -> Result<Vec<Turn>> {
-        self.conv_db.oldest_evictable_visible_turns(count)
+        self.conv_db
+            .oldest_evictable_visible_turns(&self.session(), count)
     }
 
     pub fn delete_visible_turns(&self, turn_ids: &[String]) -> Result<usize> {
-        self.conv_db.delete_visible_turns(turn_ids)
+        self.conv_db.delete_visible_turns(&self.session(), turn_ids)
     }
 
     pub fn delete_visible_turns_checked(
@@ -463,7 +615,7 @@ impl StateStore {
         expected_loaded_tools: Option<&[(String, Option<String>)]>,
     ) -> Result<usize> {
         self.conv_db
-            .delete_visible_turns_checked(turn_ids, expected_loaded_tools)
+            .delete_visible_turns_checked(&self.session(), turn_ids, expected_loaded_tools)
     }
 
     pub fn archive_and_delete_visible_turns(
@@ -474,6 +626,7 @@ impl StateStore {
         expected_loaded_tools: Option<&[(String, Option<String>)]>,
     ) -> Result<usize> {
         self.conv_db.archive_and_delete_visible_turns(
+            &self.session(),
             archive_db,
             turns,
             turn_ids,
@@ -482,12 +635,12 @@ impl StateStore {
     }
 
     pub fn reset_conversation(&self) -> Result<()> {
-        self.conv_db.reset()?;
-        self.clear_last_usage()
+        self.conv_db.reset(&self.session())?;
+        usage::reset_conversation(&self.usage_file())
     }
 
     pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
-        self.conv_db.undo_last_turn()
+        self.conv_db.undo_last_turn(&self.session())
     }
 
     pub fn add_usage(&self, usage: &Usage) -> Result<()> {
@@ -511,24 +664,25 @@ impl StateStore {
 
     #[allow(dead_code)]
     pub fn has_running_turns(&self) -> Result<bool> {
-        self.conv_db.has_running_turns()
+        self.conv_db.has_running_turns(&self.session())
     }
 
     #[allow(dead_code)]
     pub fn running_turn_summaries(&self) -> Result<Vec<String>> {
-        self.conv_db.running_turn_summaries()
+        self.conv_db.running_turn_summaries(&self.session())
     }
 
     #[allow(dead_code)]
     pub fn running_turn_summaries_excluding(&self, exclude_turn_id: &str) -> Result<Vec<String>> {
         self.conv_db
-            .running_turn_summaries_excluding(exclude_turn_id)
+            .running_turn_summaries_excluding(&self.session(), exclude_turn_id)
     }
 
     #[allow(dead_code)]
     pub fn migrate_from_jsonl(&self) -> Result<usize> {
         let jsonl_path = self.conversation_file();
-        self.conv_db.migrate_from_jsonl(&jsonl_path)
+        self.conv_db
+            .migrate_from_jsonl(&self.session(), &jsonl_path)
     }
 
     fn conversation_file(&self) -> PathBuf {
@@ -938,6 +1092,70 @@ mod tests {
     }
 
     #[test]
+    fn session_crud_switching_and_persona_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        // Migrated/default rows start persona-less and are claimed on adoption.
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let default_id = store.session_id();
+        let default = store.session_record(&default_id).unwrap().unwrap();
+        assert_eq!(default.persona, "miyu");
+
+        store.start_turn("t1", "hello", std::process::id()).unwrap();
+        store.complete_turn("t1", "hi", None).unwrap();
+
+        let created = store
+            .create_session("miyu", "旅行计划", "user", None)
+            .unwrap();
+        store.switch_session(&created.session_id).unwrap();
+        assert_eq!(&*store.session_id(), created.session_id.as_str());
+        // The new session starts empty; history stays in the old session.
+        assert!(store.load_visible_turns().unwrap().is_empty());
+
+        // The pointer is persisted: an independent store resolves to it.
+        let reopened = StateStore::new(&test_paths(temp.path())).unwrap();
+        assert_eq!(&*reopened.session_id(), created.session_id.as_str());
+
+        let listed = store.list_sessions("miyu", false).unwrap();
+        assert_eq!(listed.len(), 2);
+        let default_overview = listed
+            .iter()
+            .find(|overview| overview.record.session_id == &*default_id)
+            .unwrap();
+        assert_eq!(default_overview.turn_count, 1);
+        assert_eq!(
+            default_overview.last_user_content.as_deref(),
+            Some("hello")
+        );
+
+        assert!(store
+            .find_session_by_name("miyu", "旅行计划")
+            .unwrap()
+            .is_some());
+        store.rename_session(&created.session_id, "新名字").unwrap();
+        assert!(store
+            .find_session_by_name("miyu", "旅行计划")
+            .unwrap()
+            .is_none());
+
+        store
+            .set_session_archived(&created.session_id, true)
+            .unwrap();
+        assert_eq!(store.list_sessions("miyu", false).unwrap().len(), 1);
+        assert_eq!(store.list_sessions("miyu", true).unwrap().len(), 2);
+
+        // Deleting a session cascades its turns away.
+        store.delete_session(&default_id).unwrap();
+        assert!(store.session_record(&default_id).unwrap().is_none());
+        assert_eq!(store.list_sessions("miyu", true).unwrap().len(), 1);
+
+        // A dangling pointer self-heals back to a default session.
+        store.delete_session(&created.session_id).unwrap();
+        let healed = StateStore::new(&test_paths(temp.path())).unwrap();
+        assert!(healed.session_record(&healed.session_id()).unwrap().is_some());
+    }
+
+    #[test]
     fn image_assets_persist_with_metadata_and_are_removed_with_history() {
         let (temp, store) = test_store();
         store.init_files().unwrap();
@@ -1064,6 +1282,26 @@ mod tests {
     }
 
     #[test]
+    fn independent_process_stores_can_append_and_read_running_turns() {
+        let (temp, first_store) = test_store();
+        let second_store = StateStore::new(&test_paths(temp.path())).unwrap();
+
+        first_store
+            .start_turn("first", "first prompt", std::process::id())
+            .unwrap();
+        second_store
+            .start_turn("second", "second prompt", std::process::id())
+            .unwrap();
+
+        let turns = first_store.load_visible_turns().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|turn| turn.status == TurnStatus::Running));
+        assert!(turns
+            .iter()
+            .all(|turn| turn.assistant_content == pending_placeholder()));
+    }
+
+    #[test]
     fn queued_prompts_survive_prompt_changes_but_not_a_new_store_session() {
         let (temp, store) = test_store();
         store.reset_if_prompt_changed("system prompt one").unwrap();
@@ -1099,6 +1337,7 @@ mod tests {
         store
             .conv_db
             .enqueue_prompt(
+                &store.session_id(),
                 "other-q",
                 "content",
                 "display",
@@ -1119,7 +1358,7 @@ mod tests {
         assert_eq!(
             store
                 .conv_db
-                .load_queued_prompts("other-session")
+                .load_queued_prompts(&store.session_id(), "other-session")
                 .unwrap()
                 .len(),
             1
@@ -1341,7 +1580,10 @@ mod tests {
             BTreeSet::from(["global_tool".to_string(), "kept_tool".to_string()])
         );
         assert_eq!(
-            store.conv_db.load_session_loaded_items("target").unwrap(),
+            store
+                .conv_db
+                .load_session_loaded_items(&store.session_id(), "target")
+                .unwrap(),
             BTreeSet::from(["kept_target".to_string()])
         );
     }

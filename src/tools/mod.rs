@@ -38,6 +38,7 @@ pub mod vision;
 mod weather;
 mod web;
 mod web_images;
+pub mod workspace;
 mod write;
 mod xuanxue;
 

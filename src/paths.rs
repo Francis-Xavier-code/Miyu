@@ -74,6 +74,25 @@ impl MiyuPaths {
         self.cache_dir.join("logs")
     }
 
+    pub fn runtime_dir(&self) -> PathBuf {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir.clone())
+            .join("miyu")
+    }
+
+    pub fn ipc_socket(&self) -> PathBuf {
+        self.runtime_dir().join("core.sock")
+    }
+
+    pub fn ipc_lock(&self) -> PathBuf {
+        self.runtime_dir().join("core.lock")
+    }
+
+    pub fn daemon_start_lock(&self) -> PathBuf {
+        self.runtime_dir().join("starter.lock")
+    }
+
     pub fn print(&self) {
         println!(
             "{}: {}",
