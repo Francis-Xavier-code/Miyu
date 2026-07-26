@@ -751,6 +751,7 @@ pub struct StreamRenderer {
     reasoning_started_at: Option<std::time::Instant>,
     reasoning_elapsed: Option<std::time::Duration>,
     tool_stats: BTreeMap<String, ToolStats>,
+    tool_seq: usize,
     readable_tool_names: bool,
     command_output_lines: usize,
     command_display: Option<CommandLiveDisplay>,
@@ -788,6 +789,7 @@ impl StreamRenderer {
             reasoning_started_at: None,
             reasoning_elapsed: None,
             tool_stats: BTreeMap::new(),
+            tool_seq: 0,
             readable_tool_names,
             command_output_lines,
             command_display: None,
@@ -1064,7 +1066,7 @@ impl StreamRenderer {
             return Ok(());
         }
         if is_subagent_tool(name) && self.tool_call_mode != ToolCallDisplayMode::Hidden {
-            let stats = self.tool_stats.entry(name.to_string()).or_default();
+            let stats = self.tool_stats_entry(name);
             stats.started_at = Some(std::time::Instant::now());
             stats.elapsed = None;
         }
@@ -1075,7 +1077,7 @@ impl StreamRenderer {
             write_tool_payload(stdout, t("args", "参数"), arguments)?;
             stdout.flush()?;
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
-            let stats = self.tool_stats.entry(name.to_string()).or_default();
+            let stats = self.tool_stats_entry(name);
             stats.calls += 1;
             stats.subject = tool_subject(name, arguments);
             self.ensure_tool_waiting_phase()?;
@@ -1119,7 +1121,7 @@ impl StreamRenderer {
             if write_todo_table(stdout, output)? {
                 stdout.flush()?;
                 if self.tool_call_mode == ToolCallDisplayMode::Summary {
-                    let stats = self.tool_stats.entry(name.to_string()).or_default();
+                    let stats = self.tool_stats_entry(name);
                     stats.ok += 1;
                     stats.progress = None;
                     self.tool_stats.clear();
@@ -1143,14 +1145,21 @@ impl StreamRenderer {
             stdout.flush()?;
             self.tool_stats.remove(name);
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
-            let stats = self.tool_stats.entry(name.to_string()).or_default();
+            let stats = self.tool_stats_entry(name);
             if ok {
                 stats.ok += 1;
             } else {
                 stats.error += 1;
             }
             stats.progress = None;
-            self.finalize_tools_summary()?;
+            if self.tool_stats.values().any(|stats| !stats.settled()) {
+                // Siblings still running (parallel subagents): freeze this
+                // tool's block in the live area; commit only when the whole
+                // batch settles.
+                self.update_tool_summary_display()?;
+            } else {
+                self.finalize_tools_summary()?;
+            }
         }
         Ok(())
     }
@@ -1207,10 +1216,7 @@ impl StreamRenderer {
                 writeln!(stdout, "{} {}: {text}", t("progress", "进度"), display_name)?;
                 stdout.flush()?;
             } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
-                self.tool_stats
-                    .entry(name.to_string())
-                    .or_default()
-                    .final_progress = Some(text.to_string());
+                self.tool_stats_entry(name).final_progress = Some(text.to_string());
                 self.update_tool_summary_display()?;
             }
             return Ok(());
@@ -1305,10 +1311,7 @@ impl StreamRenderer {
             )?;
             stdout.flush()?;
         } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
-            self.tool_stats
-                .entry(name.to_string())
-                .or_default()
-                .progress = Some(message.to_string());
+            self.tool_stats_entry(name).progress = Some(message.to_string());
             self.update_tool_summary_display()?;
         }
         Ok(())
@@ -1604,67 +1607,93 @@ impl StreamRenderer {
         self.reasoning_tokens = crate::token_estimate::estimate_tokens(&self.reasoning_text);
     }
 
-    fn tool_summary_text(&self) -> String {
-        let (phase, lines) = self.tool_summary_blocks(false);
-        if lines.is_empty() {
-            phase
-        } else {
-            format!("{phase}\n{}", lines.join("\n"))
-        }
+    /// Gets or creates a tool's stats entry, stamping first-seen order so
+    /// parallel blocks render in launch order rather than name order.
+    fn tool_stats_entry(&mut self, name: &str) -> &mut ToolStats {
+        self.tool_seq += 1;
+        let seq = self.tool_seq;
+        self.tool_stats
+            .entry(name.to_string())
+            .or_insert_with(|| ToolStats {
+                seq,
+                ..ToolStats::default()
+            })
     }
 
-    /// Composes the per-tool stacked blocks shared by the live spinner and
-    /// the committed summary: the first tool's header becomes the phase line;
-    /// every other tool contributes its own `~`-prefixed header, and each
-    /// tool its own subject/progress lines. `live` selects running progress
-    /// only; the committed variant prefers `final_progress` with a `✓`.
-    fn tool_summary_blocks(&self, live: bool) -> (String, Vec<String>) {
-        let mut phase = String::new();
-        let mut lines: Vec<String> = Vec::new();
-        for (index, (name, stats)) in self.tool_stats.iter().enumerate() {
-            let display = self.display_tool_name(name);
-            let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
-            if inline_tool_subject(name) {
-                if let Some(subject) = &stats.subject {
-                    header.push_str(" · ");
-                    header.push_str(subject);
-                }
+    /// Tools in first-seen order (stable for direct test inserts with seq 0).
+    fn ordered_tool_stats(&self) -> Vec<(&String, &ToolStats)> {
+        let mut entries: Vec<_> = self.tool_stats.iter().collect();
+        entries.sort_by_key(|(_, stats)| stats.seq);
+        entries
+    }
+
+    fn tool_summary_text(&self) -> String {
+        self.ordered_tool_stats()
+            .into_iter()
+            .map(|(name, stats)| self.tool_block_lines(name, stats, false).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Builds one tool's display block: a `~`-prefixed status header plus
+    /// its own subject/progress lines. In `live` mode a still-running tool's
+    /// header carries [`wait_spinner::BLOCK_MARKER`] so the spinner animates
+    /// it, and a settled tool freezes into its final `✓` stats in place. The
+    /// committed variant (`live == false`) prefers `final_progress` with `✓`.
+    fn tool_block_lines(&self, name: &str, stats: &ToolStats, live: bool) -> Vec<String> {
+        let display = self.display_tool_name(name);
+        let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
+        if inline_tool_subject(name) {
+            if let Some(subject) = &stats.subject {
+                header.push_str(" · ");
+                header.push_str(subject);
             }
-            if index == 0 {
-                phase = self.tool_summary_with_prefix(header);
-            } else {
-                lines.push(format!("~ {header}"));
-            }
-            if !inline_tool_subject(name) {
-                if let Some(subject) = &stats.subject {
+        }
+        let header = self.tool_summary_with_prefix(header);
+        let mut lines = Vec::new();
+        if live && !stats.settled() {
+            lines.push(format!("{}{header}", wait_spinner::BLOCK_MARKER));
+        } else {
+            lines.push(header);
+        }
+        if !inline_tool_subject(name) {
+            if let Some(subject) = &stats.subject {
+                // Subagent headers already carry the description — don't
+                // repeat it as a subject line.
+                if !lines[0].contains(subject.as_str()) {
                     lines.push(format!("↳ {subject}"));
                 }
             }
-            let progress_text = if live {
-                stats.progress.as_ref()
+        }
+        let (progress_text, is_final) = if live {
+            if stats.settled() {
+                (stats.final_progress.as_ref(), true)
             } else {
-                stats.final_progress.as_ref().or(stats.progress.as_ref())
-            };
-            let is_final_progress = !live && stats.final_progress.is_some();
-            let progress_prefix = if is_final_progress { "✓" } else { "↳" };
-            if let Some(message) = progress_text {
-                for line in message.lines().filter(|line| !line.trim().is_empty()) {
-                    let line = if is_final_progress {
-                        clip_progress_line_preserving_spaces(line, 120)
-                    } else {
-                        clip_progress_line(line, 120)
-                    };
-                    lines.push(format!("{progress_prefix} {line}"));
-                }
+                (stats.progress.as_ref(), false)
+            }
+        } else if stats.final_progress.is_some() {
+            (stats.final_progress.as_ref(), true)
+        } else {
+            (stats.progress.as_ref(), false)
+        };
+        let progress_prefix = if is_final { "✓" } else { "↳" };
+        if let Some(message) = progress_text {
+            for line in message.lines().filter(|line| !line.trim().is_empty()) {
+                let line = if is_final {
+                    clip_progress_line_preserving_spaces(line, 120)
+                } else {
+                    clip_progress_line(line, 120)
+                };
+                lines.push(format!("{progress_prefix} {line}"));
             }
         }
-        (phase, lines)
+        lines
     }
 
     fn tool_summary_header(&self) -> String {
         let parts = self
-            .tool_stats
-            .iter()
+            .ordered_tool_stats()
+            .into_iter()
             .map(|(name, stats)| {
                 let display = self.display_tool_name(name);
                 let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
@@ -1683,21 +1712,29 @@ impl StreamRenderer {
 
     /// Live status for the wait spinner. A single tool keeps the classic
     /// one-line phase + progress sub-block. Multiple tools (e.g. parallel
-    /// subagents) render as stacked blocks — each tool gets its own header
-    /// line followed by its own progress lines:
+    /// subagents) switch the spinner into block mode: the phase line is
+    /// empty and every tool renders as its own block — running blocks carry
+    /// their own animated glyph, settled blocks freeze into their final
+    /// stats, and blocks are separated by blank lines:
     ///
     /// ```text
-    /// ~ 子代理·任务A×1 运行中 · 3s
-    ///   ↳ 任务A
-    ///   ~ 子代理·任务B×1 运行中 · 3s
-    ///   ↳ 任务B进度
+    /// ⠋ ~ 子代理·任务A×1 运行中 · 3s
+    ///   ↳ 任务A进度
+    ///
+    ///   ~ 子代理·任务B×1 ok · 2s
+    ///   ✓ 工具调用 1 次
     /// ```
     fn tool_summary_live(&self) -> (String, Option<String>) {
         if self.tool_stats.len() <= 1 {
             return (self.tool_summary_header(), self.tool_summary_progress());
         }
-        let (phase, lines) = self.tool_summary_blocks(true);
-        (phase, (!lines.is_empty()).then(|| lines.join("\n")))
+        let blocks = self
+            .ordered_tool_stats()
+            .into_iter()
+            .map(|(name, stats)| self.tool_block_lines(name, stats, true).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (String::new(), Some(blocks))
     }
 
     fn tool_summary_with_prefix(&self, parts: String) -> String {
@@ -1715,11 +1752,15 @@ impl StreamRenderer {
     }
 
     fn tool_summary_progress(&self) -> Option<String> {
-        for (name, stats) in &self.tool_stats {
+        for (name, stats) in self.ordered_tool_stats() {
             let mut lines = Vec::new();
             if !inline_tool_subject(name) {
                 if let Some(subject) = &stats.subject {
-                    lines.push(format!("↳ {subject}"));
+                    // Skip subjects already shown in the header (subagent
+                    // descriptions are part of the display name).
+                    if !self.display_tool_name(name).contains(subject.as_str()) {
+                        lines.push(format!("↳ {subject}"));
+                    }
                 }
             }
             if let Some(message) = &stats.progress {
@@ -1829,9 +1870,11 @@ impl StreamRenderer {
         let (header, sub) = self.tool_summary_live();
         if self.plain || !self.live_summary {
             let summary = match &sub {
+                Some(s) if header.is_empty() => s.clone(),
                 Some(s) => format!("{header}\n{s}"),
                 None => header,
             };
+            let summary = summary.replace(wait_spinner::BLOCK_MARKER, "");
             if self.summary_line_active {
                 self.clear_summary_lines()?;
             }
@@ -1978,12 +2021,18 @@ struct ToolStats {
     final_progress: Option<String>,
     started_at: Option<std::time::Instant>,
     elapsed: Option<std::time::Duration>,
+    seq: usize,
 }
 
 impl ToolStats {
     fn elapsed(&self) -> Option<std::time::Duration> {
         self.elapsed
             .or_else(|| self.started_at.map(|started| started.elapsed()))
+    }
+
+    /// Every issued call has completed (ok or err) — nothing running.
+    fn settled(&self) -> bool {
+        self.calls > 0 && self.ok + self.error >= self.calls
     }
 }
 
@@ -4635,21 +4684,66 @@ mod tests {
             );
         }
         let (phase, sub) = renderer.tool_summary_live();
-        // First block header rides the spinner line…
-        assert!(phase.starts_with("~ "));
-        assert!(phase.contains("任务A"));
+        // Block mode: no shared phase line — every subagent is its own block.
+        assert_eq!(phase, "");
         let sub = sub.expect("stacked blocks present");
+        let marker = wait_spinner::BLOCK_MARKER;
         let lines: Vec<&str> = sub.lines().collect();
-        // …followed by its progress, then each other subagent's own header
-        // and progress lines, in order.
-        assert_eq!(lines[0], "↳ 任务A");
+        // Each running block header carries the spinner marker; its own
+        // progress follows; blank lines separate blocks. The redundant
+        // subject line (same as the description in the header) is dropped.
+        assert!(lines[0].starts_with(marker) && lines[0].contains("任务A"));
         assert_eq!(lines[1], "↳ 工具 #1: 运行命令");
-        assert!(lines[2].starts_with("~ ") && lines[2].contains("任务B"));
-        assert_eq!(lines[3], "↳ 任务B");
-        assert!(lines[4].starts_with("~ ") && lines[4].contains("任务C"));
-        assert_eq!(lines[5], "↳ 任务C");
+        assert_eq!(lines[2], "");
+        assert!(lines[3].starts_with(marker) && lines[3].contains("任务B"));
+        assert_eq!(lines[4], "");
+        assert!(lines[5].starts_with(marker) && lines[5].contains("任务C"));
         assert_eq!(lines[6], "↳ 正在搜索");
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn live_blocks_freeze_settled_subagents_in_place() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        renderer.tool_stats.insert(
+            "task:任务A".to_string(),
+            ToolStats {
+                calls: 1,
+                subject: Some("任务A".to_string()),
+                progress: Some("正在搜索".to_string()),
+                ..ToolStats::default()
+            },
+        );
+        renderer.tool_stats.insert(
+            "task:任务B".to_string(),
+            ToolStats {
+                calls: 1,
+                ok: 1,
+                subject: Some("任务B".to_string()),
+                final_progress: Some("工具调用 1 次".to_string()),
+                ..ToolStats::default()
+            },
+        );
+        let (phase, sub) = renderer.tool_summary_live();
+        assert_eq!(phase, "");
+        let sub = sub.expect("blocks present");
+        let marker = wait_spinner::BLOCK_MARKER;
+        let lines: Vec<&str> = sub.lines().collect();
+        // Running block keeps its animated marker + live progress…
+        assert!(lines[0].starts_with(marker) && lines[0].contains("任务A"));
+        assert_eq!(lines[1], "↳ 正在搜索");
+        assert_eq!(lines[2], "");
+        // …while the settled block loses the spinner and shows final stats.
+        assert!(lines[3].starts_with("~ ") && lines[3].contains("任务B"));
+        assert!(lines[3].contains("ok"));
+        assert_eq!(lines[4], "✓ 工具调用 1 次");
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
@@ -4681,14 +4775,12 @@ mod tests {
         );
         let text = renderer.tool_summary_text();
         let lines: Vec<&str> = text.lines().collect();
+        // Each block keeps its own "~" header; a blank line separates blocks.
         assert!(lines[0].starts_with("~ ") && lines[0].contains("任务A"));
-        assert_eq!(lines[1], "↳ 任务A");
-        // The second block keeps its own "~" header even in the committed
-        // summary (regression: it used to lose the prefix).
+        assert_eq!(lines[1], "");
         assert!(lines[2].starts_with("~ ") && lines[2].contains("任务B"));
-        assert_eq!(lines[3], "↳ 任务B");
-        assert_eq!(lines[4], "✓ 工具调用 1 次");
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[3], "✓ 工具调用 1 次");
+        assert_eq!(lines.len(), 4);
     }
 
     #[test]
