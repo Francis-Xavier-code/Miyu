@@ -1733,6 +1733,16 @@ impl StreamRenderer {
     }
 
     fn display_tool_name<'a>(&self, name: &'a str) -> String {
+        // Subagents keep their per-call description so parallel task calls
+        // show as separate lines: "子代理·<描述>".
+        if let Some(description) = name.strip_prefix("task:") {
+            let base = if self.readable_tool_names {
+                readable_tool_name("task")
+            } else {
+                "task".to_string()
+            };
+            return format!("{base}·{description}");
+        }
         let name = tool_event_base_name(name);
         if self.readable_tool_names {
             readable_tool_name(name)
@@ -2047,6 +2057,7 @@ fn is_silent_tool(name: &str) -> bool {
 }
 
 fn is_subagent_tool(name: &str) -> bool {
+    let name = tool_event_base_name(name);
     matches!(
         name,
         "linux_input_method_diagnose"
@@ -2061,6 +2072,8 @@ fn tool_event_base_name(name: &str) -> &str {
         "load_skill"
     } else if name.starts_with("load_tools:") {
         "load_tools"
+    } else if name.starts_with("task:") {
+        "task"
     } else {
         name
     }

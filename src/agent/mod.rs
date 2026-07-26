@@ -2269,6 +2269,18 @@ fn tool_event_name(name: &str, arguments: &str) -> String {
             .filter(|tools| !tools.is_empty())
             .map(|tools| format!("load_tools:{tools}"))
             .unwrap_or_else(|| name.to_string()),
+        // Each subagent gets a distinct event name so concurrent task calls
+        // render as separate status lines instead of one aggregated counter.
+        "task" => args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(|description| {
+                let truncated: String = description.chars().take(18).collect();
+                format!("task:{truncated}")
+            })
+            .unwrap_or_else(|| name.to_string()),
         _ => name.to_string(),
     }
 }
