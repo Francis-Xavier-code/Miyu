@@ -95,8 +95,9 @@ body[data-theme="linen"] {
   --float-shadow: 0 18px 50px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.35);
   --shadow: var(--float-shadow);
 
-  /* 小签底色:身份用字形色,底色只表状态。暗色淡混,亮色(linen 块)浓混。 */
-  --chip-neutral: color-mix(in srgb, var(--surface-2) 85%, transparent);
+  /* 小签底色:身份用字形色,底色只表状态。中性签=页面背景色(白气泡上的「页面色凹陷」),
+     live/fail 暗色淡混、亮色(linen 块)浓混。 */
+  --chip-neutral: var(--app-bg);
   --chip-think: color-mix(in srgb, var(--accent-soft) 26%, transparent);
   --chip-live: color-mix(in srgb, var(--accent-soft) 48%, transparent);
   --chip-fail: color-mix(in srgb, var(--danger-soft) 55%, transparent);
@@ -148,7 +149,6 @@ body[data-theme="linen"] {
   --bubble-shadow: 0 1px 4px rgba(83, 64, 30, 0.07);
   --card-shadow: 0 2px 8px rgba(83, 64, 30, 0.06);
   --float-shadow: 0 18px 50px rgba(83, 64, 30, 0.2), 0 4px 12px rgba(83, 64, 30, 0.1);
-  --chip-neutral: color-mix(in srgb, var(--surface-2) 92%, transparent);
   --chip-think: color-mix(in srgb, var(--accent-soft) 55%, transparent);
   --chip-live: color-mix(in srgb, var(--accent-soft) 85%, transparent);
   --chip-fail: color-mix(in srgb, var(--danger-soft) 78%, transparent);
@@ -578,9 +578,16 @@ textarea:disabled {
   opacity: 0;
 }
 
+.session-menu-button {
+  align-self: center;
+}
+
 .session-menu-button .icon-slot {
+  display: grid;
+  place-items: center;
   width: 14px;
   height: 14px;
+  line-height: 1;
 }
 
 .session-item:hover .session-menu-button,
@@ -1322,6 +1329,12 @@ textarea:disabled {
   line-height: 1.75;
 }
 
+/* 只有小签(思考/工具)时气泡收缩贴合内容,正文/媒体出现后再撑满列宽 */
+.assistant-content.is-slim {
+  width: fit-content;
+  max-width: 100%;
+}
+
 .assistant-blocks {
   min-width: 0;
 }
@@ -2030,15 +2043,43 @@ textarea:disabled {
   display: none;
 }
 
-/* 展开:浅底面板 */
+/* 子代理(task)签:标题行只留 字形 + task:标题 + 状态 */
+.tool-card.is-task .tool-summary {
+  display: none;
+}
+
+/* 子代理实时进度面板:签正下方常驻(收起态也可见),tool.progress 原地刷新;
+   完成后隐藏(完整信息进展开详情),失败保留最后状态并红字 */
+/* 单行起步,内容长了自动换行撑开 */
+.tool-live-progress {
+  max-width: 640px;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-2) 70%, transparent);
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.tool-live-progress.is-error {
+  color: var(--danger);
+}
+
+/* 展开:浅底面板;各小节 pre/正文各自坐进更深一档的色块,滚动边界一眼可辨 */
 .tool-body {
   display: grid;
   margin-top: 6px;
-  padding: 9px 12px;
+  padding: 10px 12px;
   border: 0;
   border-radius: 6px;
   background: color-mix(in srgb, var(--surface-2) 70%, transparent);
-  gap: 8px;
+  gap: 9px;
 }
 
 .tool-detail[hidden] {
@@ -2047,9 +2088,9 @@ textarea:disabled {
 
 .tool-detail-label {
   display: block;
-  margin-bottom: 3px;
+  margin-bottom: 4px;
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -2057,6 +2098,9 @@ textarea:disabled {
 
 .tool-detail p {
   margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--code-bg) 85%, var(--surface-2));
   color: var(--text-soft);
   font-size: 11.5px;
   line-height: 1.6;
@@ -2067,10 +2111,11 @@ textarea:disabled {
 .tool-detail pre {
   max-height: 300px;
   margin: 0;
-  padding: 0;
+  padding: 9px 10px;
   overflow: auto;
   border: 0;
-  background: none;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--code-bg) 85%, var(--surface-2));
   color: var(--text-soft);
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -2993,10 +3038,13 @@ textarea:disabled {
   align-items: center;
 }
 
+/* 队列在输入框上方:排队的消息紧贴对话流,是「即将发生的下一条」 */
 .queue-tray {
   display: grid;
-  padding: 0 12px 8px;
+  padding: 0 0 10px;
   gap: 5px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  margin-bottom: 10px;
 }
 
 .queue-item {
@@ -3098,23 +3146,32 @@ textarea:disabled {
   transform: scale(0.92);
 }
 
+/* 停止键:头像正下方的左列圆钮,与头像同宽,只在直播期间存在 */
 .live-stop-button {
-  display: inline-grid;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 24px;
-  margin-left: auto;
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  display: grid;
+  width: 30px;
+  height: 30px;
   place-items: center;
   border: 0;
-  border-radius: 6px;
+  border-radius: 50%;
   background: var(--ribbon-soft);
   color: var(--md-sys-color-on-tertiary-container);
+  box-shadow: var(--bubble-shadow);
   cursor: pointer;
 }
 
+/* 有停止键时头像上移让位;带 meta 行的消息整体再抬 28px */
+.assistant-message:has(.live-stop-button) { min-height: 74px; }
+.assistant-message:has(.live-stop-button) .assistant-label img { bottom: 36px; }
+.assistant-message:has(.assistant-meta) .live-stop-button { bottom: 28px; }
+.assistant-message:has(.assistant-meta):has(.live-stop-button) .assistant-label img { bottom: 64px; }
+
 .live-stop-button .icon-slot {
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
 }
 
 .live-stop-button:hover:not(:disabled) {
@@ -3728,27 +3785,125 @@ textarea.config-input {
   text-transform: uppercase;
 }
 
+/* 设置卡:demo 定稿的 settings-card / settings-row / segmented / toggle 语言 */
+.settings-card {
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: var(--card-shadow);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  gap: 16px;
+}
+
+.settings-row + .settings-row {
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+
+.settings-row .lbl {
+  min-width: 0;
+}
+
+.settings-row .lbl strong {
+  display: block;
+  font-size: var(--fs-ui);
+  font-weight: 600;
+}
+
+.settings-row .lbl small {
+  display: block;
+  color: var(--text-soft);
+  font-size: var(--fs-meta);
+  line-height: 1.55;
+}
+
+.segmented {
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  gap: 2px;
+}
+
+.segmented button {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  transition: background 180ms ease, color 180ms ease;
+}
+
+.segmented button.active {
+  background: var(--surface-1);
+  box-shadow: var(--bubble-shadow);
+  color: var(--accent);
+}
+
+/* 开关:胶囊轨道 + 圆钮属语义圆形(独立按钮版,配 aria-checked) */
+.toggle {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  flex: 0 0 38px;
+  border: 0;
+  border-radius: 11px;
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background 200ms ease;
+}
+
+.toggle::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  content: "";
+  transition: transform 200ms ease, background 200ms ease;
+}
+
+.toggle[aria-checked="true"] {
+  background: var(--accent);
+}
+
+.toggle[aria-checked="true"]::after {
+  background: var(--md-sys-color-on-primary);
+  transform: translateX(16px);
+}
+
 .theme-options {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 7px;
+  display: flex;
+  padding: 14px 16px;
+  gap: 10px;
 }
 
 .theme-options button {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
+  display: flex;
+  flex: 1;
   min-height: 44px;
   align-items: center;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border: 0;
   border-radius: 8px;
-  background: var(--surface-1);
-  box-shadow: var(--bubble-shadow), inset 0 0 0 1.5px transparent;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1.5px transparent;
   color: var(--text-soft);
   cursor: pointer;
-  gap: 9px;
+  gap: 10px;
   text-align: left;
-  transition: box-shadow 180ms ease;
+  transition: box-shadow 180ms ease, color 180ms ease;
 }
 
 .theme-options button:hover,
@@ -3757,7 +3912,12 @@ textarea.config-input {
 }
 
 .theme-options button.selected {
-  box-shadow: var(--bubble-shadow), inset 0 0 0 1.5px var(--accent);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.theme-options button span {
+  font-size: var(--fs-ui);
+  font-weight: 600;
 }
 
 .theme-swatch {
@@ -3785,16 +3945,6 @@ textarea.config-input {
   background: conic-gradient(var(--accent) 0 25%, var(--gold) 25% 50%, var(--ribbon) 50% 75%, var(--online) 75% 100%);
 }
 
-.theme-options button:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-.scheme-hint {
-  margin: 8px 2px 0;
-  color: var(--text-faint);
-  font-size: var(--fs-micro);
-}
 
 .settings-model {
   display: grid;

@@ -3619,14 +3619,16 @@
     name.textContent = "Miyu";
     const status = document.createElement("span");
     status.className = "live-indicator";
-    status.textContent = "正在回复";
+    // 直播状态由三点弹跳/思考签表达,header 不再写「正在回复」;完成后写「刚刚」等
+    status.textContent = "";
     identity.append(name, status);
+    // 停止键放在头像正下方(左列),与多条并行回复/排队设计兼容:每条回复自带停止
     const stop = document.createElement("button");
     stop.type = "button";
     stop.className = "live-stop-button";
     stop.appendChild(makeIconSlot("circle-stop"));
     stop.addEventListener("click", () => cancelLiveRun(live));
-    header.append(avatar, identity, stop);
+    header.append(avatar, identity);
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content is-slim";
     const blocks = document.createElement("div");
@@ -3644,7 +3646,7 @@
     const copy = makeCopyButton(() => live.assistantText, "复制回复");
     copy.hidden = true;
     meta.append(endpoint, metaText, spacer, copy);
-    article.append(header, assistantContent, meta);
+    article.append(header, assistantContent, meta, stop);
     elements.timeline.appendChild(article);
     live.article = article;
     live.blocks = blocks;
@@ -3701,6 +3703,8 @@
     breakLiveText(live);
     live.contextOperation = null;
     const reasoning = createReasoningBlock("", "正在思考", true);
+    // 计时从 reasoning.start 事件算起,而不是签出现的时刻(签是惰性创建的)
+    if (live.reasoningClockStart != null) reasoning.startedAt = live.reasoningClockStart;
     reasoning.pendingTitle = normalizeReasoningTitle(live.reasoningTitle);
     if (!reasoningHidden()) live.blocks.appendChild(reasoning.element);
     live.reasoning = reasoning;
@@ -3752,22 +3756,18 @@
     live.reasoning = null;
     live.reasoningTitle = "";
     live.reasoningStarted = false;
+    live.reasoningClockStart = null;
     live.assistantReasoning = collectLiveReasoning(live);
   }
 
   function handleReasoningEvent(name, live, data) {
-    if (name === "reasoning.start") {
+    if (name === "reasoning.start" || name === "reasoning.part_start") {
+      // 惰性创建:只记状态,签等第一段真实思考文本(reasoning.delta)到达才出现,
+      // 避免不输出思考的模型挂着空的「正在思考」签和空面板
       finalizeLiveReasoning(live);
       live.reasoningStarted = true;
+      live.reasoningClockStart = performance.now();
       breakLiveText(live);
-      ensureLiveReasoning(live);
-      return;
-    }
-    if (name === "reasoning.part_start") {
-      finalizeLiveReasoning(live);
-      live.reasoningStarted = true;
-      breakLiveText(live);
-      ensureLiveReasoning(live);
       return;
     }
     if (name === "reasoning.reset") {
@@ -3780,13 +3780,14 @@
     }
     if (name === "reasoning.title") {
       live.reasoningTitle = String(data?.title || "").trim();
-      const reasoning = ensureLiveReasoning(live);
-      reasoning.pendingTitle = normalizeReasoningTitle(live.reasoningTitle);
+      // 只更新已存在的签;没有思考文本就不为标题单独建签
+      if (live.reasoning) live.reasoning.pendingTitle = normalizeReasoningTitle(live.reasoningTitle);
       return;
     }
     if (name === "reasoning.delta") {
       const delta = String(data?.delta || "");
       if (!delta) return;
+      if (!live.reasoning && !delta.trim()) return;
       const reasoning = ensureLiveReasoning(live);
       reasoning.raw += delta;
       reasoning.body.textContent = reasoning.raw;
@@ -3864,13 +3865,6 @@
     return "";
   }
 
-  function countToolOutputLines(tool) {
-    const streamed = `${tool.stdoutDetail.raw || ""}${tool.stderrDetail.raw || ""}`;
-    const output = streamed.trim() ? streamed : tool.resultDetail.raw || "";
-    const normalized = output.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n+$/, "");
-    return normalized ? normalized.split("\n").length : 0;
-  }
-
   function formatToolDuration(milliseconds) {
     if (!Number.isFinite(milliseconds) || milliseconds < 0) return "";
     if (milliseconds < 1_000) return `${Math.max(1, Math.round(milliseconds))} ms`;
@@ -3878,12 +3872,23 @@
     return `${Math.round(milliseconds / 1_000)} s`;
   }
 
+  // 主题与工具显示名共享 ≥6 字符前缀时去重(如「Linux 游戏兼容性调查」+「Linux 游戏兼容性: xxx」)
+  function dedupeToolSubject(title, subject) {
+    const t = String(title || "").trim();
+    const s = String(subject || "").trim();
+    if (!t || !s) return s;
+    let i = 0;
+    while (i < t.length && i < s.length && t[i] === s[i]) i += 1;
+    if (i < 6) return s;
+    const rest = s.slice(i).replace(/^[\s:：·,，、-]+/, "");
+    return rest || s;
+  }
+
   function updateToolSummary(tool) {
     const details = [];
-    if (tool.subject) details.push(tool.subject);
+    const subject = dedupeToolSubject(tool.titleText, tool.subject);
+    if (subject) details.push(subject);
     if (tool.imageCount) details.push(`${tool.imageCount} 张图片`);
-    const lines = countToolOutputLines(tool);
-    if (lines) details.push(`${lines} 行输出`);
     if (tool.finishedAt != null) details.push(formatToolDuration(tool.finishedAt - tool.startedAt));
     tool.summary.textContent = details.filter(Boolean).join(" · ") || (tool.finished ? "无输出" : "等待输出");
   }
@@ -4003,6 +4008,7 @@
       resultDetail,
       isTask,
       liveProgress,
+      titleText: String(data?.display_name || data?.name || "工具"),
       subject: subjectText,
       startedAt: performance.now(),
       finishedAt: null,
@@ -4066,6 +4072,13 @@
       updateToolSummary(tool);
     } else if (name === "tool.progress") {
       const message = String(data?.message || "");
+      // 任何持续汇报进度的工具(插件子代理如深度研究/兼容性调查)都惰性获得实时进度面板,
+      // 不再仅限内置 task 工具
+      if (!tool.liveProgress && !tool.finished && message) {
+        tool.liveProgress = document.createElement("div");
+        tool.liveProgress.className = "tool-live-progress";
+        tool.card.insertBefore(tool.liveProgress, tool.body);
+      }
       tool.progressDetail.raw = message;
       tool.progressDetail.content.textContent = message;
       tool.progressDetail.wrapper.hidden = !message || Boolean(tool.liveProgress);
@@ -4675,15 +4688,15 @@
     } else if (kind === "cancelled") {
       markUnfinishedTools(live);
       endPendingQuestions(live, "本轮已停止，无法再提交回答");
-      appendRunNotice(live, "回复已停止");
-      if (live.headerStatus) live.headerStatus.textContent = "已停止";
-      if (live.meta) live.meta.textContent = "已停止";
+      // 停止状态只由时间线的「本轮已中断」一处表达,气泡内通知与 header/meta 不再重复
+      if (live.headerStatus) live.headerStatus.textContent = "";
+      if (live.meta) live.meta.textContent = "";
     } else {
       markUnfinishedTools(live);
       endPendingQuestions(live, "本轮已结束，无法再提交回答");
       appendRunNotice(live, String(data?.message || "本轮运行失败"), true);
       if (live.headerStatus) live.headerStatus.textContent = "运行失败";
-      if (live.meta) live.meta.textContent = "运行失败";
+      if (live.meta) live.meta.textContent = "";
     }
 
     updateLocalTurnFromLive(live, kind, data);
