@@ -755,12 +755,19 @@ struct EventsQuery {
 struct CreateTurnRequest {
     content: String,
     mode: String,
+    /// Target session; defaults to the global current session. The turn runs
+    /// there without moving the current pointer (per-view WebUI sessions).
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueuePromptRequest {
     content: String,
+    /// Target session; defaults to the global current session.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1317,8 +1324,9 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
             mode,
             images,
             cwd,
+            session_id,
         } => {
-            handle_ipc_turn(&state, &mut stream, content, mode, images, cwd).await?;
+            handle_ipc_turn(&state, &mut stream, content, mode, images, cwd, session_id).await?;
         }
         IpcCommand::Cancel { run_id } => {
             let cancelled = {
@@ -1672,6 +1680,82 @@ async fn update_session_http(
     Ok(Json(json!({})).into_response())
 }
 
+/// Read-only snapshot of one session's conversation for per-view browsing:
+/// turns, queued follow-ups, and its currently running turns. Does not touch
+/// the global current-session pointer.
+async fn session_turns_http(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    if state
+        .state_store
+        .session_record(&session_id)
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "session not found"));
+    }
+    let store = state.state_store.pinned(&session_id);
+    let mut assets_by_turn = HashMap::<String, Vec<ImageAsset>>::new();
+    for asset in store.load_image_assets().map_err(ApiError::internal)? {
+        assets_by_turn
+            .entry(asset.turn_id.clone())
+            .or_default()
+            .push(asset);
+    }
+    let turns: Vec<SafeTurn> = store
+        .load_turns()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .filter(|turn| !turn.is_summary)
+        .map(|turn| {
+            let assets = assets_by_turn.remove(&turn.turn_id).unwrap_or_default();
+            SafeTurn::from_turn(turn, assets)
+        })
+        .collect();
+    let running_target = store
+        .running_turn_queue_target()
+        .map_err(ApiError::internal)?;
+    let queued_prompts: Vec<SafeQueuedPrompt> = match running_target.as_ref() {
+        Some(target) => store
+            .load_queued_prompts_for_target(target)
+            .map_err(ApiError::internal)?,
+        None => Vec::new(),
+    }
+    .into_iter()
+    .map(SafeQueuedPrompt::from)
+    .collect();
+    let runs: Vec<Value> = state
+        .manager
+        .lock()
+        .unwrap()
+        .active_runs
+        .iter()
+        .filter(|(_, info)| &*info.session_id == session_id.as_str())
+        .map(|(run_id, info)| {
+            json!({
+                "run_id": run_id,
+                "session_id": &*info.session_id,
+                "mode": mode_name(info.mode),
+            })
+        })
+        .collect();
+    let mut response = Json(json!({
+        "session_id": session_id,
+        "turns": turns,
+        "queued_prompts": queued_prompts,
+        "running_turn_id": running_target.as_ref().map(|target| target.turn_id.as_str()),
+        "runs": runs,
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 async fn delete_session_http(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1780,6 +1864,33 @@ fn session_overview_json(overview: &crate::state::SessionOverview, current: &str
     value
 }
 
+/// Resolves an optional turn-target session id: validates existence and that
+/// it is a user session; `None` falls back to the global current session.
+fn resolve_turn_session(
+    state: &WebState,
+    session_id: Option<String>,
+) -> std::result::Result<Arc<str>, String> {
+    match session_id {
+        None => Ok(state.state_store.session_id()),
+        Some(session_id) => {
+            let record = state
+                .state_store
+                .session_record(&session_id)
+                .map_err(|error| safe_error_message(&error))?
+                .ok_or_else(|| t("session not found", "找不到该会话").to_string())?;
+            if record.kind != "user" {
+                return Err(t(
+                    "turns can only run in user sessions",
+                    "只能在用户会话中发起对话",
+                )
+                .to_string());
+            }
+            Ok(record.session_id.into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_ipc_turn(
     state: &WebState,
     stream: &mut tokio::net::UnixStream,
@@ -1787,6 +1898,7 @@ async fn handle_ipc_turn(
     mode: String,
     images: Vec<Option<ImageAttachment>>,
     cwd: Option<std::path::PathBuf>,
+    session_id: Option<String>,
 ) -> Result<()> {
     let content = match validate_content(content) {
         Ok(content) => content,
@@ -1818,7 +1930,13 @@ async fn handle_ipc_turn(
     // the same session (placeholder semantics). The only rejection is a
     // transient admin mutation window.
     let run_id = random_id("run", 18);
-    let session_id = state.state_store.session_id();
+    let session_id = match resolve_turn_session(state, session_id) {
+        Ok(session_id) => session_id,
+        Err(message) => {
+            ipc::send(stream, &IpcFrame::Error { message }).await?;
+            return Ok(());
+        }
+    };
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let busy = {
         let mut manager = state.manager.lock().unwrap();
@@ -1964,6 +2082,7 @@ fn router(state: WebState) -> Router {
             "/api/sessions/{session_id}/activate",
             post(activate_session_http),
         )
+        .route("/api/sessions/{session_id}/turns", get(session_turns_http))
         .route("/api/turns", post(create_turn))
         .route("/api/queue", post(queue_prompt))
         .route("/api/queue/{prompt_id}", delete(remove_queue_prompt))
@@ -2450,9 +2569,10 @@ fn record_to_sse(record: EventRecord) -> Event {
 
 fn enqueue_running_prompt(
     state: &WebState,
+    store: &StateStore,
+    session_id: &str,
     content: &str,
 ) -> std::result::Result<(Option<String>, Option<String>, SafeQueuedPrompt), ApiError> {
-    let current_session = state.state_store.session_id();
     let active_run_id = {
         let manager = state.manager.lock().unwrap();
         if manager.admin_busy {
@@ -2461,15 +2581,13 @@ fn enqueue_running_prompt(
                 "Miyu is busy with another operation",
             ));
         }
-        manager.run_in_session(&current_session).cloned()
+        manager.run_in_session(session_id).cloned()
     };
     let prompt_id = random_id("queued", 18);
-    state
-        .state_store
+    store
         .recover_stale_turns()
         .map_err(ApiError::internal)?;
-    let target = state
-        .state_store
+    let target = store
         .running_turn_queue_target()
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
@@ -2484,8 +2602,7 @@ fn enqueue_running_prompt(
             "the running turn cannot accept messages from this WebUI",
         ));
     }
-    let prompt = state
-        .state_store
+    let prompt = store
         .enqueue_prompt_for_target(&target, &prompt_id, content, content, &[])
         .map_err(ApiError::internal)?;
     // Turns run with per-turn queue identities, so follow-ups always route
@@ -2517,16 +2634,20 @@ async fn create_turn(
     require_mutation(&headers, &state)?;
     let content = validate_content(request.content)?;
     let mode = parse_mode(&request.mode)?;
+    let session_id = resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
     state
         .state_store
         .recover_stale_turns()
         .map_err(ApiError::internal)?;
-    if state
-        .state_store
+    // A running turn in the *target* session gets the message as a queued
+    // follow-up (composer tray UX); other sessions run in parallel.
+    let target_store = state.state_store.pinned(&session_id);
+    if target_store
         .has_running_turns()
         .map_err(ApiError::internal)?
     {
-        let (run_id, turn_id, prompt) = enqueue_running_prompt(&state, &content)?;
+        let (run_id, turn_id, prompt) =
+            enqueue_running_prompt(&state, &target_store, &session_id, &content)?;
         publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &prompt);
         return Ok((
             StatusCode::ACCEPTED,
@@ -2540,7 +2661,6 @@ async fn create_turn(
             .into_response());
     }
     let run_id = random_id("run", 18);
-    let session_id = state.state_store.session_id();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     {
         let mut manager = state.manager.lock().unwrap();
@@ -2588,7 +2708,10 @@ async fn queue_prompt(
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
     let content = validate_content(request.content)?;
-    let (run_id, turn_id, safe) = enqueue_running_prompt(&state, &content)?;
+    let session_id =
+        resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
+    let store = state.state_store.pinned(&session_id);
+    let (run_id, turn_id, safe) = enqueue_running_prompt(&state, &store, &session_id, &content)?;
     publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &safe);
     Ok((StatusCode::ACCEPTED, Json(safe)).into_response())
 }

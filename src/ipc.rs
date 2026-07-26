@@ -196,11 +196,14 @@ pub enum Command {
         mode: String,
         #[serde(default)]
         images: Vec<Option<ImageAttachment>>,
-        /// Client working directory; the core adopts it for the duration of
-        /// the turn so file tools resolve relative to the caller. Interim
-        /// bridge until sessions carry a proper workspace context.
+        /// Client working directory; used as the turn workspace when the
+        /// target session has none bound.
         #[serde(default)]
         cwd: Option<std::path::PathBuf>,
+        /// Target session id. Defaults to the global current session; when
+        /// set, the turn runs there without moving the current pointer.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     Cancel {
         run_id: String,
@@ -499,6 +502,7 @@ mod tests {
                 data: vec![1, 2, 3],
             })],
             cwd: Some(std::path::PathBuf::from("/tmp/workdir")),
+            session_id: Some("sess_test".to_string()),
         });
         let writer = tokio::spawn(async move { send(&mut left, &request).await });
         let received = receive::<Request>(&mut right).await.unwrap().unwrap();
@@ -511,11 +515,13 @@ mod tests {
                 mode,
                 images,
                 cwd,
+                session_id,
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(mode, "normal");
                 assert_eq!(images.len(), 1);
                 assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp/workdir")));
+                assert_eq!(session_id.as_deref(), Some("sess_test"));
             }
             _ => panic!("unexpected command"),
         }
@@ -529,6 +535,7 @@ mod tests {
             mode: "normal".to_string(),
             images: Vec::new(),
             cwd: None,
+            session_id: None,
         });
         assert!(send(&mut left, &request).await.is_err());
     }

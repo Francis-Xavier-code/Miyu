@@ -292,6 +292,10 @@ pub struct Cli {
     #[arg(long)]
     pub stdout: bool,
 
+    /// 仅为本次命令指定目标会话（名称或编号），不改变全局当前会话
+    #[arg(long)]
+    pub session: Option<String>,
+
     #[arg(long, hide = true)]
     pub shell_intercept: bool,
 
@@ -1117,7 +1121,19 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
-            run_chat_with_options(&paths, join_message(args.message), None, cli.stdout, mode).await
+            let session_override = match cli.session.as_deref() {
+                Some(arg) => Some(resolve_session_id_for_turn(&paths, arg).await?),
+                None => None,
+            };
+            run_chat_with_options(
+                &paths,
+                join_message(args.message),
+                None,
+                cli.stdout,
+                mode,
+                session_override,
+            )
+            .await
         }
         Some(Command::Init) => run_init(&paths, InitKind::Explicit),
         Some(Command::Paths) => {
@@ -1178,9 +1194,23 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         None => {
             let message = join_message(cli.message);
             if message.is_empty() && io::stdin().is_terminal() {
+                if cli.session.is_some() {
+                    bail!(
+                        "{}",
+                        t(
+                            "--session only applies to one-shot commands; use /session inside the REPL",
+                            "--session 仅用于一次性命令；REPL 内请使用 /session 切换"
+                        )
+                    );
+                }
                 run_repl(&paths, mode).await
             } else {
-                run_chat_with_options(&paths, message, None, cli.stdout, mode).await
+                let session_override = match cli.session.as_deref() {
+                    Some(arg) => Some(resolve_session_id_for_turn(&paths, arg).await?),
+                    None => None,
+                };
+                run_chat_with_options(&paths, message, None, cli.stdout, mode, session_override)
+                    .await
             }
         }
     }
@@ -2757,7 +2787,7 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
     let (clean_message, pasted_images) = extract_image_placeholders(&message);
 
     let result = if pasted_images.is_empty() {
-        run_chat_with_options(paths, clean_message, None, false, AgentMode::Normal).await
+        run_chat_with_options(paths, clean_message, None, false, AgentMode::Normal, None).await
     } else {
         run_chat_with_images(paths, clean_message, pasted_images).await
     };
@@ -2856,6 +2886,7 @@ async fn run_chat_with_images(
             false,
             AgentMode::Normal,
             &pasted_images,
+            None,
         )
         .await
         {
@@ -3044,13 +3075,25 @@ async fn run_chat_with_options(
     show_reasoning: Option<bool>,
     plain: bool,
     mode: AgentMode,
+    session_override: Option<String>,
 ) -> Result<()> {
     let message = append_stdin_if_piped(message).await;
     if message.is_empty() {
         return run_repl(paths, mode).await;
     }
     if !direct_mode_requested() {
-        match try_run_remote_chat(paths, None, &message, show_reasoning, plain, mode, &[]).await {
+        match try_run_remote_chat(
+            paths,
+            None,
+            &message,
+            show_reasoning,
+            plain,
+            mode,
+            &[],
+            session_override.clone(),
+        )
+        .await
+        {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -3155,6 +3198,7 @@ fn is_remote_turn_cancelled(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RemoteTurnCancelled>().is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_run_remote_chat(
     paths: &MiyuPaths,
     mut live: Option<&mut LiveReplTail>,
@@ -3163,6 +3207,7 @@ async fn try_run_remote_chat(
     plain: bool,
     mode: AgentMode,
     images: &[Option<crate::clipboard::PastedImage>],
+    session_override: Option<String>,
 ) -> Result<Option<RemoteTurnSummary>> {
     let mut stream = if direct_mode_requested() {
         match ipc::connect(&paths.ipc_socket()).await {
@@ -3185,6 +3230,7 @@ async fn try_run_remote_chat(
             mode: ipc_mode_name(mode).to_string(),
             images: ipc_images(images),
             cwd: std::env::current_dir().ok(),
+            session_id: session_override,
         }),
     )
     .await?;
@@ -3918,6 +3964,33 @@ async fn session_admin(
 
 /// Resolves a `miyu session/delete` target argument outside the REPL:
 /// numbers index into the visible session list, anything else is a name.
+/// Resolves a `--session` argument (name or list index) to a concrete
+/// session id, without moving the global current pointer.
+async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: &str) -> Result<String> {
+    let (_, data) = session_admin(
+        paths,
+        IpcCommand::ListSessions {
+            include_archived: true,
+        },
+    )
+    .await?;
+    let entries = session_list_entries(&data);
+    if let Ok(index) = arg.parse::<usize>() {
+        if let Some(entry) = index.checked_sub(1).and_then(|index| entries.get(index)) {
+            return Ok(entry.id.clone());
+        }
+        bail!(
+            "{}: {index}",
+            t("no session with this number", "没有这个编号的会话")
+        );
+    }
+    entries
+        .into_iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(arg) || entry.id == arg)
+        .map(|entry| entry.id)
+        .ok_or_else(|| anyhow::anyhow!("{}: {arg}", t("session not found", "找不到该会话")))
+}
+
 async fn resolve_cli_session_target(
     paths: &MiyuPaths,
     arg: &str,
@@ -5023,8 +5096,17 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             continue;
         }
         history.push(input.to_string());
-        match try_run_remote_chat(paths, Some(&mut live_repl), input, None, false, mode, &images)
-            .await
+        match try_run_remote_chat(
+            paths,
+            Some(&mut live_repl),
+            input,
+            None,
+            false,
+            mode,
+            &images,
+            None,
+        )
+        .await
         {
             Ok(Some(summary)) => {
                 cumulative_tokens = summary.cumulative_tokens;
