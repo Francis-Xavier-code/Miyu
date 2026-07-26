@@ -1020,9 +1020,6 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         println!("Miyu WebUI: {url}");
     }
     std::io::stdout().flush().ok();
-    if !args.no_open {
-        open_browser(&format!("http://127.0.0.1:{port}"));
-    }
 
     let server = axum::serve(
         listener,
@@ -4870,41 +4867,6 @@ fn safe_error_message(error: impl std::fmt::Display) -> String {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn open_browser(url: &str) {
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    if let Ok(mut child) = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn open_browser(_url: &str) {}
 
 #[cfg(test)]
 mod tests {

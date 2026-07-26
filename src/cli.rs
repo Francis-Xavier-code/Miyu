@@ -628,12 +628,6 @@ fn localize_reset_command(command: clap::Command) -> clap::Command {
 fn localize_web_command(command: clap::Command) -> clap::Command {
     command
         .mut_arg("port", |arg| arg.help(t("Local TCP port", "本地 TCP 端口")))
-        .mut_arg("no_open", |arg| {
-            arg.help(t(
-                "Do not open the WebUI in a browser",
-                "不自动在浏览器中打开 WebUI",
-            ))
-        })
         .mut_arg("password", |arg| {
             arg.help(t(
                 "Require a password; omit the value to enter it securely",
@@ -832,9 +826,6 @@ pub struct WebArgs {
     #[arg(long, default_value_t = 4096)]
     pub port: u16,
 
-    #[arg(long)]
-    pub no_open: bool,
-
     #[arg(short = 'p', long, num_args = 0..=1, default_missing_value = "")]
     pub password: Option<String>,
 
@@ -856,7 +847,6 @@ impl std::fmt::Debug for WebArgs {
         formatter
             .debug_struct("WebArgs")
             .field("port", &self.port)
-            .field("no_open", &self.no_open)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("password_file", &self.password_file)
             .field("stop", &self.stop)
@@ -1114,8 +1104,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
 
     match cli.command {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
-        Some(Command::Daemon(mut args)) => {
-            args.no_open = true;
+        Some(Command::Daemon(args)) => {
             let _logging_guard = crate::logging::init(&paths, cli.debug).ok();
             crate::web::run(paths, args).await
         }
@@ -1269,9 +1258,6 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
         for url in ipc::web_access_urls(info.web_port) {
             println!("Miyu WebUI: {url}");
         }
-        if !args.no_open {
-            open_browser(&format!("http://127.0.0.1:{}", info.web_port));
-        }
         return Ok(());
     }
 
@@ -1284,7 +1270,6 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
     let mut daemon_args = vec![
         OsString::from("--port"),
         OsString::from(args.port.to_string()),
-        OsString::from("--no-open"),
     ];
     if args.public {
         daemon_args.push(OsString::from("--public"));
@@ -1300,9 +1285,6 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
     for url in ipc::web_access_urls(info.web_port) {
         println!("Miyu WebUI: {url}");
     }
-    if !args.no_open {
-        open_browser(&format!("http://127.0.0.1:{}", info.web_port));
-    }
     Ok(())
 }
 
@@ -1312,44 +1294,6 @@ async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(target_os = "linux")]
-fn open_browser(url: &str) {
-    let mut command = std::process::Command::new("xdg-open");
-    command.arg(url);
-    spawn_detached_helper(command);
-}
-
-#[cfg(target_os = "macos")]
-fn open_browser(url: &str) {
-    let mut command = std::process::Command::new("open");
-    command.arg(url);
-    spawn_detached_helper(command);
-}
-
-#[cfg(target_os = "windows")]
-fn open_browser(url: &str) {
-    let mut command = std::process::Command::new("cmd");
-    command.args(["/C", "start", "", url]);
-    spawn_detached_helper(command);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn spawn_detached_helper(mut command: std::process::Command) {
-    if let Ok(mut child) = command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_browser(_url: &str) {}
 
 async fn run_tool(paths: &MiyuPaths, mode: AgentMode, args: ToolArgs) -> Result<()> {
     let config = AppConfig::load_or_default(paths)?;
@@ -9376,7 +9320,7 @@ mod repl_input_tests {
     #[test]
     fn web_is_a_cli_subcommand_with_local_server_options() {
         let cli = parse_args(
-            ["miyu", "web", "--port", "4100", "--no-open"]
+            ["miyu", "web", "--port", "4100"]
                 .map(OsString::from)
                 .to_vec(),
         )
@@ -9385,7 +9329,6 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 4100,
-                no_open: true,
                 password: None,
                 password_file: None,
                 stop: false,
@@ -9411,7 +9354,6 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 4096,
-                no_open: false,
                 password: None,
                 password_file: None,
                 stop: false,
@@ -9421,7 +9363,7 @@ mod repl_input_tests {
         ));
 
         let cli = parse_args(
-            ["miyu", "web", "-p", "secret", "--no-open"]
+            ["miyu", "web", "-p", "secret"]
                 .map(OsString::from)
                 .to_vec(),
         )
@@ -9430,13 +9372,12 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 password: Some(password),
-                no_open: true,
                 ..
             })) if password == "secret"
         ));
 
         let cli = parse_args(
-            ["miyu", "web", "-p", "--no-open"]
+            ["miyu", "web", "-p", "--public"]
                 .map(OsString::from)
                 .to_vec(),
         )
@@ -9445,7 +9386,6 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 password: Some(password),
-                no_open: true,
                 ..
             })) if password.is_empty()
         ));
