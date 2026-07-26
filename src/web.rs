@@ -458,7 +458,7 @@ struct RunEventMapper {
     state_store: StateStore,
     turn_id: Option<String>,
     tool_counter: u64,
-    active_tool: Option<ActiveTool>,
+    active_tools: Vec<ActiveTool>,
 }
 
 struct ActiveTool {
@@ -481,7 +481,7 @@ impl RunEventMapper {
             state_store,
             turn_id: None,
             tool_counter: 0,
-            active_tool: None,
+            active_tools: Vec::new(),
         }
     }
 
@@ -546,7 +546,7 @@ impl RunEventMapper {
                         "arguments": arguments,
                     }),
                 );
-                self.active_tool = Some(tool);
+                self.active_tools.push(tool);
             }
             AgentEvent::ToolProgress { name, message } => {
                 let (tool_id, tool_name) = self.tool_identity(&name);
@@ -582,9 +582,14 @@ impl RunEventMapper {
                 );
             }
             AgentEvent::ToolResult { name, ok, output } => {
+                // Parallel tools finish out of order — match by event name
+                // instead of assuming the most recently started tool.
                 let tool = self
-                    .active_tool
-                    .take()
+                    .active_tools
+                    .iter()
+                    .position(|tool| tool.event_name == name)
+                    .or_else(|| (self.active_tools.len() == 1).then_some(0))
+                    .map(|index| self.active_tools.remove(index))
                     .unwrap_or_else(|| self.next_tool(name));
                 self.publish(
                     "tool.finished",
@@ -697,8 +702,13 @@ impl RunEventMapper {
     }
 
     fn tool_identity(&self, fallback: &str) -> (String, String) {
-        self.active_tool
-            .as_ref()
+        // Prefer the active tool whose event name matches; with parallel
+        // tools the "latest started" heuristic attributes progress to the
+        // wrong tool. A single active tool keeps the legacy fallback.
+        self.active_tools
+            .iter()
+            .find(|tool| tool.event_name == fallback)
+            .or_else(|| (self.active_tools.len() == 1).then(|| &self.active_tools[0]))
             .map(|tool| (tool.id.clone(), tool.name.clone()))
             .unwrap_or_else(|| {
                 (

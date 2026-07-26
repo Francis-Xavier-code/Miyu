@@ -1650,8 +1650,13 @@ impl StreamRenderer {
             }
         }
         let header = self.tool_summary_with_prefix(header);
+        // In live mode a running block's detail lines are indented to sit
+        // under its spinner glyph; a settled block drops the glyph and sits
+        // flush, matching the committed layout.
+        let running_live = live && !stats.settled();
+        let detail_indent = if running_live { "  " } else { "" };
         let mut lines = Vec::new();
-        if live && !stats.settled() {
+        if running_live {
             lines.push(format!("{}{header}", wait_spinner::BLOCK_MARKER));
         } else {
             lines.push(header);
@@ -1661,7 +1666,7 @@ impl StreamRenderer {
                 // Subagent headers already carry the description — don't
                 // repeat it as a subject line.
                 if !lines[0].contains(subject.as_str()) {
-                    lines.push(format!("↳ {subject}"));
+                    lines.push(format!("{detail_indent}↳ {subject}"));
                 }
             }
         }
@@ -1684,7 +1689,7 @@ impl StreamRenderer {
                 } else {
                     clip_progress_line(line, 120)
                 };
-                lines.push(format!("{progress_prefix} {line}"));
+                lines.push(format!("{detail_indent}{progress_prefix} {line}"));
             }
         }
         lines
@@ -4693,12 +4698,12 @@ mod tests {
         // progress follows; blank lines separate blocks. The redundant
         // subject line (same as the description in the header) is dropped.
         assert!(lines[0].starts_with(marker) && lines[0].contains("任务A"));
-        assert_eq!(lines[1], "↳ 工具 #1: 运行命令");
+        assert_eq!(lines[1], "  ↳ 工具 #1: 运行命令");
         assert_eq!(lines[2], "");
         assert!(lines[3].starts_with(marker) && lines[3].contains("任务B"));
         assert_eq!(lines[4], "");
         assert!(lines[5].starts_with(marker) && lines[5].contains("任务C"));
-        assert_eq!(lines[6], "↳ 正在搜索");
+        assert_eq!(lines[6], "  ↳ 正在搜索");
         assert_eq!(lines.len(), 7);
     }
 
@@ -4735,11 +4740,12 @@ mod tests {
         let sub = sub.expect("blocks present");
         let marker = wait_spinner::BLOCK_MARKER;
         let lines: Vec<&str> = sub.lines().collect();
-        // Running block keeps its animated marker + live progress…
+        // Running block keeps its animated marker + indented live progress…
         assert!(lines[0].starts_with(marker) && lines[0].contains("任务A"));
-        assert_eq!(lines[1], "↳ 正在搜索");
+        assert_eq!(lines[1], "  ↳ 正在搜索");
         assert_eq!(lines[2], "");
-        // …while the settled block loses the spinner and shows final stats.
+        // …while the settled block drops the spinner indent entirely and
+        // sits flush with its final stats, like the committed layout.
         assert!(lines[3].starts_with("~ ") && lines[3].contains("任务B"));
         assert!(lines[3].contains("ok"));
         assert_eq!(lines[4], "✓ 工具调用 1 次");

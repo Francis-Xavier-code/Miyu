@@ -169,7 +169,8 @@ fn render_frame_at_width(
 
 /// Renders the multi-block live layout: each `BLOCK_MARKER` line is a
 /// running block header with its own animated glyph; blank lines separate
-/// blocks; every other line is indented under its block.
+/// blocks; other lines already carry their own indentation (running-block
+/// detail lines are indented by the builder, settled blocks are flush).
 fn render_block_frame(frame: usize, sub: &str, terminal_width: usize) -> (String, u16) {
     let usable = terminal_width.saturating_sub(1).max(1);
     let glyph = paint_secondary(braille_frame(frame));
@@ -184,11 +185,8 @@ fn render_block_frame(frame: usize, sub: &str, terminal_width: usize) -> (String
         } else if line.trim().is_empty() {
             lines.push(String::new());
         } else {
-            let clipped = clip_to_display_width(line, usable.saturating_sub(2));
-            lines.push(format!(
-                "  {}",
-                paint_for_style(&clipped, SpinnerStyle::Braille)
-            ));
+            let clipped = clip_to_display_width(line, usable);
+            lines.push(paint_for_style(&clipped, SpinnerStyle::Braille));
         }
     }
     let count = lines.len().min(u16::MAX as usize) as u16;
