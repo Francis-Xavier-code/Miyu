@@ -100,10 +100,6 @@
     archivedSection: document.getElementById("archivedSection"),
     archivedToggle: document.getElementById("archivedToggle"),
     archivedList: document.getElementById("archivedList"),
-    sessionSwitchNotice: document.getElementById("sessionSwitchNotice"),
-    sessionSwitchText: document.getElementById("sessionSwitchText"),
-    followSwitchButton: document.getElementById("followSwitchButton"),
-    dismissSwitchButton: document.getElementById("dismissSwitchButton"),
     contextNumbers: document.getElementById("contextNumbers"),
     contextTrack: document.getElementById("contextTrack"),
     contextBar: document.getElementById("contextBar"),
@@ -142,7 +138,6 @@
     queueTray: document.getElementById("queueTray"),
     composerState: document.getElementById("composerState"),
     characterCount: document.getElementById("characterCount"),
-    stopButton: document.getElementById("stopButton"),
     sendButton: document.getElementById("sendButton"),
     drawerScrim: document.getElementById("drawerScrim"),
     settingsDrawer: document.getElementById("settingsDrawer"),
@@ -175,20 +170,25 @@
     bootId: null,
     latestEventId: 0,
     lastEventId: 0,
-    replayRunId: null,
+    replayRunIds: null,
     replayCutoff: 0,
     turns: [],
     queuedPrompts: [],
     models: [],
     sessions: [],
     currentSessionId: null,
+    viewSessionId: null,
+    viewRunningTurnId: null,
+    viewLoading: false,
+    viewSyncTimer: null,
+    runsBySession: new Map(),
+    liveRuns: new Map(),
     archivedSessions: [],
     archivedOpen: false,
     archivedLoading: false,
     sessionMenuFor: null,
     sessionRenaming: null,
     sessionBusy: false,
-    pendingSessionSwitch: null,
     display: {
       reasoning: "summary",
       tool_calls: "summary",
@@ -201,10 +201,6 @@
     usage: {},
     capabilities: {},
     version: null,
-    activeRunId: null,
-    externalRunningTurnId: null,
-    externalQueueAvailable: false,
-    live: null,
     eventSource: null,
     connection: "connecting",
     blocked: false,
@@ -214,7 +210,6 @@
     stagedModelKeys: null,
     modelMenuError: "",
     submitting: false,
-    cancellationRequested: false,
     pendingSubmission: null,
     bootstrapPromise: null,
     resyncing: false,
@@ -225,7 +220,6 @@
     sidebarOpener: null,
     toastTimer: null,
     healthTimer: null,
-    externalSyncTimer: null,
     terminalRunIds: new Set(),
     mode: "normal",
     composing: false,
@@ -1530,9 +1524,11 @@
   }
 
   function refreshLiveEndpointVisibility() {
-    if (!state.live?.endpoint) return;
-    const values = [state.live.providerId, state.live.model].map((value) => String(value || "").trim()).filter(Boolean);
-    state.live.endpoint.hidden = !state.display?.show_mixed_model_endpoint || values.length === 0;
+    for (const live of state.liveRuns.values()) {
+      if (!live.endpoint) continue;
+      const values = [live.providerId, live.model].map((value) => String(value || "").trim()).filter(Boolean);
+      live.endpoint.hidden = !state.display?.show_mixed_model_endpoint || values.length === 0;
+    }
   }
 
   function renderModelMenu() {
@@ -1635,9 +1631,16 @@
     updateModelMenuState();
   }
 
+  function newestLiveRun() {
+    let latest = null;
+    for (const live of state.liveRuns.values()) latest = live;
+    return latest;
+  }
+
   function deriveConversationDetails() {
+    const live = newestLiveRun();
     if (state.turns.length === 0) {
-      const liveUser = state.live?.userText || state.pendingSubmission?.content || "";
+      const liveUser = live?.userText || state.pendingSubmission?.content || "";
       if (!liveUser) return { title: "新对话", snippet: "尚未开始", timestamp: null };
       return { title: firstLine(liveUser) || "新对话", snippet: firstLine(liveUser), timestamp: new Date() };
     }
@@ -1646,9 +1649,9 @@
     const followups = Array.isArray(lastTurn?.followups) ? lastTurn.followups : [];
     const lastFollowup = followups[followups.length - 1];
     const assistant = String(lastTurn?.assistant_content || "").trim();
-    const liveContent = state.activeRunId ? String(state.live?.userText || "").trim() : "";
+    const liveContent = live ? String(live.userText || "").trim() : "";
     const snippet = firstLine(liveContent || assistant || lastFollowup?.content || lastTurn?.user_content || "");
-    const timestamp = liveContent ? state.live?.startedAt : lastTurn?.assistant_timestamp || lastFollowup?.submitted_at || lastTurn?.user_timestamp;
+    const timestamp = liveContent ? live?.startedAt : lastTurn?.assistant_timestamp || lastFollowup?.submitted_at || lastTurn?.user_timestamp;
     return {
       title: firstLine(firstTurn?.user_content) || "当前对话",
       snippet: snippet || (lastTurn?.status === "running" ? "正在回复" : "对话已开始"),
@@ -1675,18 +1678,40 @@
     return state.archivedSessions.find((session) => String(session?.session_id) === id) || null;
   }
 
-  function currentSessionEntry() {
-    return state.currentSessionId ? findSession(state.currentSessionId) : null;
+  function viewSessionEntry() {
+    return state.viewSessionId ? findSession(state.viewSessionId) : null;
   }
 
-  function updateSessionSwitchNotice() {
-    const pending = state.pendingSessionSwitch;
-    elements.sessionSwitchNotice.hidden = !pending;
-    if (!pending) return;
-    const target = findSession(pending);
-    elements.sessionSwitchText.textContent = target
-      ? `当前会话已在其他端切换到「${sessionDisplayName(target)}」`
-      : "当前会话已在其他端切换";
+  function trackRun(sessionId, runId) {
+    const session = String(sessionId || "");
+    const run = String(runId || "");
+    if (!session || !run) return;
+    let runs = state.runsBySession.get(session);
+    if (!runs) {
+      runs = new Set();
+      state.runsBySession.set(session, runs);
+    }
+    runs.add(run);
+  }
+
+  function untrackRun(runId) {
+    const run = String(runId || "");
+    for (const [sessionId, runs] of state.runsBySession) {
+      if (runs.delete(run) && runs.size === 0) state.runsBySession.delete(sessionId);
+    }
+  }
+
+  function runSessionId(runId) {
+    const run = String(runId || "");
+    if (!run) return "";
+    for (const [sessionId, runs] of state.runsBySession) {
+      if (runs.has(run)) return sessionId;
+    }
+    return "";
+  }
+
+  function sessionHasRuns(sessionId) {
+    return (state.runsBySession.get(String(sessionId || ""))?.size || 0) > 0;
   }
 
   function closeSessionMenu() {
@@ -1740,17 +1765,18 @@
     }
     renderSessionList();
     renderArchivedList();
-    if (sessionId === state.currentSessionId) updateConversationChrome();
+    if (sessionId === state.viewSessionId) updateConversationChrome();
   }
 
-  function buildSessionMenu(session, isCurrent) {
+  function buildSessionMenu(session, isDefault) {
     const id = String(session?.session_id || "");
     const menu = document.createElement("div");
     menu.className = "session-menu";
     menu.setAttribute("role", "menu");
     menu.setAttribute("aria-label", `会话操作：${sessionDisplayName(session)}`);
     const actions = [{ label: "重命名", handler: () => beginSessionRename(id) }];
-    if (isCurrent) actions.push({ label: "清空对话", handler: requestClearConversation });
+    if (!isDefault) actions.push({ label: "设为默认", handler: () => makeDefaultSession(id) });
+    if (isDefault) actions.push({ label: "清空对话", handler: requestClearConversation });
     actions.push({ label: "归档", handler: () => archiveSession(id) });
     actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
     for (const action of actions) {
@@ -1771,9 +1797,10 @@
 
   function buildSessionItem(session) {
     const id = String(session?.session_id || "");
-    const isCurrent = Boolean(id) && id === state.currentSessionId;
+    const isView = Boolean(id) && id === state.viewSessionId;
+    const isDefault = Boolean(id) && id === state.currentSessionId;
     const item = document.createElement("div");
-    item.className = `session-item${isCurrent ? " active" : ""}`;
+    item.className = `session-item${isView ? " active" : ""}`;
     item.dataset.sessionId = id;
 
     const renaming = state.sessionRenaming === id;
@@ -1781,8 +1808,8 @@
     main.className = `session-item-main${renaming ? " is-renaming" : ""}`;
     if (!renaming) {
       main.type = "button";
-      main.title = isCurrent ? sessionDisplayName(session) : `切换到「${sessionDisplayName(session)}」`;
-      main.addEventListener("click", () => activateSession(id));
+      main.title = isView ? sessionDisplayName(session) : `查看「${sessionDisplayName(session)}」`;
+      main.addEventListener("click", () => openSessionView(id));
     }
     main.appendChild(makeIconSlot("message-circle"));
 
@@ -1815,9 +1842,19 @@
         input.select();
       });
     } else {
+      const titleRow = document.createElement("span");
+      titleRow.className = "session-title-row";
       const title = document.createElement("strong");
       title.textContent = sessionDisplayName(session);
-      copy.appendChild(title);
+      titleRow.appendChild(title);
+      if (isDefault) {
+        const badge = document.createElement("span");
+        badge.className = "session-default-badge";
+        badge.textContent = "默认";
+        badge.title = "CLI 与快捷入口的默认会话";
+        titleRow.appendChild(badge);
+      }
+      copy.appendChild(titleRow);
     }
 
     // Gemini-style list rows: name only; details live in the hover tooltip.
@@ -1836,6 +1873,13 @@
     const trailing = document.createElement("span");
     trailing.className = "session-trailing";
 
+    if (sessionHasRuns(id)) {
+      const dot = document.createElement("span");
+      dot.className = "session-run-dot";
+      dot.title = "有回复正在运行";
+      trailing.appendChild(dot);
+    }
+
     const menuButton = document.createElement("button");
     menuButton.type = "button";
     menuButton.className = "session-menu-button";
@@ -1851,7 +1895,7 @@
     trailing.appendChild(menuButton);
     item.appendChild(trailing);
 
-    if (state.sessionMenuFor === id) item.appendChild(buildSessionMenu(session, isCurrent));
+    if (state.sessionMenuFor === id) item.appendChild(buildSessionMenu(session, isDefault));
     return item;
   }
 
@@ -1998,15 +2042,22 @@
   }
 
   async function createSession() {
-    if (state.blocked || state.sessionBusy || state.adminBusy || state.submitting || conversationRunning()) return;
+    if (state.blocked || state.sessionBusy || state.adminBusy || state.submitting) return;
     state.sessionBusy = true;
     updateControlState();
     try {
-      await apiRequest("/api/sessions", {
+      const response = await apiRequest("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ switch: true })
+        body: JSON.stringify({})
       });
-      await loadBootstrap();
+      const payload = await response.json();
+      const record = payload?.session && typeof payload.session === "object" ? payload.session : null;
+      const sessionId = String(record?.session_id || "");
+      if (sessionId && !findSession(sessionId)) {
+        state.sessions.unshift(record);
+        renderSessionList();
+      }
+      if (sessionId) await loadSessionView(sessionId);
       elements.composerInput.focus();
     } catch (error) {
       showToast(error.message || "新建会话失败", "error");
@@ -2016,23 +2067,125 @@
     }
   }
 
-  async function activateSession(sessionId) {
+  async function openSessionView(sessionId) {
     if (!sessionId) return;
-    if (sessionId === state.currentSessionId) {
+    if (sessionId === state.viewSessionId) {
       closeSidebar();
       scrollToBottom({ force: true, smooth: true });
       return;
     }
-    if (state.sessionBusy || state.adminBusy || state.submitting) return;
+    await loadSessionView(sessionId);
+  }
+
+  async function loadSessionView(sessionId, { quiet = false } = {}) {
+    if (!sessionId || state.viewLoading) return;
+    state.viewLoading = true;
+    try {
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/turns`);
+      applySessionView(await response.json());
+      if (!quiet) closeSidebar();
+    } catch (error) {
+      if (error.status === 401) showBlockedState(true);
+      else if (error.status === 404) {
+        showToast("会话不存在", "error");
+        refreshSessions();
+        if (sessionId === state.viewSessionId) window.setTimeout(() => openFallbackSessionView(sessionId), 0);
+      } else showToast(error.message || "载入会话失败", "error");
+    } finally {
+      state.viewLoading = false;
+      updateControlState();
+    }
+  }
+
+  function disposeAllLiveRuns() {
+    for (const live of state.liveRuns.values()) disposeLiveState(live);
+    state.liveRuns.clear();
+  }
+
+  function applySessionView(payload) {
+    const sessionId = String(payload?.session_id || "");
+    if (!sessionId) return;
+    disposeAllLiveRuns();
+    clearViewSyncTimer();
+    state.viewSessionId = sessionId;
+    state.turns = Array.isArray(payload?.turns)
+      ? payload.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
+      : [];
+    state.queuedPrompts = Array.isArray(payload?.queued_prompts) ? payload.queued_prompts : [];
+    state.pendingSubmission = null;
+    const runs = (Array.isArray(payload?.runs) ? payload.runs : []).filter((run) => run?.run_id);
+    if (runs.length) state.runsBySession.set(sessionId, new Set(runs.map((run) => String(run.run_id))));
+    else state.runsBySession.delete(sessionId);
+    state.viewRunningTurnId = !runs.length && typeof payload?.running_turn_id === "string" && payload.running_turn_id
+      ? payload.running_turn_id
+      : null;
+    renderConversation();
+    renderQueueTray();
+    restoreLiveRuns(runs);
+    updateConversationChrome();
+    updateControlState();
+    scheduleViewSync();
+  }
+
+  function findUnclaimedRunningTurn() {
+    const claimed = new Set();
+    for (const live of state.liveRuns.values()) {
+      if (live.turnId) claimed.add(String(live.turnId));
+    }
+    return state.turns.find((turn) => turn?.status === "running" && !claimed.has(String(turn?.id))) || null;
+  }
+
+  function createLiveForRun(runId, userText = "", { claimTurn = true } = {}) {
+    const existing = state.liveRuns.get(runId);
+    if (existing) return existing;
+    const runningTurn = userText || !claimTurn ? null : findUnclaimedRunningTurn();
+    const live = createLiveState(runId, {
+      turnId: runningTurn?.id || null,
+      userText: userText || runningTurn?.user_content || "",
+      startedAt: runningTurn?.user_timestamp || new Date(),
+      userRendered: Boolean(runningTurn)
+    });
+    state.liveRuns.set(runId, live);
+    return live;
+  }
+
+  function beginRunReplay() {
+    state.replayRunIds = new Set(state.liveRuns.keys());
+    state.replayCutoff = Math.max(state.lastEventId, state.replayCutoff, state.latestEventId);
+    state.lastEventId = 0;
+    connectEventSource(0);
+  }
+
+  function restoreLiveRuns(runs) {
+    let restored = false;
+    for (const run of runs) {
+      const runId = String(run?.run_id || "");
+      if (!runId || state.terminalRunIds.has(runId)) continue;
+      createLiveForRun(runId);
+      restored = true;
+    }
+    if (restored) beginRunReplay();
+  }
+
+  async function openFallbackSessionView(excludedSessionId) {
+    const excluded = String(excludedSessionId || "");
+    const fallback = state.currentSessionId && state.currentSessionId !== excluded
+      ? state.currentSessionId
+      : String(state.sessions.find((session) => String(session?.session_id) !== excluded)?.session_id || "");
+    if (fallback) await loadSessionView(fallback, { quiet: true });
+    else await loadBootstrap();
+  }
+
+  async function makeDefaultSession(sessionId) {
+    if (!sessionId || state.sessionBusy) return;
     state.sessionBusy = true;
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/activate`, { method: "POST" });
-      state.pendingSessionSwitch = null;
-      updateSessionSwitchNotice();
-      await loadBootstrap();
-      closeSidebar();
+      state.currentSessionId = sessionId;
+      renderSessionList();
+      showToast("已设为默认会话");
     } catch (error) {
-      showToast(error.message || "切换会话失败", "error");
+      showToast(error.message || "设为默认失败", "error");
     } finally {
       state.sessionBusy = false;
     }
@@ -2047,12 +2200,9 @@
         body: JSON.stringify({ archived: true })
       });
       showToast("会话已归档");
-      if (sessionId === state.currentSessionId) {
-        await loadBootstrap();
-      } else {
-        state.sessions = state.sessions.filter((session) => String(session?.session_id) !== String(sessionId));
-        renderSessionList();
-      }
+      state.sessions = state.sessions.filter((session) => String(session?.session_id) !== String(sessionId));
+      renderSessionList();
+      if (sessionId === state.viewSessionId) await openFallbackSessionView(sessionId);
       if (state.archivedOpen) await loadArchivedSessions();
     } catch (error) {
       showToast(error.message || "归档失败", "error");
@@ -2086,14 +2236,11 @@
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
       showToast("会话已删除");
-      if (sessionId === state.currentSessionId) {
-        await loadBootstrap();
-      } else {
-        state.sessions = state.sessions.filter((item) => String(item?.session_id) !== String(sessionId));
-        state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== String(sessionId));
-        renderSessionList();
-        renderArchivedList();
-      }
+      state.sessions = state.sessions.filter((item) => String(item?.session_id) !== String(sessionId));
+      state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== String(sessionId));
+      renderSessionList();
+      renderArchivedList();
+      if (sessionId === state.viewSessionId) await openFallbackSessionView(sessionId);
     } catch (error) {
       showToast(error.message || "删除失败", "error");
     } finally {
@@ -2124,8 +2271,7 @@
       if (target) target.name = String(data?.name || "");
       renderSessionList();
       renderArchivedList();
-      updateSessionSwitchNotice();
-      if (sessionId === state.currentSessionId) updateConversationChrome();
+      if (sessionId === state.viewSessionId) updateConversationChrome();
     } else if (name === "session.archived") {
       refreshSessions();
     } else if (name === "session.deleted") {
@@ -2133,45 +2279,48 @@
       state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== sessionId);
       renderSessionList();
       renderArchivedList();
-      if (sessionId === state.currentSessionId && !state.bootstrapPromise) loadBootstrap();
+      if (sessionId === state.viewSessionId && !state.bootstrapPromise && !state.viewLoading) {
+        openFallbackSessionView(sessionId);
+      }
     } else if (name === "session.updated") {
       const target = findSession(sessionId) || findArchivedSession(sessionId);
       if (target) target.workspace = String(data?.workspace || "");
       renderSessionList();
-      if (sessionId === state.currentSessionId) updateConversationChrome();
+      if (sessionId === state.viewSessionId) updateConversationChrome();
     } else if (name === "session.current_changed") {
-      if (sessionId === state.currentSessionId) {
-        state.pendingSessionSwitch = null;
-        updateSessionSwitchNotice();
-      } else if (!state.sessionBusy && !state.bootstrapPromise) {
-        state.pendingSessionSwitch = sessionId;
-        updateSessionSwitchNotice();
-      }
+      // 每视图独立浏览：默认会话只影响侧栏「默认」徽标，不再跟随切换。
+      state.currentSessionId = sessionId;
+      renderSessionList();
     }
   }
 
   function updateConversationChrome() {
     const details = deriveConversationDetails();
-    const current = multiSessionEnabled() ? currentSessionEntry() : null;
+    const current = multiSessionEnabled() ? viewSessionEntry() : null;
     const title = current ? sessionDisplayName(current) : details.title;
     elements.conversationTitle.textContent = title;
     elements.conversationTitle.title = title;
     const workspace = String(current?.workspace || "").trim();
     let meta;
-    if (conversationRunning()) meta = state.cancellationRequested ? "正在停止" : "正在回复";
-    else meta = details.timestamp ? formatRelativeTime(details.timestamp) : "尚未开始";
+    if (conversationRunning()) {
+      meta = state.liveRuns.size > 1 ? `${formatInteger(state.liveRuns.size)} 路回复进行中` : "正在回复";
+    } else meta = details.timestamp ? formatRelativeTime(details.timestamp) : "尚未开始";
     elements.conversationMeta.textContent = workspace ? `${meta} · ${workspace}` : meta;
     elements.conversationMeta.title = workspace;
     renderSessionList();
   }
 
   function conversationRunning() {
-    return Boolean(state.activeRunId || state.externalRunningTurnId);
+    return state.liveRuns.size > 0 || Boolean(state.viewRunningTurnId);
   }
 
   function hasPendingQuestion() {
-    if (!state.live) return false;
-    return Array.from(state.live.questions.values()).some((question) => question.pending);
+    for (const live of state.liveRuns.values()) {
+      for (const question of live.questions.values()) {
+        if (question.pending) return true;
+      }
+    }
+    return false;
   }
 
   function countCharacters(value) {
@@ -2196,15 +2345,13 @@
 
   function updateControlState() {
     const running = conversationRunning();
-    const cancellable = Boolean(state.activeRunId);
-    const queueAvailable = !state.externalRunningTurnId || state.externalQueueAvailable;
     const busy = state.adminBusy || state.submitting;
     const locked = state.blocked || state.adminBusy;
     const inputCount = countCharacters(elements.composerInput.value.trim());
 
     elements.composerInput.disabled = locked;
     elements.composerForm.classList.toggle("is-disabled", locked);
-    elements.newChatButton.disabled = state.blocked || running || busy || state.sessionBusy;
+    elements.newChatButton.disabled = state.blocked || busy || state.sessionBusy || state.viewLoading;
     elements.modelButton.disabled = state.blocked || running || busy || state.models.length === 0;
     elements.modeSwitch.querySelectorAll("button").forEach((button) => {
       button.disabled = state.blocked || running || busy;
@@ -2221,18 +2368,12 @@
     elements.sendButton.querySelector(".icon-slot").replaceChildren(createIcon("arrow-up"));
     elements.sendButton.title = running ? "加入队列" : "发送消息";
     elements.sendButton.setAttribute("aria-label", elements.sendButton.title);
-    elements.sendButton.disabled = state.blocked || state.adminBusy || state.submitting || hasPendingQuestion() || (running && !queueAvailable) || inputCount === 0 || inputCount > MAX_CONTENT_CHARS;
-    elements.stopButton.hidden = !cancellable;
-    elements.stopButton.disabled = !cancellable || state.cancellationRequested || state.adminBusy;
-    elements.stopButton.title = state.cancellationRequested ? "正在停止" : "停止回复";
-    elements.stopButton.setAttribute("aria-label", elements.stopButton.title);
+    elements.sendButton.disabled = state.blocked || state.adminBusy || state.submitting || hasPendingQuestion() || inputCount === 0 || inputCount > MAX_CONTENT_CHARS;
 
     if (state.blocked) elements.composerState.textContent = "未授权";
-    else if (state.cancellationRequested) elements.composerState.textContent = "正在停止";
     else if (hasPendingQuestion()) elements.composerState.textContent = "等待回答";
     else if (busy) elements.composerState.textContent = state.submitting ? (running ? "正在加入队列" : "正在发送") : "正在处理";
     else if (inputCount > MAX_CONTENT_CHARS) elements.composerState.textContent = "消息不能超过 20,000 个字符";
-    else if (running && !queueAvailable) elements.composerState.textContent = "另一会话正在运行";
     else if (running) elements.composerState.textContent = state.queuedPrompts.length
       ? `Miyu 正在回复 · ${state.queuedPrompts.length} 条排队`
       : "Miyu 正在回复";
@@ -3124,6 +3265,8 @@
       article: null,
       blocks: null,
       headerStatus: null,
+      stopButton: null,
+      cancellationRequested: false,
       meta: null,
       endpoint: null,
       copyButton: null,
@@ -3175,7 +3318,7 @@
       renderQueueTray();
     } catch (error) {
       showToast(error.message || "排队消息移除失败", "error");
-      if (error.status === 404) await loadBootstrap();
+      if (error.status === 404 && state.viewSessionId) await loadSessionView(state.viewSessionId, { quiet: true });
     }
   }
 
@@ -3195,25 +3338,6 @@
     }
   }
 
-  function establishRun(runId) {
-    if (!runId) return null;
-    if (state.live?.runId === runId) return state.live;
-    if (state.activeRunId && state.activeRunId !== runId) return null;
-    state.activeRunId = runId;
-    state.cancellationRequested = false;
-    const runningTurn = [...state.turns].reverse().find((turn) => turn?.status === "running");
-    state.live = createLiveState(runId, {
-      turnId: runningTurn?.id || null,
-      userText: runningTurn?.user_content || "",
-      startedAt: runningTurn?.user_timestamp || new Date(),
-      userRendered: Boolean(runningTurn)
-    });
-    updateConversationChrome();
-    updateRuntimeUsage();
-    updateControlState();
-    return state.live;
-  }
-
   function ensureTimelineVisible() {
     elements.loadingState.hidden = true;
     elements.blockedState.hidden = true;
@@ -3221,15 +3345,14 @@
     elements.timeline.hidden = false;
   }
 
-  function ensureLiveUser(content, runId) {
-    const live = establishRun(runId);
+  function ensureLiveUser(live, content) {
     if (!live || live.userRendered) return;
     const text = String(content || live.userText || "");
     if (!text.trim()) return;
     live.userText = text;
     ensureTimelineVisible();
     appendDayDividerIfNeeded(new Date());
-    const message = createUserMessage(text, new Date(), { runId });
+    const message = createUserMessage(text, new Date(), { runId: live.runId });
     if (live.article?.isConnected) elements.timeline.insertBefore(message, live.article);
     else elements.timeline.appendChild(message);
     live.userRendered = true;
@@ -3244,10 +3367,41 @@
     status?.remove();
   }
 
+  function updateLiveStopButton(live) {
+    if (!live.stopButton) return;
+    live.stopButton.disabled = live.ended || live.cancellationRequested;
+    live.stopButton.title = live.cancellationRequested ? "正在停止" : "停止本条回复";
+    live.stopButton.setAttribute("aria-label", live.stopButton.title);
+  }
+
+  function removeLiveStopButton(live) {
+    if (!live.stopButton) return;
+    live.stopButton.remove();
+    live.stopButton = null;
+  }
+
+  async function cancelLiveRun(live) {
+    if (!live || live.ended || live.cancellationRequested) return;
+    live.cancellationRequested = true;
+    updateLiveStopButton(live);
+    if (live.headerStatus) live.headerStatus.textContent = "正在停止";
+    try {
+      await apiRequest(`/api/runs/${encodeURIComponent(live.runId)}/cancel`, { method: "POST" });
+    } catch (error) {
+      live.cancellationRequested = false;
+      updateLiveStopButton(live);
+      if (live.headerStatus && !live.ended) live.headerStatus.textContent = "正在回复";
+      showToast(error.message || "停止失败", "error");
+      if ((error.status === 404 || error.status === 409) && state.viewSessionId) {
+        await loadSessionView(state.viewSessionId, { quiet: true });
+      }
+    }
+  }
+
   function ensureLiveArticle(live) {
     if (live.article) return live.article;
     ensureTimelineVisible();
-    ensureLiveUser(live.userText, live.runId);
+    ensureLiveUser(live, live.userText);
     removeRunningStatus(live.turnId);
     const article = document.createElement("article");
     article.className = "message assistant-message live-assistant";
@@ -3266,7 +3420,12 @@
     status.className = "live-indicator";
     status.textContent = "正在回复";
     identity.append(name, status);
-    header.append(avatar, identity);
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "live-stop-button";
+    stop.appendChild(makeIconSlot("circle-stop"));
+    stop.addEventListener("click", () => cancelLiveRun(live));
+    header.append(avatar, identity, stop);
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content";
     const blocks = document.createElement("div");
@@ -3289,9 +3448,11 @@
     live.article = article;
     live.blocks = blocks;
     live.headerStatus = status;
+    live.stopButton = stop;
     live.meta = metaText;
     live.endpoint = endpoint;
     live.copyButton = copy;
+    updateLiveStopButton(live);
     contentAdded();
     return article;
   }
@@ -3863,7 +4024,9 @@
       questionState.submit.textContent = "提交回答";
       setQuestionControlsDisabled(questionState, false);
       showToast(error.message || "回答提交失败", "error");
-      if (error.status === 404 || error.status === 409) window.setTimeout(() => loadBootstrap(), 300);
+      if ((error.status === 404 || error.status === 409) && state.viewSessionId) {
+        window.setTimeout(() => loadSessionView(state.viewSessionId, { quiet: true }), 300);
+      }
     }
   }
 
@@ -4063,7 +4226,7 @@
       submitQuestion(questionState);
     });
     live.questions.set(questionId, questionState);
-    elements.questionDock.replaceChildren(card);
+    elements.questionDock.appendChild(card);
     updateQuestionDock();
     setQuestionPage(questionState, 0);
     updateQuestionOptionClasses(questionState);
@@ -4182,6 +4345,7 @@
     }
     renderQueueTray();
 
+    removeLiveStopButton(live);
     live.article = null;
     live.blocks = null;
     live.headerStatus = null;
@@ -4240,13 +4404,13 @@
     }
   }
 
-  function finishLiveRun(kind, data) {
-    const runId = String(data?.run_id || "");
-    const live = state.live?.runId === runId ? state.live : establishRun(runId);
+  function finishLiveRun(kind, data, live) {
     if (!live || live.ended) return;
+    const runId = live.runId;
     live.ended = true;
     finalizeLiveReasoning(live);
     setLiveEndpoint(live, data?.provider_id, data?.model);
+    removeLiveStopButton(live);
     state.terminalRunIds.add(runId);
     if (state.terminalRunIds.size > 30) state.terminalRunIds.delete(state.terminalRunIds.values().next().value);
 
@@ -4272,8 +4436,12 @@
 
     updateLocalTurnFromLive(live, kind, data);
     if (kind === "completed") {
-      if (data?.context_tokens != null) state.context.tokens = Math.max(0, asFiniteNumber(data.context_tokens));
-      state.context.window = data?.context_window == null ? state.context.window : Math.max(0, asFiniteNumber(data.context_window));
+      // 上下文条展示全局（默认会话）上下文；其他会话的 run 不覆盖它。
+      const updatesGlobalContext = !data?.session_id || String(data.session_id) === String(state.currentSessionId || "");
+      if (updatesGlobalContext) {
+        if (data?.context_tokens != null) state.context.tokens = Math.max(0, asFiniteNumber(data.context_tokens));
+        state.context.window = data?.context_window == null ? state.context.window : Math.max(0, asFiniteNumber(data.context_window));
+      }
       const usage = data?.usage && typeof data.usage === "object" ? data.usage : null;
       if (usage) {
         state.usage.last_usage = usage;
@@ -4284,144 +4452,152 @@
         state.usage.total_tokens = asFiniteNumber(state.usage.total_tokens) + effectiveUsageTotal(usage);
       }
     }
-    state.activeRunId = null;
-    state.replayRunId = null;
-    state.replayCutoff = 0;
-    state.cancellationRequested = false;
+    state.liveRuns.delete(runId);
+    state.replayRunIds?.delete(runId);
     state.pendingSubmission = null;
-    state.live = null;
     updateContext();
     updateRuntimeUsage(data?.usage || null, Boolean(data?.usage_estimated));
     updateConversationChrome();
     updateControlState();
     contentAdded();
-    window.requestAnimationFrame(() => {
-      if (!state.blocked && !elements.settingsDrawer.classList.contains("open")) elements.composerInput.focus();
-    });
-    window.setTimeout(syncBootstrapSnapshot, 120);
+    if (state.liveRuns.size === 0) {
+      window.requestAnimationFrame(() => {
+        if (!state.blocked && !elements.settingsDrawer.classList.contains("open")) elements.composerInput.focus();
+      });
+      window.setTimeout(() => {
+        if (state.liveRuns.size === 0) refreshViewSnapshot();
+      }, 120);
+    }
   }
 
-  function clearExternalSyncTimer() {
-    if (!state.externalSyncTimer) return;
-    window.clearTimeout(state.externalSyncTimer);
-    state.externalSyncTimer = null;
+  function clearViewSyncTimer() {
+    if (!state.viewSyncTimer) return;
+    window.clearTimeout(state.viewSyncTimer);
+    state.viewSyncTimer = null;
   }
 
-  function scheduleExternalSync() {
-    clearExternalSyncTimer();
-    if (!state.externalRunningTurnId || state.blocked) return;
-    state.externalSyncTimer = window.setTimeout(() => {
-      state.externalSyncTimer = null;
-      syncBootstrapSnapshot();
+  function scheduleViewSync() {
+    clearViewSyncTimer();
+    if (!state.viewRunningTurnId || state.blocked) return;
+    state.viewSyncTimer = window.setTimeout(() => {
+      state.viewSyncTimer = null;
+      refreshViewSnapshot();
     }, 1_000);
   }
 
-  async function syncBootstrapSnapshot() {
-    if (state.blocked) return;
-    if (state.resyncing) {
-      scheduleExternalSync();
+  async function refreshViewSnapshot() {
+    const sessionId = state.viewSessionId;
+    if (!sessionId || state.blocked || state.viewLoading || state.resyncing) {
+      scheduleViewSync();
       return;
     }
     try {
-      const response = await apiRequest("/api/bootstrap");
-      const snapshot = await response.json();
-      if (state.bootId && snapshot?.boot_id && snapshot.boot_id !== state.bootId) {
-        await loadBootstrap();
-        return;
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/turns`);
+      const payload = await response.json();
+      if (state.viewSessionId !== sessionId || state.viewLoading) return;
+      const runs = (Array.isArray(payload?.runs) ? payload.runs : []).filter((run) => run?.run_id);
+      if (runs.length) state.runsBySession.set(sessionId, new Set(runs.map((run) => String(run.run_id))));
+      else if (state.liveRuns.size === 0) state.runsBySession.delete(sessionId);
+      state.viewRunningTurnId = !runs.length && typeof payload?.running_turn_id === "string" && payload.running_turn_id
+        ? payload.running_turn_id
+        : null;
+      if (state.liveRuns.size === 0) {
+        const nextTurns = Array.isArray(payload?.turns)
+          ? payload.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
+          : state.turns;
+        const turnsChanged = JSON.stringify(nextTurns) !== JSON.stringify(state.turns);
+        state.turns = nextTurns;
+        state.queuedPrompts = Array.isArray(payload?.queued_prompts) ? payload.queued_prompts : state.queuedPrompts;
+        if (turnsChanged) renderConversation();
+        renderQueueTray();
+        restoreLiveRuns(runs);
       }
-      const snapshotSessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : null;
-      const snapshotCurrentId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
-      if (multiSessionEnabled() && state.currentSessionId && snapshotCurrentId && snapshotCurrentId !== state.currentSessionId) {
-        // 全局当前会话已被其他端切换：快照内容属于别的会话，不覆盖当前时间线。
-        if (snapshotSessions) state.sessions = snapshotSessions;
-        if (!state.sessionBusy && !state.bootstrapPromise && !state.pendingSessionSwitch) {
-          state.pendingSessionSwitch = snapshotCurrentId;
-        }
-        updateSessionSwitchNotice();
-        renderSessionList();
-        return;
-      }
-      const snapshotActiveRunId = typeof snapshot?.active_run_id === "string" && snapshot.active_run_id ? snapshot.active_run_id : null;
-      if (snapshotActiveRunId && snapshotActiveRunId !== state.activeRunId) {
-        await loadBootstrap();
-        return;
-      }
-      if (snapshotSessions) state.sessions = snapshotSessions;
-      const previousExternalTurnId = state.externalRunningTurnId;
-      const nextExternalTurnId = snapshotActiveRunId
-        ? null
-        : typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id
-          ? snapshot.running_turn_id
-          : null;
-      const nextTurns = Array.isArray(snapshot?.turns)
-        ? snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
-        : state.turns;
-      const turnsChanged = JSON.stringify(nextTurns) !== JSON.stringify(state.turns);
-      state.turns = nextTurns;
-      state.queuedPrompts = Array.isArray(snapshot?.queued_prompts) ? snapshot.queued_prompts : state.queuedPrompts;
-      state.models = Array.isArray(snapshot?.models) ? snapshot.models : state.models;
-      state.display = snapshot?.display && typeof snapshot.display === "object" ? snapshot.display : state.display;
-      state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : state.context;
-      state.usage = snapshot?.usage && typeof snapshot.usage === "object" ? snapshot.usage : state.usage;
-      state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : state.capabilities;
-      state.version = snapshot?.version ?? state.version;
-      state.externalRunningTurnId = nextExternalTurnId;
-      state.externalQueueAvailable = Boolean(nextExternalTurnId && snapshot?.external_queue_available);
-      elements.versionLabel.textContent = state.version ? `v${state.version}` : "--";
-      if ((previousExternalTurnId || nextExternalTurnId) && (turnsChanged || previousExternalTurnId !== nextExternalTurnId)) {
-        renderConversation();
-      }
-      renderModelMenu();
-      renderQueueTray();
-      updateCapabilities();
-      updateContext();
-      updateRuntimeUsage();
+      renderSessionList();
       updateConversationChrome();
       updateControlState();
     } catch (error) {
-      if (error.status === 401) showBlockedState(true);
+      if (error.status === 401) {
+        showBlockedState(true);
+        return;
+      }
+      if (error.status === 404) {
+        state.viewRunningTurnId = null;
+        refreshSessions();
+        return;
+      }
     } finally {
-      scheduleExternalSync();
+      scheduleViewSync();
     }
   }
 
-  async function ensureActiveTurnUser(turnId) {
-    const live = state.live;
+  async function ensureActiveTurnUser(live, turnId) {
     if (!live || live.userRendered || !turnId) return;
     const existing = state.turns.find((turn) => String(turn?.id) === String(turnId));
     if (existing) {
       live.userText = String(existing.user_content || "");
-      ensureLiveUser(live.userText, live.runId);
+      live.userRendered = true;
+      updateConversationChrome();
       return;
     }
+    const sessionId = state.viewSessionId;
     try {
-      const response = await apiRequest("/api/bootstrap");
-      const snapshot = await response.json();
-      const turn = Array.isArray(snapshot?.turns) ? snapshot.turns.find((item) => String(item?.id) === String(turnId)) : null;
-      if (!turn || state.live !== live) return;
-      state.turns = snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq));
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/turns`);
+      const payload = await response.json();
+      if (state.viewSessionId !== sessionId || state.liveRuns.get(live.runId) !== live || live.userRendered) return;
+      const turn = Array.isArray(payload?.turns) ? payload.turns.find((item) => String(item?.id) === String(turnId)) : null;
+      if (!turn) return;
       live.userText = String(turn.user_content || "");
-      ensureLiveUser(live.userText, live.runId);
+      ensureLiveUser(live, live.userText);
     } catch (_) {
-      // The stream can continue; a later bootstrap will recover the user turn.
+      // The stream can continue; a later view refresh will recover the user turn.
     }
   }
 
   function handleRunEvent(name, data) {
     const runId = String(data?.run_id || "");
     if (!runId) return;
-    if (state.activeRunId && state.activeRunId !== runId) return;
-    if (!state.activeRunId && name !== "run.started" && state.live?.runId !== runId) return;
-    const live = establishRun(runId);
-    if (!live) return;
+    const sessionId = typeof data?.session_id === "string" && data.session_id ? data.session_id : runSessionId(runId);
+    const terminal = name === "run.completed" || name === "run.cancelled" || name === "run.failed";
+    if (name === "run.started" && sessionId) trackRun(sessionId, runId);
+
+    let live = state.liveRuns.get(runId);
+    if (!live && !terminal && !state.terminalRunIds.has(runId) && sessionId && sessionId === state.viewSessionId) {
+      // 视图会话里出现的新 run（本端发起、他端发起或重放）都会挂上 live 块。
+      // run.started 意味着全新的 turn，不去认领时间线里已有的 running turn。
+      live = createLiveForRun(runId, "", { claimTurn: name !== "run.started" });
+      if (live.turnId && state.viewRunningTurnId === String(live.turnId)) state.viewRunningTurnId = null;
+    }
 
     if (name === "run.started") {
-      if (["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+      if (live && ["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+      renderSessionList();
+      updateConversationChrome();
       updateControlState();
-    } else if (name === "turn.started") {
+      return;
+    }
+    if (terminal) {
+      untrackRun(runId);
+      if (live) {
+        finishLiveRun(name.slice("run.".length), data, live);
+      } else {
+        state.terminalRunIds.add(runId);
+        if (state.terminalRunIds.size > 30) state.terminalRunIds.delete(state.terminalRunIds.values().next().value);
+        if (name === "run.completed" && data?.session_id && String(data.session_id) === String(state.currentSessionId || "")) {
+          if (data?.context_tokens != null) state.context.tokens = Math.max(0, asFiniteNumber(data.context_tokens));
+          state.context.window = data?.context_window == null ? state.context.window : Math.max(0, asFiniteNumber(data.context_window));
+          updateContext();
+        }
+        renderSessionList();
+      }
+      return;
+    }
+    if (!live) return;
+
+    if (name === "turn.started") {
       live.turnId = String(data?.turn_id || "");
+      if (state.viewRunningTurnId === live.turnId) state.viewRunningTurnId = null;
       removeRunningStatus(live.turnId);
-      ensureActiveTurnUser(live.turnId);
+      ensureActiveTurnUser(live, live.turnId);
     } else if (name === "assistant.delta") appendAssistantDelta(live, data?.delta);
     else if (name.startsWith("reasoning.")) handleReasoningEvent(name, live, data);
     else if (name === "queue.consumed") consumeLiveQueue(live, data);
@@ -4431,9 +4607,6 @@
       const question = live.questions.get(String(data?.question_id || ""));
       if (question) markQuestionAnswered(question, data?.answers);
     } else if (name.startsWith("context.")) handleContextEvent(name, live, data);
-    else if (name === "run.completed") finishLiveRun("completed", data);
-    else if (name === "run.cancelled") finishLiveRun("cancelled", data);
-    else if (name === "run.failed") finishLiveRun("failed", data);
   }
 
   function eventShouldBeHandled(name, data, eventId) {
@@ -4443,11 +4616,12 @@
     }
     if (eventId > 0 && eventId <= state.lastEventId) return false;
     if (eventId > 0) state.lastEventId = eventId;
-    if (state.replayRunId && eventId > 0 && eventId <= state.replayCutoff) {
+    if (state.replayRunIds && eventId > 0 && eventId <= state.replayCutoff) {
+      // 重放窗口内只重建正在恢复的 run，其余事件已经反映在快照里。
       if (!RUN_EVENTS.has(name)) return false;
-      return String(data?.run_id || "") === state.replayRunId;
+      return state.replayRunIds.has(String(data?.run_id || ""));
     }
-    if (RUN_EVENTS.has(name) && state.activeRunId && String(data?.run_id || "") !== state.activeRunId) return false;
+    if (state.replayRunIds && eventId > state.replayCutoff) state.replayRunIds = null;
     return true;
   }
 
@@ -4475,33 +4649,48 @@
       handleSessionEvent(name, data);
       return;
     }
-    const eventSessionId = typeof data?.session_id === "string" && data.session_id ? data.session_id : "";
-    if (multiSessionEnabled() && eventSessionId && state.currentSessionId && eventSessionId !== state.currentSessionId) {
-      // 其他会话里的活动：各端独立浏览，不打断当前视图。
-      return;
-    }
     if (name === "queue.added") {
       const prompt = data?.prompt;
-      if (prompt && !state.queuedPrompts.some((item) => String(item?.id) === String(prompt?.id))) {
+      if (queueEventTargetsView(data) && prompt && !state.queuedPrompts.some((item) => String(item?.id) === String(prompt?.id))) {
         state.queuedPrompts.push(prompt);
         renderQueueTray();
       }
       return;
     }
     if (name === "queue.removed") {
-      state.queuedPrompts = state.queuedPrompts.filter((prompt) => String(prompt?.id) !== String(data?.prompt_id));
-      renderQueueTray();
+      if (queueEventTargetsView(data)) {
+        state.queuedPrompts = state.queuedPrompts.filter((prompt) => String(prompt?.id) !== String(data?.prompt_id));
+        renderQueueTray();
+      }
       return;
     }
-    if (name === "conversation.reset") {
-      loadBootstrap();
-      return;
-    }
-    if (name === "conversation.pop") {
-      loadBootstrap();
+    if (name === "conversation.reset" || name === "conversation.pop") {
+      // 这两个事件作用于全局默认会话；仅当视图正停在默认会话时才需要重载。
+      if (!state.viewSessionId || state.viewSessionId === state.currentSessionId) loadBootstrap();
+      else refreshSessions();
       return;
     }
     handleRunEvent(name, data);
+  }
+
+  function queueEventTargetsView(data) {
+    const explicit = typeof data?.session_id === "string" && data.session_id ? data.session_id : "";
+    if (explicit) return explicit === state.viewSessionId;
+    const runId = String(data?.run_id || "");
+    if (runId) {
+      if (state.liveRuns.has(runId)) return true;
+      const sessionId = runSessionId(runId);
+      if (sessionId) return sessionId === state.viewSessionId;
+    }
+    const turnId = String(data?.turn_id || "");
+    if (turnId) {
+      if (state.viewRunningTurnId && turnId === state.viewRunningTurnId) return true;
+      for (const live of state.liveRuns.values()) {
+        if (String(live.turnId || "") === turnId) return true;
+      }
+      return state.turns.some((turn) => String(turn?.id) === turnId && turn?.status === "running");
+    }
+    return false;
   }
 
   function closeEventSource() {
@@ -4548,12 +4737,9 @@
 
   function showBlockedState(unauthorized, message = "") {
     state.blocked = true;
-    state.activeRunId = null;
-    state.externalRunningTurnId = null;
-    state.externalQueueAvailable = false;
-    clearExternalSyncTimer();
-    disposeLiveState(state.live);
-    state.live = null;
+    state.viewRunningTurnId = null;
+    clearViewSyncTimer();
+    disposeAllLiveRuns();
     clearQuestionDock();
     closeEventSource();
     elements.loadingState.hidden = true;
@@ -4574,12 +4760,10 @@
 
   function applyBootstrap(snapshot) {
     state.blocked = false;
-    clearExternalSyncTimer();
-    disposeLiveState(state.live);
+    clearViewSyncTimer();
+    disposeAllLiveRuns();
     state.bootId = String(snapshot?.boot_id || "");
     state.latestEventId = Math.max(0, asFiniteNumber(snapshot?.latest_event_id));
-    state.turns = Array.isArray(snapshot?.turns) ? snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq)) : [];
-    state.queuedPrompts = Array.isArray(snapshot?.queued_prompts) ? snapshot.queued_prompts : [];
     state.models = Array.isArray(snapshot?.models) ? snapshot.models : [];
     state.display = snapshot?.display && typeof snapshot.display === "object" ? snapshot.display : state.display;
     state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : { tokens: 0, window: null };
@@ -4587,20 +4771,14 @@
     state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {};
     state.sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : [];
     state.currentSessionId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
-    state.pendingSessionSwitch = null;
     state.sessionMenuFor = null;
     state.sessionRenaming = null;
-    updateSessionSwitchNotice();
     if (state.archivedOpen) loadArchivedSessions();
     state.version = snapshot?.version ?? null;
-    state.activeRunId = typeof snapshot?.active_run_id === "string" && snapshot.active_run_id ? snapshot.active_run_id : null;
-    state.externalRunningTurnId = !state.activeRunId && typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id
-      ? snapshot.running_turn_id
-      : null;
-    state.externalQueueAvailable = Boolean(state.externalRunningTurnId && snapshot?.external_queue_available);
-    state.cancellationRequested = false;
     state.pendingSubmission = null;
-    state.live = null;
+    const allRuns = (Array.isArray(snapshot?.runs) ? snapshot.runs : []).filter((run) => run?.run_id && run?.session_id);
+    state.runsBySession = new Map();
+    for (const run of allRuns) trackRun(String(run.session_id), String(run.run_id));
     elements.loginForm.hidden = true;
     elements.retryBootstrapButton.hidden = false;
     elements.loginPassword.value = "";
@@ -4609,26 +4787,37 @@
     setLoginSubmitting(false);
     elements.versionLabel.textContent = state.version ? `v${state.version}` : "--";
     clearInlineError();
-    renderConversation();
     renderModelMenu();
-    renderQueueTray();
     updateCapabilities();
     updateContext();
-    if (state.activeRunId) {
-      const runningTurn = [...state.turns].reverse().find((turn) => turn?.status === "running");
-      state.live = createLiveState(state.activeRunId, {
-        turnId: runningTurn?.id || null,
-        userText: runningTurn?.user_content || "",
-        startedAt: runningTurn?.user_timestamp || new Date(),
-        userRendered: Boolean(runningTurn)
+    state.replayRunIds = null;
+    state.replayCutoff = 0;
+    const keepView = state.viewSessionId && state.viewSessionId !== state.currentSessionId && findSession(state.viewSessionId);
+    if (keepView) {
+      // 视图停留在非默认会话：全局重载不改变浏览位置，改用会话接口回填。
+      state.lastEventId = state.latestEventId;
+      connectEventSource(state.latestEventId);
+      loadSessionView(state.viewSessionId, { quiet: true });
+    } else if (state.currentSessionId) {
+      applySessionView({
+        session_id: state.currentSessionId,
+        turns: snapshot?.turns,
+        queued_prompts: snapshot?.queued_prompts,
+        running_turn_id: snapshot?.running_turn_id,
+        runs: allRuns.filter((run) => String(run.session_id) === String(state.currentSessionId))
       });
-      state.replayRunId = state.activeRunId;
-      state.replayCutoff = state.latestEventId;
-      state.lastEventId = 0;
-      connectEventSource(0);
+      if (state.liveRuns.size === 0) {
+        state.lastEventId = state.latestEventId;
+        connectEventSource(state.latestEventId);
+      }
     } else {
-      state.replayRunId = null;
-      state.replayCutoff = 0;
+      // 单会话兜底：没有会话指针时直接使用 bootstrap 快照。
+      state.viewSessionId = null;
+      state.viewRunningTurnId = typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id ? snapshot.running_turn_id : null;
+      state.turns = Array.isArray(snapshot?.turns) ? snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq)) : [];
+      state.queuedPrompts = Array.isArray(snapshot?.queued_prompts) ? snapshot.queued_prompts : [];
+      renderConversation();
+      renderQueueTray();
       state.lastEventId = state.latestEventId;
       connectEventSource(state.latestEventId);
     }
@@ -4636,17 +4825,16 @@
     updateRuntimeUsage();
     updateConversationChrome();
     updateControlState();
-    scheduleExternalSync();
   }
 
   async function loadBootstrap() {
     if (state.bootstrapPromise) return state.bootstrapPromise;
     state.bootstrapPromise = (async () => {
-      clearExternalSyncTimer();
+      clearViewSyncTimer();
       closeEventSource();
       state.adminBusy = false;
       state.submitting = false;
-      if (!state.turns.length && !state.live) {
+      if (!state.turns.length && state.liveRuns.size === 0) {
         elements.loadingState.hidden = false;
         elements.blockedState.hidden = true;
         elements.emptyState.hidden = true;
@@ -4763,7 +4951,8 @@
 
   async function submitTurn() {
     if (state.adminBusy || state.submitting || state.blocked) return;
-    if (hasPendingQuestion() || (state.externalRunningTurnId && !state.externalQueueAvailable)) return;
+    if (hasPendingQuestion()) return;
+    const sessionId = state.viewSessionId;
     const queueing = conversationRunning();
     const content = elements.composerInput.value.trim();
     const count = countCharacters(content);
@@ -4782,9 +4971,11 @@
     clearInlineError();
     updateControlState();
     try {
+      const body = queueing ? { content } : { content, mode: state.mode };
+      if (sessionId) body.session_id = sessionId;
       const response = await apiRequest(queueing ? "/api/queue" : "/api/turns", {
         method: "POST",
-        body: JSON.stringify(queueing ? { content } : { content, mode: state.mode })
+        body: JSON.stringify(body)
       });
       const payload = await response.json();
       const queuedPrompt = queueing ? payload : payload?.queued ? payload.prompt : null;
@@ -4793,67 +4984,64 @@
           state.queuedPrompts.push(queuedPrompt);
         }
         state.pendingSubmission = null;
-        if (!queueing) {
-          const fallbackRunId = String(payload?.run_id || "");
-          state.externalRunningTurnId = fallbackRunId ? null : String(payload?.running_turn_id || "") || null;
-          state.externalQueueAvailable = Boolean(state.externalRunningTurnId);
-          if (fallbackRunId) state.activeRunId = fallbackRunId;
-        }
         elements.composerInput.value = "";
         resizeComposer();
         renderQueueTray();
-        if (!queueing && state.activeRunId) await loadBootstrap();
-        else scheduleExternalSync();
+        if (!queueing) {
+          // 服务端发现该会话已有 turn 在运行并自动转排队：同步该 run 的 live 状态。
+          const runningRunId = String(payload?.run_id || "");
+          if (runningRunId && sessionId) {
+            trackRun(sessionId, runningRunId);
+            if (!state.liveRuns.has(runningRunId) && !state.terminalRunIds.has(runningRunId)) {
+              createLiveForRun(runningRunId);
+              beginRunReplay();
+            }
+          } else {
+            state.viewRunningTurnId = String(payload?.running_turn_id || "") || state.viewRunningTurnId;
+            scheduleViewSync();
+          }
+          renderSessionList();
+          updateConversationChrome();
+        }
         return;
       }
       const runId = String(payload?.run_id || "");
       if (!runId) throw new ApiError("服务未返回运行标识", response.status);
       if (state.terminalRunIds.has(runId)) {
-        await loadBootstrap();
+        if (sessionId) await loadSessionView(sessionId, { quiet: true });
+        else await loadBootstrap();
       } else {
-        state.activeRunId = runId;
-        const live = state.live?.runId === runId ? state.live : createLiveState(runId, { userText: content });
+        if (sessionId) trackRun(sessionId, runId);
+        const live = createLiveForRun(runId, content);
         live.userText = content;
-        state.live = live;
-        ensureLiveUser(content, runId);
+        ensureLiveUser(live, content);
         elements.composerInput.value = "";
         resizeComposer();
         updateRuntimeUsage();
         updateConversationChrome();
+        renderSessionList();
       }
     } catch (error) {
       if (!queueing) state.pendingSubmission = null;
       showInlineError(error.status === 409
-        ? queueing ? "回复状态刚刚发生变化，正在同步" : "已有回复正在运行，正在同步当前状态"
+        ? "回复状态刚刚发生变化，正在同步"
         : error.message);
       showToast(error.status === 409 ? "回复状态已同步，请重新发送" : error.message, "error");
-      if (error.status === 409) await loadBootstrap();
+      if (error.status === 409) {
+        if (sessionId) await loadSessionView(sessionId, { quiet: true });
+        else await loadBootstrap();
+      }
     } finally {
       state.submitting = false;
       updateControlState();
     }
   }
 
-  async function cancelActiveRun() {
-    const runId = state.activeRunId;
-    if (!runId || state.cancellationRequested) return;
-    state.cancellationRequested = true;
-    updateConversationChrome();
-    updateControlState();
-    try {
-      await apiRequest(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
-    } catch (error) {
-      state.cancellationRequested = false;
-      showInlineError(error.message);
-      showToast(error.message, "error");
-      updateConversationChrome();
-      updateControlState();
-      if (error.status === 404 || error.status === 409) await loadBootstrap();
-    }
-  }
-
   function hasHistory() {
-    return state.turns.length > 0 || Boolean(state.live?.userRendered) || Boolean(elements.timeline.querySelector(".user-message"));
+    for (const live of state.liveRuns.values()) {
+      if (live.userRendered) return true;
+    }
+    return state.turns.length > 0 || Boolean(elements.timeline.querySelector(".user-message"));
   }
 
   function openResetDialog() {
@@ -4962,15 +5150,6 @@
     elements.sidebarClose.addEventListener("click", closeSidebar);
     elements.sidebarScrim.addEventListener("click", closeSidebar);
     elements.archivedToggle.addEventListener("click", toggleArchivedSection);
-    elements.followSwitchButton.addEventListener("click", () => {
-      state.pendingSessionSwitch = null;
-      updateSessionSwitchNotice();
-      loadBootstrap();
-    });
-    elements.dismissSwitchButton.addEventListener("click", () => {
-      state.pendingSessionSwitch = null;
-      updateSessionSwitchNotice();
-    });
     elements.settingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.settingsClose.addEventListener("click", () => closeSettings());
@@ -5050,7 +5229,6 @@
       event.preventDefault();
       submitTurn();
     });
-    elements.stopButton.addEventListener("click", cancelActiveRun);
     elements.loginForm.addEventListener("submit", (event) => {
       event.preventDefault();
       submitLogin();
