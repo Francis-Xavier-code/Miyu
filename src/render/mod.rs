@@ -1605,53 +1605,60 @@ impl StreamRenderer {
     }
 
     fn tool_summary_text(&self) -> String {
-        let parts = self
-            .tool_stats
-            .iter()
-            .map(|(name, stats)| {
-                let display = self.display_tool_name(name);
-                let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
-                if inline_tool_subject(name) {
-                    if let Some(subject) = &stats.subject {
-                        header.push_str(" · ");
-                        header.push_str(subject);
-                    }
+        let (phase, lines) = self.tool_summary_blocks(false);
+        if lines.is_empty() {
+            phase
+        } else {
+            format!("{phase}\n{}", lines.join("\n"))
+        }
+    }
+
+    /// Composes the per-tool stacked blocks shared by the live spinner and
+    /// the committed summary: the first tool's header becomes the phase line;
+    /// every other tool contributes its own `~`-prefixed header, and each
+    /// tool its own subject/progress lines. `live` selects running progress
+    /// only; the committed variant prefers `final_progress` with a `✓`.
+    fn tool_summary_blocks(&self, live: bool) -> (String, Vec<String>) {
+        let mut phase = String::new();
+        let mut lines: Vec<String> = Vec::new();
+        for (index, (name, stats)) in self.tool_stats.iter().enumerate() {
+            let display = self.display_tool_name(name);
+            let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
+            if inline_tool_subject(name) {
+                if let Some(subject) = &stats.subject {
+                    header.push_str(" · ");
+                    header.push_str(subject);
                 }
-                let progress_text = stats.final_progress.as_ref().or(stats.progress.as_ref());
-                let progress_prefix = if stats.final_progress.is_some() {
-                    "✓"
-                } else {
-                    "↳"
-                };
-                let is_final_progress = stats.final_progress.is_some();
-                let subject = (!inline_tool_subject(name))
-                    .then(|| stats.subject.as_ref().map(|subject| format!("↳ {subject}")))
-                    .flatten();
-                let progress = progress_text.and_then(|message| {
-                    let progress = message
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .map(|line| {
-                            let line = if is_final_progress {
-                                clip_progress_line_preserving_spaces(line, 120)
-                            } else {
-                                clip_progress_line(line, 120)
-                            };
-                            format!("{progress_prefix} {line}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!progress.is_empty()).then_some(progress)
-                });
-                [Some(header), subject, progress]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.tool_summary_with_prefix(parts)
+            }
+            if index == 0 {
+                phase = self.tool_summary_with_prefix(header);
+            } else {
+                lines.push(format!("~ {header}"));
+            }
+            if !inline_tool_subject(name) {
+                if let Some(subject) = &stats.subject {
+                    lines.push(format!("↳ {subject}"));
+                }
+            }
+            let progress_text = if live {
+                stats.progress.as_ref()
+            } else {
+                stats.final_progress.as_ref().or(stats.progress.as_ref())
+            };
+            let is_final_progress = !live && stats.final_progress.is_some();
+            let progress_prefix = if is_final_progress { "✓" } else { "↳" };
+            if let Some(message) = progress_text {
+                for line in message.lines().filter(|line| !line.trim().is_empty()) {
+                    let line = if is_final_progress {
+                        clip_progress_line_preserving_spaces(line, 120)
+                    } else {
+                        clip_progress_line(line, 120)
+                    };
+                    lines.push(format!("{progress_prefix} {line}"));
+                }
+            }
+        }
+        (phase, lines)
     }
 
     fn tool_summary_header(&self) -> String {
@@ -1689,37 +1696,8 @@ impl StreamRenderer {
         if self.tool_stats.len() <= 1 {
             return (self.tool_summary_header(), self.tool_summary_progress());
         }
-        let mut phase = None;
-        let mut sub_lines: Vec<String> = Vec::new();
-        for (index, (name, stats)) in self.tool_stats.iter().enumerate() {
-            let display = self.display_tool_name(name);
-            let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
-            if inline_tool_subject(name) {
-                if let Some(subject) = &stats.subject {
-                    header.push_str(" · ");
-                    header.push_str(subject);
-                }
-            }
-            if index == 0 {
-                phase = Some(self.tool_summary_with_prefix(header));
-            } else {
-                sub_lines.push(format!("~ {header}"));
-            }
-            if !inline_tool_subject(name) {
-                if let Some(subject) = &stats.subject {
-                    sub_lines.push(format!("↳ {subject}"));
-                }
-            }
-            if let Some(message) = &stats.progress {
-                for line in message.lines().filter(|line| !line.trim().is_empty()) {
-                    sub_lines.push(format!("↳ {}", clip_progress_line(line, 120)));
-                }
-            }
-        }
-        (
-            phase.unwrap_or_default(),
-            (!sub_lines.is_empty()).then(|| sub_lines.join("\n")),
-        )
+        let (phase, lines) = self.tool_summary_blocks(true);
+        (phase, (!lines.is_empty()).then(|| lines.join("\n")))
     }
 
     fn tool_summary_with_prefix(&self, parts: String) -> String {
@@ -4672,6 +4650,45 @@ mod tests {
         assert_eq!(lines[5], "↳ 任务C");
         assert_eq!(lines[6], "↳ 正在搜索");
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn committed_summary_keeps_block_headers_when_one_subagent_finishes() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        renderer.tool_stats.insert(
+            "task:任务A".to_string(),
+            ToolStats {
+                calls: 1,
+                subject: Some("任务A".to_string()),
+                ..ToolStats::default()
+            },
+        );
+        renderer.tool_stats.insert(
+            "task:任务B".to_string(),
+            ToolStats {
+                calls: 1,
+                ok: 1,
+                subject: Some("任务B".to_string()),
+                final_progress: Some("工具调用 1 次".to_string()),
+                ..ToolStats::default()
+            },
+        );
+        let text = renderer.tool_summary_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("~ ") && lines[0].contains("任务A"));
+        assert_eq!(lines[1], "↳ 任务A");
+        // The second block keeps its own "~" header even in the committed
+        // summary (regression: it used to lose the prefix).
+        assert!(lines[2].starts_with("~ ") && lines[2].contains("任务B"));
+        assert_eq!(lines[3], "↳ 任务B");
+        assert_eq!(lines[4], "✓ 工具调用 1 次");
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
