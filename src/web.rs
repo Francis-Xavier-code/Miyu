@@ -42,7 +42,6 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as FilePath, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -957,6 +956,21 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
     state_store.adopt_sessions_for_persona(&config.active_persona_scope())?;
+    // Subagent audit sessions are kept for a week, cleaned at startup and
+    // then daily while the daemon runs.
+    const SUBAGENT_AUDIT_RETENTION_DAYS: i64 = 7;
+    let _ = state_store.delete_subagent_sessions_older_than(SUBAGENT_AUDIT_RETENTION_DAYS);
+    {
+        let store = state_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let _ = store.delete_subagent_sessions_older_than(SUBAGENT_AUDIT_RETENTION_DAYS);
+            }
+        });
+    }
     let client = OpenAiCompatibleClient::from_config(&config, &paths)?;
     let registry = build_tool_registry(&config, &paths, AgentMode::Normal, true)?;
     let mut agent = Agent::new(
@@ -3022,13 +3036,16 @@ async fn actor_loop(
                     events.clone(),
                     questions.clone(),
                     run_id,
-                    session_id,
+                    session_id.clone(),
                     content,
                     mode,
                     images,
                     cancel,
                 );
-                tokio::task::spawn_local(crate::tools::workspace::with_workspace(workspace, task));
+                tokio::task::spawn_local(crate::tools::workspace::with_workspace(
+                    workspace,
+                    crate::tools::workspace::with_session(session_id, task),
+                ));
             }
             ActorCommand::SetModels { models, reply } => {
                 let result = rebuild_for_models(

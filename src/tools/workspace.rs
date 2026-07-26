@@ -9,6 +9,19 @@ use std::path::PathBuf;
 
 tokio::task_local! {
     static TURN_WORKSPACE: PathBuf;
+    static TURN_SESSION: std::sync::Arc<str>;
+}
+
+/// Runs `future` with the given session id as the ambient turn session.
+/// Subagents spawned inside the turn read it to link their audit sessions to
+/// the parent.
+pub async fn with_session<F: Future>(session_id: std::sync::Arc<str>, future: F) -> F::Output {
+    TURN_SESSION.scope(session_id, future).await
+}
+
+/// The ambient turn session, if inside a turn scope.
+pub fn try_session() -> Option<std::sync::Arc<str>> {
+    TURN_SESSION.try_with(|session| session.clone()).ok()
 }
 
 /// Runs `future` with the given workspace as the ambient turn workspace.

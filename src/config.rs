@@ -229,6 +229,9 @@ pub struct ToolsConfig {
     pub loading_mode: String,
     #[serde(default = "default_true")]
     pub persist_loaded_tools: bool,
+    /// How many `task` subagents from one tool batch may run concurrently.
+    #[serde(default = "default_subagent_concurrency")]
+    pub subagent_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -876,6 +879,7 @@ impl Default for ToolsConfig {
             max_rounds: 0,
             loading_mode: default_tools_loading_mode(),
             persist_loaded_tools: default_true(),
+            subagent_concurrency: default_subagent_concurrency(),
         }
     }
 }
@@ -2028,6 +2032,10 @@ fn default_true() -> bool {
 
 fn default_tools_loading_mode() -> String {
     "hybrid".to_string()
+}
+
+fn default_subagent_concurrency() -> usize {
+    4
 }
 
 fn default_display_language() -> String {

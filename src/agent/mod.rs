@@ -274,6 +274,13 @@ struct PreparedUserInput {
     hints: Vec<ChatMessage>,
 }
 
+/// Output of a `task` call executed in the parallel group.
+struct GroupTaskOutput {
+    output: String,
+    /// Persistable tool report, extracted at completion.
+    report: Option<String>,
+}
+
 impl Agent {
     pub fn new(
         config: AppConfig,
@@ -319,6 +326,166 @@ impl Agent {
         }
         self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
         Ok(())
+    }
+
+    /// Runs a batch's `task` tool calls concurrently, in waves bounded by
+    /// `tools.subagent_concurrency`. Subagents are independent by design, so
+    /// fanning them out preserves semantics while collapsing wall-clock time.
+    /// Batches with fewer than two task calls — or a not-yet-loaded task tool
+    /// (hybrid lazy loading) — return an empty map and take the serial path.
+    async fn execute_parallel_task_calls<F>(
+        &self,
+        calls: &[crate::llm::ToolCall],
+        loaded_tools: &std::collections::BTreeSet<String>,
+        on_event: &mut F,
+    ) -> Result<std::collections::HashMap<usize, GroupTaskOutput>>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let mut outputs = std::collections::HashMap::new();
+        let eligible: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.function.name == "task")
+            .map(|(index, _)| index)
+            .collect();
+        if eligible.len() < 2 {
+            return Ok(outputs);
+        }
+        {
+            let tools = self.tools.lock().unwrap();
+            if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode)
+                && tools.requires_lazy_load("task", loaded_tools)
+            {
+                return Ok(outputs);
+            }
+        }
+
+        struct Slot {
+            call_index: usize,
+            event_name: String,
+            future: Option<tools::ToolFuture>,
+            progress: mpsc::UnboundedReceiver<tools::ToolProgressEvent>,
+        }
+        enum WaveEvent {
+            Done(usize, Result<String>),
+            Progress(usize, tools::ToolProgressEvent),
+            Spinner,
+        }
+
+        let limit = self.config.tools.subagent_concurrency.max(1);
+        for wave in eligible.chunks(limit) {
+            let mut slots: Vec<Slot> = Vec::new();
+            {
+                let tools = self.tools.lock().unwrap();
+                for &call_index in wave {
+                    let call = &calls[call_index];
+                    let event_name =
+                        tool_event_name(&call.function.name, &call.function.arguments);
+                    on_event(AgentEvent::ToolCall {
+                        name: event_name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    })?;
+                    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+                    match tools.call_with_progress_future(
+                        &call.function.name,
+                        &call.function.arguments,
+                        progress_tx,
+                    ) {
+                        Ok(future) => slots.push(Slot {
+                            call_index,
+                            event_name,
+                            future: Some(future),
+                            progress: progress_rx,
+                        }),
+                        Err(err) => {
+                            let output = format!("tool error: {err}");
+                            on_event(AgentEvent::ToolResult {
+                                name: event_name,
+                                ok: false,
+                                output: output.clone(),
+                            })?;
+                            outputs.insert(call_index, GroupTaskOutput {
+                                output,
+                                report: None,
+                            });
+                        }
+                    }
+                }
+            }
+            let mut remaining = slots.iter().filter(|slot| slot.future.is_some()).count();
+            let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+            spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            spinner_interval.tick().await;
+            while remaining > 0 {
+                let event = {
+                    let poll_slots = std::future::poll_fn(|context| {
+                        for (position, slot) in slots.iter_mut().enumerate() {
+                            if let std::task::Poll::Ready(Some(progress)) =
+                                slot.progress.poll_recv(context)
+                            {
+                                return std::task::Poll::Ready(WaveEvent::Progress(
+                                    position, progress,
+                                ));
+                            }
+                            if let Some(future) = slot.future.as_mut() {
+                                if let std::task::Poll::Ready(result) =
+                                    future.as_mut().poll(context)
+                                {
+                                    slot.future = None;
+                                    return std::task::Poll::Ready(WaveEvent::Done(
+                                        position, result,
+                                    ));
+                                }
+                            }
+                        }
+                        std::task::Poll::Pending
+                    });
+                    tokio::select! {
+                        event = poll_slots => event,
+                        _ = spinner_interval.tick() => WaveEvent::Spinner,
+                    }
+                };
+                match event {
+                    WaveEvent::Spinner => on_event(AgentEvent::SpinnerTick)?,
+                    WaveEvent::Progress(position, progress) => {
+                        emit_tool_progress(on_event, &slots[position].event_name, progress)?;
+                    }
+                    WaveEvent::Done(position, result) => {
+                        remaining -= 1;
+                        while let Ok(progress) = slots[position].progress.try_recv() {
+                            emit_tool_progress(on_event, &slots[position].event_name, progress)?;
+                        }
+                        let call_index = slots[position].call_index;
+                        let event_name = slots[position].event_name.clone();
+                        match result {
+                            Ok(output) => {
+                                on_event(AgentEvent::ToolResult {
+                                    name: event_name,
+                                    ok: true,
+                                    output: output.clone(),
+                                })?;
+                                let report = extract_persistable_tool_report("task", &output);
+                                outputs.insert(call_index, GroupTaskOutput { output, report });
+                            }
+                            Err(err) => {
+                                let output = format!("tool error: {err}");
+                                on_event(AgentEvent::ToolResult {
+                                    name: event_name,
+                                    ok: false,
+                                    output: output.clone(),
+                                })?;
+                                outputs.insert(call_index, GroupTaskOutput {
+                                    output,
+                                    report: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(outputs)
     }
 
     /// Rebuilds the system prompt for the current mode without running
@@ -1087,7 +1254,26 @@ impl Agent {
             let question_round_allowed =
                 question_call_count == 1 && question_rounds <= MAX_QUESTION_ROUNDS_PER_TURN;
             let defer_sibling_tools = question_call_count == 1 && result.tool_calls.len() > 1;
-            for call in result.tool_calls {
+            // Multiple `task` calls in one batch run concurrently (subagents
+            // are independent by design); everything else stays serial.
+            let mut parallel_task_outputs = if defer_sibling_tools
+                || matches!(self.mode, AgentMode::Plan | AgentMode::Chat)
+            {
+                std::collections::HashMap::new()
+            } else {
+                self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
+                    .await?
+            };
+            for (call_index, call) in result.tool_calls.into_iter().enumerate() {
+                if let Some(group_output) = parallel_task_outputs.remove(&call_index) {
+                    // Executed in the parallel group; events already emitted.
+                    used_tools.push(call.function.name.clone());
+                    if let Some(report) = group_output.report {
+                        persisted_tool_reports.push((call.function.name.clone(), report));
+                    }
+                    messages.push(ChatMessage::tool(call.id, group_output.output));
+                    continue;
+                }
                 let event_name = tool_event_name(&call.function.name, &call.function.arguments);
                 on_event(AgentEvent::ToolCall {
                     name: event_name.clone(),
@@ -3021,6 +3207,88 @@ mod tests {
         let with_replayed_reasoning = turn_context_tokens(&turn);
         turn.assistant_reasoning = None;
         assert!(with_replayed_reasoning > turn_context_tokens(&turn));
+    }
+
+    #[tokio::test]
+    async fn parallel_task_calls_run_concurrently_and_map_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::tools::ToolSpec::new(
+            "task",
+            "stub subagent",
+            crate::tools::empty_parameters(),
+            |args| async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(format!(
+                    "done:{}",
+                    args.get("n").and_then(serde_json::Value::as_str).unwrap_or("?")
+                ))
+            },
+        ));
+        let agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            registry,
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        let calls: Vec<crate::llm::ToolCall> = (0..3)
+            .map(|index| crate::llm::ToolCall {
+                id: format!("call_{index}"),
+                kind: "function".to_string(),
+                function: crate::llm::ToolCallFunction {
+                    name: "task".to_string(),
+                    arguments: format!(r#"{{"n":"{index}"}}"#),
+                },
+            })
+            .collect();
+        let mut events = Vec::new();
+        let started = std::time::Instant::now();
+        let outputs = agent
+            .execute_parallel_task_calls(&calls, &std::collections::BTreeSet::new(), &mut |event| {
+                match &event {
+                    AgentEvent::ToolCall { .. } => events.push("call"),
+                    AgentEvent::ToolResult { ok: true, .. } => events.push("ok"),
+                    AgentEvent::ToolResult { ok: false, .. } => events.push("err"),
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(outputs.len(), 3);
+        for index in 0..3 {
+            assert_eq!(outputs[&index].output, format!("done:{index}"));
+        }
+        // Three 80ms tasks run concurrently, not sequentially (~240ms).
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "tasks did not run in parallel: {elapsed:?}"
+        );
+        assert_eq!(events.iter().filter(|event| **event == "call").count(), 3);
+        assert_eq!(events.iter().filter(|event| **event == "ok").count(), 3);
+
+        // Fewer than two task calls: empty map, serial path handles it.
+        let single = agent
+            .execute_parallel_task_calls(
+                &calls[..1],
+                &std::collections::BTreeSet::new(),
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert!(single.is_empty());
     }
 
     #[test]

@@ -50,8 +50,8 @@ use std::sync::RwLock;
 
 #[allow(unused_imports)]
 pub use registry::{
-    empty_parameters, CommandOutputStream, ToolPermission, ToolProgress, ToolProgressEvent,
-    ToolRegistry, ToolSpec,
+    empty_parameters, CommandOutputStream, ToolFuture, ToolPermission, ToolProgress,
+    ToolProgressEvent, ToolRegistry, ToolSpec,
 };
 pub(crate) use scripts::rescan_scripts;
 pub use skills::register_skills;

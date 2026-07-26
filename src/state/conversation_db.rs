@@ -387,6 +387,51 @@ impl ConversationDb {
             .optional()?)
     }
 
+    /// Records the model identity and token usage a subagent session actually
+    /// used (audit columns on `sessions`).
+    pub fn record_subagent_usage(
+        &self,
+        session_id: &str,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        context_window: Option<i64>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_tokens: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET provider_id = ?2, model = ?3, context_window = ?4,
+                    prompt_tokens = ?5, completion_tokens = ?6, total_tokens = ?7,
+                    updated_at = ?8
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                provider_id,
+                model,
+                context_window,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes subagent audit sessions older than the retention window;
+    /// their turns/images/queues cascade away.
+    pub fn delete_subagent_sessions_older_than(&self, days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM sessions
+             WHERE kind = 'subagent'
+               AND datetime(updated_at) < datetime('now', '-' || ?1 || ' days')",
+            params![days],
+        )?;
+        Ok(deleted)
+    }
+
     fn update_session_field(
         &self,
         session_id: &str,

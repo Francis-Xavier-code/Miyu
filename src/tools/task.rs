@@ -221,7 +221,7 @@ async fn run_task(
         match tokio::time::timeout(Duration::from_secs(total_timeout), runner.run(&prompt)).await {
             Ok(Ok((result, stats))) => (result, stats),
             Ok(Err(err)) => {
-                return Ok(serde_json::to_string_pretty(&json!({
+                let output = serde_json::to_string_pretty(&json!({
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
@@ -229,10 +229,12 @@ async fn run_task(
                     "state": "error",
                     "error": err.to_string(),
                     "stats": SubagentStats::default().public(),
-                }))?);
+                }))?;
+                record_subagent_audit(&context, &description, &prompt, &output, None);
+                return Ok(output);
             }
             Err(_) => {
-                return Ok(serde_json::to_string_pretty(&json!({
+                let output = serde_json::to_string_pretty(&json!({
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
@@ -240,7 +242,9 @@ async fn run_task(
                     "state": "timeout",
                     "error": format!("subagent timed out after {total_timeout}s"),
                     "stats": SubagentStats::default().public(),
-                }))?);
+                }))?;
+                record_subagent_audit(&context, &description, &prompt, &output, None);
+                return Ok(output);
             }
         };
 
@@ -252,7 +256,7 @@ async fn run_task(
 
     let final_text = result.content.trim().to_string();
 
-    Ok(serde_json::to_string_pretty(&json!({
+    let output = serde_json::to_string_pretty(&json!({
         "ok": true,
         "kind": "task",
         "subagent_type": sa_type.label(),
@@ -260,5 +264,72 @@ async fn run_task(
         "state": state,
         "result": final_text,
         "stats": stats.public(),
-    }))?)
+    }))?;
+    record_subagent_audit(&context, &description, &prompt, &output, Some(&stats));
+    Ok(output)
+}
+
+/// Persists an audit session for a subagent run: a hidden `kind='subagent'`
+/// session linked to the parent turn's session, holding one turn (prompt →
+/// result JSON) plus the model identity and token usage on the session row.
+/// Best-effort: audit failures never fail the task itself.
+fn record_subagent_audit(
+    context: &TaskContext,
+    description: &str,
+    prompt: &str,
+    output: &str,
+    stats: Option<&SubagentStats>,
+) {
+    let outcome = (|| -> Result<()> {
+        let store = crate::state::StateStore::new(&context.paths)?;
+        let parent = crate::tools::workspace::try_session();
+        let persona = context.config.active_persona_scope();
+        let name: String = description.chars().take(40).collect();
+        let record = store.create_session(&persona, &name, "subagent", parent.as_deref())?;
+        let pinned = store.pinned(&record.session_id);
+        let turn_id = format!(
+            "sat_{}_{:08x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            rand::random::<u32>()
+        );
+        pinned.start_turn(&turn_id, prompt, std::process::id())?;
+        pinned.complete_turn(&turn_id, output, None)?;
+        let choice = context.config.active_provider_model_choices().into_iter().next();
+        let (provider_id, model) = match choice.as_ref() {
+            Some(choice) => (Some(choice.provider_id.as_str()), Some(choice.model.as_str())),
+            None => (None, None),
+        };
+        let context_window = match (provider_id, model) {
+            (Some(provider), Some(model)) => context
+                .config
+                .context_window_for_provider_model(provider, model)
+                .ok()
+                .flatten()
+                .map(|window| window as i64),
+            _ => None,
+        };
+        let (prompt_tokens, completion_tokens, total_tokens) = match stats {
+            Some(stats) => (
+                stats.prompt_tokens as i64,
+                stats.completion_tokens as i64,
+                stats.total_tokens.max(stats.token_estimate) as i64,
+            ),
+            None => (0, 0, 0),
+        };
+        store.record_subagent_usage(
+            &record.session_id,
+            provider_id,
+            model,
+            context_window,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+    })();
+    if let Err(error) = outcome {
+        tracing::warn!(error = %error, "failed to record subagent audit session");
+    }
 }

@@ -183,6 +183,32 @@ impl StateStore {
         self.conv_db.find_session_by_name(persona, name)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_subagent_usage(
+        &self,
+        session_id: &str,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        context_window: Option<i64>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_tokens: i64,
+    ) -> Result<()> {
+        self.conv_db.record_subagent_usage(
+            session_id,
+            provider_id,
+            model,
+            context_window,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+    }
+
+    pub fn delete_subagent_sessions_older_than(&self, days: i64) -> Result<usize> {
+        self.conv_db.delete_subagent_sessions_older_than(days)
+    }
+
     pub fn init_files(&self) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
         if !self.usage_file().exists() {
@@ -1153,6 +1179,60 @@ mod tests {
         store.delete_session(&created.session_id).unwrap();
         let healed = StateStore::new(&test_paths(temp.path())).unwrap();
         assert!(healed.session_record(&healed.session_id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn subagent_audit_sessions_are_hidden_and_expire() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let parent = store.session_id();
+        let audit = store
+            .create_session("miyu", "探索代码库", "subagent", Some(&parent))
+            .unwrap();
+        let pinned = store.pinned(&audit.session_id);
+        pinned.start_turn("sat_1", "task prompt", std::process::id()).unwrap();
+        pinned.complete_turn("sat_1", "{\"ok\":true}", None).unwrap();
+        store
+            .record_subagent_usage(&audit.session_id, Some("opencode"), Some("big-pickle"), Some(168000), 100, 50, 150)
+            .unwrap();
+
+        // Hidden from the user-facing session list.
+        assert!(store
+            .list_sessions("miyu", true)
+            .unwrap()
+            .iter()
+            .all(|overview| overview.record.session_id != audit.session_id));
+        let record = store.session_record(&audit.session_id).unwrap().unwrap();
+        assert_eq!(record.kind, "subagent");
+        assert_eq!(record.parent_session_id.as_deref(), Some(&*parent));
+
+        // Fresh audit survives cleanup; a backdated one is removed with its
+        // turns (FK cascade).
+        assert_eq!(store.delete_subagent_sessions_older_than(7).unwrap(), 0);
+        store
+            .conv_db()
+            .record_subagent_usage(&audit.session_id, None, None, None, 0, 0, 0)
+            .unwrap();
+        // Backdate updated_at directly.
+        store
+            .conv_db()
+            .touch_session(&audit.session_id)
+            .unwrap();
+        let backdated = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        // No public API to backdate; use a raw update via the test-only conv_db handle.
+        {
+            use rusqlite::params;
+            let db_path = temp.path().join("state").join("conversation.db");
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+                params![backdated, audit.session_id],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.delete_subagent_sessions_older_than(7).unwrap(), 1);
+        assert!(store.session_record(&audit.session_id).unwrap().is_none());
     }
 
     #[test]
