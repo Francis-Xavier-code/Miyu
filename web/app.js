@@ -2967,7 +2967,8 @@
     const details = document.createElement("details");
     details.className = "reasoning-block";
     details.classList.toggle("is-summary", summaryOnly);
-    details.open = true;
+    details.classList.toggle("is-live", live);
+    details.open = false;
     const summary = document.createElement("summary");
     const atom = makeIconSlot("atom", "reasoning-icon");
     const titleNode = document.createElement("span");
@@ -2980,7 +2981,7 @@
     if (live) {
       liveStatus = document.createElement("span");
       liveStatus.className = "reasoning-live-status";
-      liveStatus.textContent = "正在思考 · 0s";
+      liveStatus.textContent = "0s";
       summary.appendChild(liveStatus);
       progress = document.createElement("div");
       progress.className = "reasoning-progress";
@@ -3507,7 +3508,7 @@
     const updateProgress = () => {
       if (!reasoning.liveStatus || reasoning.startedAt == null) return;
       const elapsed = Math.max(0, Math.floor((performance.now() - reasoning.startedAt) / 1000));
-      reasoning.liveStatus.textContent = `正在思考 · ${elapsed}s`;
+      reasoning.liveStatus.textContent = `${elapsed}s`;
     };
     updateProgress();
     live.reasoningTimer = window.setInterval(updateProgress, 1000);
@@ -3535,11 +3536,17 @@
     if (!reasoning.raw.trim() && title === "已思考") {
       reasoning.element.remove();
     } else {
+      reasoning.element.classList.remove("is-live");
       reasoning.title.textContent = title;
       reasoning.body.textContent = reasoning.raw;
       if (reasoning.progress) reasoning.progress.remove();
-      if (reasoning.liveStatus) reasoning.liveStatus.remove();
-      if (!reasoning.userToggled) reasoning.element.open = true;
+      if (reasoning.liveStatus) {
+        if (reasoning.startedAt != null) {
+          reasoning.liveStatus.textContent = `${((performance.now() - reasoning.startedAt) / 1000).toFixed(1)}s`;
+        } else {
+          reasoning.liveStatus.remove();
+        }
+      }
     }
     live.reasoning = null;
     live.reasoningTitle = "";
@@ -3724,13 +3731,15 @@
     const card = document.createElement("section");
     card.className = "tool-card collapsed";
     card.dataset.toolId = toolId;
+    const isCommand = String(data?.name || "") === "run_command";
+    if (isCommand) card.classList.add("is-command");
     const head = document.createElement("button");
     head.className = "tool-head";
     head.type = "button";
     head.setAttribute("aria-expanded", "false");
     const icon = document.createElement("span");
     icon.className = "tool-icon";
-    icon.appendChild(makeIconSlot("wrench"));
+    icon.appendChild(makeIconSlot(isCommand ? "fileTerminal" : "wrench"));
     const title = document.createElement("span");
     title.className = "tool-title";
     const displayName = document.createElement("strong");

@@ -2277,7 +2277,7 @@ fn tool_event_name(name: &str, arguments: &str) -> String {
             .map(str::trim)
             .filter(|description| !description.is_empty())
             .map(|description| {
-                let truncated: String = description.chars().take(18).collect();
+                let truncated: String = description.chars().take(32).collect();
                 format!("task:{truncated}")
             })
             .unwrap_or_else(|| name.to_string()),

@@ -24,15 +24,13 @@
             <span><i class="status-dot is-connecting" id="sidebarStatusDot"></i><span id="sidebarConnectionStatus">连接中</span></span>
           </div>
         </div>
+        <button class="new-chat-button" id="newChatButton" type="button" title="新对话" aria-label="新对话" disabled>
+          <span class="icon-slot" data-icon="square-pen" aria-hidden="true"><span class="icon-fallback">＋</span></span>
+        </button>
         <button class="icon-button sidebar-close" id="sidebarClose" type="button" title="关闭会话栏" aria-label="关闭会话栏">
           <span class="icon-slot" data-icon="x" aria-hidden="true"><span class="icon-fallback">×</span></span>
         </button>
       </header>
-
-      <button class="new-chat-button" id="newChatButton" type="button" disabled>
-        <span class="icon-slot" data-icon="square-pen" aria-hidden="true"><span class="icon-fallback">＋</span></span>
-        <span>新对话</span>
-      </button>
 
       <nav class="session-list" id="sessionList" aria-label="会话">
         <div class="session-items" id="sessionItems"></div>

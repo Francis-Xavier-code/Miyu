@@ -949,8 +949,7 @@ impl StreamRenderer {
                 && !self.tool_stats.is_empty()
                 && self.wait_spinner.is_some()
             {
-                let header = self.tool_summary_header();
-                let sub = self.tool_summary_progress();
+                let (header, sub) = self.tool_summary_live();
                 self.set_tool_waiting_phase(&header, sub.as_deref());
             } else if self.reasoning_mode == ReasoningDisplayMode::Summary
                 && self.reasoning_started_at.is_some()
@@ -1318,8 +1317,7 @@ impl StreamRenderer {
     fn update_tool_summary_display(&mut self) -> Result<()> {
         self.end_subagent_stream_line()?;
         if self.wait_spinner.is_some() {
-            let header = self.tool_summary_header();
-            let sub = self.tool_summary_progress();
+            let (header, sub) = self.tool_summary_live();
             self.set_tool_waiting_phase(&header, sub.as_deref());
         } else {
             self.end_active_stream_line()?;
@@ -1652,7 +1650,7 @@ impl StreamRenderer {
                     .join("\n")
             })
             .collect::<Vec<_>>()
-            .join(", ");
+            .join("\n");
         self.tool_summary_with_prefix(parts)
     }
 
@@ -1674,6 +1672,54 @@ impl StreamRenderer {
             .collect::<Vec<_>>()
             .join(", ");
         self.tool_summary_with_prefix(parts)
+    }
+
+    /// Live status for the wait spinner. A single tool keeps the classic
+    /// one-line phase + progress sub-block. Multiple tools (e.g. parallel
+    /// subagents) render as stacked blocks — each tool gets its own header
+    /// line followed by its own progress lines:
+    ///
+    /// ```text
+    /// ~ 子代理·任务A×1 运行中 · 3s
+    ///   ↳ 任务A
+    ///   ~ 子代理·任务B×1 运行中 · 3s
+    ///   ↳ 任务B进度
+    /// ```
+    fn tool_summary_live(&self) -> (String, Option<String>) {
+        if self.tool_stats.len() <= 1 {
+            return (self.tool_summary_header(), self.tool_summary_progress());
+        }
+        let mut phase = None;
+        let mut sub_lines: Vec<String> = Vec::new();
+        for (index, (name, stats)) in self.tool_stats.iter().enumerate() {
+            let display = self.display_tool_name(name);
+            let mut header = tool_status_text(&display, stats, is_subagent_tool(name));
+            if inline_tool_subject(name) {
+                if let Some(subject) = &stats.subject {
+                    header.push_str(" · ");
+                    header.push_str(subject);
+                }
+            }
+            if index == 0 {
+                phase = Some(self.tool_summary_with_prefix(header));
+            } else {
+                sub_lines.push(format!("~ {header}"));
+            }
+            if !inline_tool_subject(name) {
+                if let Some(subject) = &stats.subject {
+                    sub_lines.push(format!("↳ {subject}"));
+                }
+            }
+            if let Some(message) = &stats.progress {
+                for line in message.lines().filter(|line| !line.trim().is_empty()) {
+                    sub_lines.push(format!("↳ {}", clip_progress_line(line, 120)));
+                }
+            }
+        }
+        (
+            phase.unwrap_or_default(),
+            (!sub_lines.is_empty()).then(|| sub_lines.join("\n")),
+        )
     }
 
     fn tool_summary_with_prefix(&self, parts: String) -> String {
@@ -1802,8 +1848,7 @@ impl StreamRenderer {
 
     fn ensure_tool_waiting_phase(&mut self) -> Result<()> {
         debug_assert!(self.command_display.is_none());
-        let header = self.tool_summary_header();
-        let sub = self.tool_summary_progress();
+        let (header, sub) = self.tool_summary_live();
         if self.plain || !self.live_summary {
             let summary = match &sub {
                 Some(s) => format!("{header}\n{s}"),
@@ -4582,6 +4627,51 @@ mod tests {
             renderer.tool_summary_text(),
             format!("{header}\n↳ 定位活动摘要渲染链路")
         );
+    }
+
+    #[test]
+    fn parallel_subagents_render_stacked_blocks() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            true,
+            true,
+            10,
+        );
+        for (name, subject, progress) in [
+            ("task:任务A", "任务A", Some("工具 #1: 运行命令")),
+            ("task:任务B", "任务B", None),
+            ("task:任务C", "任务C", Some("正在搜索")),
+        ] {
+            renderer.tool_stats.insert(
+                name.to_string(),
+                ToolStats {
+                    calls: 1,
+                    ok: 0,
+                    error: 0,
+                    subject: Some(subject.to_string()),
+                    progress: progress.map(str::to_string),
+                    final_progress: None,
+                    ..ToolStats::default()
+                },
+            );
+        }
+        let (phase, sub) = renderer.tool_summary_live();
+        // First block header rides the spinner line…
+        assert!(phase.starts_with("~ "));
+        assert!(phase.contains("任务A"));
+        let sub = sub.expect("stacked blocks present");
+        let lines: Vec<&str> = sub.lines().collect();
+        // …followed by its progress, then each other subagent's own header
+        // and progress lines, in order.
+        assert_eq!(lines[0], "↳ 任务A");
+        assert_eq!(lines[1], "↳ 工具 #1: 运行命令");
+        assert!(lines[2].starts_with("~ ") && lines[2].contains("任务B"));
+        assert_eq!(lines[3], "↳ 任务B");
+        assert!(lines[4].starts_with("~ ") && lines[4].contains("任务C"));
+        assert_eq!(lines[5], "↳ 任务C");
+        assert_eq!(lines[6], "↳ 正在搜索");
+        assert_eq!(lines.len(), 7);
     }
 
     #[test]
