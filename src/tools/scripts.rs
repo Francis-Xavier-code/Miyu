@@ -539,24 +539,68 @@ async fn run_script(
         }
     }
 
-    let output = tokio::time::timeout(
+    // Collect with a hard per-stream cap: wait_with_output() buffers
+    // without bounds, so a runaway script could exhaust memory.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (status, stdout_bytes, stderr_bytes) = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
+        async {
+            let (stdout_bytes, stderr_bytes, status) = tokio::join!(
+                read_capped_stream(stdout_pipe),
+                read_capped_stream(stderr_pipe),
+                child.wait(),
+            );
+            status.map(|status| (status, stdout_bytes, stderr_bytes))
+        },
     )
     .await
     .map_err(|_| anyhow::anyhow!("script timed out after {timeout_secs}s"))??;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let stdout = clip_output(stdout.trim());
     let stderr = clip_output(stderr.trim());
 
     Ok(serde_json::to_string_pretty(&json!({
-        "success": output.status.success(),
-        "exit_code": output.status.code(),
+        "success": status.success(),
+        "exit_code": status.code(),
         "stdout": stdout,
         "stderr": stderr,
     }))?)
+}
+
+/// Drains a child stream, keeping at most 8MB in memory.
+async fn read_capped_stream(reader: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    const CAP: usize = 8 * 1024 * 1024;
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = CAP.saturating_sub(output.len());
+                if remaining == 0 {
+                    truncated = true;
+                    continue;
+                }
+                let take = read.min(remaining);
+                if take < read {
+                    truncated = true;
+                }
+                output.extend_from_slice(&buffer[..take]);
+            }
+        }
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[truncated at 8MB]");
+    }
+    output
 }
 
 fn clip_output(value: &str) -> String {

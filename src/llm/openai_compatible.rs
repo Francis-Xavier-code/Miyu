@@ -2508,6 +2508,12 @@ struct AnthropicStreamState {
     tool_calls: AnthropicToolAccumulator,
 }
 
+/// Upper bound on streamed tool calls per response. Indices come from the
+/// upstream stream verbatim; without a cap a single malformed chunk (e.g.
+/// index 2^30) makes the accumulator allocate gigabytes. Chunks addressing
+/// an index beyond the cap are dropped.
+const MAX_STREAM_TOOL_CALLS: usize = 128;
+
 #[derive(Debug, Default)]
 struct AnthropicToolAccumulator {
     calls: Vec<PartialToolCall>,
@@ -2515,6 +2521,9 @@ struct AnthropicToolAccumulator {
 
 impl AnthropicToolAccumulator {
     fn start(&mut self, index: usize, block: AnthropicStreamBlock) -> Option<String> {
+        if index >= MAX_STREAM_TOOL_CALLS {
+            return None;
+        }
         while self.calls.len() <= index {
             self.calls.push(PartialToolCall::default());
         }
@@ -2526,6 +2535,9 @@ impl AnthropicToolAccumulator {
     }
 
     fn append_arguments(&mut self, index: usize, text: String) {
+        if index >= MAX_STREAM_TOOL_CALLS {
+            return;
+        }
         while self.calls.len() <= index {
             self.calls.push(PartialToolCall::default());
         }
@@ -2656,6 +2668,9 @@ struct PartialToolCall {
 
 impl ToolCallAccumulator {
     fn push(&mut self, delta: ToolCallDelta) -> Option<String> {
+        if delta.index >= MAX_STREAM_TOOL_CALLS {
+            return None;
+        }
         while self.calls.len() <= delta.index {
             self.calls.push(PartialToolCall::default());
         }
@@ -3867,6 +3882,51 @@ mod tests {
     use crate::llm::{ChatContent, ChatContentPart, ImageUrlContent};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn tool_call_accumulators_drop_out_of_range_indices() {
+        // A malformed upstream chunk with a huge index must not make the
+        // accumulator allocate gigabytes (regression: 160GB VmSize).
+        let mut acc = ToolCallAccumulator::default();
+        let huge = ToolCallDelta {
+            index: 1 << 30,
+            id: Some("x".to_string()),
+            kind: None,
+            function: ToolCallFunctionDelta {
+                name: Some("evil".to_string()),
+                arguments: None,
+            },
+        };
+        assert!(acc.push(huge).is_none());
+        assert!(acc.calls.is_empty());
+        let ok = ToolCallDelta {
+            index: 0,
+            id: Some("a".to_string()),
+            kind: None,
+            function: ToolCallFunctionDelta {
+                name: Some("fine".to_string()),
+                arguments: Some("{}".to_string()),
+            },
+        };
+        assert!(acc.push(ok).is_some());
+        assert_eq!(acc.calls.len(), 1);
+
+        let mut anthropic = AnthropicToolAccumulator::default();
+        assert!(anthropic
+            .start(
+                usize::MAX,
+                AnthropicStreamBlock {
+                    kind: "tool_use".to_string(),
+                    id: Some("x".to_string()),
+                    name: Some("evil".to_string()),
+                    text: None,
+                    thinking: None,
+                },
+            )
+            .is_none());
+        anthropic.append_arguments(1 << 30, "{}".to_string());
+        assert!(anthropic.calls.is_empty());
+    }
 
     #[test]
     fn stream_chunk_accepts_null_tool_calls() {

@@ -413,7 +413,12 @@ fn start_daemon_process(paths: &MiyuPaths, args: &[OsString]) -> Result<()> {
             Ok(())
         });
     }
-    command.spawn().context("starting Miyu daemon")?;
+    let mut child = command.spawn().context("starting Miyu daemon")?;
+    // Reap the daemon when it eventually exits: long-lived parents (the
+    // REPL) would otherwise accumulate a zombie per spawned daemon.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 

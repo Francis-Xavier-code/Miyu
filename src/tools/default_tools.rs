@@ -569,21 +569,43 @@ impl Drop for CommandProcessGroup {
     }
 }
 
+/// Cumulative cap for collected command output. Beyond it the stream is
+/// still drained (so the child never blocks on a full pipe) but no longer
+/// buffered or forwarded — unbounded collection plus a clone per chunk
+/// into the progress channel is a memory hazard on runaway commands.
+const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 async fn read_command_output(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     progress: ToolProgress,
     report: impl Fn(&ToolProgress, Vec<u8>),
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0; 8192];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        let chunk = buffer[..read].to_vec();
+        let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(output.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let take = read.min(remaining);
+        if take < read {
+            truncated = true;
+        }
+        let chunk = buffer[..take].to_vec();
         output.extend_from_slice(&chunk);
         report(&progress, chunk);
+    }
+    if truncated {
+        output.extend_from_slice(
+            crate::i18n::text("\n[output truncated at the 8MB cap]", "\n[输出超出 8MB 上限，已截断]")
+                .as_bytes(),
+        );
     }
     Ok(output)
 }
