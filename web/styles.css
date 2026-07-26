@@ -2,67 +2,121 @@
   color-scheme: dark;
   --font-ui: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --app-bg: #111512;
-  --sidebar-bg: #0c100d;
-  --topbar-bg: #111512;
-  --surface-1: #171c18;
-  --surface-2: #202722;
-  --surface-3: #28302a;
-  --surface-soft: #141915;
-  --line: #303a33;
-  --line-strong: #4a584f;
-  --text: #e7ece8;
-  --text-soft: #9aa69e;
-  --text-faint: #6f7b73;
-  --inverse-text: #152019;
-  --accent: #62c891;
-  --accent-strong: #84d9aa;
-  --accent-soft: #183c29;
-  --cyan: #73bdd2;
-  --cyan-soft: #18343d;
-  --gold: #dfb461;
-  --gold-soft: #3a301c;
-  --coral: #e9877e;
-  --coral-soft: #40221f;
-  --danger: #ec786f;
-  --danger-soft: #40221f;
-  --user-bg: #dceae1;
-  --user-text: #18221c;
-  --code-bg: #0d110e;
-  --shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
   --sidebar-width: 252px;
+
+  /*
+   * 夜阑 (dusk) —— 默认暗色主题。
+   * MD3 system tokens;matugen 生成的 /theme.css 可整套覆盖。
+   * 种子色取自 miyu-logo:primary=瞳色减淡的雾蓝,secondary=发色暖金,
+   * tertiary=丝带酒红,surface=傍晚蓝紫。
+   */
+  --md-sys-color-primary: #aebde8;
+  --md-sys-color-on-primary: #1f2c55;
+  --md-sys-color-primary-container: #394877;
+  --md-sys-color-on-primary-container: #dce3f9;
+  --md-sys-color-secondary: #e4bf79;
+  --md-sys-color-on-secondary: #402d02;
+  --md-sys-color-secondary-container: #443716;
+  --md-sys-color-on-secondary-container: #f6e7c4;
+  --md-sys-color-tertiary: #e38c9a;
+  --md-sys-color-on-tertiary: #55212e;
+  --md-sys-color-tertiary-container: #4e242d;
+  --md-sys-color-on-tertiary-container: #fadde3;
+  --md-sys-color-error: #ec7a6e;
+  --md-sys-color-on-error: #3f1210;
+  --md-sys-color-error-container: #47231f;
+  --md-sys-color-on-error-container: #f8dad4;
+  --md-sys-color-surface: #171821;
+  --md-sys-color-surface-container-lowest: #101117;
+  --md-sys-color-surface-container-low: #12131b;
+  --md-sys-color-surface-container: #1f212c;
+  --md-sys-color-surface-container-high: #282b38;
+  --md-sys-color-surface-container-highest: #323648;
+  --md-sys-color-on-surface: #e9e6ef;
+  --md-sys-color-on-surface-variant: #9993a5;
+  --md-sys-color-outline: #4c5065;
+  --md-sys-color-outline-variant: #303341;
+  /* 扩展语义色:在线状态(不属于 MD3 标准 token) */
+  --md-ext-color-online: #7ccb96;
+}
+
+/*
+ * 旧变量层 —— 组件规则引用这些别名,一律从 MD3 token 派生。
+ * 同时挂在 :root 和亮色 body 上:var() 在声明元素上解析,
+ * 只挂 :root 的话亮色主题重定义 token 不会生效。
+ */
+:root,
+body[data-theme="linen"] {
+  --app-bg: var(--md-sys-color-surface);
+  --sidebar-bg: var(--md-sys-color-surface-container-low);
+  --topbar-bg: var(--md-sys-color-surface);
+  --surface-1: var(--md-sys-color-surface-container);
+  --surface-2: var(--md-sys-color-surface-container-high);
+  --surface-3: var(--md-sys-color-surface-container-highest);
+  --surface-soft: color-mix(in srgb, var(--md-sys-color-surface-container) 55%, var(--md-sys-color-surface));
+  --line: var(--md-sys-color-outline-variant);
+  --line-strong: var(--md-sys-color-outline);
+  --text: var(--md-sys-color-on-surface);
+  --text-soft: var(--md-sys-color-on-surface-variant);
+  --text-faint: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 70%, var(--md-sys-color-surface));
+  --inverse-text: var(--md-sys-color-on-primary);
+  --accent: var(--md-sys-color-primary);
+  --accent-strong: color-mix(in srgb, var(--md-sys-color-primary) 82%, #ffffff);
+  --accent-soft: var(--md-sys-color-primary-container);
+  --cyan: var(--md-sys-color-primary);
+  --cyan-soft: var(--md-sys-color-primary-container);
+  --gold: var(--md-sys-color-secondary);
+  --gold-soft: var(--md-sys-color-secondary-container);
+  --coral: var(--md-sys-color-tertiary);
+  --coral-soft: var(--md-sys-color-tertiary-container);
+  --danger: var(--md-sys-color-error);
+  --danger-soft: var(--md-sys-color-error-container);
+  --online: var(--md-ext-color-online);
+  --ribbon: var(--md-sys-color-tertiary);
+  --ribbon-soft: var(--md-sys-color-tertiary-container);
+  --user-bg: var(--md-sys-color-primary-container);
+  --user-text: var(--md-sys-color-on-primary-container);
+  --code-bg: var(--md-sys-color-surface-container-lowest);
+  --shadow: 0 18px 44px rgba(0, 0, 0, 0.4);
 }
 
 body[data-theme="linen"] {
   color-scheme: light;
-  --app-bg: #f2f5f3;
-  --sidebar-bg: #e8ece9;
-  --topbar-bg: #f2f5f3;
-  --surface-1: #ffffff;
-  --surface-2: #e8eeea;
-  --surface-3: #dce5df;
-  --surface-soft: #edf1ee;
-  --line: #d2dad5;
-  --line-strong: #aebbb3;
-  --text: #202722;
-  --text-soft: #68756d;
-  --text-faint: #8a958e;
-  --inverse-text: #f5f8f6;
-  --accent: #377a5c;
-  --accent-strong: #286447;
-  --accent-soft: #dbece2;
-  --cyan: #2f7890;
-  --cyan-soft: #d8ebf0;
-  --gold: #946415;
-  --gold-soft: #f2e7ce;
-  --coral: #b7544c;
-  --coral-soft: #f3dedb;
-  --danger: #b84840;
-  --danger-soft: #f3dedb;
-  --user-bg: #2f6d50;
-  --user-text: #f7fbf8;
-  --code-bg: #18201b;
-  --shadow: 0 18px 44px rgba(34, 51, 41, 0.14);
+
+  /* 晨光 (dawn) —— 亮色主题。primary=发影藤紫,底色=窗边奶油白。 */
+  --md-sys-color-primary: #7568b0;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #e6e1f6;
+  --md-sys-color-on-primary-container: #372e66;
+  --md-sys-color-secondary: #8f6b1e;
+  --md-sys-color-on-secondary: #ffffff;
+  --md-sys-color-secondary-container: #f3e2bb;
+  --md-sys-color-on-secondary-container: #4a3608;
+  --md-sys-color-tertiary: #a5495a;
+  --md-sys-color-on-tertiary: #ffffff;
+  --md-sys-color-tertiary-container: #f6dce0;
+  --md-sys-color-on-tertiary-container: #5e222c;
+  --md-sys-color-error: #b3403a;
+  --md-sys-color-on-error: #ffffff;
+  --md-sys-color-error-container: #f6dcd6;
+  --md-sys-color-on-error-container: #5f1d18;
+  --md-sys-color-surface: #f6f0e2;
+  --md-sys-color-surface-container-lowest: #fffdf6;
+  --md-sys-color-surface-container-low: #efe7d3;
+  --md-sys-color-surface-container: #fffdf6;
+  --md-sys-color-surface-container-high: #f1eada;
+  --md-sys-color-surface-container-highest: #e8dfc9;
+  --md-sys-color-on-surface: #34303a;
+  --md-sys-color-on-surface-variant: #797064;
+  --md-sys-color-outline: #c6b795;
+  --md-sys-color-outline-variant: #e3d8c1;
+  --md-ext-color-online: #3e8e5c;
+
+  /* 亮色下少数别名的映射不同:用户气泡用实心主色,代码块保持深底 */
+  --user-bg: var(--md-sys-color-primary);
+  --user-text: var(--md-sys-color-on-primary);
+  --code-bg: color-mix(in srgb, var(--md-sys-color-on-surface) 90%, var(--md-sys-color-primary));
+  --shadow: 0 18px 44px rgba(83, 64, 30, 0.15);
 }
 
 * {
@@ -150,7 +204,7 @@ textarea:disabled {
   flex: 0 0 34px;
   place-items: center;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 10px;
   background: transparent;
   color: var(--text-soft);
   cursor: pointer;
@@ -173,8 +227,8 @@ textarea:disabled {
   height: 6px;
   flex: 0 0 6px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+  background: var(--online);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--online) 15%, transparent);
 }
 
 .status-dot.is-connecting {
@@ -218,7 +272,7 @@ textarea:disabled {
   width: 38px;
   height: 38px;
   flex: 0 0 38px;
-  border: 1px solid var(--line-strong);
+  border: 2px solid var(--gold);
   border-radius: 50%;
   object-fit: cover;
 }
@@ -255,11 +309,11 @@ textarea:disabled {
   min-height: 40px;
   align-items: center;
   margin: 0 12px 10px;
-  padding: 0 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: 6px;
-  background: var(--surface-1);
-  color: var(--text);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--md-sys-color-on-primary-container);
   cursor: pointer;
   gap: 8px;
   text-align: left;
@@ -293,35 +347,47 @@ textarea:disabled {
   scrollbar-width: thin;
 }
 
+.session-items {
+  display: grid;
+  gap: 3px;
+}
+
 .session-item {
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   width: 100%;
   min-height: 54px;
-  align-items: center;
-  padding: 7px;
-  border-radius: 6px;
-  background: var(--surface-2);
+  align-items: stretch;
+  border-radius: 12px;
+  background: transparent;
   color: var(--text);
-  cursor: pointer;
-  gap: 5px;
+  gap: 0;
   text-align: left;
 }
 
-.session-item::before {
+.session-item:hover,
+.session-item:focus-within {
+  background: var(--surface-2);
+}
+
+.session-item.active {
+  background: var(--surface-2);
+}
+
+.session-item.active:hover {
+  background: var(--surface-3);
+}
+
+.session-item.active::before {
   position: absolute;
   top: 8px;
   bottom: 8px;
   left: 0;
-  width: 2px;
-  border-radius: 2px;
-  background: var(--accent);
+  width: 3px;
+  border-radius: 3px;
+  background: var(--ribbon);
   content: "";
-}
-
-.session-item:hover {
-  background: var(--surface-3);
 }
 
 .session-item-main {
@@ -329,7 +395,17 @@ textarea:disabled {
   grid-template-columns: 17px minmax(0, 1fr);
   min-width: 0;
   align-items: center;
+  padding: 7px;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
   gap: 8px;
+  text-align: left;
+}
+
+.session-item-main.is-renaming {
+  cursor: default;
 }
 
 .session-item-main > .icon-slot {
@@ -363,10 +439,194 @@ textarea:disabled {
   font-size: 9px;
 }
 
+.session-rename-input {
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.session-rename-input:focus {
+  outline: none;
+}
+
+.session-trailing {
+  display: grid;
+  align-content: space-between;
+  justify-items: end;
+  padding: 7px 6px 5px 0;
+  gap: 2px;
+}
+
 .session-time {
   max-width: 45px;
-  align-self: start;
-  padding-top: 5px;
+}
+
+.session-menu-button {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.session-menu-button .icon-slot {
+  width: 14px;
+  height: 14px;
+}
+
+.session-item:hover .session-menu-button,
+.session-item:focus-within .session-menu-button,
+.session-menu-button[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.session-menu-button:hover,
+.session-menu-button[aria-expanded="true"] {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.session-menu {
+  position: absolute;
+  top: calc(100% - 12px);
+  right: 6px;
+  z-index: 30;
+  display: grid;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface-1);
+  box-shadow: var(--shadow);
+  gap: 1px;
+}
+
+.session-menu.open-up {
+  top: auto;
+  bottom: calc(100% - 12px);
+}
+
+.session-menu button {
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+
+.session-menu button:hover {
+  background: var(--surface-2);
+}
+
+.session-menu button.is-danger {
+  color: var(--danger);
+}
+
+.session-menu button.is-danger:hover {
+  background: var(--danger-soft);
+}
+
+.archived-section {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.archived-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  font-size: 12px;
+  gap: 6px;
+}
+
+.archived-toggle:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.archived-toggle .icon-slot {
+  width: 14px;
+  height: 14px;
+  transition: transform 140ms ease;
+}
+
+.archived-toggle.is-open .icon-slot {
+  transform: rotate(90deg);
+}
+
+.archived-list {
+  display: grid;
+  padding-top: 4px;
+  gap: 2px;
+}
+
+.archived-note {
+  margin: 0;
+  padding: 6px 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.archived-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 5px 4px 5px 8px;
+  border-radius: 8px;
+  gap: 6px;
+}
+
+.archived-item:hover {
+  background: var(--surface-2);
+}
+
+.archived-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.archived-copy strong,
+.archived-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archived-copy strong {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.archived-copy small {
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
+.archived-actions {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.archived-actions .text-button {
+  min-height: 26px;
+  font-size: 11px;
 }
 
 .sidebar-footer {
@@ -448,10 +708,66 @@ textarea:disabled {
 
 .main-stage {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   background: var(--app-bg);
+}
+
+.main-stage > .topbar {
+  grid-row: 1;
+}
+
+.session-switch-notice {
+  grid-row: 2;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent-soft) 42%, var(--topbar-bg));
+  color: var(--text);
+  font-size: 12px;
+  gap: 8px;
+}
+
+.session-switch-notice > .icon-slot {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: var(--accent);
+}
+
+.session-switch-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-switch-follow {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.session-switch-follow:hover {
+  background: var(--accent-soft);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.session-switch-dismiss {
+  width: 26px;
+  height: 26px;
+  flex-basis: 26px;
+  margin-left: auto;
 }
 
 .topbar {
@@ -729,6 +1045,7 @@ textarea:disabled {
 .conversation-stage {
   position: relative;
   display: grid;
+  grid-row: 3;
   grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
@@ -800,7 +1117,7 @@ textarea:disabled {
 .user-bubble {
   max-width: min(82%, 650px);
   padding: 11px 14px;
-  border-radius: 8px 8px 2px 8px;
+  border-radius: 18px 18px 4px 18px;
   background: var(--user-bg);
   color: var(--user-text);
   font-size: 16px;
@@ -1360,8 +1677,8 @@ textarea:disabled {
   min-width: 0;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-left: 2px solid var(--cyan);
-  border-radius: 6px;
+  border-left: 2px solid var(--gold);
+  border-radius: 10px;
   background: var(--surface-soft);
 }
 
@@ -1396,9 +1713,9 @@ textarea:disabled {
   width: 24px;
   height: 24px;
   place-items: center;
-  border-radius: 5px;
-  background: var(--cyan-soft);
-  color: var(--cyan);
+  border-radius: 8px;
+  background: var(--gold-soft);
+  color: var(--gold);
 }
 
 .tool-icon .icon-slot {
@@ -1457,7 +1774,7 @@ textarea:disabled {
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  color: var(--cyan);
+  color: var(--gold);
   font-size: 11px;
   gap: 4px;
   white-space: nowrap;
@@ -2215,20 +2532,22 @@ textarea:disabled {
   grid-template-columns: 24px minmax(0, 1fr);
   min-height: 45px;
   align-items: center;
-  padding: 7px 10px;
+  padding: 7px 12px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 14px;
   background: var(--surface-1);
   color: var(--text-soft);
   cursor: pointer;
   gap: 8px;
   text-align: left;
+  transition: transform 150ms ease, border-color 150ms ease;
 }
 
 .prompt-grid button:hover:not(:disabled) {
-  border-color: var(--line-strong);
+  border-color: var(--gold);
   background: var(--surface-2);
   color: var(--text);
+  transform: translateY(-1px);
 }
 
 .prompt-grid button:disabled {
@@ -2321,13 +2640,15 @@ textarea:disabled {
   width: 100%;
   overflow: hidden;
   border: 1px solid var(--line-strong);
-  border-radius: 8px;
+  border-radius: 18px;
   background: var(--surface-1);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
 .composer:focus-within {
   border-color: color-mix(in srgb, var(--accent) 72%, var(--line));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent), 0 8px 24px rgba(0, 0, 0, 0.12);
 }
 
 .composer.is-disabled {
@@ -2469,10 +2790,19 @@ textarea:disabled {
   height: 32px;
   flex: 0 0 32px;
   place-items: center;
-  border-radius: 6px;
+  border-radius: 50%;
   background: var(--accent);
-  color: #102017;
+  color: var(--md-sys-color-on-primary);
   cursor: pointer;
+  transition: transform 180ms cubic-bezier(0.34, 1.56, 0.64, 1), background 150ms ease;
+}
+
+.send-button:hover:not(:disabled) {
+  transform: scale(1.08) rotate(-8deg);
+}
+
+.send-button:active:not(:disabled) {
+  transform: scale(0.92);
 }
 
 .stop-button {
@@ -2481,16 +2811,16 @@ textarea:disabled {
   height: 32px;
   flex: 0 0 32px;
   place-items: center;
-  border: 1px solid var(--danger);
-  border-radius: 6px;
-  background: var(--danger-soft);
-  color: var(--danger);
+  border: 1px solid var(--ribbon);
+  border-radius: 50%;
+  background: var(--ribbon-soft);
+  color: var(--ribbon);
   cursor: pointer;
 }
 
 .stop-button:hover:not(:disabled) {
-  background: var(--danger);
-  color: #fff;
+  background: var(--ribbon);
+  color: var(--md-sys-color-on-tertiary);
 }
 
 .stop-button:disabled {
@@ -3103,11 +3433,11 @@ textarea.config-input {
 }
 
 .theme-swatch.linen {
-  background: #eef2ef;
+  background: linear-gradient(135deg, #f6f0e2 55%, #7568b0 55%);
 }
 
 .theme-swatch.graphite {
-  background: #151a17;
+  background: linear-gradient(135deg, #171821 55%, #aebde8 55%);
 }
 
 .settings-model {
@@ -3729,7 +4059,8 @@ textarea.config-input {
 
 @media (hover: none) {
   .message-actions button,
-  .assistant-meta button {
+  .assistant-meta button,
+  .session-menu-button {
     opacity: 1;
   }
 }

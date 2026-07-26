@@ -19,6 +19,7 @@
     "circle-stop": [["circle", { cx: "12", cy: "12", r: "10" }], ["rect", { width: "6", height: "6", x: "9", y: "9", rx: "1" }]],
     copy: [["rect", { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }], ["path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }]],
     download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["polyline", { points: "7 10 12 15 17 10" }], ["line", { x1: "12", x2: "12", y1: "15", y2: "3" }]],
+    ellipsis: [["circle", { cx: "12", cy: "12", r: "1" }], ["circle", { cx: "19", cy: "12", r: "1" }], ["circle", { cx: "5", cy: "12", r: "1" }]],
     "external-link": [["path", { d: "M15 3h6v6" }], ["path", { d: "M10 14 21 3" }], ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }]],
     fileTerminal: [["path", { d: "M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" }], ["polyline", { points: "14 2 14 8 20 8" }], ["path", { d: "m8 13 2 2-2 2" }], ["path", { d: "M12 17h4" }]],
     lightbulb: [["path", { d: "M9 18h6" }], ["path", { d: "M10 22h4" }], ["path", { d: "M15.09 14c.18-.59.59-1.05 1.05-1.52A6 6 0 1 0 7.86 12.5c.45.44.85.9 1.03 1.5" }], ["path", { d: "M9 14h6v1a3 3 0 0 1-6 0v-1Z" }]],
@@ -73,10 +74,17 @@
     "run.cancelled",
     "run.failed",
     "conversation.reset",
+    "conversation.pop",
+    "session.created",
+    "session.renamed",
+    "session.archived",
+    "session.deleted",
+    "session.current_changed",
+    "session.updated",
     "resync_required"
   ];
 
-  const RUN_EVENTS = new Set(EVENT_NAMES.filter((name) => !["conversation.reset", "resync_required", "queue.added", "queue.removed"].includes(name)));
+  const RUN_EVENTS = new Set(EVENT_NAMES.filter((name) => !name.startsWith("session.") && !["conversation.reset", "conversation.pop", "resync_required", "queue.added", "queue.removed"].includes(name)));
 
   const elements = {
     body: document.body,
@@ -87,10 +95,15 @@
     sidebarStatusDot: document.getElementById("sidebarStatusDot"),
     sidebarConnectionStatus: document.getElementById("sidebarConnectionStatus"),
     newChatButton: document.getElementById("newChatButton"),
-    currentConversation: document.getElementById("currentConversation"),
-    sidebarConversationTitle: document.getElementById("sidebarConversationTitle"),
-    sidebarConversationSnippet: document.getElementById("sidebarConversationSnippet"),
-    sidebarConversationTime: document.getElementById("sidebarConversationTime"),
+    sessionList: document.getElementById("sessionList"),
+    sessionItems: document.getElementById("sessionItems"),
+    archivedSection: document.getElementById("archivedSection"),
+    archivedToggle: document.getElementById("archivedToggle"),
+    archivedList: document.getElementById("archivedList"),
+    sessionSwitchNotice: document.getElementById("sessionSwitchNotice"),
+    sessionSwitchText: document.getElementById("sessionSwitchText"),
+    followSwitchButton: document.getElementById("followSwitchButton"),
+    dismissSwitchButton: document.getElementById("dismissSwitchButton"),
     contextNumbers: document.getElementById("contextNumbers"),
     contextTrack: document.getElementById("contextTrack"),
     contextBar: document.getElementById("contextBar"),
@@ -167,6 +180,15 @@
     turns: [],
     queuedPrompts: [],
     models: [],
+    sessions: [],
+    currentSessionId: null,
+    archivedSessions: [],
+    archivedOpen: false,
+    archivedLoading: false,
+    sessionMenuFor: null,
+    sessionRenaming: null,
+    sessionBusy: false,
+    pendingSessionSwitch: null,
     display: {
       reasoning: "summary",
       tool_calls: "summary",
@@ -295,11 +317,11 @@
     for (const button of [elements.themeButton, elements.sidebarThemeButton]) {
       const slot = button.querySelector(".icon-slot");
       slot.replaceChildren(createIcon(nextIcon));
-      button.title = selected === "graphite" ? "切换到浅色主题" : "切换到石墨主题";
+      button.title = selected === "graphite" ? "切换到晨光主题" : "切换到夜阑主题";
       button.setAttribute("aria-label", button.title);
     }
     const themeColor = document.querySelector('meta[name="theme-color"]');
-    if (themeColor) themeColor.content = selected === "graphite" ? "#111512" : "#f2f5f3";
+    if (themeColor) themeColor.content = selected === "graphite" ? "#171821" : "#f6f0e2";
     if (persist) safeStorageSet("miyu.web.theme", selected);
   }
 
@@ -1634,17 +1656,513 @@
     };
   }
 
+  function multiSessionEnabled() {
+    return Boolean(state.capabilities?.multi_conversation);
+  }
+
+  function sessionDisplayName(session) {
+    const name = firstLine(session?.name || "");
+    return name || "新会话";
+  }
+
+  function findSession(sessionId) {
+    const id = String(sessionId || "");
+    return state.sessions.find((session) => String(session?.session_id) === id) || null;
+  }
+
+  function findArchivedSession(sessionId) {
+    const id = String(sessionId || "");
+    return state.archivedSessions.find((session) => String(session?.session_id) === id) || null;
+  }
+
+  function currentSessionEntry() {
+    return state.currentSessionId ? findSession(state.currentSessionId) : null;
+  }
+
+  function updateSessionSwitchNotice() {
+    const pending = state.pendingSessionSwitch;
+    elements.sessionSwitchNotice.hidden = !pending;
+    if (!pending) return;
+    const target = findSession(pending);
+    elements.sessionSwitchText.textContent = target
+      ? `当前会话已在其他端切换到「${sessionDisplayName(target)}」`
+      : "当前会话已在其他端切换";
+  }
+
+  function closeSessionMenu() {
+    if (!state.sessionMenuFor) return;
+    state.sessionMenuFor = null;
+    renderSessionList();
+  }
+
+  function toggleSessionMenu(sessionId) {
+    state.sessionMenuFor = state.sessionMenuFor === sessionId ? null : sessionId;
+    renderSessionList();
+    if (!state.sessionMenuFor) return;
+    const item = elements.sessionItems.querySelector(`.session-item[data-session-id="${CSS.escape(sessionId)}"]`);
+    const menu = item?.querySelector(".session-menu");
+    if (menu) {
+      const menuRect = menu.getBoundingClientRect();
+      const listRect = elements.sessionList.getBoundingClientRect();
+      if (menuRect.bottom > listRect.bottom - 4) menu.classList.add("open-up");
+      window.requestAnimationFrame(() => menu.querySelector("button")?.focus());
+    }
+  }
+
+  function beginSessionRename(sessionId) {
+    state.sessionRenaming = sessionId;
+    renderSessionList();
+  }
+
+  function cancelSessionRename() {
+    state.sessionRenaming = null;
+    renderSessionList();
+  }
+
+  async function commitSessionRename(sessionId, value) {
+    if (state.sessionRenaming !== sessionId) return;
+    state.sessionRenaming = null;
+    const session = findSession(sessionId) || findArchivedSession(sessionId);
+    const name = String(value || "").trim();
+    if (!session || !name || name === String(session.name || "").trim()) {
+      renderSessionList();
+      return;
+    }
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name })
+      });
+      session.name = name;
+      showToast("会话已重命名");
+    } catch (error) {
+      showToast(error.message || "重命名失败", "error");
+    }
+    renderSessionList();
+    renderArchivedList();
+    if (sessionId === state.currentSessionId) updateConversationChrome();
+  }
+
+  function buildSessionMenu(session, isCurrent) {
+    const id = String(session?.session_id || "");
+    const menu = document.createElement("div");
+    menu.className = "session-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", `会话操作：${sessionDisplayName(session)}`);
+    const actions = [{ label: "重命名", handler: () => beginSessionRename(id) }];
+    if (isCurrent) actions.push({ label: "清空对话", handler: requestClearConversation });
+    actions.push({ label: "归档", handler: () => archiveSession(id) });
+    actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
+    for (const action of actions) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      if (action.danger) button.classList.add("is-danger");
+      button.textContent = action.label;
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        closeSessionMenu();
+        action.handler();
+      });
+      menu.appendChild(button);
+    }
+    return menu;
+  }
+
+  function buildSessionItem(session) {
+    const id = String(session?.session_id || "");
+    const isCurrent = Boolean(id) && id === state.currentSessionId;
+    const item = document.createElement("div");
+    item.className = `session-item${isCurrent ? " active" : ""}`;
+    item.dataset.sessionId = id;
+
+    const renaming = state.sessionRenaming === id;
+    const main = document.createElement(renaming ? "div" : "button");
+    main.className = `session-item-main${renaming ? " is-renaming" : ""}`;
+    if (!renaming) {
+      main.type = "button";
+      main.title = isCurrent ? sessionDisplayName(session) : `切换到「${sessionDisplayName(session)}」`;
+      main.addEventListener("click", () => activateSession(id));
+    }
+    main.appendChild(makeIconSlot("message-circle"));
+
+    const copy = document.createElement("span");
+    copy.className = "session-copy";
+    if (renaming) {
+      const input = document.createElement("input");
+      input.className = "session-rename-input";
+      input.type = "text";
+      input.value = String(session?.name || "");
+      input.maxLength = 200;
+      input.setAttribute("aria-label", "会话名称");
+      input.addEventListener("click", (event) => event.stopPropagation());
+      input.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+        if (event.key === "Enter") {
+          event.preventDefault();
+          commitSessionRename(id, input.value);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          cancelSessionRename();
+        }
+      });
+      input.addEventListener("blur", () => {
+        if (state.sessionRenaming === id) commitSessionRename(id, input.value);
+      });
+      copy.appendChild(input);
+      window.requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+      });
+    } else {
+      const title = document.createElement("strong");
+      title.textContent = sessionDisplayName(session);
+      copy.appendChild(title);
+    }
+
+    // Gemini-style list rows: name only; details live in the hover tooltip.
+    if (!renaming) {
+      const snippet = firstLine(session?.last_user_content || "");
+      const workspace = String(session?.workspace || "").trim();
+      const details = [snippet, workspace].filter(Boolean).join("\n");
+      if (details) {
+        main.title = `${sessionDisplayName(session)}\n${details}`;
+      }
+    }
+
+    main.appendChild(copy);
+    item.appendChild(main);
+
+    const trailing = document.createElement("span");
+    trailing.className = "session-trailing";
+
+    const menuButton = document.createElement("button");
+    menuButton.type = "button";
+    menuButton.className = "session-menu-button";
+    menuButton.title = "会话操作";
+    menuButton.setAttribute("aria-label", `会话操作：${sessionDisplayName(session)}`);
+    menuButton.setAttribute("aria-haspopup", "menu");
+    menuButton.setAttribute("aria-expanded", String(state.sessionMenuFor === id));
+    menuButton.appendChild(makeIconSlot("ellipsis"));
+    menuButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleSessionMenu(id);
+    });
+    trailing.appendChild(menuButton);
+    item.appendChild(trailing);
+
+    if (state.sessionMenuFor === id) item.appendChild(buildSessionMenu(session, isCurrent));
+    return item;
+  }
+
+  function buildFallbackSessionItem() {
+    const details = deriveConversationDetails();
+    const item = document.createElement("div");
+    item.className = "session-item active";
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "session-item-main";
+    main.title = details.title;
+    main.appendChild(makeIconSlot("message-circle"));
+    const copy = document.createElement("span");
+    copy.className = "session-copy";
+    const title = document.createElement("strong");
+    title.textContent = details.title;
+    const snippet = document.createElement("small");
+    snippet.className = "session-snippet";
+    snippet.textContent = details.snippet;
+    snippet.title = details.snippet;
+    copy.append(title, snippet);
+    main.appendChild(copy);
+    main.addEventListener("click", () => {
+      closeSidebar();
+      scrollToBottom({ force: true, smooth: true });
+    });
+    item.appendChild(main);
+    const trailing = document.createElement("span");
+    trailing.className = "session-trailing";
+    const time = document.createElement("span");
+    time.className = "session-time";
+    time.textContent = details.timestamp ? formatRelativeTime(details.timestamp) : "";
+    trailing.appendChild(time);
+    item.appendChild(trailing);
+    return item;
+  }
+
+  function renderSessionList() {
+    if (!elements.sessionItems) return;
+    if (state.sessionRenaming && elements.sessionItems.querySelector(".session-rename-input")) return;
+    elements.sessionItems.replaceChildren();
+    if (!multiSessionEnabled() || state.sessions.length === 0) {
+      elements.sessionItems.appendChild(buildFallbackSessionItem());
+      elements.archivedSection.hidden = !multiSessionEnabled();
+      return;
+    }
+    for (const session of state.sessions) {
+      if (session?.archived) continue;
+      elements.sessionItems.appendChild(buildSessionItem(session));
+    }
+    elements.archivedSection.hidden = false;
+  }
+
+  function renderArchivedList() {
+    elements.archivedToggle.setAttribute("aria-expanded", String(state.archivedOpen));
+    elements.archivedToggle.classList.toggle("is-open", state.archivedOpen);
+    elements.archivedList.hidden = !state.archivedOpen;
+    if (!state.archivedOpen) return;
+    elements.archivedList.replaceChildren();
+    if (state.archivedLoading) {
+      const note = document.createElement("p");
+      note.className = "archived-note";
+      note.textContent = "正在载入";
+      elements.archivedList.appendChild(note);
+      return;
+    }
+    if (state.archivedSessions.length === 0) {
+      const note = document.createElement("p");
+      note.className = "archived-note";
+      note.textContent = "暂无已归档会话";
+      elements.archivedList.appendChild(note);
+      return;
+    }
+    for (const session of state.archivedSessions) {
+      const id = String(session?.session_id || "");
+      const row = document.createElement("div");
+      row.className = "archived-item";
+      const copy = document.createElement("span");
+      copy.className = "archived-copy";
+      const title = document.createElement("strong");
+      title.textContent = sessionDisplayName(session);
+      title.title = sessionDisplayName(session);
+      const meta = document.createElement("small");
+      const workspace = String(session?.workspace || "").trim();
+      const turnCount = Math.max(0, asFiniteNumber(session?.turn_count));
+      meta.textContent = workspace ? `${formatInteger(turnCount)} 轮 · ${workspace}` : `${formatInteger(turnCount)} 轮`;
+      if (workspace) meta.title = workspace;
+      copy.append(title, meta);
+      row.appendChild(copy);
+      const actions = document.createElement("span");
+      actions.className = "archived-actions";
+      const restore = document.createElement("button");
+      restore.type = "button";
+      restore.className = "text-button";
+      restore.textContent = "恢复";
+      restore.addEventListener("click", () => restoreSession(id));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "text-button danger-text";
+      remove.textContent = "删除";
+      remove.addEventListener("click", () => deleteSession(id));
+      actions.append(restore, remove);
+      row.appendChild(actions);
+      elements.archivedList.appendChild(row);
+    }
+  }
+
+  async function loadArchivedSessions() {
+    if (state.archivedLoading) return;
+    state.archivedLoading = true;
+    renderArchivedList();
+    try {
+      const response = await apiRequest("/api/sessions?include_archived=true");
+      const payload = await response.json();
+      const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      state.archivedSessions = sessions.filter((session) => session?.archived);
+    } catch (error) {
+      showToast(error.message || "载入归档会话失败", "error");
+    } finally {
+      state.archivedLoading = false;
+      renderArchivedList();
+    }
+  }
+
+  function toggleArchivedSection() {
+    state.archivedOpen = !state.archivedOpen;
+    renderArchivedList();
+    if (state.archivedOpen) loadArchivedSessions();
+  }
+
+  async function refreshSessions() {
+    try {
+      const response = await apiRequest("/api/sessions?include_archived=true");
+      const payload = await response.json();
+      const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      state.sessions = sessions.filter((session) => !session?.archived);
+      state.archivedSessions = sessions.filter((session) => session?.archived);
+      renderSessionList();
+      renderArchivedList();
+      updateConversationChrome();
+    } catch (_) {
+      // 后续 SSE 或 bootstrap 会补齐会话列表。
+    }
+  }
+
+  async function createSession() {
+    if (state.blocked || state.sessionBusy || state.adminBusy || state.submitting || conversationRunning()) return;
+    state.sessionBusy = true;
+    updateControlState();
+    try {
+      await apiRequest("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({ switch: true })
+      });
+      await loadBootstrap();
+      elements.composerInput.focus();
+    } catch (error) {
+      showToast(error.message || "新建会话失败", "error");
+    } finally {
+      state.sessionBusy = false;
+      updateControlState();
+    }
+  }
+
+  async function activateSession(sessionId) {
+    if (!sessionId) return;
+    if (sessionId === state.currentSessionId) {
+      closeSidebar();
+      scrollToBottom({ force: true, smooth: true });
+      return;
+    }
+    if (state.sessionBusy || state.adminBusy || state.submitting) return;
+    state.sessionBusy = true;
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/activate`, { method: "POST" });
+      state.pendingSessionSwitch = null;
+      updateSessionSwitchNotice();
+      await loadBootstrap();
+      closeSidebar();
+    } catch (error) {
+      showToast(error.message || "切换会话失败", "error");
+    } finally {
+      state.sessionBusy = false;
+    }
+  }
+
+  async function archiveSession(sessionId) {
+    if (state.sessionBusy) return;
+    state.sessionBusy = true;
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ archived: true })
+      });
+      showToast("会话已归档");
+      if (sessionId === state.currentSessionId) {
+        await loadBootstrap();
+      } else {
+        state.sessions = state.sessions.filter((session) => String(session?.session_id) !== String(sessionId));
+        renderSessionList();
+      }
+      if (state.archivedOpen) await loadArchivedSessions();
+    } catch (error) {
+      showToast(error.message || "归档失败", "error");
+    } finally {
+      state.sessionBusy = false;
+    }
+  }
+
+  async function restoreSession(sessionId) {
+    if (state.sessionBusy) return;
+    state.sessionBusy = true;
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ archived: false })
+      });
+      showToast("会话已恢复");
+      await refreshSessions();
+    } catch (error) {
+      showToast(error.message || "恢复失败", "error");
+    } finally {
+      state.sessionBusy = false;
+    }
+  }
+
+  async function deleteSession(sessionId) {
+    const session = findSession(sessionId) || findArchivedSession(sessionId);
+    if (!window.confirm(`删除会话「${sessionDisplayName(session)}」？此操作无法撤销。`)) return;
+    if (state.sessionBusy) return;
+    state.sessionBusy = true;
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      showToast("会话已删除");
+      if (sessionId === state.currentSessionId) {
+        await loadBootstrap();
+      } else {
+        state.sessions = state.sessions.filter((item) => String(item?.session_id) !== String(sessionId));
+        state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== String(sessionId));
+        renderSessionList();
+        renderArchivedList();
+      }
+    } catch (error) {
+      showToast(error.message || "删除失败", "error");
+    } finally {
+      state.sessionBusy = false;
+    }
+  }
+
+  function handleSessionEvent(name, data) {
+    const sessionId = String(data?.session_id || "");
+    if (!sessionId) return;
+    if (name === "session.created") {
+      if (!findSession(sessionId) && !findArchivedSession(sessionId)) {
+        state.sessions.unshift({
+          session_id: sessionId,
+          name: String(data?.name || ""),
+          kind: "",
+          workspace: "",
+          archived: false,
+          created_at: null,
+          updated_at: new Date().toISOString(),
+          turn_count: 0,
+          last_user_content: ""
+        });
+        renderSessionList();
+      }
+    } else if (name === "session.renamed") {
+      const target = findSession(sessionId) || findArchivedSession(sessionId);
+      if (target) target.name = String(data?.name || "");
+      renderSessionList();
+      renderArchivedList();
+      updateSessionSwitchNotice();
+      if (sessionId === state.currentSessionId) updateConversationChrome();
+    } else if (name === "session.archived") {
+      refreshSessions();
+    } else if (name === "session.deleted") {
+      state.sessions = state.sessions.filter((item) => String(item?.session_id) !== sessionId);
+      state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== sessionId);
+      renderSessionList();
+      renderArchivedList();
+      if (sessionId === state.currentSessionId && !state.bootstrapPromise) loadBootstrap();
+    } else if (name === "session.updated") {
+      const target = findSession(sessionId) || findArchivedSession(sessionId);
+      if (target) target.workspace = String(data?.workspace || "");
+      renderSessionList();
+      if (sessionId === state.currentSessionId) updateConversationChrome();
+    } else if (name === "session.current_changed") {
+      if (sessionId === state.currentSessionId) {
+        state.pendingSessionSwitch = null;
+        updateSessionSwitchNotice();
+      } else if (!state.sessionBusy && !state.bootstrapPromise) {
+        state.pendingSessionSwitch = sessionId;
+        updateSessionSwitchNotice();
+      }
+    }
+  }
+
   function updateConversationChrome() {
     const details = deriveConversationDetails();
-    elements.conversationTitle.textContent = details.title;
-    elements.conversationTitle.title = details.title;
-    elements.sidebarConversationTitle.textContent = details.title;
-    elements.sidebarConversationTitle.title = details.title;
-    elements.sidebarConversationSnippet.textContent = details.snippet;
-    elements.sidebarConversationSnippet.title = details.snippet;
-    elements.sidebarConversationTime.textContent = details.timestamp ? formatRelativeTime(details.timestamp) : "";
-    if (conversationRunning()) elements.conversationMeta.textContent = state.cancellationRequested ? "正在停止" : "正在回复";
-    else elements.conversationMeta.textContent = details.timestamp ? formatRelativeTime(details.timestamp) : "尚未开始";
+    const current = multiSessionEnabled() ? currentSessionEntry() : null;
+    const title = current ? sessionDisplayName(current) : details.title;
+    elements.conversationTitle.textContent = title;
+    elements.conversationTitle.title = title;
+    const workspace = String(current?.workspace || "").trim();
+    let meta;
+    if (conversationRunning()) meta = state.cancellationRequested ? "正在停止" : "正在回复";
+    else meta = details.timestamp ? formatRelativeTime(details.timestamp) : "尚未开始";
+    elements.conversationMeta.textContent = workspace ? `${meta} · ${workspace}` : meta;
+    elements.conversationMeta.title = workspace;
+    renderSessionList();
   }
 
   function conversationRunning() {
@@ -1686,7 +2204,7 @@
 
     elements.composerInput.disabled = locked;
     elements.composerForm.classList.toggle("is-disabled", locked);
-    elements.newChatButton.disabled = state.blocked || running || busy;
+    elements.newChatButton.disabled = state.blocked || running || busy || state.sessionBusy;
     elements.modelButton.disabled = state.blocked || running || busy || state.models.length === 0;
     elements.modeSwitch.querySelectorAll("button").forEach((button) => {
       button.disabled = state.blocked || running || busy;
@@ -3811,11 +4329,24 @@
         await loadBootstrap();
         return;
       }
+      const snapshotSessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : null;
+      const snapshotCurrentId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
+      if (multiSessionEnabled() && state.currentSessionId && snapshotCurrentId && snapshotCurrentId !== state.currentSessionId) {
+        // 全局当前会话已被其他端切换：快照内容属于别的会话，不覆盖当前时间线。
+        if (snapshotSessions) state.sessions = snapshotSessions;
+        if (!state.sessionBusy && !state.bootstrapPromise && !state.pendingSessionSwitch) {
+          state.pendingSessionSwitch = snapshotCurrentId;
+        }
+        updateSessionSwitchNotice();
+        renderSessionList();
+        return;
+      }
       const snapshotActiveRunId = typeof snapshot?.active_run_id === "string" && snapshot.active_run_id ? snapshot.active_run_id : null;
       if (snapshotActiveRunId && snapshotActiveRunId !== state.activeRunId) {
         await loadBootstrap();
         return;
       }
+      if (snapshotSessions) state.sessions = snapshotSessions;
       const previousExternalTurnId = state.externalRunningTurnId;
       const nextExternalTurnId = snapshotActiveRunId
         ? null
@@ -3940,6 +4471,15 @@
       }
       return;
     }
+    if (name.startsWith("session.")) {
+      handleSessionEvent(name, data);
+      return;
+    }
+    const eventSessionId = typeof data?.session_id === "string" && data.session_id ? data.session_id : "";
+    if (multiSessionEnabled() && eventSessionId && state.currentSessionId && eventSessionId !== state.currentSessionId) {
+      // 其他会话里的活动：各端独立浏览，不打断当前视图。
+      return;
+    }
     if (name === "queue.added") {
       const prompt = data?.prompt;
       if (prompt && !state.queuedPrompts.some((item) => String(item?.id) === String(prompt?.id))) {
@@ -3954,6 +4494,10 @@
       return;
     }
     if (name === "conversation.reset") {
+      loadBootstrap();
+      return;
+    }
+    if (name === "conversation.pop") {
       loadBootstrap();
       return;
     }
@@ -4041,6 +4585,13 @@
     state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : { tokens: 0, window: null };
     state.usage = snapshot?.usage && typeof snapshot.usage === "object" ? snapshot.usage : {};
     state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {};
+    state.sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : [];
+    state.currentSessionId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
+    state.pendingSessionSwitch = null;
+    state.sessionMenuFor = null;
+    state.sessionRenaming = null;
+    updateSessionSwitchNotice();
+    if (state.archivedOpen) loadArchivedSessions();
     state.version = snapshot?.version ?? null;
     state.activeRunId = typeof snapshot?.active_run_id === "string" && snapshot.active_run_id ? snapshot.active_run_id : null;
     state.externalRunningTurnId = !state.activeRunId && typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id
@@ -4305,16 +4856,33 @@
     return state.turns.length > 0 || Boolean(state.live?.userRendered) || Boolean(elements.timeline.querySelector(".user-message"));
   }
 
+  function openResetDialog() {
+    if (typeof elements.resetDialog.showModal === "function") elements.resetDialog.showModal();
+    else elements.resetDialog.setAttribute("open", "");
+    window.requestAnimationFrame(() => elements.resetCancelButton.focus());
+  }
+
   function requestNewConversation() {
     closeSidebar();
+    if (multiSessionEnabled()) {
+      createSession();
+      return;
+    }
     if (!hasHistory()) {
       elements.composerInput.focus();
       return;
     }
     if (conversationRunning() || state.adminBusy || state.submitting) return;
-    if (typeof elements.resetDialog.showModal === "function") elements.resetDialog.showModal();
-    else elements.resetDialog.setAttribute("open", "");
-    window.requestAnimationFrame(() => elements.resetCancelButton.focus());
+    openResetDialog();
+  }
+
+  function requestClearConversation() {
+    if (conversationRunning() || state.adminBusy || state.submitting) return;
+    if (!hasHistory()) {
+      showToast("当前会话没有可清除的记录");
+      return;
+    }
+    openResetDialog();
   }
 
   async function resetConversation() {
@@ -4337,7 +4905,7 @@
       state.adminBusy = false;
       elements.resetConfirmButton.disabled = false;
       elements.resetCancelButton.disabled = false;
-      elements.resetConfirmButton.textContent = "清除并新建";
+      elements.resetConfirmButton.textContent = "清空记录";
       updateControlState();
     }
   }
@@ -4362,6 +4930,11 @@
     }
     if (event.key === "Escape") {
       if (elements.resetDialog.open) return;
+      if (state.sessionMenuFor) {
+        event.preventDefault();
+        closeSessionMenu();
+        return;
+      }
       if (!elements.modelMenu.hidden) {
         event.preventDefault();
         closeModelMenu({ restoreFocus: true });
@@ -4388,9 +4961,15 @@
     elements.mobileMenuButton.addEventListener("click", (event) => openSidebar(event.currentTarget));
     elements.sidebarClose.addEventListener("click", closeSidebar);
     elements.sidebarScrim.addEventListener("click", closeSidebar);
-    elements.currentConversation.addEventListener("click", () => {
-      closeSidebar();
-      scrollToBottom({ force: true, smooth: true });
+    elements.archivedToggle.addEventListener("click", toggleArchivedSection);
+    elements.followSwitchButton.addEventListener("click", () => {
+      state.pendingSessionSwitch = null;
+      updateSessionSwitchNotice();
+      loadBootstrap();
+    });
+    elements.dismissSwitchButton.addEventListener("click", () => {
+      state.pendingSessionSwitch = null;
+      updateSessionSwitchNotice();
     });
     elements.settingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
@@ -4444,6 +5023,7 @@
     });
     document.addEventListener("click", (event) => {
       if (!elements.modelMenu.hidden && !event.target.closest("#modelMenuWrap")) closeModelMenu();
+      if (state.sessionMenuFor && !event.target.closest(".session-menu") && !event.target.closest(".session-menu-button")) closeSessionMenu();
     });
     elements.promptGrid.querySelectorAll("[data-prompt]").forEach((button) => {
       button.addEventListener("click", () => {

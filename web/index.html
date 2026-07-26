@@ -4,16 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#111512">
+  <meta name="theme-color" content="#171821">
   <title>Miyu</title>
   <link rel="stylesheet" href="/styles.css">
+  <!-- matugen 生成的 MD3 token 覆盖;文件不存在时 404,浏览器静默忽略 -->
+  <link rel="stylesheet" href="/theme.css">
   <script defer src="/app.js"></script>
 </head>
 <body data-theme="graphite">
   <div class="app-shell" id="appShell">
     <button class="page-scrim sidebar-scrim" id="sidebarScrim" type="button" aria-label="关闭会话栏" tabindex="-1"></button>
 
-    <aside class="sidebar" id="sidebar" aria-label="当前会话">
+    <aside class="sidebar" id="sidebar" aria-label="会话">
       <header class="brand-row">
         <div class="brand-identity">
           <img src="/assets/miyu-logo.png" alt="Miyu" class="brand-avatar">
@@ -32,17 +34,15 @@
         <span>新对话</span>
       </button>
 
-      <nav class="session-list" aria-label="会话">
-        <button class="session-item active" id="currentConversation" type="button">
-          <span class="session-item-main">
-            <span class="icon-slot" data-icon="message-circle" aria-hidden="true"><span class="icon-fallback">●</span></span>
-            <span class="session-copy">
-              <strong id="sidebarConversationTitle">新对话</strong>
-              <small id="sidebarConversationSnippet">尚未开始</small>
-            </span>
-          </span>
-          <span class="session-time" id="sidebarConversationTime"></span>
-        </button>
+      <nav class="session-list" id="sessionList" aria-label="会话">
+        <div class="session-items" id="sessionItems"></div>
+        <div class="archived-section" id="archivedSection" hidden>
+          <button class="archived-toggle" id="archivedToggle" type="button" aria-expanded="false" aria-controls="archivedList">
+            <span class="icon-slot" data-icon="chevron-right" aria-hidden="true"><span class="icon-fallback">›</span></span>
+            <span>已归档</span>
+          </button>
+          <div class="archived-list" id="archivedList" hidden></div>
+        </div>
       </nav>
 
       <footer class="sidebar-footer">
@@ -87,6 +87,15 @@
           </button>
         </div>
       </header>
+
+      <div class="session-switch-notice" id="sessionSwitchNotice" hidden>
+        <span class="icon-slot" data-icon="refresh-cw" aria-hidden="true"><span class="icon-fallback">↻</span></span>
+        <span class="session-switch-text" id="sessionSwitchText">当前会话已在其他端切换</span>
+        <button class="session-switch-follow" id="followSwitchButton" type="button">跟随切换</button>
+        <button class="icon-button session-switch-dismiss" id="dismissSwitchButton" type="button" title="忽略" aria-label="忽略">
+          <span class="icon-slot" data-icon="x" aria-hidden="true"><span class="icon-fallback">×</span></span>
+        </button>
+      </div>
 
       <section class="conversation-stage" id="conversationStage">
         <div class="inline-error" id="errorRegion" role="alert" hidden></div>
@@ -216,8 +225,8 @@
           <section class="settings-section settings-panel" data-settings-panel="interface">
           <h2>界面主题</h2>
           <div class="theme-options" role="group" aria-label="界面主题">
-            <button type="button" data-theme-choice="linen"><i class="theme-swatch linen"></i><span>浅色</span></button>
-            <button type="button" data-theme-choice="graphite"><i class="theme-swatch graphite"></i><span>石墨</span></button>
+            <button type="button" data-theme-choice="linen"><i class="theme-swatch linen"></i><span>晨光</span></button>
+            <button type="button" data-theme-choice="graphite"><i class="theme-swatch graphite"></i><span>夜阑</span></button>
           </div>
           </section>
           <section class="settings-section settings-panel" data-settings-panel="interface">
@@ -285,13 +294,13 @@
             <span class="icon-slot" data-icon="triangle-alert"><span class="icon-fallback">!</span></span>
           </span>
           <div>
-            <h2 id="resetDialogTitle">开始新对话？</h2>
-            <p id="resetDialogDescription">当前对话记录将被永久清除，此操作无法撤销。</p>
+            <h2 id="resetDialogTitle">清空当前会话？</h2>
+            <p id="resetDialogDescription">该会话的对话记录将被永久清除，此操作无法撤销。</p>
           </div>
         </header>
         <footer>
           <button class="secondary-button" id="resetCancelButton" type="submit" value="cancel">取消</button>
-          <button class="danger-button" id="resetConfirmButton" type="button">清除并新建</button>
+          <button class="danger-button" id="resetConfirmButton" type="button">清空记录</button>
         </footer>
       </form>
     </dialog>
