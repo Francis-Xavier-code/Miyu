@@ -6898,6 +6898,12 @@ impl LiveReplTail {
             &self.footer,
             false,
         )?;
+        // The editor is back on screen: the cursor must be visible no
+        // matter which path hid it (e.g. a question prompt suspended the
+        // editor with the cursor hidden and then exited early). This is
+        // the single convergence point for every editor redraw, so an
+        // unconditional Show here prevents a permanently invisible cursor.
+        execute!(io::stdout(), crossterm::cursor::Show)?;
         self.input_cursor = cursor::position()?;
         self.output_cursor = (output_col, output_row);
         self.tail_start = tail_start;
