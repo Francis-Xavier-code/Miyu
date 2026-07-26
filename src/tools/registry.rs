@@ -269,6 +269,21 @@ impl ToolRegistry {
         self.tools.insert(tool.name.clone(), Arc::new(tool));
     }
 
+    /// Appends runtime info to a registered tool's description. Applied
+    /// after `apply_built_in_description`, so it survives the built-in
+    /// overlay (which wholesale replaces the description). The registry is
+    /// rebuilt per turn, keeping such suffixes current with the config.
+    pub fn amend_description(&mut self, name: &str, suffix: &str) {
+        if suffix.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.tools.get(name) {
+            let mut spec = (**tool).clone();
+            spec.description.push_str(suffix);
+            self.tools.insert(name.to_string(), Arc::new(spec));
+        }
+    }
+
     pub fn replace_script_tools(
         &mut self,
         scripts: Vec<ToolSpec>,

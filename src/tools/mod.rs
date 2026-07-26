@@ -489,5 +489,32 @@ mod tier_schema_probe {
         let task = defs.iter().find(|d| d.function.name == "task").expect("task registered");
         let props = task.function.parameters.get("properties").unwrap();
         assert!(props.get("tier").is_some(), "tier missing: {}", task.function.parameters);
+        // Unconfigured pools are announced as falling back to main.
+        assert!(task.function.description.contains("cheap=["));
+    }
+
+    /// The description suffix lists the concrete models per tier pool.
+    #[test]
+    fn task_description_lists_configured_tier_models() {
+        let mut config = crate::config::AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0].models.push("mini-a".to_string());
+        config.providers[0].models.push("mini-b".to_string());
+        config
+            .toggle_subagent_tier_model(crate::config::ModelTier::Cheap, &provider_id, "mini-a")
+            .unwrap();
+        config
+            .toggle_subagent_tier_model(crate::config::ModelTier::Balanced, &provider_id, "mini-a")
+            .unwrap();
+        config
+            .toggle_subagent_tier_model(crate::config::ModelTier::Balanced, &provider_id, "mini-b")
+            .unwrap();
+        let paths = crate::paths::MiyuPaths::new().unwrap();
+        let registry = super::builtin_registry(&config, &paths);
+        let defs = registry.definitions();
+        let task = defs.iter().find(|d| d.function.name == "task").unwrap();
+        assert!(task.function.description.contains("cheap=[mini-a]"));
+        assert!(task.function.description.contains("balanced=[mini-a, mini-b]"));
+        assert!(task.function.description.contains("strong=["));
     }
 }

@@ -127,6 +127,7 @@ pub fn register(
     paths: MiyuPaths,
     tools: ToolRegistry,
 ) {
+    let config_for_status = config.clone();
     let context = TaskContext {
         config,
         paths,
@@ -173,6 +174,31 @@ pub fn register(
             async move { run_task(args, context, progress).await }
         },
     ).writes());
+    registry.amend_description("task", &tier_pool_status(&config_for_status));
+}
+
+/// Human-readable tier pool status appended to the task tool description,
+/// so the calling agent knows which tiers are configured and with which
+/// concrete models when choosing a tier.
+fn tier_pool_status(config: &AppConfig) -> String {
+    let describe = |tier: ModelTier| {
+        let pool = config.subagent_tier_choices(tier);
+        if pool.is_empty() {
+            t("not configured (falls back to the main model pool)", "未配置（回退主模型池）").to_string()
+        } else {
+            pool.iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    format!(
+        "{}cheap=[{}]; balanced=[{}]; strong=[{}]",
+        t(" Current tier pools: ", " 当前档位池状态："),
+        describe(ModelTier::Cheap),
+        describe(ModelTier::Balanced),
+        describe(ModelTier::Strong),
+    )
 }
 
 fn main_pool_choice(config: &AppConfig) -> Option<(String, String)> {
