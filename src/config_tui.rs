@@ -73,6 +73,11 @@ fn run_main_menu(
                 t("Configure multimodal model", "配置多模态模型"),
                 t("Current", "当前")
             ),
+            format!(
+                "{} ({})",
+                t("Configure subagent tier pools", "配置子代理档位池"),
+                subagent_tiers_label(config)
+            ),
             t("Providers and models", "供应商和模型").to_string(),
             t("Plugins", "插件配置").to_string(),
             t("Custom prompts", "自定义提示词").to_string(),
@@ -104,11 +109,12 @@ fn run_main_menu(
             KeyCode::Enter => match selected {
                 0 => select_active_provider(stdout, config)?,
                 1 => select_active_multimodal_provider(stdout, config)?,
-                2 => ProviderBrowser::new(paths, config).run(stdout)?,
-                3 => edit_plugins(stdout, config)?,
-                4 => edit_custom_prompts(stdout, paths, config)?,
-                5 => edit_settings(stdout, config)?,
-                6 => {
+                2 => select_subagent_tiers(stdout, config)?,
+                3 => ProviderBrowser::new(paths, config).run(stdout)?,
+                4 => edit_plugins(stdout, config)?,
+                5 => edit_custom_prompts(stdout, paths, config)?,
+                6 => edit_settings(stdout, config)?,
+                7 => {
                     config.save(paths)?;
                     return Ok(true);
                 }
@@ -1614,6 +1620,7 @@ impl<'a> ProviderBrowser<'a> {
             return;
         }
         let removed = self.config.providers.remove(self.provider_idx);
+        self.config.prune_subagent_tiers();
         if self.config.active_provider == removed.id {
             self.config.active_provider = self
                 .config
@@ -1990,6 +1997,128 @@ fn select_active_provider(stdout: &mut io::Stdout, config: &mut AppConfig) -> Re
                     return Ok(());
                 }
                 selected = selected.min(choices.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn subagent_tiers_label(config: &AppConfig) -> String {
+    let counts = crate::config::ModelTier::ALL
+        .map(|tier| config.subagent_tier_choices(tier).len());
+    if counts.iter().all(|count| *count == 0) {
+        t("not configured", "未配置").to_string()
+    } else {
+        format!("cheap:{} balanced:{} strong:{}", counts[0], counts[1], counts[2])
+    }
+}
+
+fn tier_display_name(tier: crate::config::ModelTier) -> &'static str {
+    use crate::config::ModelTier;
+    match tier {
+        ModelTier::Cheap => "cheap",
+        ModelTier::Balanced => "balanced",
+        ModelTier::Strong => "strong",
+    }
+}
+
+/// Tier pool overview: pick a tier, then toggle models for it. Subagents
+/// choose a tier by task complexity; unconfigured pools fall back to the
+/// main model pool.
+fn select_subagent_tiers(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    use crate::config::ModelTier;
+    let mut selected = 0usize;
+    loop {
+        let options = ModelTier::ALL
+            .iter()
+            .map(|tier| {
+                let pool = config.subagent_tier_choices(*tier);
+                let summary = if pool.is_empty() {
+                    t("fallback to main model", "回退主模型").to_string()
+                } else {
+                    pool.iter()
+                        .map(|choice| choice.model.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let hint = match tier {
+                    ModelTier::Cheap => t("simple tasks", "简单任务"),
+                    ModelTier::Balanced => t("normal tasks", "普通任务"),
+                    ModelTier::Strong => t("complex tasks", "复杂任务"),
+                };
+                format!("{} ({hint}): {summary}", tier_display_name(*tier))
+            })
+            .collect::<Vec<_>>();
+        draw_menu(
+            stdout,
+            t(" SUBAGENT TIER POOLS ", " 子代理档位池 "),
+            &options,
+            selected,
+            t(
+                "[Enter]configure tier [j/k]move [q]back",
+                "[Enter]配置该档位 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => select_subagent_tier_models(stdout, config, ModelTier::ALL[selected])?,
+            _ => {}
+        }
+    }
+}
+
+/// Model multi-select for one tier pool, mirroring the text-model picker:
+/// candidates are the configured text models, Tab toggles membership.
+fn select_subagent_tier_models(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+    tier: crate::config::ModelTier,
+) -> Result<()> {
+    let choices = config.text_provider_model_choices();
+    if choices.is_empty() {
+        message(
+            stdout,
+            t(
+                "No text models are configured. Add models under Providers and models first.",
+                "没有可用的文本模型，请先在供应商和模型里添加模型。",
+            ),
+        )?;
+        return Ok(());
+    }
+    let mut selected = 0usize;
+    let title = format!(" {} · {} ", t("TIER POOL", "档位池"), tier_display_name(tier));
+    loop {
+        let options = choices
+            .iter()
+            .map(|choice| {
+                let marker =
+                    if config.is_subagent_tier_model(tier, &choice.provider_id, &choice.model) {
+                        "[*] "
+                    } else {
+                        "[ ] "
+                    };
+                format!("{marker}{}", choice.label())
+            })
+            .collect::<Vec<_>>();
+        draw_menu(
+            stdout,
+            &title,
+            &options,
+            selected,
+            t(
+                "[Tab]add/remove [Enter/q]confirm",
+                "[Tab]加入/移出 [Enter/q]确认",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Tab => {
+                let choice = choices[selected].clone();
+                config.toggle_subagent_tier_model(tier, &choice.provider_id, &choice.model)?;
             }
             _ => {}
         }

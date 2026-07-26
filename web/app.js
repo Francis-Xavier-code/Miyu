@@ -96,7 +96,8 @@
     sidebarConnectionStatus: document.getElementById("sidebarConnectionStatus"),
     newChatButton: document.getElementById("newChatButton"),
     matugenThemeLink: document.getElementById("matugenThemeLink"),
-    schemeHint: document.getElementById("schemeHint"),
+    reasoningExpandToggle: document.getElementById("reasoningExpandToggle"),
+    toolExpandToggle: document.getElementById("toolExpandToggle"),
     sessionList: document.getElementById("sessionList"),
     sessionItems: document.getElementById("sessionItems"),
     archivedSection: document.getElementById("archivedSection"),
@@ -215,6 +216,8 @@
     pendingSubmission: null,
     colorScheme: null,
     matugenAvailable: null,
+    reasoningExpanded: false,
+    toolExpanded: false,
     finishedTurnArticles: new Map(),
     bootstrapPromise: null,
     resyncing: false,
@@ -339,9 +342,9 @@
       const active = button.dataset.schemeChoice === selected;
       button.classList.toggle("selected", active);
       button.setAttribute("aria-pressed", String(active));
-      if (button.dataset.schemeChoice === "matugen") button.disabled = state.matugenAvailable === false;
+      // 探测不到 matugen 输出时,「壁纸取色」整个选项不显示。
+      if (button.dataset.schemeChoice === "matugen") button.hidden = state.matugenAvailable !== true;
     });
-    if (elements.schemeHint) elements.schemeHint.hidden = state.matugenAvailable !== false;
     if (persist) safeStorageSet("miyu.web.colorScheme", requested);
   }
 
@@ -354,6 +357,41 @@
     }
     // 无持久化记录时:matugen 可用则维持现状(matugen),否则窗边。默认值不写入存储。
     setColorScheme(safeStorageGet("miyu.web.colorScheme") || (state.matugenAvailable ? "matugen" : "madobe"), false);
+  }
+
+  /* 仅 WebUI 的本地显示偏好(localStorage,不写入 config) */
+  const CHAT_FONT_SIZES = ["14px", "15px", "16px"];
+
+  function setChatFontSize(size, persist = true) {
+    const selected = CHAT_FONT_SIZES.includes(size) ? size : "15px";
+    document.documentElement.style.setProperty("--fs-chat", selected);
+    document.querySelectorAll("[data-chat-font]").forEach((button) => {
+      const active = button.dataset.chatFont === selected;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    if (persist) safeStorageSet("miyu.web.chatFontSize", selected);
+  }
+
+  function setReasoningExpanded(value, persist = true) {
+    state.reasoningExpanded = Boolean(value);
+    elements.reasoningExpandToggle?.setAttribute("aria-checked", String(state.reasoningExpanded));
+    // 对已渲染的思考块即时生效
+    document.querySelectorAll(".reasoning-block").forEach((block) => {
+      block.open = state.reasoningExpanded;
+    });
+    if (persist) safeStorageSet("miyu.web.reasoningExpanded", String(state.reasoningExpanded));
+  }
+
+  function setToolExpanded(value, persist = true) {
+    state.toolExpanded = Boolean(value);
+    elements.toolExpandToggle?.setAttribute("aria-checked", String(state.toolExpanded));
+    // 对已渲染的工具签即时生效
+    document.querySelectorAll(".tool-card").forEach((card) => {
+      card.classList.toggle("collapsed", !state.toolExpanded);
+      card.querySelector(".tool-head")?.setAttribute("aria-expanded", String(state.toolExpanded));
+    });
+    if (persist) safeStorageSet("miyu.web.toolExpanded", String(state.toolExpanded));
   }
 
   function setMode(mode, persist = true) {
@@ -700,12 +738,13 @@
         booleanConfigField("启用 Skills", "skills.enabled"),
         booleanConfigField("允许执行命令", "skills.allow_command_execution")
       ]),
-      configGroup("显示", [
-        selectConfigField("界面语言", "display.language", [{ value: "auto", label: "自动" }, { value: "zh", label: "简体中文" }, { value: "en", label: "English" }]),
-        selectConfigField("思考过程", "display.reasoning", [{ value: "summary", label: "摘要" }, { value: "full", label: "完整" }, { value: "hidden", label: "隐藏" }]),
-        selectConfigField("工具调用", "display.tool_calls", [{ value: "summary", label: "摘要" }, { value: "full", label: "完整" }, { value: "hidden", label: "隐藏" }]),
-        booleanConfigField("显示可读工具名", "display.readable_tool_names"),
-        selectConfigField("Mixed 模型端点", "display.mixed_model_endpoint_display", [{ value: "off", label: "关闭" }, { value: "interactive", label: "仅交互模式" }, { value: "all", label: "全部模式" }])
+      configGroup("思考", [
+        selectConfigField(
+          "思考详细程度",
+          "display.reasoning",
+          [{ value: "summary", label: "摘要" }, { value: "full", label: "完整" }, { value: "hidden", label: "隐藏" }],
+          "决定向模型请求摘要还是完整思考并写入会话；设为隐藏则不产生思考内容。WebUI 的展开/收起在「界面」里设置。"
+        )
       ]),
       configGroup("上下文", [
         selectConfigField("到达上限后", "context.on_overflow", [{ value: "pop", label: "弹出旧消息" }, { value: "compact", label: "压缩上下文" }]),
@@ -1034,6 +1073,49 @@
     return group;
   }
 
+  function renderSubagentTierList(titleText, tierKey, choices) {
+    if (!state.configDraft.subagent_tiers || typeof state.configDraft.subagent_tiers !== "object") {
+      state.configDraft.subagent_tiers = {};
+    }
+    const tiers = state.configDraft.subagent_tiers;
+    const selected = Array.isArray(tiers[tierKey]) ? tiers[tierKey] : [];
+    const group = configGroup(titleText);
+    const body = group.querySelector(".config-group-body");
+    if (!choices.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-empty";
+      empty.textContent = "请先在供应商中配置模型。";
+      body.appendChild(empty);
+    }
+    for (const model of choices) {
+      const label = document.createElement("label");
+      label.className = "model-pool-option";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = selected.some((item) => item.provider_id === model.provider_id && item.model === model.model);
+      input.addEventListener("change", () => {
+        let pool = Array.isArray(tiers[tierKey]) ? tiers[tierKey] : [];
+        if (input.checked && !pool.some((item) => item.provider_id === model.provider_id && item.model === model.model)) {
+          pool = [...pool, { provider_id: model.provider_id, model: model.model }];
+        } else if (!input.checked) {
+          pool = pool.filter((item) => item.provider_id !== model.provider_id || item.model !== model.model);
+        }
+        tiers[tierKey] = pool;
+        markConfigDirty();
+        updateAdvancedConfigEditor();
+      });
+      const copy = document.createElement("span");
+      const name = document.createElement("strong");
+      name.textContent = model.model;
+      const provider = document.createElement("small");
+      provider.textContent = model.provider_name;
+      copy.append(name, provider);
+      label.append(input, copy);
+      body.appendChild(label);
+    }
+    return group;
+  }
+
   function renderModelPools() {
     const providers = Array.isArray(state.configDraft?.providers) ? state.configDraft.providers : [];
     const choices = configuredModelChoices();
@@ -1065,7 +1147,10 @@
     elements.modelPoolEditor.replaceChildren(
       configGroup("默认供应商", [configField("未设置文本模型池时使用", activeProvider)]),
       renderModelPoolList("文本模型池", "active_provider_models", choices),
-      renderModelPoolList("多模态模型池", "active_multimodal_provider_models", multimodal)
+      renderModelPoolList("多模态模型池", "active_multimodal_provider_models", multimodal),
+      renderSubagentTierList("子代理档位池 · cheap（简单任务）", "cheap", choices),
+      renderSubagentTierList("子代理档位池 · balanced（普通任务）", "balanced", choices),
+      renderSubagentTierList("子代理档位池 · strong（复杂任务）", "strong", choices)
     );
   }
 
@@ -2981,8 +3066,13 @@
     return figure;
   }
 
-  function reasoningDisplayMode() {
-    return ["hidden", "summary", "full"].includes(state.display?.reasoning) ? state.display.reasoning : "summary";
+  /*
+   * display.reasoning 只决定后端产生什么(摘要/完整/不产生);
+   * WebUI 是否渲染仅以「有没有思考内容」为准,hidden 时若仍收到文本则不渲染(保底)。
+   * 默认展开/收起由本地偏好 miyu.web.reasoningExpanded 决定,与 summary/full 无关。
+   */
+  function reasoningHidden() {
+    return state.display?.reasoning === "hidden";
   }
 
   function normalizeReasoningTitle(value) {
@@ -3005,7 +3095,7 @@
     details.className = "reasoning-block";
     details.classList.toggle("is-summary", summaryOnly);
     details.classList.toggle("is-live", live);
-    details.open = false;
+    details.open = state.reasoningExpanded === true;
     const summary = document.createElement("summary");
     const atom = makeIconSlot("atom", "reasoning-icon");
     if (live) for (let index = 0; index < 3; index += 1) atom.appendChild(document.createElement("i"));
@@ -3098,10 +3188,9 @@
     assistantContent.className = "assistant-content";
     const blocks = document.createElement("div");
     blocks.className = "assistant-blocks";
-    if (String(reasoning || "").trim() && reasoningDisplayMode() !== "hidden") {
+    if (String(reasoning || "").trim() && !reasoningHidden()) {
       const parsed = splitReasoningText(reasoning);
-      const summaryOnly = reasoningDisplayMode() === "summary";
-      blocks.appendChild(createReasoningBlock(parsed.body, "已思考", false, summaryOnly).element);
+      blocks.appendChild(createReasoningBlock(parsed.body, "已思考", false).element);
     }
     if (String(content || "").trim()) {
       const markdown = document.createElement("div");
@@ -3111,6 +3200,7 @@
     }
     for (const asset of Array.isArray(assets) ? assets : []) blocks.appendChild(createConversationMedia(asset));
     assistantContent.appendChild(blocks);
+    assistantContent.classList.toggle("is-slim", !blocks.querySelector(WIDE_BLOCK_SELECTOR));
     article.append(header, assistantContent);
 
     const meta = document.createElement("div");
@@ -3500,6 +3590,15 @@
     }
   }
 
+  // 气泡宽度:blocks 里出现正文/媒体/上下文操作等「宽内容」前保持贴合内容
+  const WIDE_BLOCK_SELECTOR = ".markdown-body, .conversation-media, .context-operation, img, .tool-live-progress:not([hidden])";
+  function syncBubbleWidth(article) {
+    if (!article) return;
+    const content = article.querySelector(".assistant-content");
+    if (!content) return;
+    content.classList.toggle("is-slim", !content.querySelector(WIDE_BLOCK_SELECTOR));
+  }
+
   function ensureLiveArticle(live) {
     if (live.article) return live.article;
     ensureTimelineVisible();
@@ -3529,7 +3628,7 @@
     stop.addEventListener("click", () => cancelLiveRun(live));
     header.append(avatar, identity, stop);
     const assistantContent = document.createElement("div");
-    assistantContent.className = "assistant-content";
+    assistantContent.className = "assistant-content is-slim";
     const blocks = document.createElement("div");
     blocks.className = "assistant-blocks";
     assistantContent.appendChild(blocks);
@@ -3583,6 +3682,7 @@
       element.className = "markdown-body live-text-block";
       const block = { element, raw: "", renderFrame: null };
       live.blocks.appendChild(element);
+      syncBubbleWidth(live.article);
       live.currentText = block;
       live.contextOperation = null;
       if (live.assistantText && !/\s$/.test(live.assistantText)) live.assistantText += "\n\n";
@@ -3600,10 +3700,9 @@
     if (live.reasoning) return live.reasoning;
     breakLiveText(live);
     live.contextOperation = null;
-    const mode = reasoningDisplayMode();
-    const reasoning = createReasoningBlock("", "正在思考", true, mode === "summary");
+    const reasoning = createReasoningBlock("", "正在思考", true);
     reasoning.pendingTitle = normalizeReasoningTitle(live.reasoningTitle);
-    if (mode !== "hidden") live.blocks.appendChild(reasoning.element);
+    if (!reasoningHidden()) live.blocks.appendChild(reasoning.element);
     live.reasoning = reasoning;
     live.reasoningParts.push(reasoning);
     if (live.reasoningTimer) window.clearInterval(live.reasoningTimer);
@@ -3830,14 +3929,17 @@
     const toolId = String(data?.tool_id || `${live.runId}_tool_unknown_${live.tools.size + 1}`);
     if (live.tools.has(toolId)) return live.tools.get(toolId);
     const card = document.createElement("section");
-    card.className = "tool-card collapsed";
+    card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
     card.dataset.toolId = toolId;
     const isCommand = String(data?.name || "") === "run_command";
     if (isCommand) card.classList.add("is-command");
+    const isTask = String(data?.name || "") === "task" || /^task[:：]/i.test(String(data?.display_name || ""));
+    if (isTask) card.classList.add("is-task");
+    const subjectText = toolSubject(data?.name, data?.arguments);
     const head = document.createElement("button");
     head.className = "tool-head";
     head.type = "button";
-    head.setAttribute("aria-expanded", "false");
+    head.setAttribute("aria-expanded", String(Boolean(state.toolExpanded)));
     const icon = document.createElement("span");
     icon.className = "tool-icon";
     icon.appendChild(makeIconSlot(isCommand ? "fileTerminal" : "wrench"));
@@ -3874,7 +3976,16 @@
       argumentsDetail.wrapper.hidden = false;
     }
     body.append(argumentsDetail.wrapper, progressDetail.wrapper, stdoutDetail.wrapper, stderrDetail.wrapper, resultDetail.wrapper);
-    card.append(head, body);
+    // 子代理签:标题行下方的实时进度面板,收起态也可见,tool.progress 原地刷新
+    let liveProgress = null;
+    if (isTask) {
+      liveProgress = document.createElement("div");
+      liveProgress.className = "tool-live-progress";
+      liveProgress.textContent = subjectText || "正在启动子代理…";
+      card.append(head, liveProgress, body);
+    } else {
+      card.append(head, body);
+    }
     const tool = {
       id: toolId,
       name: String(data?.name || ""),
@@ -3890,7 +4001,9 @@
       stdoutDetail,
       stderrDetail,
       resultDetail,
-      subject: toolSubject(data?.name, data?.arguments),
+      isTask,
+      liveProgress,
+      subject: subjectText,
       startedAt: performance.now(),
       finishedAt: null,
       imageCount: 0,
@@ -3937,20 +4050,30 @@
           live.contextOperation = null;
           live.assets.push(asset);
           live.blocks.appendChild(createConversationMedia(asset, { eager: true }));
+          syncBubbleWidth(live.article);
           tool.imageCount += 1;
         }
       } else if (data?.error) {
         const message = String(data.error);
         tool.progressDetail.raw = message;
         tool.progressDetail.content.textContent = message;
-        tool.progressDetail.wrapper.hidden = false;
+        tool.progressDetail.wrapper.hidden = Boolean(tool.liveProgress);
+        if (tool.liveProgress) {
+          tool.liveProgress.textContent = message;
+          tool.liveProgress.hidden = false;
+        }
       }
       updateToolSummary(tool);
     } else if (name === "tool.progress") {
       const message = String(data?.message || "");
       tool.progressDetail.raw = message;
       tool.progressDetail.content.textContent = message;
-      tool.progressDetail.wrapper.hidden = !message;
+      tool.progressDetail.wrapper.hidden = !message || Boolean(tool.liveProgress);
+      if (tool.liveProgress && message) {
+        tool.liveProgress.textContent = message;
+        tool.liveProgress.hidden = false;
+        syncBubbleWidth(live.article);
+      }
       if (!tool.subject && message) tool.subject = compactLine(message);
       updateToolStatus(tool, "运行中", "loader-circle");
       updateToolSummary(tool);
@@ -3971,10 +4094,13 @@
       const ok = Boolean(data?.ok);
       updateToolStatus(tool, ok ? "完成" : "失败", ok ? "check" : "circle-alert", ok ? "is-success" : "is-failure");
       updateToolSummary(tool);
-      if (ok) {
-        tool.card.classList.add("collapsed");
-        tool.head.setAttribute("aria-expanded", "false");
-      } else {
+      if (tool.liveProgress) {
+        if (ok) tool.liveProgress.hidden = true;
+        else tool.liveProgress.classList.add("is-error");
+        tool.progressDetail.wrapper.hidden = !tool.progressDetail.raw;
+        syncBubbleWidth(live.article);
+      }
+      if (!state.toolExpanded) {
         tool.card.classList.add("collapsed");
         tool.head.setAttribute("aria-expanded", "false");
       }
@@ -4376,6 +4502,7 @@
     block.append(title, output);
     const operation = { kind, block, title: title.lastChild, output, raw: "" };
     live.blocks.appendChild(block);
+    syncBubbleWidth(live.article);
     live.contextOperation = operation;
     contentAdded();
     return operation;
@@ -4427,8 +4554,16 @@
       tool.finishedAt = performance.now();
       updateToolStatus(tool, "已中断", "circle-alert", "is-failure");
       updateToolSummary(tool);
-      tool.card.classList.add("collapsed");
-      tool.head.setAttribute("aria-expanded", "false");
+      if (tool.liveProgress) {
+        if (tool.liveProgress.textContent.trim()) tool.liveProgress.classList.add("is-error");
+        else tool.liveProgress.hidden = true;
+        tool.progressDetail.wrapper.hidden = !tool.progressDetail.raw;
+        syncBubbleWidth(live.article);
+      }
+      if (!state.toolExpanded) {
+        tool.card.classList.add("collapsed");
+        tool.head.setAttribute("aria-expanded", "false");
+      }
     }
   }
 
@@ -5300,6 +5435,9 @@
     elements.sidebarThemeButton.addEventListener("click", () => setTheme(elements.body.dataset.theme === "graphite" ? "linen" : "graphite"));
     document.querySelectorAll("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => setTheme(button.dataset.themeChoice)));
     document.querySelectorAll("[data-scheme-choice]").forEach((button) => button.addEventListener("click", () => setColorScheme(button.dataset.schemeChoice)));
+    document.querySelectorAll("[data-chat-font]").forEach((button) => button.addEventListener("click", () => setChatFontSize(button.dataset.chatFont)));
+    elements.reasoningExpandToggle?.addEventListener("click", () => setReasoningExpanded(!state.reasoningExpanded));
+    elements.toolExpandToggle?.addEventListener("click", () => setToolExpanded(!state.toolExpanded));
     elements.modeSwitch.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
     elements.modelButton.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -5384,6 +5522,9 @@
     const storedScheme = safeStorageGet("miyu.web.colorScheme");
     if (storedScheme) setColorScheme(storedScheme, false);
     probeMatugenTheme();
+    setChatFontSize(safeStorageGet("miyu.web.chatFontSize") || "15px", false);
+    setReasoningExpanded(safeStorageGet("miyu.web.reasoningExpanded") === "true", false);
+    setToolExpanded(safeStorageGet("miyu.web.toolExpanded") === "true", false);
     setMode(safeStorageGet("miyu.web.mode") || "normal", false);
     setSettingsView("interface");
     bindEvents();

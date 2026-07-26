@@ -3461,10 +3461,10 @@ fn finish_turn_task(
     trim_process_memory();
 }
 
-/// Best-effort AI pass over the truncated default session name: when a
-/// cheap tier is configured, ask it for a concise title and apply it only
-/// if the auto-generated name is still in place (a user rename wins).
-/// Runs detached on the actor's LocalSet — never blocks the turn.
+/// Best-effort AI pass over the truncated default session name: ask the
+/// main model pool for a concise title and apply it only if the
+/// auto-generated name is still in place (a user rename wins). Runs
+/// detached on the actor's LocalSet — never blocks the turn.
 fn spawn_session_title_refinement(
     config: &AppConfig,
     paths: &MiyuPaths,
@@ -3473,10 +3473,7 @@ fn spawn_session_title_refinement(
     fallback: String,
     seed: &str,
 ) {
-    let Some(provider) = config.tier_provider(crate::config::ModelTier::Cheap) else {
-        return;
-    };
-    let Ok(client) = OpenAiCompatibleClient::new(&provider, config, paths) else {
+    let Ok(client) = OpenAiCompatibleClient::from_config(config, paths) else {
         return;
     };
     let store = store.clone();
@@ -3610,6 +3607,9 @@ fn rebuild_for_config(
     prompts: &PromptDocuments,
     reset_conversation: bool,
 ) -> std::result::Result<(), AdminFailure> {
+    let mut next_config = next_config;
+    // Models removed from the text models must leave the tier pools too.
+    next_config.prune_subagent_tiers();
     let previous_prompts = read_prompt_documents(config, paths)
         .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
     let prompt_backups =

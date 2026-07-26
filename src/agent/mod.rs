@@ -922,29 +922,6 @@ impl Agent {
         }))
     }
 
-    /// Client + effective context window for auxiliary work (compact): the
-    /// cheap tier when configured, otherwise the main conversation client.
-    /// The window shrinks to the auxiliary model's if it is smaller — the
-    /// compaction prompt must fit the model that actually runs it.
-    fn auxiliary_compact_client(
-        &self,
-        context_window: usize,
-    ) -> (OpenAiCompatibleClient, usize) {
-        let Some(provider) = self.config.tier_provider(crate::config::ModelTier::Cheap) else {
-            return (self.client.clone(), context_window);
-        };
-        let Ok(client) = OpenAiCompatibleClient::new(&provider, &self.config, &self.paths) else {
-            return (self.client.clone(), context_window);
-        };
-        let window = client
-            .context_window(&self.config)
-            .ok()
-            .flatten()
-            .map(|aux| aux.min(context_window))
-            .unwrap_or(context_window);
-        (client, window)
-    }
-
     pub async fn compact_now<F>(&self, on_event: F) -> Result<Option<ChatResult>>
     where
         F: FnMut(AgentEvent) -> Result<()>,
@@ -983,11 +960,10 @@ impl Agent {
         }
         let check = overflow::OverflowCheck::new(Some(context_window), self.trim_at_ratio, None);
         on_event(AgentEvent::CompactStart)?;
-        let (compact_client, compact_window) = self.auxiliary_compact_client(context_window);
         let compactor = compact::Compactor::new(
-            compact_client,
+            self.client.clone(),
             self.state.clone(),
-            compact_window,
+            context_window,
             check.reserved_tokens,
         );
         let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
@@ -1037,12 +1013,10 @@ impl Agent {
                     return Ok(None);
                 }
                 on_event(AgentEvent::CompactStart)?;
-                let (compact_client, compact_window) =
-                    self.auxiliary_compact_client(context_window.unwrap());
                 let compactor = compact::Compactor::new(
-                    compact_client,
+                    self.client.clone(),
                     self.state.clone(),
-                    compact_window,
+                    context_window.unwrap(),
                     check.reserved_tokens,
                 );
                 let mut on_chunk =

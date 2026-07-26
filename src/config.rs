@@ -39,37 +39,46 @@ pub struct AppConfig {
     pub system_prompt_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "ModelTiersConfig::is_empty")]
-    pub model_tiers: ModelTiersConfig,
+    #[serde(default, skip_serializing_if = "SubagentTiersConfig::is_empty")]
+    pub subagent_tiers: SubagentTiersConfig,
 }
 
-/// Model tier routing for subagents and auxiliary tasks (compact, session
-/// title generation). The main conversation model is never routed through
-/// tiers — it stays fully user-selected. Unconfigured tiers fall back to
-/// the active main model.
+/// Subagent model tier pools. When the main agent spawns a subagent it
+/// picks a tier by task complexity (cheap/balanced/strong); requests then
+/// load-balance across that tier's pool exactly like the main text-model
+/// pool. Tiers are subagent-only — the main conversation and auxiliary
+/// work always use the user-selected main models. An unconfigured or
+/// unavailable pool falls back to the main model pool.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelTiersConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cheap: Option<ModelTierTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub balanced: Option<ModelTierTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strong: Option<ModelTierTarget>,
+pub struct SubagentTiersConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cheap: Vec<ActiveProviderModelConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub balanced: Vec<ActiveProviderModelConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strong: Vec<ActiveProviderModelConfig>,
 }
 
-impl ModelTiersConfig {
+impl SubagentTiersConfig {
     pub fn is_empty(&self) -> bool {
-        self.cheap.is_none() && self.balanced.is_none() && self.strong.is_none()
+        self.cheap.is_empty() && self.balanced.is_empty() && self.strong.is_empty()
     }
-}
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelTierTarget {
-    #[serde(default)]
-    pub provider_id: String,
-    /// Empty model uses the provider's default model.
-    #[serde(default)]
-    pub model: String,
+    pub fn pool(&self, tier: ModelTier) -> &Vec<ActiveProviderModelConfig> {
+        match tier {
+            ModelTier::Cheap => &self.cheap,
+            ModelTier::Balanced => &self.balanced,
+            ModelTier::Strong => &self.strong,
+        }
+    }
+
+    pub fn pool_mut(&mut self, tier: ModelTier) -> &mut Vec<ActiveProviderModelConfig> {
+        match tier {
+            ModelTier::Cheap => &mut self.cheap,
+            ModelTier::Balanced => &mut self.balanced,
+            ModelTier::Strong => &mut self.strong,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +89,8 @@ pub enum ModelTier {
 }
 
 impl ModelTier {
+    pub const ALL: [Self; 3] = [Self::Cheap, Self::Balanced, Self::Strong];
+
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "cheap" => Some(Self::Cheap),
@@ -658,7 +669,7 @@ impl Default for AppConfig {
             memory: MemoryConfig::default(),
             system_prompt_file: Some("system-prompt.md".to_string()),
             system_prompt: None,
-            model_tiers: ModelTiersConfig::default(),
+            subagent_tiers: SubagentTiersConfig::default(),
         }
     }
 }
@@ -1598,6 +1609,12 @@ impl AppConfig {
             active_models
                 .retain(|active| !(active.provider_id == provider_id && active.model == model));
         }
+        // A model gone from the text models must leave every tier pool too.
+        for tier in ModelTier::ALL {
+            self.subagent_tiers
+                .pool_mut(tier)
+                .retain(|entry| !(entry.provider_id == provider_id && entry.model == model));
+        }
     }
 
     pub fn toggle_active_multimodal_provider_model(
@@ -1667,45 +1684,73 @@ impl AppConfig {
         ))
     }
 
-    /// Resolves a tier to a concrete (provider_id, model), or `None` when
-    /// the tier is not configured (callers fall back to the active model).
-    /// An empty model in the target uses the provider's default model.
-    pub fn tier_provider_choice(&self, tier: ModelTier) -> Option<(String, String)> {
-        let target = match tier {
-            ModelTier::Cheap => self.model_tiers.cheap.as_ref(),
-            ModelTier::Balanced => self.model_tiers.balanced.as_ref(),
-            ModelTier::Strong => self.model_tiers.strong.as_ref(),
-        }?;
-        let provider_id = target.provider_id.trim();
-        if provider_id.is_empty() {
-            return None;
-        }
-        let provider = self.provider(Some(provider_id)).ok()?;
-        let model = if target.model.trim().is_empty() {
-            provider.default_model.clone()
-        } else {
-            target.model.trim().to_string()
-        };
-        if model.trim().is_empty() {
-            return None;
-        }
-        Some((provider_id.to_string(), model))
+    /// A tier pool's usable model choices: configured entries filtered to
+    /// models that still exist under their provider (entries whose model
+    /// was removed from the text models are ignored, mirroring
+    /// `active_provider_model_choices`).
+    pub fn subagent_tier_choices(&self, tier: ModelTier) -> Vec<ProviderModelChoice> {
+        self.subagent_tiers
+            .pool(tier)
+            .iter()
+            .filter_map(|entry| {
+                let provider = self.provider(Some(entry.provider_id.trim())).ok()?;
+                let model = entry.model.trim();
+                provider
+                    .has_configured_model(model)
+                    .then(|| ProviderModelChoice {
+                        provider_id: provider.id.clone(),
+                        provider_name: provider.display_name.clone(),
+                        model: model.to_string(),
+                    })
+            })
+            .collect()
     }
 
-    /// Builds the provider config for a tier (default model overridden),
-    /// ready for `OpenAiCompatibleClient::new`. `None` when unconfigured.
-    pub fn tier_provider(&self, tier: ModelTier) -> Option<ProviderConfig> {
-        let (provider_id, model) = self.tier_provider_choice(tier)?;
-        let mut provider = self.provider(Some(&provider_id)).ok()?.clone();
-        provider.default_model = model;
-        if !provider
-            .models
+    pub fn is_subagent_tier_model(&self, tier: ModelTier, provider_id: &str, model: &str) -> bool {
+        self.subagent_tiers
+            .pool(tier)
             .iter()
-            .any(|item| item == &provider.default_model)
-        {
-            provider.models.push(provider.default_model.clone());
+            .any(|entry| entry.provider_id == provider_id && entry.model == model)
+    }
+
+    /// Adds/removes a model in a tier pool. Returns `true` when the model
+    /// is in the pool after the call.
+    pub fn toggle_subagent_tier_model(
+        &mut self,
+        tier: ModelTier,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<bool> {
+        if model.trim().is_empty() {
+            bail!("model cannot be empty");
         }
-        Some(provider)
+        self.provider(Some(provider_id))?;
+        let pool = self.subagent_tiers.pool_mut(tier);
+        if let Some(index) = pool
+            .iter()
+            .position(|entry| entry.provider_id == provider_id && entry.model == model)
+        {
+            pool.remove(index);
+            Ok(false)
+        } else {
+            pool.push(ActiveProviderModelConfig {
+                provider_id: provider_id.to_string(),
+                model: model.to_string(),
+            });
+            Ok(true)
+        }
+    }
+
+    /// Drops tier pool entries whose model no longer exists among the
+    /// configured text models (a model removed from a provider must also
+    /// leave every tier pool).
+    pub fn prune_subagent_tiers(&mut self) {
+        for tier in ModelTier::ALL {
+            let providers = &self.providers;
+            self.subagent_tiers
+                .pool_mut(tier)
+                .retain(|entry| active_model_exists(providers, entry));
+        }
     }
 
     pub fn is_active_provider_model(&self, provider_id: &str, model: &str) -> bool {
@@ -2582,74 +2627,81 @@ mod tests {
     }
 
     #[test]
-    fn tier_provider_choice_resolves_and_falls_back() {
+    fn subagent_tier_pools_toggle_filter_and_prune() {
         let mut config = AppConfig::default();
-        // Unconfigured tiers resolve to None (callers fall back to main).
-        assert_eq!(config.tier_provider_choice(ModelTier::Cheap), None);
-        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0].models.push("mini-a".to_string());
+        config.providers[0].models.push("mini-b".to_string());
 
-        // Explicit provider + model.
-        config.model_tiers.cheap = Some(ModelTierTarget {
-            provider_id: OPENCODE_PROVIDER_ID.to_string(),
-            model: "mini-model".to_string(),
-        });
+        // Unconfigured pool resolves empty.
+        assert!(config.subagent_tier_choices(ModelTier::Cheap).is_empty());
+
+        // Toggle in/out mirrors the text-model picker semantics.
+        assert!(config
+            .toggle_subagent_tier_model(ModelTier::Cheap, &provider_id, "mini-a")
+            .unwrap());
+        assert!(config
+            .toggle_subagent_tier_model(ModelTier::Cheap, &provider_id, "mini-b")
+            .unwrap());
+        assert!(config.is_subagent_tier_model(ModelTier::Cheap, &provider_id, "mini-a"));
+        let choices = config.subagent_tier_choices(ModelTier::Cheap);
         assert_eq!(
-            config.tier_provider_choice(ModelTier::Cheap),
-            Some((OPENCODE_PROVIDER_ID.to_string(), "mini-model".to_string()))
+            choices.iter().map(|c| c.model.as_str()).collect::<Vec<_>>(),
+            vec!["mini-a", "mini-b"]
         );
-        // The provider clone carries the tier model as its default.
-        let provider = config.tier_provider(ModelTier::Cheap).unwrap();
-        assert_eq!(provider.default_model, "mini-model");
-        assert!(provider.models.iter().any(|m| m == "mini-model"));
+        assert!(!config
+            .toggle_subagent_tier_model(ModelTier::Cheap, &provider_id, "mini-b")
+            .unwrap());
+        assert_eq!(config.subagent_tier_choices(ModelTier::Cheap).len(), 1);
 
-        // Empty model uses the provider's default model.
-        let default_model = config
-            .provider(Some(OPENCODE_PROVIDER_ID))
-            .unwrap()
-            .default_model
-            .clone();
-        config.model_tiers.balanced = Some(ModelTierTarget {
-            provider_id: OPENCODE_PROVIDER_ID.to_string(),
-            model: String::new(),
-        });
-        assert_eq!(
-            config.tier_provider_choice(ModelTier::Balanced),
-            Some((OPENCODE_PROVIDER_ID.to_string(), default_model))
-        );
+        // Unknown provider is rejected.
+        assert!(config
+            .toggle_subagent_tier_model(ModelTier::Strong, "no-such", "x")
+            .is_err());
 
-        // Unknown provider or empty provider id resolve to None.
-        config.model_tiers.strong = Some(ModelTierTarget {
-            provider_id: "no-such-provider".to_string(),
-            model: "x".to_string(),
-        });
-        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
-        config.model_tiers.strong = Some(ModelTierTarget::default());
-        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
+        // A model removed from the text models leaves the pool too.
+        config
+            .toggle_subagent_tier_model(ModelTier::Balanced, &provider_id, "mini-a")
+            .unwrap();
+        config
+            .remove_active_provider_model(&provider_id, "mini-a")
+            .unwrap();
+        assert!(config.subagent_tier_choices(ModelTier::Cheap).is_empty());
+        assert!(config.subagent_tiers.pool(ModelTier::Cheap).is_empty());
+        assert!(config.subagent_tiers.pool(ModelTier::Balanced).is_empty());
+
+        // prune_subagent_tiers drops entries that no longer resolve.
+        config
+            .toggle_subagent_tier_model(ModelTier::Cheap, &provider_id, "mini-b")
+            .unwrap();
+        config.providers[0].models.retain(|m| m != "mini-b");
+        assert!(config.subagent_tier_choices(ModelTier::Cheap).is_empty());
+        config.prune_subagent_tiers();
+        assert!(config.subagent_tiers.pool(ModelTier::Cheap).is_empty());
     }
 
     #[test]
-    fn model_tiers_roundtrip_and_default_omission() {
+    fn subagent_tiers_roundtrip_and_default_omission() {
         let config = AppConfig::default();
         let json = serde_json::to_string(&config).unwrap();
-        // Empty tiers stay out of the serialized config.
-        assert!(!json.contains("model_tiers"));
+        // Empty pools stay out of the serialized config.
+        assert!(!json.contains("subagent_tiers"));
 
         let parsed: AppConfig = serde_json::from_str(
             r#"{
                 "active_provider": "opencode",
                 "providers": [],
-                "model_tiers": { "cheap": { "provider_id": "p", "model": "m" } }
+                "subagent_tiers": {
+                    "cheap": [ { "provider_id": "p", "model": "m" } ]
+                }
             }"#,
         )
         .unwrap();
-        assert_eq!(
-            parsed.model_tiers.cheap,
-            Some(ModelTierTarget {
-                provider_id: "p".to_string(),
-                model: "m".to_string()
-            })
-        );
-        assert!(parsed.model_tiers.balanced.is_none());
+        assert_eq!(parsed.subagent_tiers.cheap.len(), 1);
+        assert_eq!(parsed.subagent_tiers.cheap[0].model, "m");
+        assert!(parsed.subagent_tiers.balanced.is_empty());
+        // Choices filter out entries with unknown providers.
+        assert!(parsed.subagent_tier_choices(ModelTier::Cheap).is_empty());
     }
 
     #[test]

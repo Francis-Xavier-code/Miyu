@@ -572,6 +572,63 @@ impl OpenAiCompatibleClient {
         Ok(client)
     }
 
+    /// Builds a client over an explicit provider/model pool (e.g. a
+    /// subagent tier pool). Requests load-balance across the pool through
+    /// the shared endpoint scheduler, exactly like the main model pool.
+    pub fn from_choices(
+        config: &AppConfig,
+        paths: &MiyuPaths,
+        choices: &[crate::config::ProviderModelChoice],
+    ) -> Result<Self> {
+        let mut endpoints = Vec::new();
+        let mut errors = Vec::new();
+        for choice in choices {
+            let mut provider = match config.provider(Some(&choice.provider_id)) {
+                Ok(provider) => provider.clone(),
+                Err(err) => {
+                    errors.push(format!("{} / {}: {err}", choice.provider_id, choice.model));
+                    continue;
+                }
+            };
+            provider.default_model = choice.model.clone();
+            let client = endpoint_client(&provider)?;
+            match provider.resolved_api_keys(paths) {
+                Ok(keys) => {
+                    for key in keys {
+                        endpoints.push(LlmEndpoint {
+                            client: client.clone(),
+                            provider: provider.clone(),
+                            api_key: key.value,
+                            key_index: key.index,
+                        });
+                    }
+                }
+                Err(err) => errors.push(format!(
+                    "{} / {}: {err}",
+                    provider.id, provider.default_model
+                )),
+            }
+        }
+        let first = match endpoints.first() {
+            Some(first) => first,
+            None => bail!(
+                "no usable endpoint in the model pool:\n- {}",
+                errors.join("\n- ")
+            ),
+        };
+        let mut client = Self {
+            client: first.client.clone(),
+            provider: first.provider.clone(),
+            api_key: first.api_key.clone(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: reasoning_visibility(config),
+            detailed_reasoning_summary: reasoning_summary_is_detailed(config),
+        };
+        client.restore_saved_thinking_variants(paths);
+        Ok(client)
+    }
+
     pub fn new(provider: &ProviderConfig, config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
         if provider.default_model.trim().is_empty() {
             bail!(

@@ -88,19 +88,20 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
 `MIYU_LANG=en` 或 `MIYU_LANG=zh` 可以临时覆盖配置。语言选择优先级为 `MIYU_LANG`、`display.language`、系统 locale；在配置 TUI 中保存后，下次启动 Miyu 时生效。
 
-### 模型档位（子代理与辅助任务）
+### 子代理模型档位池
 
-主对话模型完全由你手选；档位仅路由**子代理**（task 工具，由主模型按任务复杂度选 `cheap`/`balanced`/`strong`，默认 explore→cheap、general→balanced）和**辅助任务**（上下文压缩、会话标题自动生成走 cheap）。在 `config.jsonc` 中按需配置，未配置的档位自动回退当前主模型：
+主对话模型完全由你手选；档位池只作用于**子代理**：AI 开启子代理（task 工具）时按任务复杂度自主选择 `cheap`（简单任务）、`balanced`（普通任务）或 `strong`（复杂任务），请求在该档位的模型池内像主模型池一样负载均衡。
+
+在 `miyu config` 的“配置子代理档位池”中为每个档位从已配置的文本模型里勾选模型（WebUI 的 设置 → 模型池 同样可配）。模型从文本模型中移除时会自动同步移出档位池。未配置或临时不可用的档位自动回退主模型池（回退提示会随工具结果返回给 AI，不打扰使用）。子代理实际使用的模型会记录进审计会话，可追溯用量。
 
 ```jsonc
-"model_tiers": {
-  "cheap":    { "provider_id": "opencode", "model": "gemini-3.5-flash-lite" },
-  "balanced": { "provider_id": "opencode", "model": "claude-haiku-4-5" },
-  "strong":   { "provider_id": "opencode", "model": "claude-sonnet-4-6" }
+"subagent_tiers": {
+  "cheap":    [ { "provider_id": "opencode", "model": "gemini-3.5-flash-lite" } ],
+  "balanced": [ { "provider_id": "opencode", "model": "claude-haiku-4-5" },
+                { "provider_id": "opencode", "model": "kimi-k2.5" } ],
+  "strong":   [ { "provider_id": "opencode", "model": "claude-sonnet-4-6" } ]
 }
 ```
-
-`model` 留空时使用该 provider 的默认模型。子代理实际使用的档位模型会记录进审计会话，可追溯用量。
 
 ### 内置插件
 

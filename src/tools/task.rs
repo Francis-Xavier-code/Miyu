@@ -175,6 +175,14 @@ pub fn register(
     ).writes());
 }
 
+fn main_pool_choice(config: &AppConfig) -> Option<(String, String)> {
+    config
+        .active_provider_model_choices()
+        .into_iter()
+        .next()
+        .map(|choice| (choice.provider_id, choice.model))
+}
+
 async fn run_task(
     args: Value,
     context: TaskContext,
@@ -221,22 +229,43 @@ async fn run_task(
     let enabled = context.config.plugins.deep_research.show_progress;
     let sa_progress = SubagentProgress::new(progress, mode, enabled);
 
-    // Tier routing: a configured tier gets its own client (provider clone
-    // with the tier model); otherwise fall back to the active main model.
-    let (client, model_choice) = match context.config.tier_provider(tier) {
-        Some(provider) => (
-            OpenAiCompatibleClient::new(&provider, &context.config, &context.paths)?,
-            Some((provider.id.clone(), provider.default_model.clone())),
-        ),
-        None => (
+    // Tier routing: the tier's pool gets its own load-balanced client;
+    // an unconfigured pool silently uses the main model pool, and a
+    // configured-but-unusable pool falls back with a notice returned to
+    // the calling agent (not printed to the user).
+    let pool = context.config.subagent_tier_choices(tier);
+    let mut tier_notice: Option<String> = None;
+    let (client, model_choice) = if pool.is_empty() {
+        if !context.config.subagent_tiers.pool(tier).is_empty() {
+            tier_notice = Some(format!(
+                "tier '{}' pool has no usable model (models were removed from the text models); fell back to the main model pool",
+                tier.label()
+            ));
+        }
+        (
             OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
-            context
-                .config
-                .active_provider_model_choices()
-                .into_iter()
-                .next()
-                .map(|choice| (choice.provider_id, choice.model)),
-        ),
+            main_pool_choice(&context.config),
+        )
+    } else {
+        match OpenAiCompatibleClient::from_choices(&context.config, &context.paths, &pool) {
+            Ok(client) => {
+                let first = &pool[0];
+                (
+                    client,
+                    Some((first.provider_id.clone(), first.model.clone())),
+                )
+            }
+            Err(err) => {
+                tier_notice = Some(format!(
+                    "tier '{}' pool is unavailable ({err}); fell back to the main model pool",
+                    tier.label()
+                ));
+                (
+                    OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+                    main_pool_choice(&context.config),
+                )
+            }
+        }
     };
     let client = client.for_subagent_output(mode == ProgressMode::Full);
     let tools = match sa_type {
@@ -262,6 +291,7 @@ async fn run_task(
                     "kind": "task",
                     "subagent_type": sa_type.label(),
                     "tier": tier.label(),
+                    "tier_notice": tier_notice,
                     "description": description,
                     "state": "error",
                     "error": err.to_string(),
@@ -276,6 +306,7 @@ async fn run_task(
                     "kind": "task",
                     "subagent_type": sa_type.label(),
                     "tier": tier.label(),
+                    "tier_notice": tier_notice,
                     "description": description,
                     "state": "timeout",
                     "error": format!("subagent timed out after {total_timeout}s"),
@@ -299,11 +330,18 @@ async fn run_task(
         "kind": "task",
         "subagent_type": sa_type.label(),
         "tier": tier.label(),
+        "tier_notice": tier_notice,
         "description": description,
         "state": state,
         "result": final_text,
         "stats": stats.public(),
     }))?;
+    // Prefer the endpoint that actually produced the final reply (pools
+    // load-balance, so the representative pool entry may differ).
+    let model_choice = match (&result.provider_id, &result.model) {
+        (Some(provider_id), Some(model)) => Some((provider_id.clone(), model.clone())),
+        _ => model_choice,
+    };
     record_subagent_audit(&context, &description, &prompt, &output, Some(&stats), &model_choice);
     Ok(output)
 }
