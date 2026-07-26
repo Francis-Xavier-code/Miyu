@@ -39,6 +39,63 @@ pub struct AppConfig {
     pub system_prompt_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "ModelTiersConfig::is_empty")]
+    pub model_tiers: ModelTiersConfig,
+}
+
+/// Model tier routing for subagents and auxiliary tasks (compact, session
+/// title generation). The main conversation model is never routed through
+/// tiers — it stays fully user-selected. Unconfigured tiers fall back to
+/// the active main model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelTiersConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheap: Option<ModelTierTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balanced: Option<ModelTierTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strong: Option<ModelTierTarget>,
+}
+
+impl ModelTiersConfig {
+    pub fn is_empty(&self) -> bool {
+        self.cheap.is_none() && self.balanced.is_none() && self.strong.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelTierTarget {
+    #[serde(default)]
+    pub provider_id: String,
+    /// Empty model uses the provider's default model.
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    Cheap,
+    Balanced,
+    Strong,
+}
+
+impl ModelTier {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim() {
+            "cheap" => Some(Self::Cheap),
+            "balanced" => Some(Self::Balanced),
+            "strong" => Some(Self::Strong),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Balanced => "balanced",
+            Self::Strong => "strong",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +658,7 @@ impl Default for AppConfig {
             memory: MemoryConfig::default(),
             system_prompt_file: Some("system-prompt.md".to_string()),
             system_prompt: None,
+            model_tiers: ModelTiersConfig::default(),
         }
     }
 }
@@ -1609,6 +1667,47 @@ impl AppConfig {
         ))
     }
 
+    /// Resolves a tier to a concrete (provider_id, model), or `None` when
+    /// the tier is not configured (callers fall back to the active model).
+    /// An empty model in the target uses the provider's default model.
+    pub fn tier_provider_choice(&self, tier: ModelTier) -> Option<(String, String)> {
+        let target = match tier {
+            ModelTier::Cheap => self.model_tiers.cheap.as_ref(),
+            ModelTier::Balanced => self.model_tiers.balanced.as_ref(),
+            ModelTier::Strong => self.model_tiers.strong.as_ref(),
+        }?;
+        let provider_id = target.provider_id.trim();
+        if provider_id.is_empty() {
+            return None;
+        }
+        let provider = self.provider(Some(provider_id)).ok()?;
+        let model = if target.model.trim().is_empty() {
+            provider.default_model.clone()
+        } else {
+            target.model.trim().to_string()
+        };
+        if model.trim().is_empty() {
+            return None;
+        }
+        Some((provider_id.to_string(), model))
+    }
+
+    /// Builds the provider config for a tier (default model overridden),
+    /// ready for `OpenAiCompatibleClient::new`. `None` when unconfigured.
+    pub fn tier_provider(&self, tier: ModelTier) -> Option<ProviderConfig> {
+        let (provider_id, model) = self.tier_provider_choice(tier)?;
+        let mut provider = self.provider(Some(&provider_id)).ok()?.clone();
+        provider.default_model = model;
+        if !provider
+            .models
+            .iter()
+            .any(|item| item == &provider.default_model)
+        {
+            provider.models.push(provider.default_model.clone());
+        }
+        Some(provider)
+    }
+
     pub fn is_active_provider_model(&self, provider_id: &str, model: &str) -> bool {
         match &self.active_provider_models {
             None => self
@@ -2480,6 +2579,77 @@ mod tests {
                 OPENCODE_DEFAULT_VISION_MODEL.to_string()
             )
         );
+    }
+
+    #[test]
+    fn tier_provider_choice_resolves_and_falls_back() {
+        let mut config = AppConfig::default();
+        // Unconfigured tiers resolve to None (callers fall back to main).
+        assert_eq!(config.tier_provider_choice(ModelTier::Cheap), None);
+        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
+
+        // Explicit provider + model.
+        config.model_tiers.cheap = Some(ModelTierTarget {
+            provider_id: OPENCODE_PROVIDER_ID.to_string(),
+            model: "mini-model".to_string(),
+        });
+        assert_eq!(
+            config.tier_provider_choice(ModelTier::Cheap),
+            Some((OPENCODE_PROVIDER_ID.to_string(), "mini-model".to_string()))
+        );
+        // The provider clone carries the tier model as its default.
+        let provider = config.tier_provider(ModelTier::Cheap).unwrap();
+        assert_eq!(provider.default_model, "mini-model");
+        assert!(provider.models.iter().any(|m| m == "mini-model"));
+
+        // Empty model uses the provider's default model.
+        let default_model = config
+            .provider(Some(OPENCODE_PROVIDER_ID))
+            .unwrap()
+            .default_model
+            .clone();
+        config.model_tiers.balanced = Some(ModelTierTarget {
+            provider_id: OPENCODE_PROVIDER_ID.to_string(),
+            model: String::new(),
+        });
+        assert_eq!(
+            config.tier_provider_choice(ModelTier::Balanced),
+            Some((OPENCODE_PROVIDER_ID.to_string(), default_model))
+        );
+
+        // Unknown provider or empty provider id resolve to None.
+        config.model_tiers.strong = Some(ModelTierTarget {
+            provider_id: "no-such-provider".to_string(),
+            model: "x".to_string(),
+        });
+        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
+        config.model_tiers.strong = Some(ModelTierTarget::default());
+        assert_eq!(config.tier_provider_choice(ModelTier::Strong), None);
+    }
+
+    #[test]
+    fn model_tiers_roundtrip_and_default_omission() {
+        let config = AppConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        // Empty tiers stay out of the serialized config.
+        assert!(!json.contains("model_tiers"));
+
+        let parsed: AppConfig = serde_json::from_str(
+            r#"{
+                "active_provider": "opencode",
+                "providers": [],
+                "model_tiers": { "cheap": { "provider_id": "p", "model": "m" } }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.model_tiers.cheap,
+            Some(ModelTierTarget {
+                provider_id: "p".to_string(),
+                model: "m".to_string()
+            })
+        );
+        assert!(parsed.model_tiers.balanced.is_none());
     }
 
     #[test]

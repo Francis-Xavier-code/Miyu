@@ -90,7 +90,7 @@ mod tests {
             (include_str!("prompts/compact.md"), 230),
             (include_str!("prompts/plan.md"), 85),
             (include_str!("prompts/chat.md"), 29),
-            (include_str!("../README.md"), 3042),
+            (include_str!("../README.md"), 3280),
         ];
 
         for (text, expected) in vectors {

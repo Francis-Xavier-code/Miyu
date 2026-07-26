@@ -1,6 +1,6 @@
 use super::subagent_runner::{ProgressMode, SubagentProgress, SubagentRunner, SubagentStats};
 use super::{ToolRegistry, ToolSpec};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ModelTier};
 use crate::i18n::agent_text as t;
 use crate::llm::OpenAiCompatibleClient;
 use crate::paths::MiyuPaths;
@@ -110,6 +110,15 @@ impl SubagentType {
             Self::General => GENERAL_TOTAL_TIMEOUT,
         }
     }
+
+    /// Default model tier when the caller doesn't pick one: exploration is
+    /// read-only search (cheap), general work gets the balanced tier.
+    fn default_tier(self) -> ModelTier {
+        match self {
+            Self::Explore => ModelTier::Cheap,
+            Self::General => ModelTier::Balanced,
+        }
+    }
 }
 
 pub fn register(
@@ -149,6 +158,11 @@ pub fn register(
                 "max_steps": {
                     "type": "integer",
                     "description": t("Optional. Override the subagent's tool call budget. explore defaults to 30, general defaults to 50.", "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。")
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["cheap", "balanced", "strong"],
+                    "description": t("Optional model tier, picked by task complexity: cheap for simple lookups/mechanical steps, balanced for typical multi-step work, strong for hard reasoning. Defaults: explore→cheap, general→balanced. Unconfigured tiers fall back to the main model.", "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 explore→cheap、general→balanced。未配置的档位回退主模型。")
                 }
             },
             "required": ["description", "prompt"],
@@ -197,12 +211,34 @@ async fn run_task(
     let tool_timeout = sa_type.tool_timeout();
     let total_timeout = sa_type.total_timeout();
 
+    let tier = args
+        .get("tier")
+        .and_then(Value::as_str)
+        .and_then(ModelTier::from_str)
+        .unwrap_or_else(|| sa_type.default_tier());
+
     let mode = ProgressMode::from_config(&context.config);
     let enabled = context.config.plugins.deep_research.show_progress;
     let sa_progress = SubagentProgress::new(progress, mode, enabled);
 
-    let client = OpenAiCompatibleClient::from_config(&context.config, &context.paths)?
-        .for_subagent_output(mode == ProgressMode::Full);
+    // Tier routing: a configured tier gets its own client (provider clone
+    // with the tier model); otherwise fall back to the active main model.
+    let (client, model_choice) = match context.config.tier_provider(tier) {
+        Some(provider) => (
+            OpenAiCompatibleClient::new(&provider, &context.config, &context.paths)?,
+            Some((provider.id.clone(), provider.default_model.clone())),
+        ),
+        None => (
+            OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+            context
+                .config
+                .active_provider_model_choices()
+                .into_iter()
+                .next()
+                .map(|choice| (choice.provider_id, choice.model)),
+        ),
+    };
+    let client = client.for_subagent_output(mode == ProgressMode::Full);
     let tools = match sa_type {
         SubagentType::Explore => context.tools.clone_filtered(EXPLORE_ALLOWED),
         SubagentType::General => context.tools.clone(),
@@ -225,12 +261,13 @@ async fn run_task(
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
+                    "tier": tier.label(),
                     "description": description,
                     "state": "error",
                     "error": err.to_string(),
                     "stats": SubagentStats::default().public(),
                 }))?;
-                record_subagent_audit(&context, &description, &prompt, &output, None);
+                record_subagent_audit(&context, &description, &prompt, &output, None, &model_choice);
                 return Ok(output);
             }
             Err(_) => {
@@ -238,12 +275,13 @@ async fn run_task(
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
+                    "tier": tier.label(),
                     "description": description,
                     "state": "timeout",
                     "error": format!("subagent timed out after {total_timeout}s"),
                     "stats": SubagentStats::default().public(),
                 }))?;
-                record_subagent_audit(&context, &description, &prompt, &output, None);
+                record_subagent_audit(&context, &description, &prompt, &output, None, &model_choice);
                 return Ok(output);
             }
         };
@@ -260,12 +298,13 @@ async fn run_task(
         "ok": true,
         "kind": "task",
         "subagent_type": sa_type.label(),
+        "tier": tier.label(),
         "description": description,
         "state": state,
         "result": final_text,
         "stats": stats.public(),
     }))?;
-    record_subagent_audit(&context, &description, &prompt, &output, Some(&stats));
+    record_subagent_audit(&context, &description, &prompt, &output, Some(&stats), &model_choice);
     Ok(output)
 }
 
@@ -279,6 +318,7 @@ fn record_subagent_audit(
     prompt: &str,
     output: &str,
     stats: Option<&SubagentStats>,
+    model_choice: &Option<(String, String)>,
 ) {
     let outcome = (|| -> Result<()> {
         let store = crate::state::StateStore::new(&context.paths)?;
@@ -297,9 +337,8 @@ fn record_subagent_audit(
         );
         pinned.start_turn(&turn_id, prompt, std::process::id())?;
         pinned.complete_turn(&turn_id, output, None)?;
-        let choice = context.config.active_provider_model_choices().into_iter().next();
-        let (provider_id, model) = match choice.as_ref() {
-            Some(choice) => (Some(choice.provider_id.as_str()), Some(choice.model.as_str())),
+        let (provider_id, model) = match model_choice.as_ref() {
+            Some((provider_id, model)) => (Some(provider_id.as_str()), Some(model.as_str())),
             None => (None, None),
         };
         let context_window = match (provider_id, model) {

@@ -3323,7 +3323,7 @@ async fn run_turn_task(
                 &session_id,
                 updates_context(),
             );
-            finish_turn_task(&store, &title_seed, events, false);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, false);
             return;
         }
         TurnOutcome::Finished(Err(error)) if question::is_question_cancelled(&error) => {
@@ -3336,7 +3336,7 @@ async fn run_turn_task(
                 &session_id,
                 updates_context(),
             );
-            finish_turn_task(&store, &title_seed, events, false);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, false);
             return;
         }
         TurnOutcome::Finished(Err(error)) => {
@@ -3350,7 +3350,7 @@ async fn run_turn_task(
                 updates_context(),
                 &error,
             );
-            finish_turn_task(&store, &title_seed, events, false);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, false);
             return;
         }
         TurnOutcome::Finished(Ok(result)) => result,
@@ -3370,7 +3370,7 @@ async fn run_turn_task(
                 &result,
                 &error,
             );
-            finish_turn_task(&store, &title_seed, events, true);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, true);
             return;
         }
     };
@@ -3399,7 +3399,7 @@ async fn run_turn_task(
                 current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
             finish_run(manager, run_id, updates_context().then_some(context));
             publish_completed(events, run_id, &session_id, &result, context);
-            finish_turn_task(&store, &title_seed, events, true);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, true);
             return;
         }
         OverflowOutcome::Finished(Err(error)) => {
@@ -3413,7 +3413,7 @@ async fn run_turn_task(
                 &result,
                 &error,
             );
-            finish_turn_task(&store, &title_seed, events, true);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, true);
             return;
         }
         OverflowOutcome::Finished(Ok(_)) => {}
@@ -3431,25 +3431,118 @@ async fn run_turn_task(
                 &result,
                 &error,
             );
-            finish_turn_task(&store, &title_seed, events, true);
+            finish_turn_task(&config, &paths, &store, &title_seed, events, true);
             return;
         }
     };
     finish_run(manager, run_id, updates_context().then_some(context));
     publish_completed(events, run_id, &session_id, &result, context);
-    finish_turn_task(&store, &title_seed, events, true);
+    finish_turn_task(&config, &paths, &store, &title_seed, events, true);
 }
 
 /// Shared per-turn cleanup: auto-naming, activity timestamp, queue-identity
 /// cleanup, and allocator trimming. `store` is the turn's pinned store, so
 /// session-scoped operations hit the turn's own session.
-fn finish_turn_task(store: &StateStore, title_seed: &str, events: &EventHub, completed: bool) {
+fn finish_turn_task(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    store: &StateStore,
+    title_seed: &str,
+    events: &EventHub,
+    completed: bool,
+) {
     if completed {
-        maybe_auto_name_session(store, events, title_seed);
+        if let Some(fallback) = maybe_auto_name_session(store, events, title_seed) {
+            spawn_session_title_refinement(config, paths, store, events, fallback, title_seed);
+        }
         let _ = store.touch_session(&store.session_id());
     }
     let _ = store.discard_queued_prompts();
     trim_process_memory();
+}
+
+/// Best-effort AI pass over the truncated default session name: when a
+/// cheap tier is configured, ask it for a concise title and apply it only
+/// if the auto-generated name is still in place (a user rename wins).
+/// Runs detached on the actor's LocalSet — never blocks the turn.
+fn spawn_session_title_refinement(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    store: &StateStore,
+    events: &EventHub,
+    fallback: String,
+    seed: &str,
+) {
+    let Some(provider) = config.tier_provider(crate::config::ModelTier::Cheap) else {
+        return;
+    };
+    let Ok(client) = OpenAiCompatibleClient::new(&provider, config, paths) else {
+        return;
+    };
+    let store = store.clone();
+    let events = events.clone();
+    let seed = seed.to_string();
+    tokio::task::spawn_local(async move {
+        let session_id = store.session_id();
+        let prompt = format!(
+            "为下面这条用户消息生成一个简洁的会话标题。要求：不超过 16 个字，             概括主题，只输出标题本身，不要引号、句号或任何解释。
+
+用户消息：{seed}"
+        );
+        let result = client
+            .chat_stream(
+                vec![
+                    crate::llm::ChatMessage::system(
+                        "你是会话标题生成器，只输出标题本身。",
+                    ),
+                    crate::llm::ChatMessage::plain("user", prompt),
+                ],
+                Vec::new(),
+                |_| Ok(()),
+            )
+            .await;
+        let Ok(result) = result else { return };
+        let title = sanitize_session_title(&result.content);
+        if title.is_empty() {
+            return;
+        }
+        let Ok(Some(record)) = store.session_record(&session_id) else {
+            return;
+        };
+        if record.name != fallback {
+            return;
+        }
+        if store.rename_session(&record.session_id, &title).is_ok() {
+            events.publish(
+                "session.renamed",
+                json!({ "session_id": record.session_id, "name": title }),
+            );
+        }
+        if let Some(usage) = result.usage.as_ref() {
+            let _ = store.add_auxiliary_usage(usage);
+        }
+    });
+}
+
+/// Cleans an LLM-generated title down to a single short line: first line
+/// only, surrounding quotes/punctuation stripped, clipped to 20 chars.
+fn sanitize_session_title(raw: &str) -> String {
+    let cleaned = raw
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '“' | '”' | '‘' | '’' | '「' | '」' | '《' | '》' | '。' | '.' | '，' | ','
+            )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    cleaned.chars().take(20).collect()
 }
 
 enum TurnOutcome {
@@ -3622,17 +3715,19 @@ fn rebuild_for_config(
 /// Auto-names a still-unnamed session from its first prompt once a turn has
 /// run in it. Explicit names (given at creation or via rename) are never
 /// overwritten.
-fn maybe_auto_name_session(state_store: &StateStore, events: &EventHub, seed: &str) {
+fn maybe_auto_name_session(
+    state_store: &StateStore,
+    events: &EventHub,
+    seed: &str,
+) -> Option<String> {
     let session_id = state_store.session_id();
-    let Ok(Some(record)) = state_store.session_record(&session_id) else {
-        return;
-    };
+    let record = state_store.session_record(&session_id).ok().flatten()?;
     if !record.name.trim().is_empty() {
-        return;
+        return None;
     }
     let title = session_title_from_prompt(seed);
     if title.is_empty() {
-        return;
+        return None;
     }
     if state_store
         .rename_session(&record.session_id, &title)
@@ -3642,7 +3737,9 @@ fn maybe_auto_name_session(state_store: &StateStore, events: &EventHub, seed: &s
             "session.renamed",
             json!({ "session_id": record.session_id, "name": title }),
         );
+        return Some(title);
     }
+    None
 }
 
 fn session_title_from_prompt(prompt: &str) -> String {
@@ -4899,6 +4996,20 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::question::{QuestionOption, QuestionPrompt};
+
+    #[test]
+    fn sanitize_session_title_cleans_llm_output() {
+        assert_eq!(sanitize_session_title("「东京天气查询」"), "东京天气查询");
+        assert_eq!(
+            sanitize_session_title("\"Arch Linux 新闻\"\n第二行忽略"),
+            "Arch Linux 新闻"
+        );
+        assert_eq!(sanitize_session_title("  标题。  "), "标题");
+        assert_eq!(sanitize_session_title(""), "");
+        // Overlong output clips to 20 chars.
+        let long = "很长的标题".repeat(10);
+        assert_eq!(sanitize_session_title(&long).chars().count(), 20);
+    }
 
     fn manager_with_run(
         run_id: &str,
