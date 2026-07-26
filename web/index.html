@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#171821">
   <title>Miyu</title>
@@ -203,6 +203,7 @@
       <div class="settings-layout">
         <nav class="settings-nav" aria-label="设置分类">
           <button class="active" type="button" data-settings-view="interface">界面</button>
+          <button type="button" data-settings-view="platforms">通讯平台</button>
           <button type="button" data-settings-view="general">全局</button>
           <button type="button" data-settings-view="providers">供应商</button>
           <button type="button" data-settings-view="models">模型池</button>
@@ -259,6 +260,11 @@
           <section class="settings-section about-section settings-panel" data-settings-panel="interface">
           <h2>关于</h2>
           <div class="about-row"><span>Miyu WebUI</span><span id="versionLabel">--</span></div>
+          </section>
+          <section class="settings-section settings-panel" data-settings-panel="platforms" hidden>
+          <h2>接入通讯平台</h2>
+          <p class="settings-description">让 NapCat 以「反向 WebSocket 客户端」连接 <code>ws://本机地址:端口/onebot/v11/ws</code>，即可通过 QQ 与 Miyu 对话。</p>
+          <div class="config-form" id="platformsConfigForm"></div>
           </section>
           <section class="settings-section settings-panel" data-settings-panel="general" hidden>
           <h2>全局设置</h2>

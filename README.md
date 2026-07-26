@@ -104,6 +104,29 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 }
 ```
 
+### 接入通讯平台（QQ / OneBot）
+
+Miyu 可以通过 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11 协议）接入 QQ，实现用 QQ 远程与 Miyu 对话——支持私聊、群聊（@我 或前缀触发）、收发图片、接收文件。每个 QQ 会话映射到一个独立的专属会话（如 `qq:private:12345`），上下文长期连续，与本地对话互不干扰。
+
+配置入口：`miyu config` → “接入通讯平台”，或 WebUI 的 设置 → 通讯平台。NapCat 侧在网络配置中新建「**WebSocket 客户端**」（即反向 WS），地址填 `ws://<Miyu 所在机器>:<端口>/onebot/v11/ws`（端口即 WebUI 端口，默认 8300），消息格式选 **Array**，token 与 Miyu 配置中的 Access Token 保持一致（同机部署可留空）。
+
+安全模型：私聊/群白名单留空表示放行所有人，由**限流**兜底（默认每人 6 条/分钟、全局 30 条/分钟，均可配）；建议在白名单里填上自己的 QQ 号。启停与参数修改保存后即刻生效，无需重启 daemon。
+
+```jsonc
+"platforms": {
+  "onebot": {
+    "enabled": true,
+    "access_token": "与 NapCat 一致",
+    "allowed_users": [ 12345678 ],          // 留空 = 允许所有人
+    "allow_groups": true,
+    "allowed_groups": [ 87654321 ],
+    "group_trigger": "at",                  // at | prefix | at_or_prefix
+    "rate_per_sender_per_min": 6,
+    "rate_global_per_min": 30
+  }
+}
+```
+
 ### 内置插件
 
 <details><summary>[展开/收起] 具体介绍</summary>

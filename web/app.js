@@ -153,6 +153,7 @@
     capabilityList: document.getElementById("capabilityList"),
     versionLabel: document.getElementById("versionLabel"),
     generalConfigForm: document.getElementById("generalConfigForm"),
+    platformsConfigForm: document.getElementById("platformsConfigForm"),
     providerEditor: document.getElementById("providerEditor"),
     addProviderButton: document.getElementById("addProviderButton"),
     modelPoolEditor: document.getElementById("modelPoolEditor"),
@@ -565,6 +566,13 @@
     if (input.dataset.valueType === "lines") {
       return raw.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean);
     }
+    if (input.dataset.valueType === "numbers") {
+      return raw.split(/[\s,;，；]+/).filter(Boolean).map((item) => {
+        const number = Number(item);
+        if (!Number.isSafeInteger(number)) throw new Error(`无效号码：${item}`);
+        return number;
+      });
+    }
     return raw;
   }
 
@@ -614,7 +622,9 @@
       ? (current == null ? "" : JSON.stringify(current, null, 2))
       : options.type === "lines"
         ? (Array.isArray(current) ? current.join("\n") : "")
-        : String(current ?? "");
+        : options.type === "numbers"
+          ? (Array.isArray(current) ? current.join(", ") : "")
+          : String(current ?? "");
     if (options.placeholder) input.placeholder = options.placeholder;
     if (options.min != null) input.min = String(options.min);
     if (options.max != null) input.max = String(options.max);
@@ -724,6 +734,30 @@
   function updateAdvancedConfigEditor() {
     if (!state.configDraft || document.activeElement === elements.advancedConfigEditor) return;
     elements.advancedConfigEditor.value = JSON.stringify(state.configDraft, null, 2);
+  }
+
+  function renderPlatformsConfig() {
+    if (!elements.platformsConfigForm) return;
+    elements.platformsConfigForm.replaceChildren(
+      configGroup("OneBot v11（QQ / NapCat）", [
+        booleanConfigField("启用", "platforms.onebot.enabled", "在 NapCat 网络配置里新建「WebSocket 客户端」，地址填 ws://<本机地址>:<端口>/onebot/v11/ws，消息格式选 Array"),
+        secretEditor("Access Token（空 = 不校验）", "platforms.onebot.access_token"),
+        booleanConfigField("允许私聊", "platforms.onebot.allow_private"),
+        textConfigField("私聊白名单 QQ 号", "platforms.onebot.allowed_users", { type: "numbers", placeholder: "逗号分隔；留空 = 允许所有人", description: "留空放行所有人，由下方限流兜底" }),
+        booleanConfigField("允许群聊", "platforms.onebot.allow_groups"),
+        textConfigField("群白名单", "platforms.onebot.allowed_groups", { type: "numbers", placeholder: "逗号分隔；留空 = 允许所有群" }),
+        selectConfigField("群聊触发方式", "platforms.onebot.group_trigger", [
+          { value: "at", label: "@我" },
+          { value: "prefix", label: "前缀" },
+          { value: "at_or_prefix", label: "@我或前缀" }
+        ]),
+        textConfigField("触发前缀", "platforms.onebot.trigger_prefix", { placeholder: "如 / 或 喵" }),
+        booleanConfigField("群内按人隔离会话", "platforms.onebot.group_session_per_user", "关闭时全群共享一个会话"),
+        textConfigField("单条回复最大字数", "platforms.onebot.max_reply_chars", { type: "number", integer: true, inputType: "number", min: 0, description: "超长回复按此长度分多条发送；0 = 不分段" }),
+        textConfigField("每人每分钟消息上限", "platforms.onebot.rate_per_sender_per_min", { type: "number", integer: true, inputType: "number", min: 0, description: "0 = 不限" }),
+        textConfigField("全局每分钟消息上限", "platforms.onebot.rate_global_per_min", { type: "number", integer: true, inputType: "number", min: 0, description: "0 = 不限" })
+      ])
+    );
   }
 
   function renderGeneralConfig() {
@@ -1305,6 +1339,7 @@
   function renderConfigEditors() {
     if (!state.configLoaded || !state.configDraft) return;
     state.invalidConfigFields.clear();
+    renderPlatformsConfig();
     renderGeneralConfig();
     renderProviders();
     renderModelPools();
@@ -1323,8 +1358,30 @@
     return states;
   }
 
+  // 配置文件对未动过的 platforms 段整体省略；把默认值补进草稿，
+  // 让表单显示真实生效值（如 allow_private=true、限流 6/30）。
+  function ensurePlatformDefaults(draft) {
+    if (!draft || typeof draft !== "object") return;
+    draft.platforms = Object.assign({}, draft.platforms);
+    draft.platforms.onebot = Object.assign({
+      enabled: false,
+      access_token: "",
+      allow_private: true,
+      allowed_users: [],
+      allow_groups: false,
+      allowed_groups: [],
+      group_trigger: "at",
+      trigger_prefix: "",
+      group_session_per_user: false,
+      max_reply_chars: 3000,
+      rate_per_sender_per_min: 6,
+      rate_global_per_min: 30
+    }, draft.platforms.onebot);
+  }
+
   function applyConfigPayload(payload) {
     state.configDraft = deepClone(payload?.config || {});
+    ensurePlatformDefaults(state.configDraft);
     state.configOriginal = deepClone(payload?.config || {});
     state.promptDraft = deepClone(payload?.prompts || { personas: [], identities: [] });
     state.promptOriginal = deepClone(payload?.prompts || { personas: [], identities: [] });
@@ -1409,6 +1466,7 @@
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("配置必须是 JSON 对象");
       const oldSecretStates = new Map((state.configDraft?.providers || []).map((provider, index) => [String(provider?.id || ""), Boolean(state.providerSecretStates[index])]));
       state.configDraft = parsed;
+      ensurePlatformDefaults(state.configDraft);
       state.providerSecretStates = (Array.isArray(parsed.providers) ? parsed.providers : []).map((provider) => oldSecretStates.get(String(provider?.id || "")) || false);
       refreshProviderSecretStates();
       clearProviderSecretChanges();
@@ -2180,7 +2238,7 @@
         renderSessionList();
       }
       if (sessionId) await loadSessionView(sessionId);
-      elements.composerInput.focus();
+      focusComposerIfDesktop();
     } catch (error) {
       showToast(error.message || "新建会话失败", "error");
     } finally {
@@ -2449,6 +2507,12 @@
     return Array.from(String(value || "")).length;
   }
 
+  // 触屏设备上程序化聚焦会弹出软键盘挡住内容，只在桌面端自动聚焦
+  function focusComposerIfDesktop() {
+    if (window.matchMedia("(hover: none), (pointer: coarse)").matches) return;
+    elements.composerInput.focus();
+  }
+
   function resizeComposer() {
     const input = elements.composerInput;
     input.style.height = "auto";
@@ -2496,9 +2560,6 @@
     else if (hasPendingQuestion()) elements.composerState.textContent = "等待回答";
     else if (busy) elements.composerState.textContent = state.submitting ? (running ? "正在加入队列" : "正在发送") : "正在处理";
     else if (inputCount > MAX_CONTENT_CHARS) elements.composerState.textContent = "消息不能超过 20,000 个字符";
-    else if (running) elements.composerState.textContent = state.queuedPrompts.length
-      ? `Miyu 正在回复 · ${state.queuedPrompts.length} 条排队`
-      : "Miyu 正在回复";
     else elements.composerState.textContent = "";
     elements.composerState.classList.toggle("is-error", inputCount > MAX_CONTENT_CHARS);
     updateSettingsControls();
@@ -4728,7 +4789,7 @@
     contentAdded();
     if (state.liveRuns.size === 0) {
       window.requestAnimationFrame(() => {
-        if (!state.blocked && !elements.settingsDrawer.classList.contains("open")) elements.composerInput.focus();
+        if (!state.blocked && !elements.settingsDrawer.classList.contains("open")) focusComposerIfDesktop();
       });
       window.setTimeout(() => {
         if (state.liveRuns.size === 0) refreshViewSnapshot();
@@ -5325,7 +5386,7 @@
       return;
     }
     if (!hasHistory()) {
-      elements.composerInput.focus();
+      focusComposerIfDesktop();
       return;
     }
     if (conversationRunning() || state.adminBusy || state.submitting) return;
@@ -5352,7 +5413,7 @@
       await apiRequest("/api/conversation/reset", { method: "POST" });
       if (elements.resetDialog.open) elements.resetDialog.close("confirmed");
       await loadBootstrap();
-      elements.composerInput.focus();
+      focusComposerIfDesktop();
     } catch (error) {
       showInlineError(error.message);
       showToast(error.message, "error");

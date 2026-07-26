@@ -81,6 +81,11 @@ fn run_main_menu(
             t("Providers and models", "供应商和模型").to_string(),
             t("Plugins", "插件配置").to_string(),
             t("Custom prompts", "自定义提示词").to_string(),
+            format!(
+                "{} ({})",
+                t("IM platforms", "接入通讯平台"),
+                platforms_label(config)
+            ),
             t("Global settings", "全局参数设置").to_string(),
             t("Save and exit", "保存并退出").to_string(),
         ];
@@ -113,8 +118,9 @@ fn run_main_menu(
                 3 => ProviderBrowser::new(paths, config).run(stdout)?,
                 4 => edit_plugins(stdout, config)?,
                 5 => edit_custom_prompts(stdout, paths, config)?,
-                6 => edit_settings(stdout, config)?,
-                7 => {
+                6 => select_platforms(stdout, config)?,
+                7 => edit_settings(stdout, config)?,
+                8 => {
                     config.save(paths)?;
                     return Ok(true);
                 }
@@ -2123,6 +2129,134 @@ fn select_subagent_tier_models(
             _ => {}
         }
     }
+}
+
+fn platforms_label(config: &AppConfig) -> String {
+    if config.platforms.onebot.enabled {
+        t("OneBot enabled", "OneBot 已启用").to_string()
+    } else {
+        t("disabled", "未启用").to_string()
+    }
+}
+
+/// Platform list submenu; each platform opens its own form. Later
+/// phases (Telegram, QQ official, WeChat) append entries here.
+fn select_platforms(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let onebot_state = if config.platforms.onebot.enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
+        let options = [format!("OneBot v11 (QQ / NapCat): {onebot_state}")];
+        draw_menu(
+            stdout,
+            t(" IM PLATFORMS ", " 接入通讯平台 "),
+            &options,
+            selected,
+            t(
+                "[Enter]configure [j/k]move [q]back",
+                "[Enter]配置 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => edit_onebot(stdout, config)?,
+            _ => {}
+        }
+    }
+}
+
+fn edit_onebot(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let onebot = &config.platforms.onebot;
+    let mut fields = vec![
+        Field::boolean(t("Enabled", "启用"), onebot.enabled),
+        Field::new(
+            t("Access token (empty = no check)", "Access Token（空 = 不校验）"),
+            onebot.access_token.clone(),
+        )
+        .sensitive(),
+        Field::boolean(t("Allow private chats", "允许私聊"), onebot.allow_private),
+        Field::new(
+            t(
+                "Private whitelist QQ ids (comma separated, empty = everyone)",
+                "私聊白名单 QQ 号（逗号分隔，空 = 允许所有人）",
+            ),
+            format_id_list(&onebot.allowed_users),
+        ),
+        Field::boolean(t("Allow group chats", "允许群聊"), onebot.allow_groups),
+        Field::new(
+            t(
+                "Group whitelist ids (comma separated, empty = all groups)",
+                "群白名单（逗号分隔，空 = 允许所有群）",
+            ),
+            format_id_list(&onebot.allowed_groups),
+        ),
+        Field::new(
+            t("Group wake trigger", "群聊触发方式"),
+            onebot.group_trigger.clone(),
+        )
+        .choices(&["at", "prefix", "at_or_prefix"]),
+        Field::new(t("Wake prefix", "触发前缀"), onebot.trigger_prefix.clone()),
+        Field::boolean(
+            t(
+                "Isolated session per group member",
+                "群内按人隔离会话",
+            ),
+            onebot.group_session_per_user,
+        ),
+        Field::new(
+            t("Max reply chars per message (0 = no split)", "单条回复最大字数（0 = 不分段）"),
+            onebot.max_reply_chars.to_string(),
+        ),
+        Field::new(
+            t("Per-sender messages/min (0 = unlimited)", "每人每分钟消息上限（0 = 不限）"),
+            onebot.rate_per_sender_per_min.to_string(),
+        ),
+        Field::new(
+            t("Global messages/min (0 = unlimited)", "全局每分钟消息上限（0 = 不限）"),
+            onebot.rate_global_per_min.to_string(),
+        ),
+    ];
+    run_form_without_buttons(stdout, t(" ONEBOT v11 (NAPCAT) ", " ONEBOT v11（NAPCAT）"), &mut fields)?;
+    let onebot = &mut config.platforms.onebot;
+    onebot.enabled = parse_bool_field(&fields[0].value)?;
+    onebot.access_token = fields[1].value.trim().to_string();
+    onebot.allow_private = parse_bool_field(&fields[2].value)?;
+    onebot.allowed_users = parse_id_list(&fields[3].value)?;
+    onebot.allow_groups = parse_bool_field(&fields[4].value)?;
+    onebot.allowed_groups = parse_id_list(&fields[5].value)?;
+    onebot.group_trigger = crate::config::GroupTrigger::from_str(&fields[6].value)
+        .label()
+        .to_string();
+    onebot.trigger_prefix = fields[7].value.trim().to_string();
+    onebot.group_session_per_user = parse_bool_field(&fields[8].value)?;
+    onebot.max_reply_chars = fields[9].value.trim().parse::<usize>()?;
+    onebot.rate_per_sender_per_min = fields[10].value.trim().parse::<u32>()?;
+    onebot.rate_global_per_min = fields[11].value.trim().parse::<u32>()?;
+    Ok(())
+}
+
+fn format_id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_id_list(value: &str) -> Result<Vec<i64>> {
+    value
+        .split([',', ' ', '\u{3000}', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            item.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!(t("invalid id: {}", "无效的号码：{}").replace("{}", item)))
+        })
+        .collect()
 }
 
 fn edit_provider_form(

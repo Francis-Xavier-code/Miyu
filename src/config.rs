@@ -41,6 +41,107 @@ pub struct AppConfig {
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "SubagentTiersConfig::is_empty")]
     pub subagent_tiers: SubagentTiersConfig,
+    #[serde(default, skip_serializing_if = "PlatformsConfig::is_empty")]
+    pub platforms: PlatformsConfig,
+}
+
+/// IM platform bridge settings. Each platform gets its own sub-config;
+/// Phase A ships OneBot v11 (NapCat / QQ). Later phases add qq_official,
+/// wechat_mp and telegram alongside `onebot` without touching this shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlatformsConfig {
+    #[serde(default, skip_serializing_if = "OneBotConfig::is_default")]
+    pub onebot: OneBotConfig,
+}
+
+impl PlatformsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.onebot.is_default()
+    }
+}
+
+/// OneBot v11 bridge (NapCat connects to Miyu as a reverse-WebSocket
+/// client). Empty whitelists allow everyone — rate limits are the
+/// backstop against strangers draining LLM quota.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OneBotConfig {
+    pub enabled: bool,
+    /// Checked against NapCat's `Authorization: Bearer` handshake header.
+    /// Empty disables the check (same-machine deployments).
+    pub access_token: String,
+    pub allow_private: bool,
+    /// QQ ids allowed to chat privately; empty = allow everyone.
+    pub allowed_users: Vec<i64>,
+    pub allow_groups: bool,
+    /// Group ids the bot responds in; empty = all groups (when enabled).
+    pub allowed_groups: Vec<i64>,
+    /// How group messages wake the bot: "at" | "prefix" | "at_or_prefix".
+    pub group_trigger: String,
+    pub trigger_prefix: String,
+    /// true = every group member gets an isolated session; false = the
+    /// whole group shares one session.
+    pub group_session_per_user: bool,
+    /// Replies longer than this are split into multiple messages. 0 = never split.
+    pub max_reply_chars: usize,
+    /// Per-sender message quota per minute. 0 = unlimited.
+    pub rate_per_sender_per_min: u32,
+    /// Global inbound quota per minute across all senders. 0 = unlimited.
+    pub rate_global_per_min: u32,
+}
+
+impl Default for OneBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            access_token: String::new(),
+            allow_private: true,
+            allowed_users: Vec::new(),
+            allow_groups: false,
+            allowed_groups: Vec::new(),
+            group_trigger: "at".to_string(),
+            trigger_prefix: String::new(),
+            group_session_per_user: false,
+            max_reply_chars: 3000,
+            rate_per_sender_per_min: 6,
+            rate_global_per_min: 30,
+        }
+    }
+}
+
+impl OneBotConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn group_trigger(&self) -> GroupTrigger {
+        GroupTrigger::from_str(&self.group_trigger)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupTrigger {
+    At,
+    Prefix,
+    AtOrPrefix,
+}
+
+impl GroupTrigger {
+    pub fn from_str(value: &str) -> Self {
+        match value.trim() {
+            "prefix" => Self::Prefix,
+            "at_or_prefix" => Self::AtOrPrefix,
+            _ => Self::At,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::At => "at",
+            Self::Prefix => "prefix",
+            Self::AtOrPrefix => "at_or_prefix",
+        }
+    }
 }
 
 /// Subagent model tier pools. When the main agent spawns a subagent it
@@ -670,6 +771,7 @@ impl Default for AppConfig {
             system_prompt_file: Some("system-prompt.md".to_string()),
             system_prompt: None,
             subagent_tiers: SubagentTiersConfig::default(),
+            platforms: PlatformsConfig::default(),
         }
     }
 }
@@ -2702,6 +2804,51 @@ mod tests {
         assert!(parsed.subagent_tiers.balanced.is_empty());
         // Choices filter out entries with unknown providers.
         assert!(parsed.subagent_tier_choices(ModelTier::Cheap).is_empty());
+    }
+
+    #[test]
+    fn platforms_config_roundtrip_and_default_omission() {
+        let config = AppConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        // An untouched platforms config stays out of the serialized file.
+        assert!(!json.contains("platforms"));
+
+        let parsed: AppConfig = serde_json::from_str(
+            r#"{
+                "active_provider": "opencode",
+                "providers": [],
+                "platforms": {
+                    "onebot": {
+                        "enabled": true,
+                        "access_token": "secret",
+                        "allowed_users": [12345],
+                        "group_trigger": "at_or_prefix",
+                        "rate_per_sender_per_min": 10
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let onebot = &parsed.platforms.onebot;
+        assert!(onebot.enabled);
+        assert_eq!(onebot.access_token, "secret");
+        assert_eq!(onebot.allowed_users, vec![12345]);
+        assert_eq!(onebot.group_trigger(), GroupTrigger::AtOrPrefix);
+        assert_eq!(onebot.rate_per_sender_per_min, 10);
+        // Unspecified fields keep their defaults.
+        assert!(onebot.allow_private);
+        assert!(!onebot.allow_groups);
+        assert_eq!(onebot.max_reply_chars, 3000);
+        assert_eq!(onebot.rate_global_per_min, 30);
+
+        // Round-trip preserves the non-default config.
+        let json = serde_json::to_string(&parsed).unwrap();
+        let reparsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.platforms, parsed.platforms);
+
+        // Unknown trigger strings fall back to At.
+        assert_eq!(GroupTrigger::from_str("bogus"), GroupTrigger::At);
+        assert_eq!(GroupTrigger::from_str("prefix"), GroupTrigger::Prefix);
     }
 
     #[test]

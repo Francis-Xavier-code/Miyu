@@ -48,6 +48,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
+mod platforms;
+use platforms::PlatformRuntime;
+
 const JSON_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_CHARS: usize = 20_000;
 const MAX_PROMPT_DOCUMENT_CHARS: usize = 200_000;
@@ -77,6 +80,7 @@ struct WebState {
     questions: QuestionBroker,
     actor_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown_tx: broadcast::Sender<()>,
+    platforms: PlatformRuntime,
 }
 
 #[derive(Clone)]
@@ -1036,6 +1040,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         questions,
         actor_tx: actor_tx.clone(),
         shutdown_tx,
+        platforms: PlatformRuntime::new()?,
     };
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     let app = router(state);
@@ -2111,6 +2116,9 @@ fn router(state: WebState) -> Router {
         .route("/api/questions/{question_id}/answer", post(answer_question))
         .route("/api/models/active", put(set_models))
         .route("/api/conversation/reset", post(reset_conversation))
+        // OneBot v11 reverse-WS endpoint: NapCat connects here as a WS
+        // client. Gated by platforms.onebot config, not web auth.
+        .route("/onebot/v11/ws", get(platforms::onebot::onebot_ws))
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
 }
@@ -4031,6 +4039,11 @@ fn config_response(
         !redacted.plugins.exchange_rate.api_key.trim().is_empty(),
     );
     redacted.plugins.exchange_rate.api_key.clear();
+    secret_states.insert(
+        "platforms.onebot.access_token".to_string(),
+        !redacted.platforms.onebot.access_token.trim().is_empty(),
+    );
+    redacted.platforms.onebot.access_token.clear();
     redact_secret_list(
         &mut secret_states,
         "plugins.image_generation.api_keys",
@@ -4129,6 +4142,16 @@ fn restore_config_secrets(
         }
         Some(SecretMutation::Clear) => String::new(),
         None => current.plugins.exchange_rate.api_key.clone(),
+    };
+
+    let onebot_token_key = "platforms.onebot.access_token";
+    recognized.insert(onebot_token_key.to_string());
+    candidate.platforms.onebot.access_token = match mutations.get(onebot_token_key) {
+        Some(SecretMutation::Set(value)) => {
+            normalize_single_secret(value, onebot_token_key)?.unwrap_or_default()
+        }
+        Some(SecretMutation::Clear) => String::new(),
+        None => current.platforms.onebot.access_token.clone(),
     };
 
     if let Some(key) = mutations.keys().find(|key| !recognized.contains(*key)) {
