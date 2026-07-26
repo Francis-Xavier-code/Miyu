@@ -827,7 +827,7 @@ pub struct WebArgs {
     #[arg(value_enum)]
     pub action: Option<WebAction>,
 
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8300)]
     pub port: u16,
 
     #[arg(short = 'p', long, num_args = 0..=1, default_missing_value = "")]
@@ -9402,7 +9402,7 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 action: None,
-                port: 4096,
+                port: 8300,
                 password: None,
                 password_file: None,
                 stop: false,
