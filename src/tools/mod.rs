@@ -473,3 +473,21 @@ mod tests {
         assert_eq!(english, chinese);
     }
 }
+
+#[cfg(test)]
+mod tier_schema_probe {
+    /// Regression: the built-in description overlay
+    /// (`descriptions/task.json`) wholesale replaces the task schema at
+    /// register time — a param added only in code silently vanishes from
+    /// what the LLM sees.
+    #[test]
+    fn task_definition_includes_tier() {
+        let config = crate::config::AppConfig::default();
+        let paths = crate::paths::MiyuPaths::new().unwrap();
+        let registry = super::builtin_registry(&config, &paths);
+        let defs = registry.definitions();
+        let task = defs.iter().find(|d| d.function.name == "task").expect("task registered");
+        let props = task.function.parameters.get("properties").unwrap();
+        assert!(props.get("tier").is_some(), "tier missing: {}", task.function.parameters);
+    }
+}
