@@ -29,6 +29,10 @@ const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const HTTP_STATUS_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const HTTP_STATUS_RETRY_MAX_DELAY: Duration = Duration::from_millis(120);
 
 const CHAT_RESERVED_BODY_KEYS: &[&str] = &[
     "model",
@@ -145,7 +149,9 @@ fn retryable_http_status(status: u16) -> bool {
 }
 
 fn http_status_retry_delay(attempt: usize) -> Duration {
-    HTTP_STATUS_RETRY_INITIAL_DELAY.saturating_mul(1 << attempt.saturating_sub(1).min(4))
+    HTTP_STATUS_RETRY_INITIAL_DELAY
+        .saturating_mul(1 << attempt.saturating_sub(1).min(6))
+        .min(HTTP_STATUS_RETRY_MAX_DELAY)
 }
 
 #[derive(Debug)]
@@ -5145,6 +5151,19 @@ mod tests {
         assert!(retryable_http_status(599));
         assert!(!retryable_http_status(429));
         assert!(!retryable_http_status(400));
+    }
+
+    #[test]
+    fn http_status_retry_delay_caps_at_configured_maximum() {
+        assert_eq!(http_status_retry_delay(1), Duration::from_millis(10));
+        assert_eq!(http_status_retry_delay(2), Duration::from_millis(20));
+        assert_eq!(http_status_retry_delay(3), Duration::from_millis(40));
+        assert_eq!(http_status_retry_delay(4), Duration::from_millis(80));
+        assert_eq!(http_status_retry_delay(5), Duration::from_millis(120));
+        assert_eq!(
+            http_status_retry_delay(usize::MAX),
+            Duration::from_millis(120)
+        );
     }
 
     #[test]
