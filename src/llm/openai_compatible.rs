@@ -25,6 +25,10 @@ static LLM_SCHEDULER: LazyLock<Mutex<LlmScheduler>> =
     LazyLock::new(|| Mutex::new(LlmScheduler::default()));
 
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 
 const CHAT_RESERVED_BODY_KEYS: &[&str] = &[
     "model",
@@ -134,6 +138,14 @@ impl std::fmt::Display for TransportFailureKind {
 
 fn retryable_transport_failure(kind: TransportFailureKind) -> bool {
     kind == TransportFailureKind::Connect
+}
+
+fn retryable_http_status(status: u16) -> bool {
+    (500..=599).contains(&status)
+}
+
+fn http_status_retry_delay(attempt: usize) -> Duration {
+    HTTP_STATUS_RETRY_INITIAL_DELAY.saturating_mul(1 << attempt.saturating_sub(1).min(4))
 }
 
 #[derive(Debug)]
@@ -1227,18 +1239,38 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
-        for attempt in 1..=2 {
+        let mut connect_retry_used = false;
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
             let started = Instant::now();
             match build_request().send().await {
                 Ok(response) => {
+                    let status = response.status().as_u16();
+                    let will_retry = retryable_http_status(status);
                     tracing::debug!(
                         request_id,
                         stage,
                         attempt,
-                        status = response.status().as_u16(),
+                        status,
+                        will_retry,
                         elapsed_ms = started.elapsed().as_millis(),
                         "LLM HTTP response headers received"
                     );
+                    if will_retry {
+                        let delay = http_status_retry_delay(attempt);
+                        tracing::warn!(
+                            request_id,
+                            stage,
+                            attempt,
+                            status,
+                            retry_delay_ms = delay.as_millis(),
+                            "LLM HTTP request returned a transient server error"
+                        );
+                        let _ = response.bytes().await;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     return Ok(response);
                 }
                 Err(error) => {
@@ -1249,7 +1281,8 @@ impl OpenAiCompatibleClient {
                     } else {
                         TransportFailureKind::Other
                     };
-                    let will_retry = attempt == 1 && retryable_transport_failure(kind);
+                    let will_retry = !connect_retry_used && retryable_transport_failure(kind);
+                    connect_retry_used |= will_retry;
                     let error = error.without_url();
                     tracing::warn!(
                         request_id,
@@ -1269,7 +1302,6 @@ impl OpenAiCompatibleClient {
                 }
             }
         }
-        unreachable!("transport retry loop always returns")
     }
 
     async fn try_zen_chat_completion_compat_retry<F>(
@@ -4813,6 +4845,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_http_server_errors_are_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/retry", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for status in [500, 503, 200] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                let body = if status == 200 { "ok" } else { "error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client = test_client(test_provider("test", "http://example.invalid/v1"));
+        let mut builds = 0;
+        let response = client
+            .send_with_transport_retry("request-test", "chat.send", || {
+                builds += 1;
+                client.client.get(&url)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(builds, 3);
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.text().await.unwrap(), "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_http_server_errors_continue_until_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/retry", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                read_http_headers(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\nConnection: close\r\n\r\nerror",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = test_client(test_provider("test", "http://example.invalid/v1"));
+        let mut builds = 0;
+        let result = tokio::time::timeout(
+            Duration::from_millis(120),
+            client.send_with_transport_retry("request-test", "chat.send", || {
+                builds += 1;
+                client.client.get(&url)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "persistent 5xx unexpectedly stopped retrying"
+        );
+        assert!(builds >= 4, "expected repeated 5xx attempts, got {builds}");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn endpoint_accepts_reasoning_only_completion() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -5035,6 +5141,10 @@ mod tests {
         assert!(retryable_transport_failure(TransportFailureKind::Connect));
         assert!(!retryable_transport_failure(TransportFailureKind::Timeout));
         assert!(!retryable_transport_failure(TransportFailureKind::Other));
+        assert!(retryable_http_status(500));
+        assert!(retryable_http_status(599));
+        assert!(!retryable_http_status(429));
+        assert!(!retryable_http_status(400));
     }
 
     #[test]
