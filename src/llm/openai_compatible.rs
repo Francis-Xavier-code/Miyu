@@ -4109,7 +4109,8 @@ mod tests {
         let error = finalize_stream_result(String::new(), String::new(), None, Vec::new(), false)
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("流式响应为空"));
+        let message = format!("{error:#}");
+        assert!(message.contains("流式响应为空") || message.contains("stream response was empty"));
     }
 
     #[test]

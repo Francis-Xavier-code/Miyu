@@ -6,7 +6,7 @@ use crate::paths::MiyuPaths;
 use crate::prompts::default_system_prompt;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 pub const MAX_COMMAND_OUTPUT_LINES: usize = 1_000;
@@ -45,66 +45,450 @@ pub struct AppConfig {
     pub platforms: PlatformsConfig,
 }
 
-/// IM platform bridge settings. Each platform gets its own sub-config;
-/// Phase A ships OneBot v11 (NapCat / QQ). Later phases add qq_official,
-/// wechat_mp and telegram alongside `onebot` without touching this shape.
+/// Messaging-platform settings. Public configuration is named after the
+/// product users connect to; transport protocols remain implementation
+/// details of each platform adapter.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlatformsConfig {
     #[serde(default, skip_serializing_if = "OneBotConfig::is_default")]
-    pub onebot: OneBotConfig,
+    pub qq: OneBotConfig,
 }
 
 impl PlatformsConfig {
     pub fn is_empty(&self) -> bool {
-        self.onebot.is_default()
+        self.qq.is_default()
+    }
+
+    pub fn model_route(
+        &self,
+        kind: PlatformConversationKind,
+        conversation_id: &str,
+    ) -> Option<&PlatformModelRoute> {
+        self.qq
+            .conversations
+            .iter()
+            .find(|route| route.matches(kind, conversation_id))
+    }
+
+    pub fn model_route_mut(
+        &mut self,
+        kind: PlatformConversationKind,
+        conversation_id: &str,
+    ) -> Option<&mut PlatformModelRoute> {
+        self.qq
+            .conversations
+            .iter_mut()
+            .find(|route| route.matches(kind, conversation_id))
+    }
+
+    /// Inserts a route or replaces the route with the same stable identity.
+    /// Inherited pools are meaningful conversation configuration and are kept
+    /// until the user explicitly removes the entry.
+    pub fn upsert_model_route(&mut self, mut route: PlatformModelRoute) {
+        route.normalize();
+        if let Some(index) = self
+            .qq
+            .conversations
+            .iter()
+            .position(|existing| existing.identity() == route.identity())
+        {
+            self.qq.conversations[index] = route;
+        } else {
+            self.qq.conversations.push(route);
+        }
+    }
+
+    pub fn remove_model_route(
+        &mut self,
+        kind: PlatformConversationKind,
+        conversation_id: &str,
+    ) -> bool {
+        let old_len = self.qq.conversations.len();
+        self.qq
+            .conversations
+            .retain(|route| !route.matches(kind, conversation_id));
+        self.qq.conversations.len() != old_len
+    }
+
+    pub fn normalize_model_routes(&mut self) {
+        self.qq.admin_users.sort_unstable();
+        self.qq.admin_users.dedup();
+        self.qq.private_chats.whitelist.sort_unstable();
+        self.qq.private_chats.whitelist.dedup();
+        self.qq.group_chats.whitelist.sort_unstable();
+        self.qq.group_chats.whitelist.dedup();
+        let mut keywords = HashSet::with_capacity(self.qq.group_chats.trigger_keywords.len());
+        self.qq.group_chats.trigger_keywords = self
+            .qq
+            .group_chats
+            .trigger_keywords
+            .drain(..)
+            .map(|keyword| keyword.trim().to_string())
+            .filter(|keyword| !keyword.is_empty() && keywords.insert(keyword.clone()))
+            .collect();
+        self.qq.asset_base_url = self
+            .qq
+            .asset_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        for route in &mut self.qq.conversations {
+            route.normalize();
+        }
+        self.qq
+            .plugins
+            .retain(|name, instance| !name.trim().is_empty() && !instance.is_empty());
+    }
+
+    pub fn prune_model_references(&mut self, providers: &[ProviderConfig]) {
+        for route in &mut self.qq.conversations {
+            route.prune_model_references(providers);
+        }
+        self.normalize_model_routes();
+    }
+
+    pub fn remove_model_references(&mut self, provider_id: &str, model: &str) {
+        for route in &mut self.qq.conversations {
+            route.remove_model_references(provider_id, model);
+        }
+        self.normalize_model_routes();
+    }
+
+    pub fn remove_provider_references(&mut self, provider_id: &str) {
+        for route in &mut self.qq.conversations {
+            for pool in [&mut route.text_models, &mut route.multimodal_models] {
+                if let Some(entries) = pool {
+                    entries.retain(|entry| entry.provider_id != provider_id);
+                }
+                normalize_route_pool(pool);
+            }
+        }
+        self.normalize_model_routes();
+    }
+
+    pub fn rename_provider_references(&mut self, old_id: &str, new_id: &str) {
+        for route in &mut self.qq.conversations {
+            route.rename_provider_references(old_id, new_id);
+        }
+    }
+
+    pub fn rename_model_references(&mut self, provider_id: &str, old: &str, new: &str) {
+        for route in &mut self.qq.conversations {
+            route.rename_model_references(provider_id, old, new);
+        }
     }
 }
 
-/// OneBot v11 bridge (NapCat connects to Miyu as a reverse-WebSocket
-/// client). Empty whitelists allow everyone — rate limits are the
-/// backstop against strangers draining LLM quota.
+pub type PlatformPluginsConfig = BTreeMap<String, PlatformPluginInstanceConfig>;
+
+type PlatformPluginConfigValidator = fn(&PlatformPluginInstanceConfig) -> Result<()>;
+
+const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValidator)] =
+    &[("reply_processor", validate_reply_processor_plugin_config)];
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlatformPluginInstanceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+
+impl PlatformPluginInstanceConfig {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.settings.is_empty()
+    }
+
+    pub fn enabled_or(&self, default: bool) -> bool {
+        self.enabled.unwrap_or(default)
+    }
+}
+
+fn validate_reply_processor_plugin_config(instance: &PlatformPluginInstanceConfig) -> Result<()> {
+    let settings = &instance.settings;
+    for key in [
+        "default_enabled",
+        "followup_mention",
+        "strip_period",
+        "context_notice",
+        "send_tool_intercept",
+    ] {
+        if settings.get(key).is_some_and(|value| !value.is_boolean()) {
+            bail!("platform plugin reply_processor.{key} must be a boolean");
+        }
+    }
+    for (key, min, max) in [
+        ("threshold", 1_u64, 100_000_u64),
+        ("max_height", 1_000, 5_000),
+        ("font_size", 24, 56),
+        ("code_font_size", 20, 46),
+        ("padding", 36, 120),
+        ("ttl_hours", 1, 168),
+        ("max_records", 1, 10),
+    ] {
+        if let Some(value) = settings.get(key) {
+            let value = value.as_u64().with_context(|| {
+                format!("platform plugin reply_processor.{key} must be an unsigned integer")
+            })?;
+            if !(min..=max).contains(&value) {
+                bail!("platform plugin reply_processor.{key} must be between {min} and {max}");
+            }
+        }
+    }
+    validate_plugin_string_choice(settings, "mode", &["image", "forward"])?;
+    validate_plugin_string_choice(settings, "theme", &["paper", "light", "dark"])?;
+    for key in ["font", "title_font", "code_font", "emoji_font"] {
+        if let Some(value) = settings.get(key) {
+            let value = value.as_str().with_context(|| {
+                format!("platform plugin reply_processor.{key} must be a string")
+            })?;
+            if value.len() > 4_096 || value.contains('\0') {
+                bail!("platform plugin reply_processor.{key} is invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_string_choice(
+    settings: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    choices: &[&str],
+) -> Result<()> {
+    let Some(value) = settings.get(key) else {
+        return Ok(());
+    };
+    let value = value
+        .as_str()
+        .with_context(|| format!("platform plugin reply_processor.{key} must be a string"))?;
+    if !choices.contains(&value) {
+        bail!(
+            "platform plugin reply_processor.{key} must be one of: {}",
+            choices.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformConversationKind {
+    Private,
+    Group,
+}
+
+impl PlatformConversationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Group => "group",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlatformConversationConfig {
+    pub kind: PlatformConversationKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformModelRoute {
+    pub conversation: PlatformConversationConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_models: Option<Vec<ActiveProviderModelConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multimodal_models: Option<Vec<ActiveProviderModelConfig>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_prompt: String,
+}
+
+impl PlatformModelRoute {
+    pub fn identity(&self) -> (PlatformConversationKind, &str) {
+        (self.conversation.kind, self.conversation.id.as_str())
+    }
+
+    pub fn matches(&self, kind: PlatformConversationKind, conversation_id: &str) -> bool {
+        self.conversation.kind == kind && self.conversation.id == conversation_id
+    }
+
+    pub fn normalize(&mut self) {
+        self.conversation.id = self.conversation.id.trim().to_string();
+        self.extra_prompt = self.extra_prompt.trim().to_string();
+        normalize_route_pool(&mut self.text_models);
+        normalize_route_pool(&mut self.multimodal_models);
+    }
+
+    fn prune_model_references(&mut self, providers: &[ProviderConfig]) {
+        if let Some(pool) = &mut self.text_models {
+            pool.retain(|entry| active_model_exists(providers, entry));
+        }
+        if let Some(pool) = &mut self.multimodal_models {
+            pool.retain(|entry| active_model_supports_image(providers, entry));
+        }
+        normalize_route_pool(&mut self.text_models);
+        normalize_route_pool(&mut self.multimodal_models);
+    }
+
+    fn remove_model_references(&mut self, provider_id: &str, model: &str) {
+        for pool in [&mut self.text_models, &mut self.multimodal_models] {
+            if let Some(entries) = pool {
+                entries.retain(|entry| !(entry.provider_id == provider_id && entry.model == model));
+            }
+            normalize_route_pool(pool);
+        }
+    }
+
+    fn rename_provider_references(&mut self, old_id: &str, new_id: &str) {
+        for entries in [&mut self.text_models, &mut self.multimodal_models]
+            .into_iter()
+            .flatten()
+        {
+            for entry in entries {
+                if entry.provider_id == old_id {
+                    entry.provider_id = new_id.to_string();
+                }
+            }
+        }
+    }
+
+    fn rename_model_references(&mut self, provider_id: &str, old: &str, new: &str) {
+        for entries in [&mut self.text_models, &mut self.multimodal_models]
+            .into_iter()
+            .flatten()
+        {
+            for entry in entries {
+                if entry.provider_id == provider_id && entry.model == old {
+                    entry.model = new.to_string();
+                }
+            }
+        }
+    }
+}
+
+fn normalize_route_pool(pool: &mut Option<Vec<ActiveProviderModelConfig>>) {
+    let Some(entries) = pool else {
+        return;
+    };
+    let mut seen = HashSet::with_capacity(entries.len());
+    entries.retain_mut(|entry| {
+        entry.provider_id = entry.provider_id.trim().to_string();
+        entry.model = entry.model.trim().to_string();
+        !entry.provider_id.is_empty()
+            && !entry.model.is_empty()
+            && seen.insert((entry.provider_id.clone(), entry.model.clone()))
+    });
+    if entries.is_empty() {
+        *pool = None;
+    }
+}
+
+fn rename_provider_in_pool(pool: &mut [ActiveProviderModelConfig], old_id: &str, new_id: &str) {
+    for entry in pool {
+        if entry.provider_id == old_id {
+            entry.provider_id = new_id.to_string();
+        }
+    }
+}
+
+fn retain_provider_pool(pool: &mut Option<Vec<ActiveProviderModelConfig>>, provider_id: &str) {
+    if let Some(entries) = pool {
+        entries.retain(|entry| entry.provider_id != provider_id);
+    }
+    retain_nonempty_pool(pool);
+}
+
+fn retain_nonempty_pool(pool: &mut Option<Vec<ActiveProviderModelConfig>>) {
+    if pool.as_ref().is_some_and(Vec::is_empty) {
+        *pool = None;
+    }
+}
+
+/// Tencent QQ integration implemented through a OneBot v11 reverse
+/// WebSocket transport (for example NapCat).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OneBotConfig {
     pub enabled: bool,
+    pub reverse_ws_port: u16,
     /// Checked against NapCat's `Authorization: Bearer` handshake header.
-    /// Empty disables the check (same-machine deployments).
+    /// Empty tokens are accepted only from a loopback peer.
     pub access_token: String,
-    pub allow_private: bool,
-    /// QQ ids allowed to chat privately; empty = allow everyone.
-    pub allowed_users: Vec<i64>,
-    pub allow_groups: bool,
-    /// Group ids the bot responds in; empty = all groups (when enabled).
-    pub allowed_groups: Vec<i64>,
-    /// How group messages wake the bot: "at" | "prefix" | "at_or_prefix".
-    pub group_trigger: String,
-    pub trigger_prefix: String,
-    /// true = every group member gets an isolated session; false = the
-    /// whole group shares one session.
-    pub group_session_per_user: bool,
+    pub admin_users: Vec<i64>,
+    /// Grants full host tools only to non-admin users in `private_chats.whitelist`.
+    pub allow_non_admin_host_tools: bool,
+    pub private_chats: QqPrivateChatsConfig,
+    pub group_chats: QqGroupChatsConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversations: Vec<PlatformModelRoute>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: PlatformPluginsConfig,
+    /// Public HTTP base URL NapCat can use to fetch temporary local assets.
+    pub asset_base_url: String,
     /// Replies longer than this are split into multiple messages. 0 = never split.
     pub max_reply_chars: usize,
-    /// Per-sender message quota per minute. 0 = unlimited.
-    pub rate_per_sender_per_min: u32,
-    /// Global inbound quota per minute across all senders. 0 = unlimited.
-    pub rate_global_per_min: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QqPrivateChatsConfig {
+    /// QQ ids whose private conversations bypass admission rate limits.
+    pub whitelist: Vec<i64>,
+    pub allow_non_whitelist: bool,
+    /// Per private conversation. Zero disables this limit.
+    pub non_whitelist_rate_per_minute: u32,
+}
+
+impl Default for QqPrivateChatsConfig {
+    fn default() -> Self {
+        Self {
+            whitelist: Vec::new(),
+            allow_non_whitelist: true,
+            non_whitelist_rate_per_minute: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QqGroupChatsConfig {
+    /// Group ids that use the whitelist-group rate limit.
+    pub whitelist: Vec<i64>,
+    /// Additional wake prefixes. @-mentions always remain active.
+    pub trigger_keywords: Vec<String>,
+    /// Shared by all senders in one whitelisted group. Zero is unlimited.
+    pub whitelist_rate_per_minute: u32,
+    pub allow_non_whitelist: bool,
+    /// Shared by all senders in one non-whitelisted group. Zero is unlimited.
+    pub non_whitelist_rate_per_minute: u32,
+}
+
+impl Default for QqGroupChatsConfig {
+    fn default() -> Self {
+        Self {
+            whitelist: Vec::new(),
+            trigger_keywords: Vec::new(),
+            whitelist_rate_per_minute: 30,
+            allow_non_whitelist: true,
+            non_whitelist_rate_per_minute: 10,
+        }
+    }
 }
 
 impl Default for OneBotConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            reverse_ws_port: 8300,
             access_token: String::new(),
-            allow_private: true,
-            allowed_users: Vec::new(),
-            allow_groups: false,
-            allowed_groups: Vec::new(),
-            group_trigger: "at".to_string(),
-            trigger_prefix: String::new(),
-            group_session_per_user: false,
+            admin_users: Vec::new(),
+            allow_non_admin_host_tools: false,
+            private_chats: QqPrivateChatsConfig::default(),
+            group_chats: QqGroupChatsConfig::default(),
+            conversations: Vec::new(),
+            plugins: PlatformPluginsConfig::new(),
+            asset_base_url: String::new(),
             max_reply_chars: 3000,
-            rate_per_sender_per_min: 6,
-            rate_global_per_min: 30,
         }
     }
 }
@@ -112,35 +496,6 @@ impl Default for OneBotConfig {
 impl OneBotConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
-    }
-
-    pub fn group_trigger(&self) -> GroupTrigger {
-        GroupTrigger::from_str(&self.group_trigger)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupTrigger {
-    At,
-    Prefix,
-    AtOrPrefix,
-}
-
-impl GroupTrigger {
-    pub fn from_str(value: &str) -> Self {
-        match value.trim() {
-            "prefix" => Self::Prefix,
-            "at_or_prefix" => Self::AtOrPrefix,
-            _ => Self::At,
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::At => "at",
-            Self::Prefix => "prefix",
-            Self::AtOrPrefix => "at_or_prefix",
-        }
     }
 }
 
@@ -1285,6 +1640,60 @@ fn active_model_exists(providers: &[ProviderConfig], active: &ActiveProviderMode
         .is_some_and(|provider| provider.has_configured_model(&active.model))
 }
 
+fn active_model_supports_image(
+    providers: &[ProviderConfig],
+    active: &ActiveProviderModelConfig,
+) -> bool {
+    providers
+        .iter()
+        .find(|provider| provider.id == active.provider_id.trim())
+        .filter(|provider| provider.has_configured_model(&active.model))
+        .and_then(|provider| provider.input_modalities(&active.model))
+        .is_some_and(|modalities| modalities.iter().any(|input| input == "image"))
+}
+
+fn validate_unique_existing_pool(
+    providers: &[ProviderConfig],
+    label: &str,
+    pool: &[ActiveProviderModelConfig],
+    require_image: bool,
+) -> Result<()> {
+    let mut seen = HashSet::with_capacity(pool.len());
+    for entry in pool {
+        if !seen.insert((entry.provider_id.as_str(), entry.model.as_str())) {
+            bail!(
+                "duplicate {label} model: {} / {}",
+                entry.provider_id,
+                entry.model
+            );
+        }
+        let valid = if require_image {
+            active_model_supports_image(providers, entry)
+        } else {
+            active_model_exists(providers, entry)
+        };
+        if !valid {
+            let requirement = if require_image {
+                "configured image-capable"
+            } else {
+                "configured"
+            };
+            bail!(
+                "unknown or non-{requirement} {label} model: {} / {}",
+                entry.provider_id,
+                entry.model
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_positive_decimal_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|id| id > 0)
+}
+
 impl AppConfig {
     pub fn display_language_hint(paths: &MiyuPaths) -> Option<String> {
         let raw = std::fs::read_to_string(&paths.config_file).ok()?;
@@ -1306,6 +1715,10 @@ impl AppConfig {
     }
 
     pub fn load(paths: &MiyuPaths) -> Result<Self> {
+        // Platform multimodal routes may rely on cached models.dev
+        // capabilities. Load the full cache before validation; callers can
+        // compact it to their active configuration afterwards.
+        crate::models_cache::try_load(paths);
         let raw = std::fs::read_to_string(&paths.config_file)
             .with_context(|| format!("failed to read {}", paths.config_file.display()))?;
         let stripped = json_comments::StripComments::new(raw.as_bytes());
@@ -1333,11 +1746,13 @@ impl AppConfig {
     }
 
     pub fn save(&self, paths: &MiyuPaths) -> Result<()> {
-        paths.create_dirs()?;
         let mut config = self.clone();
+        config.normalize_platform_model_routes();
         let effective_memory = config.memory_config().clone();
         config.plugins.memory = effective_memory;
         config.memory = MemoryConfig::default();
+        config.validate()?;
+        paths.create_dirs()?;
         if let Some(prompt) = config.system_prompt.take() {
             let prompt_file = config.system_prompt_path(paths);
             if let Some(parent) = prompt_file.parent() {
@@ -1397,7 +1812,10 @@ impl AppConfig {
                 }
             }
         }
+        self.platforms
+            .rename_provider_references("opencodezen", OPENCODE_PROVIDER_ID);
         self.prune_stale_active_provider_models();
+        self.normalize_platform_model_routes();
         if self.plugins.vision.vision_provider_id == "opencodezen" {
             self.plugins.vision.vision_provider_id = OPENCODE_PROVIDER_ID.to_string();
         }
@@ -1425,7 +1843,7 @@ impl AppConfig {
             active_models.retain(|active| active_model_exists(&self.providers, active));
         }
         if let Some(active_models) = &mut self.active_multimodal_provider_models {
-            active_models.retain(|active| active_model_exists(&self.providers, active));
+            active_models.retain(|active| active_model_supports_image(&self.providers, active));
         }
     }
 
@@ -1445,9 +1863,19 @@ impl AppConfig {
         if self.providers.is_empty() {
             bail!("at least one provider is required");
         }
+        let mut provider_ids = HashSet::with_capacity(self.providers.len());
         for provider in &self.providers {
             if provider.id.trim().is_empty() {
                 bail!("provider id cannot be empty");
+            }
+            if provider.id.trim() != provider.id {
+                bail!(
+                    "provider id must not contain surrounding whitespace: {}",
+                    provider.id
+                );
+            }
+            if !provider_ids.insert(provider.id.as_str()) {
+                bail!("duplicate provider id: {}", provider.id);
             }
             if provider.base_url.trim().is_empty() {
                 bail!("provider {} base_url cannot be empty", provider.id);
@@ -1574,8 +2002,288 @@ impl AppConfig {
         if !(0.0..=1.0).contains(&self.plugins.knowledge_base.semantic_min_score) {
             bail!("plugins.knowledge_base.semantic_min_score must be between 0.0 and 1.0");
         }
+        self.validate_model_references()?;
+        self.validate_global_multimodal_config()?;
+        self.validate_platforms()?;
         self.provider(None)?;
         Ok(())
+    }
+
+    fn validate_model_references(&self) -> Result<()> {
+        if let Some(pool) = &self.active_provider_models {
+            if pool.is_empty() {
+                bail!("at least one model endpoint must remain active");
+            }
+            validate_unique_existing_pool(&self.providers, "active text", pool, false)?;
+        }
+        let kb_provider = self.plugins.knowledge_base.embedding_provider_id.trim();
+        if !kb_provider.is_empty() {
+            self.provider(Some(kb_provider))?;
+        }
+        Ok(())
+    }
+
+    fn validate_global_multimodal_config(&self) -> Result<()> {
+        if let Some(pool) = &self.active_multimodal_provider_models {
+            validate_unique_existing_pool(&self.providers, "active multimodal", pool, true)?;
+        }
+        if self.plugins.vision.enabled && !self.plugins.vision.vision_provider_id.trim().is_empty()
+        {
+            self.vision_provider_choice()?;
+        }
+        Ok(())
+    }
+
+    fn validate_platforms(&self) -> Result<()> {
+        let qq = &self.platforms.qq;
+        if qq.reverse_ws_port == 0 {
+            bail!("platforms.qq.reverse_ws_port must be between 1 and 65535");
+        }
+        for (field, ids) in [
+            ("admin_users", qq.admin_users.as_slice()),
+            (
+                "private_chats.whitelist",
+                qq.private_chats.whitelist.as_slice(),
+            ),
+            ("group_chats.whitelist", qq.group_chats.whitelist.as_slice()),
+        ] {
+            let mut seen = HashSet::with_capacity(ids.len());
+            if ids.iter().any(|id| *id <= 0 || !seen.insert(*id)) {
+                bail!("platforms.qq.{field} must contain unique positive QQ ids");
+            }
+        }
+        let mut trigger_keywords = HashSet::with_capacity(qq.group_chats.trigger_keywords.len());
+        for keyword in &qq.group_chats.trigger_keywords {
+            if keyword.is_empty()
+                || keyword.trim() != keyword
+                || keyword.chars().count() > 128
+                || keyword.chars().any(char::is_control)
+                || !trigger_keywords.insert(keyword)
+            {
+                bail!(
+                    "platforms.qq.group_chats.trigger_keywords must contain unique, trimmed, non-empty values of at most 128 characters"
+                );
+            }
+        }
+        let mut identities = HashSet::with_capacity(qq.conversations.len());
+        for route in &qq.conversations {
+            self.validate_platform_model_route(route)?;
+            if !identities.insert(route.identity()) {
+                bail!(
+                    "duplicate QQ conversation configuration: {} / {}",
+                    route.conversation.kind.as_str(),
+                    route.conversation.id
+                );
+            }
+        }
+        for (plugin_id, instance) in &qq.plugins {
+            if plugin_id.trim().is_empty() || plugin_id.trim() != plugin_id {
+                bail!("QQ plugin ids must be non-empty and trimmed");
+            }
+            if let Some((_, validate)) = PLATFORM_PLUGIN_VALIDATORS
+                .iter()
+                .find(|(id, _)| *id == plugin_id)
+            {
+                validate(instance)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_platform_model_route(&self, route: &PlatformModelRoute) -> Result<()> {
+        if !is_positive_decimal_id(&route.conversation.id) {
+            let label = match route.conversation.kind {
+                PlatformConversationKind::Private => "QQ id",
+                PlatformConversationKind::Group => "group id",
+            };
+            bail!("QQ conversation id must be a positive decimal {label}");
+        }
+        if route.extra_prompt.chars().count() > 200_000 || route.extra_prompt.contains('\0') {
+            bail!("QQ conversation extra_prompt is invalid or exceeds 200000 characters");
+        }
+        self.validate_platform_model_pool(
+            route,
+            "text_models",
+            route.text_models.as_deref(),
+            false,
+        )?;
+        self.validate_platform_model_pool(
+            route,
+            "multimodal_models",
+            route.multimodal_models.as_deref(),
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn validate_platform_model_pool(
+        &self,
+        route: &PlatformModelRoute,
+        field: &str,
+        pool: Option<&[ActiveProviderModelConfig]>,
+        require_multimodal: bool,
+    ) -> Result<()> {
+        let Some(pool) = pool else {
+            return Ok(());
+        };
+        let mut seen = HashSet::with_capacity(pool.len());
+        for entry in pool {
+            if !seen.insert((entry.provider_id.as_str(), entry.model.as_str())) {
+                bail!(
+                    "duplicate {} model in platform route: {} / {}",
+                    field,
+                    entry.provider_id,
+                    entry.model
+                );
+            }
+            if !active_model_exists(&self.providers, entry) {
+                bail!(
+                    "unknown {} provider/model in QQ conversation {} / {}: {} / {}",
+                    field,
+                    route.conversation.kind.as_str(),
+                    route.conversation.id,
+                    entry.provider_id,
+                    entry.model
+                );
+            }
+            if require_multimodal
+                && !self.model_supports_any_input(&entry.provider_id, &entry.model, &["image"])
+            {
+                bail!(
+                    "platform route multimodal model does not declare image input: {} / {}",
+                    entry.provider_id,
+                    entry.model
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn platform_model_route(
+        &self,
+        kind: PlatformConversationKind,
+        conversation_id: &str,
+    ) -> Option<&PlatformModelRoute> {
+        self.platforms.model_route(kind, conversation_id)
+    }
+
+    pub fn normalize_platform_model_routes(&mut self) {
+        self.platforms.normalize_model_routes();
+    }
+
+    pub fn prune_platform_model_routes(&mut self) {
+        self.platforms.prune_model_references(&self.providers);
+    }
+
+    pub fn rename_platform_provider_references(&mut self, old_id: &str, new_id: &str) {
+        self.platforms.rename_provider_references(old_id, new_id);
+    }
+
+    pub fn rename_platform_model_references(&mut self, provider_id: &str, old: &str, new: &str) {
+        self.platforms
+            .rename_model_references(provider_id, old, new);
+    }
+
+    pub fn rename_provider_references(&mut self, old_id: &str, new_id: &str) {
+        if old_id == new_id || old_id.is_empty() || new_id.is_empty() {
+            return;
+        }
+        if self.active_provider == old_id {
+            self.active_provider = new_id.to_string();
+        }
+        for entries in [
+            self.active_provider_models.as_mut(),
+            self.active_multimodal_provider_models.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            rename_provider_in_pool(entries, old_id, new_id);
+        }
+        for tier in ModelTier::ALL {
+            rename_provider_in_pool(self.subagent_tiers.pool_mut(tier), old_id, new_id);
+        }
+        self.platforms.rename_provider_references(old_id, new_id);
+        if self.plugins.vision.vision_provider_id == old_id {
+            self.plugins.vision.vision_provider_id = new_id.to_string();
+        }
+        if self.plugins.knowledge_base.embedding_provider_id == old_id {
+            self.plugins.knowledge_base.embedding_provider_id = new_id.to_string();
+        }
+    }
+
+    /// Removes references after a provider has been deleted from `providers`.
+    pub fn remove_provider_references(&mut self, provider_id: &str) {
+        retain_provider_pool(&mut self.active_provider_models, provider_id);
+        retain_provider_pool(&mut self.active_multimodal_provider_models, provider_id);
+        for tier in ModelTier::ALL {
+            self.subagent_tiers
+                .pool_mut(tier)
+                .retain(|entry| entry.provider_id != provider_id);
+        }
+        self.platforms.remove_provider_references(provider_id);
+        if self.plugins.vision.vision_provider_id == provider_id {
+            self.plugins.vision.vision_provider_id.clear();
+            self.plugins.vision.vision_model.clear();
+        }
+        if self.plugins.knowledge_base.embedding_provider_id == provider_id {
+            self.plugins.knowledge_base.embedding_provider_id.clear();
+            self.plugins.knowledge_base.embedding_model.clear();
+        }
+        if self.active_provider == provider_id {
+            self.active_provider = self
+                .active_provider_models
+                .as_ref()
+                .and_then(|pool| pool.first())
+                .map(|entry| entry.provider_id.clone())
+                .or_else(|| {
+                    self.providers
+                        .iter()
+                        .find(|provider| !provider.default_model.trim().is_empty())
+                        .or_else(|| self.providers.first())
+                        .map(|provider| provider.id.clone())
+                })
+                .unwrap_or_default();
+        }
+    }
+
+    /// Reconciles every model reference with the current provider models and
+    /// input capabilities after an editor changes model metadata.
+    pub fn prune_model_references(&mut self) {
+        self.prune_stale_active_provider_models();
+        retain_nonempty_pool(&mut self.active_provider_models);
+        retain_nonempty_pool(&mut self.active_multimodal_provider_models);
+        self.prune_subagent_tiers();
+        self.prune_platform_model_routes();
+
+        let vision_provider_id = self.plugins.vision.vision_provider_id.trim();
+        if !vision_provider_id.is_empty() {
+            let vision_model = self.plugins.vision.vision_model.trim();
+            let valid = self
+                .provider(Some(vision_provider_id))
+                .ok()
+                .map(|provider| {
+                    let model = if vision_model.is_empty() {
+                        provider.default_model.as_str()
+                    } else {
+                        vision_model
+                    };
+                    provider
+                        .input_modalities(model)
+                        .is_some_and(|modalities| modalities.iter().any(|item| item == "image"))
+                })
+                .unwrap_or(false);
+            if !valid {
+                self.plugins.vision.vision_provider_id.clear();
+                self.plugins.vision.vision_model.clear();
+            }
+        }
+
+        let kb_provider_id = self.plugins.knowledge_base.embedding_provider_id.trim();
+        if !kb_provider_id.is_empty() && self.provider(Some(kb_provider_id)).is_err() {
+            self.plugins.knowledge_base.embedding_provider_id.clear();
+            self.plugins.knowledge_base.embedding_model.clear();
+        }
     }
 
     pub fn provider(&self, id: Option<&str>) -> Result<&ProviderConfig> {
@@ -1662,11 +2370,7 @@ impl AppConfig {
         self.text_provider_model_choices()
             .into_iter()
             .filter(|choice| {
-                self.model_supports_any_input(
-                    &choice.provider_id,
-                    &choice.model,
-                    &["image", "audio", "video", "pdf"],
-                )
+                self.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
             })
             .collect()
     }
@@ -1678,13 +2382,15 @@ impl AppConfig {
                 .filter_map(|active| {
                     let provider = self.provider(Some(active.provider_id.trim())).ok()?;
                     let model = active.model.trim();
-                    provider
-                        .has_configured_model(model)
-                        .then(|| ProviderModelChoice {
-                            provider_id: provider.id.clone(),
-                            provider_name: provider.display_name.clone(),
-                            model: model.to_string(),
-                        })
+                    (provider.has_configured_model(model)
+                        && provider.input_modalities(model).is_some_and(|modalities| {
+                            modalities.iter().any(|item| item == "image")
+                        }))
+                    .then(|| ProviderModelChoice {
+                        provider_id: provider.id.clone(),
+                        provider_name: provider.display_name.clone(),
+                        model: model.to_string(),
+                    })
                 })
                 .collect(),
             None => Vec::new(),
@@ -1717,6 +2423,21 @@ impl AppConfig {
                 .pool_mut(tier)
                 .retain(|entry| !(entry.provider_id == provider_id && entry.model == model));
         }
+        self.platforms.remove_model_references(provider_id, model);
+        if self.plugins.vision.vision_provider_id == provider_id
+            && self.plugins.vision.vision_model == model
+        {
+            self.plugins.vision.vision_provider_id.clear();
+            self.plugins.vision.vision_model.clear();
+        }
+        if self.plugins.knowledge_base.embedding_provider_id == provider_id
+            && self.plugins.knowledge_base.embedding_model == model
+        {
+            self.plugins.knowledge_base.embedding_provider_id.clear();
+            self.plugins.knowledge_base.embedding_model.clear();
+        }
+        retain_nonempty_pool(&mut self.active_provider_models);
+        retain_nonempty_pool(&mut self.active_multimodal_provider_models);
     }
 
     pub fn toggle_active_multimodal_provider_model(
@@ -1727,17 +2448,28 @@ impl AppConfig {
         if model.trim().is_empty() {
             bail!("model cannot be empty");
         }
-        self.provider(Some(provider_id))?;
+        if let Some(active_models) = &mut self.active_multimodal_provider_models {
+            if let Some(index) = active_models
+                .iter()
+                .position(|active| active.provider_id == provider_id && active.model == model)
+            {
+                active_models.remove(index);
+                return Ok(false);
+            }
+        }
+        let provider = self.provider(Some(provider_id))?;
+        if !provider.has_configured_model(model) {
+            bail!("model is not configured for provider {provider_id}: {model}");
+        }
+        if !provider
+            .input_modalities(model)
+            .is_some_and(|modalities| modalities.iter().any(|item| item == "image"))
+        {
+            bail!("multimodal model does not declare image input: {provider_id} / {model}");
+        }
         let active_models = self
             .active_multimodal_provider_models
             .get_or_insert_with(Vec::new);
-        if let Some(index) = active_models
-            .iter()
-            .position(|active| active.provider_id == provider_id && active.model == model)
-        {
-            active_models.remove(index);
-            return Ok(false);
-        }
         active_models.push(ActiveProviderModelConfig {
             provider_id: provider_id.to_string(),
             model: model.to_string(),
@@ -1766,19 +2498,33 @@ impl AppConfig {
         let vision = &self.plugins.vision;
         if !vision.vision_provider_id.trim().is_empty() {
             let provider_id = vision.vision_provider_id.trim().to_string();
+            let provider = self.provider(Some(&provider_id))?;
             let model = if vision.vision_model.trim().is_empty() {
-                self.provider(Some(&provider_id))?.default_model.clone()
+                provider.default_model.clone()
             } else {
                 vision.vision_model.trim().to_string()
             };
+            if !provider
+                .input_modalities(&model)
+                .is_some_and(|modalities| modalities.iter().any(|item| item == "image"))
+            {
+                bail!("vision model does not declare image input: {provider_id} / {model}");
+            }
             return Ok((provider_id, model));
         }
-        if let Some(choice) = self
-            .active_multimodal_provider_model_choices()
-            .into_iter()
-            .next()
-        {
-            return Ok((choice.provider_id, choice.model));
+        if let Some(active) = self.active_multimodal_provider_models.as_ref() {
+            if let Some(choice) = self
+                .active_multimodal_provider_model_choices()
+                .into_iter()
+                .find(|choice| {
+                    self.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+                })
+            {
+                return Ok((choice.provider_id, choice.model));
+            }
+            if !active.is_empty() {
+                bail!("the configured multimodal model pool has no image-capable model");
+            }
         }
         Ok((
             OPENCODE_PROVIDER_ID.to_string(),
@@ -2543,6 +3289,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_overflow_defaults_to_compact() {
+        assert_eq!(ContextConfig::default().on_overflow, "compact");
+
+        let deserialized: ContextConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(deserialized.on_overflow, "compact");
+    }
+
+    #[test]
     fn provider_config_can_be_saved_without_active_model() {
         let mut config = AppConfig::default();
         config.providers[0].models.clear();
@@ -2681,18 +3435,26 @@ mod tests {
 
         config.remove_active_model_references(&provider_id, "old-model");
 
-        assert_eq!(config.active_provider_models, Some(Vec::new()));
-        assert_eq!(config.active_multimodal_provider_models, Some(Vec::new()));
+        assert_eq!(config.active_provider_models, None);
+        assert_eq!(config.active_multimodal_provider_models, None);
     }
 
     #[test]
     fn multimodal_provider_model_choices_use_input_modalities() {
         let mut config = AppConfig::default();
         let provider = &mut config.providers[0];
-        provider.models = vec!["text-only".to_string(), "vision-model".to_string()];
+        provider.models = vec![
+            "text-only".to_string(),
+            "audio-only".to_string(),
+            "vision-model".to_string(),
+        ];
         provider
             .model_modalities
             .insert("text-only".to_string(), vec!["text".to_string()]);
+        provider.model_modalities.insert(
+            "audio-only".to_string(),
+            vec!["text".to_string(), "audio".to_string()],
+        );
         provider.model_modalities.insert(
             "vision-model".to_string(),
             vec!["text".to_string(), "image".to_string()],
@@ -2702,12 +3464,56 @@ mod tests {
 
         assert!(choices.iter().any(|choice| choice.model == "vision-model"));
         assert!(!choices.iter().any(|choice| choice.model == "text-only"));
+        assert!(!choices.iter().any(|choice| choice.model == "audio-only"));
+    }
+
+    #[test]
+    fn active_multimodal_pool_rejects_and_prunes_non_image_models() {
+        let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0]
+            .models
+            .extend(["audio-only".to_string(), "vision-model".to_string()]);
+        config.providers[0].model_modalities.insert(
+            "audio-only".to_string(),
+            vec!["text".to_string(), "audio".to_string()],
+        );
+        config.providers[0].model_modalities.insert(
+            "vision-model".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+
+        assert!(config
+            .toggle_active_multimodal_provider_model(&provider_id, "audio-only")
+            .is_err());
+        assert!(config
+            .toggle_active_multimodal_provider_model(&provider_id, "vision-model")
+            .unwrap());
+        config
+            .active_multimodal_provider_models
+            .as_mut()
+            .unwrap()
+            .push(ActiveProviderModelConfig {
+                provider_id,
+                model: "audio-only".to_string(),
+            });
+        assert!(config.validate_global_multimodal_config().is_err());
+
+        config.normalize_builtin_providers();
+
+        let active = config.active_multimodal_provider_models.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].model, "vision-model");
     }
 
     #[test]
     fn vision_provider_choice_prefers_multimodal_pool_then_default_mimo() {
         let mut config = AppConfig::default();
         config.providers[0].models.push("vision-model".to_string());
+        config.providers[0].model_modalities.insert(
+            "vision-model".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
         config.active_multimodal_provider_models = Some(vec![ActiveProviderModelConfig {
             provider_id: OPENCODE_PROVIDER_ID.to_string(),
             model: "vision-model".to_string(),
@@ -2726,6 +3532,40 @@ mod tests {
                 OPENCODE_DEFAULT_VISION_MODEL.to_string()
             )
         );
+    }
+
+    #[test]
+    fn vision_provider_choice_rejects_an_audio_only_active_pool() {
+        let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0].models.push("audio-only".to_string());
+        config.providers[0].model_modalities.insert(
+            "audio-only".to_string(),
+            vec!["text".to_string(), "audio".to_string()],
+        );
+        config.active_multimodal_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id,
+            model: "audio-only".to_string(),
+        }]);
+
+        assert!(config.vision_provider_choice().is_err());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn vision_provider_choice_rejects_an_explicit_non_image_model() {
+        let mut config = AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0].models.push("audio-only".to_string());
+        config.providers[0].model_modalities.insert(
+            "audio-only".to_string(),
+            vec!["text".to_string(), "audio".to_string()],
+        );
+        config.plugins.vision.vision_provider_id = provider_id;
+        config.plugins.vision.vision_model = "audio-only".to_string();
+
+        assert!(config.vision_provider_choice().is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -2818,37 +3658,349 @@ mod tests {
                 "active_provider": "opencode",
                 "providers": [],
                 "platforms": {
-                    "onebot": {
+                    "qq": {
                         "enabled": true,
+                        "reverse_ws_port": 8400,
                         "access_token": "secret",
-                        "allowed_users": [12345],
-                        "group_trigger": "at_or_prefix",
-                        "rate_per_sender_per_min": 10
+                        "admin_users": [9988],
+                        "asset_base_url": "https://assets.example.test",
+                        "private_chats": {
+                            "whitelist": [12345],
+                            "allow_non_whitelist": false,
+                            "non_whitelist_rate_per_minute": 4
+                        },
+                        "group_chats": {
+                            "whitelist": [54321],
+                            "trigger_keywords": ["Miyu"],
+                            "whitelist_rate_per_minute": 30,
+                            "allow_non_whitelist": true,
+                            "non_whitelist_rate_per_minute": 10
+                        }
                     }
                 }
             }"#,
         )
         .unwrap();
-        let onebot = &parsed.platforms.onebot;
-        assert!(onebot.enabled);
-        assert_eq!(onebot.access_token, "secret");
-        assert_eq!(onebot.allowed_users, vec![12345]);
-        assert_eq!(onebot.group_trigger(), GroupTrigger::AtOrPrefix);
-        assert_eq!(onebot.rate_per_sender_per_min, 10);
-        // Unspecified fields keep their defaults.
-        assert!(onebot.allow_private);
-        assert!(!onebot.allow_groups);
-        assert_eq!(onebot.max_reply_chars, 3000);
-        assert_eq!(onebot.rate_global_per_min, 30);
+        let qq = &parsed.platforms.qq;
+        assert!(qq.enabled);
+        assert_eq!(qq.reverse_ws_port, 8400);
+        assert_eq!(qq.access_token, "secret");
+        assert_eq!(qq.admin_users, vec![9988]);
+        assert_eq!(qq.asset_base_url, "https://assets.example.test");
+        assert_eq!(qq.private_chats.whitelist, vec![12345]);
+        assert!(!qq.private_chats.allow_non_whitelist);
+        assert_eq!(qq.group_chats.whitelist, vec![54321]);
+        assert_eq!(qq.group_chats.trigger_keywords, vec!["Miyu"]);
+        assert_eq!(qq.max_reply_chars, 3000);
 
         // Round-trip preserves the non-default config.
         let json = serde_json::to_string(&parsed).unwrap();
         let reparsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(reparsed.platforms, parsed.platforms);
 
-        // Unknown trigger strings fall back to At.
-        assert_eq!(GroupTrigger::from_str("bogus"), GroupTrigger::At);
-        assert_eq!(GroupTrigger::from_str("prefix"), GroupTrigger::Prefix);
+        // The retired protocol-shaped key is a clean break and does not
+        // silently enable Tencent QQ under the new defaults.
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"active_provider":"opencode","providers":[],"platforms":{"onebot":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.platforms.qq.enabled);
+    }
+
+    fn route_test_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        let provider = &mut config.providers[0];
+        provider.models = vec!["text-only".to_string(), "vision".to_string()];
+        provider.default_model = "text-only".to_string();
+        provider
+            .model_modalities
+            .insert("text-only".to_string(), vec!["text".to_string()]);
+        provider.model_modalities.insert(
+            "vision".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        config
+    }
+
+    fn test_route(config: &AppConfig) -> PlatformModelRoute {
+        PlatformModelRoute {
+            conversation: PlatformConversationConfig {
+                kind: PlatformConversationKind::Group,
+                id: "20002".to_string(),
+            },
+            text_models: Some(vec![ActiveProviderModelConfig {
+                provider_id: config.providers[0].id.clone(),
+                model: "text-only".to_string(),
+            }]),
+            multimodal_models: Some(vec![ActiveProviderModelConfig {
+                provider_id: config.providers[0].id.clone(),
+                model: "vision".to_string(),
+            }]),
+            extra_prompt: "Reply naturally in this group.".to_string(),
+        }
+    }
+
+    #[test]
+    fn platform_model_routes_roundtrip_lookup_and_plugin_shape() {
+        let mut config = route_test_config();
+        let route = test_route(&config);
+        config.platforms.upsert_model_route(route.clone());
+        config.platforms.qq.plugins.insert(
+            "reply_processor".to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: Some(false),
+                settings: serde_json::json!({"threshold": 150})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        );
+
+        let found = config
+            .platform_model_route(PlatformConversationKind::Group, "20002")
+            .unwrap();
+        assert_eq!(found, &route);
+        assert!(config.validate().is_ok());
+
+        let json = serde_json::to_string(&config).unwrap();
+        let reparsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.platforms, config.platforms);
+        assert_eq!(
+            reparsed.platforms.qq.plugins["reply_processor"].enabled,
+            Some(false)
+        );
+        assert_eq!(
+            reparsed.platforms.qq.plugins["reply_processor"].settings["threshold"],
+            150
+        );
+    }
+
+    #[test]
+    fn built_in_platform_plugin_settings_are_validated() {
+        let mut config = AppConfig::default();
+        config.platforms.qq.plugins.insert(
+            "reply_processor".to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: None,
+                settings: serde_json::json!({"threshold": 0, "mode": "invalid"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config
+            .platforms
+            .qq
+            .plugins
+            .get_mut("reply_processor")
+            .unwrap()
+            .settings = serde_json::json!({
+            "threshold": 150,
+            "mode": "image",
+            "future_option": 1
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn platform_model_route_normalization_uses_none_for_inheritance() {
+        let mut config = route_test_config();
+        let provider_id = config.providers[0].id.clone();
+        let mut route = test_route(&config);
+        route.conversation.id = " 20002 ".to_string();
+        route.extra_prompt = "  group prompt  ".to_string();
+        route.text_models = Some(vec![
+            ActiveProviderModelConfig {
+                provider_id: format!(" {provider_id} "),
+                model: " text-only ".to_string(),
+            },
+            ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: "text-only".to_string(),
+            },
+        ]);
+        route.multimodal_models = Some(Vec::new());
+        config.platforms.qq.conversations.push(route);
+        config.normalize_platform_model_routes();
+
+        let normalized = &config.platforms.qq.conversations[0];
+        assert_eq!(normalized.conversation.id, "20002");
+        assert_eq!(normalized.extra_prompt, "group prompt");
+        assert_eq!(normalized.text_models.as_ref().unwrap().len(), 1);
+        assert!(normalized.multimodal_models.is_none());
+
+        config.platforms.qq.conversations[0].text_models = Some(Vec::new());
+        config.normalize_platform_model_routes();
+        assert_eq!(config.platforms.qq.conversations.len(), 1);
+        assert!(config.platforms.qq.conversations[0].text_models.is_none());
+    }
+
+    #[test]
+    fn platform_model_route_validation_rejects_bad_identity_models_and_duplicates() {
+        let mut config = route_test_config();
+        let mut route = test_route(&config);
+        route.conversation.id = "0".to_string();
+        assert!(config.validate_platform_model_route(&route).is_err());
+        route.conversation.id = "not-a-qq".to_string();
+        assert!(config.validate_platform_model_route(&route).is_err());
+
+        route.conversation.id = "20002".to_string();
+        route.multimodal_models.as_mut().unwrap()[0].model = "text-only".to_string();
+        assert!(config.validate_platform_model_route(&route).is_err());
+
+        route.multimodal_models = None;
+        route.text_models.as_mut().unwrap()[0].model = "missing".to_string();
+        assert!(config.validate_platform_model_route(&route).is_err());
+
+        let route = test_route(&config);
+        config.platforms.qq.conversations = vec![route.clone(), route];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn platform_model_references_are_renamed_and_pruned() {
+        let mut config = route_test_config();
+        let old_provider = config.providers[0].id.clone();
+        config.platforms.qq.conversations.push(test_route(&config));
+
+        config.rename_platform_provider_references(&old_provider, "renamed");
+        let route = &config.platforms.qq.conversations[0];
+        assert_eq!(
+            route.text_models.as_ref().unwrap()[0].provider_id,
+            "renamed"
+        );
+        assert_eq!(
+            route.multimodal_models.as_ref().unwrap()[0].provider_id,
+            "renamed"
+        );
+
+        config.rename_platform_provider_references("renamed", &old_provider);
+        config.remove_active_model_references(&old_provider, "vision");
+        assert!(config.platforms.qq.conversations[0]
+            .multimodal_models
+            .is_none());
+        config.remove_active_model_references(&old_provider, "text-only");
+        assert_eq!(config.platforms.qq.conversations.len(), 1);
+        assert!(config.platforms.qq.conversations[0].text_models.is_none());
+    }
+
+    #[test]
+    fn provider_reference_updates_cover_every_model_pool_and_plugin() {
+        let mut config = route_test_config();
+        let old_id = config.providers[0].id.clone();
+        config.active_provider = old_id.clone();
+        config.active_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: old_id.clone(),
+            model: "text-only".to_string(),
+        }]);
+        config.active_multimodal_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: old_id.clone(),
+            model: "vision".to_string(),
+        }]);
+        config.subagent_tiers.cheap.push(ActiveProviderModelConfig {
+            provider_id: old_id.clone(),
+            model: "text-only".to_string(),
+        });
+        config.platforms.qq.conversations.push(test_route(&config));
+        config.plugins.vision.vision_provider_id = old_id.clone();
+        config.plugins.vision.vision_model = "vision".to_string();
+        config.plugins.knowledge_base.embedding_provider_id = old_id.clone();
+        config.plugins.knowledge_base.embedding_model = "text-only".to_string();
+
+        config.providers[0].id = "renamed".to_string();
+        config.rename_provider_references(&old_id, "renamed");
+
+        assert_eq!(config.active_provider, "renamed");
+        assert_eq!(
+            config.active_provider_models.as_ref().unwrap()[0].provider_id,
+            "renamed"
+        );
+        assert_eq!(
+            config.active_multimodal_provider_models.as_ref().unwrap()[0].provider_id,
+            "renamed"
+        );
+        assert_eq!(config.subagent_tiers.cheap[0].provider_id, "renamed");
+        assert_eq!(
+            config.platforms.qq.conversations[0]
+                .text_models
+                .as_ref()
+                .unwrap()[0]
+                .provider_id,
+            "renamed"
+        );
+        assert_eq!(config.plugins.vision.vision_provider_id, "renamed");
+        assert_eq!(
+            config.plugins.knowledge_base.embedding_provider_id,
+            "renamed"
+        );
+        assert!(config.validate().is_ok());
+
+        config.providers.remove(0);
+        config.remove_provider_references("renamed");
+        assert!(config.active_provider_models.is_none());
+        assert!(config.active_multimodal_provider_models.is_none());
+        assert!(config.subagent_tiers.cheap.is_empty());
+        assert_eq!(config.platforms.qq.conversations.len(), 1);
+        assert!(config.platforms.qq.conversations[0].text_models.is_none());
+        assert!(config.plugins.vision.vision_provider_id.is_empty());
+        assert!(config
+            .plugins
+            .knowledge_base
+            .embedding_provider_id
+            .is_empty());
+        assert_ne!(config.active_provider, "renamed");
+    }
+
+    #[test]
+    fn model_capability_pruning_clears_all_invalid_image_references() {
+        let mut config = route_test_config();
+        let provider_id = config.providers[0].id.clone();
+        config.active_multimodal_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "vision".to_string(),
+        }]);
+        config.platforms.qq.conversations.push(test_route(&config));
+        config.plugins.vision.vision_provider_id = provider_id;
+        config.plugins.vision.vision_model = "vision".to_string();
+        config.providers[0]
+            .model_modalities
+            .insert("vision".to_string(), vec!["text".to_string()]);
+
+        config.prune_model_references();
+
+        assert!(config.active_multimodal_provider_models.is_none());
+        assert!(config.platforms.qq.conversations[0]
+            .multimodal_models
+            .is_none());
+        assert!(config.plugins.vision.vision_provider_id.is_empty());
+        assert!(config.plugins.vision.vision_model.is_empty());
+    }
+
+    #[test]
+    fn duplicate_provider_ids_are_rejected() {
+        let mut config = AppConfig::default();
+        config.providers.push(config.providers[0].clone());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn platform_multimodal_pruning_tracks_provider_capabilities() {
+        let mut config = route_test_config();
+        config.platforms.qq.conversations.push(test_route(&config));
+        config.providers[0]
+            .model_modalities
+            .insert("vision".to_string(), vec!["text".to_string()]);
+
+        config.prune_platform_model_routes();
+
+        let route = &config.platforms.qq.conversations[0];
+        assert!(route.multimodal_models.is_none());
+        assert_eq!(route.text_models.as_ref().unwrap().len(), 1);
     }
 
     #[test]

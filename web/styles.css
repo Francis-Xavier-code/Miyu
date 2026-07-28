@@ -414,7 +414,7 @@ textarea:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   width: 100%;
-  min-height: 54px;
+  min-height: 48px;
   align-items: stretch;
   border-radius: 8px;
   background: transparent;
@@ -437,8 +437,8 @@ textarea:disabled {
 
 .session-item.active::before {
   position: absolute;
-  top: 8px;
-  bottom: 8px;
+  top: 7px;
+  bottom: 7px;
   left: 0;
   width: 3px;
   border-radius: 3px;
@@ -451,7 +451,7 @@ textarea:disabled {
   grid-template-columns: 17px minmax(0, 1fr);
   min-width: 0;
   align-items: center;
-  padding: 7px 7px 7px 11px;
+  padding: 5px 7px 5px 11px;
   border-radius: 8px;
   background: transparent;
   color: inherit;
@@ -555,10 +555,11 @@ textarea:disabled {
 }
 
 .session-trailing {
-  display: grid;
-  align-content: space-between;
-  justify-items: end;
-  padding: 7px 6px 5px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 5px 6px 5px 0;
   gap: 2px;
 }
 
@@ -576,10 +577,6 @@ textarea:disabled {
   color: var(--text-soft);
   cursor: pointer;
   opacity: 0;
-}
-
-.session-menu-button {
-  align-self: center;
 }
 
 .session-menu-button .icon-slot {
@@ -1288,6 +1285,7 @@ textarea:disabled {
   border: 1.5px solid var(--gold);
   border-radius: 50%;
   object-fit: cover;
+  transition: bottom 200ms ease;
 }
 
 .assistant-message:has(.assistant-meta) .assistant-label img {
@@ -1319,6 +1317,7 @@ textarea:disabled {
 
 /* 助手气泡:surface-1 无边框 + 软阴影,左下角 3px 收尾 */
 .assistant-content {
+  position: relative;
   min-width: 0;
   padding: 12px 16px;
   border-radius: 8px 8px 8px 3px;
@@ -1335,9 +1334,27 @@ textarea:disabled {
   max-width: 100%;
 }
 
+.assistant-bubble {
+  position: relative;
+  min-width: 0;
+}
+
+.assistant-bubble:has(.assistant-content.is-slim) {
+  width: fit-content;
+  max-width: 100%;
+}
+
 .assistant-blocks {
   min-width: 0;
 }
+
+.avatar-path-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.avatar-path-row .config-input { flex: 1 1 auto; min-width: 0; }
+.avatar-path-row .icon-button { flex: 0 0 34px; }
+.persona-avatar-preview { display: block; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50%; object-fit: cover; border: 1px solid var(--outline); }
+.persona-board-preview { border-radius: 6px; }
+.persona-avatar-preview.is-missing { background: var(--surface-3); }
+.persona-starter-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 
 .assistant-blocks > * {
   margin-top: 0;
@@ -2908,18 +2925,17 @@ textarea:disabled {
   right: max(18px, calc((100% - 960px) / 2));
   bottom: 116px;
   z-index: 11;
-  display: inline-flex;
-  min-height: 32px;
-  align-items: center;
-  padding: 0 10px;
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
   border: 0;
   border-radius: 6px;
   background: var(--surface-1);
   color: var(--text-soft);
   box-shadow: var(--float-shadow);
   cursor: pointer;
-  gap: 5px;
-  font-size: 10.5px;
 }
 
 .jump-bottom-button:hover {
@@ -3088,10 +3104,22 @@ textarea:disabled {
 
 .composer-context {
   display: grid;
+  overflow: hidden;
   width: 132px;
   min-width: 92px;
   margin-right: 2px;
   gap: 4px;
+}
+
+/* 数字过长时省略号截断,不允许伸到发送按钮底下 */
+.composer-context .context-heading {
+  min-width: 0;
+}
+
+.composer-context .context-heading > span:last-child {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
 }
 
 .composer-context .context-heading {
@@ -3118,7 +3146,9 @@ textarea:disabled {
 
 .composer-submit {
   display: flex;
-  flex: 0 0 auto;
+  position: relative;
+  min-width: 0;
+  flex: 0 1 auto;
   align-items: center;
   gap: 8px;
 }
@@ -3146,37 +3176,42 @@ textarea:disabled {
   transform: scale(0.92);
 }
 
-/* 停止键:头像正下方的左列圆钮,与头像同宽,只在直播期间存在 */
-.live-stop-button {
+/* Compact per-reply stop controls above the composer send button. */
+.live-stop-rail {
   position: absolute;
-  left: 0;
-  bottom: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 12;
   display: grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border: 0;
-  border-radius: 50%;
-  background: var(--ribbon-soft);
-  color: var(--md-sys-color-on-tertiary-container);
-  box-shadow: var(--bubble-shadow);
-  cursor: pointer;
+  justify-items: end;
+  gap: 6px;
 }
 
-/* 有停止键时头像上移让位;带 meta 行的消息整体再抬 28px */
-.assistant-message:has(.live-stop-button) { min-height: 74px; }
-.assistant-message:has(.live-stop-button) .assistant-label img { bottom: 36px; }
-.assistant-message:has(.assistant-meta) .live-stop-button { bottom: 28px; }
-.assistant-message:has(.assistant-meta):has(.live-stop-button) .assistant-label img { bottom: 64px; }
+.live-stop-button {
+  position: relative;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--ribbon) 42%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ribbon) 18%, var(--surface-1));
+  color: var(--ribbon);
+  cursor: pointer;
+  transition: background 150ms ease, color 150ms ease, transform 150ms ease;
+}
 
 .live-stop-button .icon-slot {
-  width: 15px;
-  height: 15px;
+  width: 20px;
+  height: 20px;
 }
 
 .live-stop-button:hover:not(:disabled) {
-  background: var(--ribbon);
-  color: var(--md-sys-color-on-tertiary);
+  background: color-mix(in srgb, var(--ribbon) 30%, var(--surface-1));
+}
+
+.live-stop-button:active:not(:disabled) {
+  transform: scale(0.92);
 }
 
 .live-stop-button:disabled {
@@ -3749,6 +3784,16 @@ textarea.config-input {
   min-width: 0;
 }
 
+.prompt-document > header .config-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.prompt-document > header .icon-button {
+  flex: 0 0 34px;
+  margin-top: 18px;
+}
+
 .prompt-content {
   min-height: 240px !important;
   font-family: var(--font-ui) !important;
@@ -4206,6 +4251,10 @@ textarea.config-input {
 }
 
 @media (max-width: 760px) {
+  .persona-starter-fields {
+    grid-template-columns: 1fr;
+  }
+
   .app-shell {
     display: block;
   }
@@ -4240,7 +4289,7 @@ textarea.config-input {
 
   .main-stage {
     width: 100%;
-    height: 100dvh;
+    height: var(--app-height, 100dvh);
   }
 
   .topbar {
@@ -4358,8 +4407,15 @@ textarea.config-input {
   }
 
   .composer-context {
-    width: 102px;
-    min-width: 80px;
+    width: auto;
+    min-width: 0;
+    max-width: 220px;
+    flex: 1 1 auto;
+  }
+
+  .composer-submit {
+    flex: 1 1 auto;
+    justify-content: flex-end;
   }
 
   .send-button {
@@ -4508,8 +4564,19 @@ textarea.config-input {
 
   .composer-context {
     display: grid;
-    width: 76px;
-    min-width: 70px;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    flex: 1 1 auto;
+  }
+
+  .composer-context .context-heading {
+    justify-content: flex-end;
+  }
+
+  /* 窄屏下隐藏「上下文」标签,把宽度让给数字 */
+  .composer-context .context-heading > span:first-child {
+    display: none;
   }
 
   .composer-state {

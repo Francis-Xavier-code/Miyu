@@ -16,6 +16,7 @@ use crate::state::{
 };
 use crate::tools::{self, CommandOutputStream};
 use anyhow::{Context, Result};
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, ORIGIN, REFERRER_POLICY,
@@ -42,16 +43,25 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path as FilePath, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
-mod platforms;
-use platforms::PlatformRuntime;
+use crate::platforms::{self, PlatformRuntime};
 
 const JSON_BODY_LIMIT: usize = 4 * 1024 * 1024;
+const PERSONA_ASSET_LIMIT: usize = 8 * 1024 * 1024;
+const DEFAULT_BOARD_TITLE: &str = "今天想聊些什么？";
+const DEFAULT_BOARD_SUBTITLE: &str = "从一个问题、计划或此刻的想法开始。";
+const DEFAULT_STARTER_PROMPTS: [&str; 4] = [
+    "查询今天的天气",
+    "分析一个问题",
+    "发表情包打个招呼吧",
+    "搜索一张图片",
+];
 const MAX_CONTENT_CHARS: usize = 20_000;
 const MAX_PROMPT_DOCUMENT_CHARS: usize = 200_000;
 const MAX_PROMPT_DOCUMENTS: usize = 128;
@@ -68,19 +78,158 @@ const MIYU_LOGO: &[u8] = include_bytes!("../pics/miyu-logo.png");
 const MIYU_WALLPAPER: &[u8] = include_bytes!("../pics/miyuwallpaper.png");
 
 #[derive(Clone)]
-struct WebState {
+pub(crate) struct DaemonState {
     auth: WebAuth,
     boot_id: Arc<str>,
-    web_port: u16,
+    pub(crate) web_port: u16,
     web_public: bool,
-    paths: MiyuPaths,
-    manager: Arc<Mutex<ManagerState>>,
-    state_store: StateStore,
-    events: EventHub,
-    questions: QuestionBroker,
-    actor_tx: mpsc::UnboundedSender<ActorCommand>,
+    pub(crate) paths: MiyuPaths,
+    pub(crate) manager: Arc<Mutex<ManagerState>>,
+    pub(crate) state_store: StateStore,
+    pub(crate) events: EventHub,
+    pub(crate) questions: QuestionBroker,
+    pub(crate) actor_tx: mpsc::UnboundedSender<ActorCommand>,
     shutdown_tx: broadcast::Sender<()>,
-    platforms: PlatformRuntime,
+    turn_engine: TurnEngineState,
+    pub(crate) platforms: PlatformRuntime,
+}
+
+#[cfg(test)]
+impl DaemonState {
+    pub(crate) fn for_test(paths: MiyuPaths, web_port: u16) -> Result<Self> {
+        let state_store = StateStore::new(&paths)?;
+        let config = AppConfig::default();
+        let context = cold_context(&config, &state_store)?;
+        let manager = Arc::new(Mutex::new(ManagerState {
+            config,
+            active_runs: HashMap::new(),
+            admin_busy: false,
+            context,
+            persona_session_ids: HashMap::new(),
+        }));
+        let (actor_tx, _actor_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+        Ok(Self {
+            auth: WebAuth::new(None),
+            boot_id: Arc::from("boot-test"),
+            web_port,
+            web_public: false,
+            paths,
+            manager,
+            state_store,
+            events: EventHub::new(),
+            questions: QuestionBroker::new(),
+            actor_tx,
+            shutdown_tx,
+            turn_engine: TurnEngineState::default(),
+            platforms: PlatformRuntime::new()?,
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct TurnEngineState(Arc<AtomicU8>);
+
+impl TurnEngineState {
+    const COLD: u8 = 0;
+    const INITIALIZING: u8 = 1;
+    const READY: u8 = 2;
+    const FAILED: u8 = 3;
+
+    fn set(&self, state: u8) {
+        self.0.store(state, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::READY
+    }
+
+    fn label(&self) -> &'static str {
+        match self.0.load(Ordering::Acquire) {
+            Self::INITIALIZING => "initializing",
+            Self::READY => "ready",
+            Self::FAILED => "failed",
+            _ => "cold",
+        }
+    }
+}
+
+/// Expensive per-turn dependencies are initialized on first use and shared
+/// by subsequent turns. The cache is keyed by the effective configuration so
+/// a QQ conversation-specific model pool gets its own client/tool snapshot.
+/// Configuration reloads clear the cache before the next request.
+struct TurnResources {
+    client: OpenAiCompatibleClient,
+    normal_tools: tools::ToolRegistry,
+    plan_tools: tools::ToolRegistry,
+    chat_tools: tools::ToolRegistry,
+    restricted_tools: tools::ToolRegistry,
+}
+
+const MAX_CACHED_TURN_RESOURCE_CONFIGS: usize = 16;
+
+struct TurnResourceCache {
+    entries: HashMap<[u8; 32], Arc<TurnResources>>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl Default for TurnResourceCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl TurnResourceCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    fn key(config: &AppConfig) -> Result<[u8; 32]> {
+        let encoded =
+            serde_json::to_vec(config).context("serializing effective turn configuration")?;
+        Ok(*blake3::hash(&encoded).as_bytes())
+    }
+
+    fn get_or_build(
+        &mut self,
+        config: &AppConfig,
+        paths: &MiyuPaths,
+    ) -> Result<Arc<TurnResources>> {
+        let key = Self::key(config)?;
+        if let Some(resources) = self.entries.get(&key).cloned() {
+            self.order.retain(|entry| *entry != key);
+            self.order.push_back(key);
+            return Ok(resources);
+        }
+
+        crate::models_cache::ensure_active_metadata(paths, config);
+        let restricted_tools = if config.tools.enabled {
+            tools::restricted_platform_registry(config, paths)
+        } else {
+            tools::ToolRegistry::new()
+        };
+        tools::register_script_display_names(&restricted_tools);
+        let resources = Arc::new(TurnResources {
+            client: OpenAiCompatibleClient::from_config(config, paths)?,
+            normal_tools: build_tool_registry(config, paths, AgentMode::Normal, false)?,
+            plan_tools: build_tool_registry(config, paths, AgentMode::Plan, false)?,
+            chat_tools: build_tool_registry(config, paths, AgentMode::Chat, false)?,
+            restricted_tools,
+        });
+
+        if self.entries.len() >= MAX_CACHED_TURN_RESOURCE_CONFIGS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, resources.clone());
+        Ok(resources)
+    }
 }
 
 #[derive(Clone)]
@@ -170,28 +319,29 @@ impl WebAuth {
 }
 
 /// A turn currently executing in the daemon.
-struct RunInfo {
-    session_id: Arc<str>,
-    mode: AgentMode,
+pub(crate) struct RunInfo {
+    pub(crate) session_id: Arc<str>,
+    pub(crate) mode: AgentMode,
     /// Signals cancellation to the turn task; the task selects on the
     /// paired receiver.
-    cancel: tokio::sync::watch::Sender<bool>,
+    pub(crate) cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl RunInfo {
-    fn request_cancel(&self) {
+    pub(crate) fn request_cancel(&self) {
         let _ = self.cancel.send(true);
     }
 }
 
-struct ManagerState {
-    config: AppConfig,
+pub(crate) struct ManagerState {
+    pub(crate) config: AppConfig,
     /// Concurrently running turns, keyed by run id. Turns run in parallel —
     /// including several in the same session (placeholder semantics) — so
     /// this replaces the old single `active_run_id`.
-    active_runs: HashMap<String, RunInfo>,
-    admin_busy: bool,
-    context: ContextSnapshot,
+    pub(crate) active_runs: HashMap<String, RunInfo>,
+    pub(crate) admin_busy: bool,
+    pub(crate) context: ContextSnapshot,
+    persona_session_ids: HashMap<String, String>,
 }
 
 impl ManagerState {
@@ -212,13 +362,13 @@ impl ManagerState {
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-struct ContextSnapshot {
-    tokens: u64,
-    window: Option<usize>,
-    cumulative_tokens: u64,
+pub(crate) struct ContextSnapshot {
+    pub(crate) tokens: u64,
+    pub(crate) window: Option<usize>,
+    pub(crate) cumulative_tokens: u64,
 }
 
-enum ActorCommand {
+pub(crate) enum ActorCommand {
     StartTurn {
         run_id: String,
         session_id: Arc<str>,
@@ -226,6 +376,8 @@ enum ActorCommand {
         mode: AgentMode,
         images: Vec<Option<ImageAttachment>>,
         cwd: Option<std::path::PathBuf>,
+        /// Platform-only per-turn overrides. CLI/WebUI turns leave this empty.
+        profile: Option<platforms::TurnProfile>,
         cancel: tokio::sync::watch::Receiver<bool>,
     },
     SetModels {
@@ -233,7 +385,7 @@ enum ActorCommand {
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ApplyConfig {
-        config: AppConfig,
+        config: Box<AppConfig>,
         prompts: PromptDocuments,
         reset_conversation: bool,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
@@ -260,20 +412,20 @@ enum ActorCommand {
 }
 
 #[derive(Debug)]
-enum AdminFailure {
+pub(crate) enum AdminFailure {
     Invalid(String),
     Internal(String),
 }
 
 #[derive(Clone, Debug)]
-struct EventRecord {
-    id: u64,
-    kind: String,
-    data: String,
+pub(crate) struct EventRecord {
+    pub(crate) id: u64,
+    pub(crate) kind: String,
+    pub(crate) data: String,
 }
 
 #[derive(Clone)]
-struct EventHub {
+pub(crate) struct EventHub {
     inner: Arc<Mutex<EventHubInner>>,
     sender: broadcast::Sender<EventRecord>,
 }
@@ -283,9 +435,9 @@ struct EventHubInner {
     records: VecDeque<EventRecord>,
 }
 
-struct EventSubscription {
-    pending: VecDeque<EventRecord>,
-    receiver: broadcast::Receiver<EventRecord>,
+pub(crate) struct EventSubscription {
+    pub(crate) pending: VecDeque<EventRecord>,
+    pub(crate) receiver: broadcast::Receiver<EventRecord>,
 }
 
 impl EventHub {
@@ -300,7 +452,7 @@ impl EventHub {
         }
     }
 
-    fn publish(&self, kind: impl Into<String>, data: Value) -> u64 {
+    pub(crate) fn publish(&self, kind: impl Into<String>, data: Value) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;
         inner.next_id = inner.next_id.saturating_add(1);
@@ -318,18 +470,18 @@ impl EventHub {
         id
     }
 
-    fn latest_id(&self) -> u64 {
+    pub(crate) fn latest_id(&self) -> u64 {
         self.inner.lock().unwrap().next_id.saturating_sub(1)
     }
 
-    fn subscribe_after(&self, after: u64) -> EventSubscription {
+    pub(crate) fn subscribe_after(&self, after: u64) -> EventSubscription {
         let mut inner = self.inner.lock().unwrap();
         let receiver = self.sender.subscribe();
         let pending = replay_records(&mut inner, after);
         EventSubscription { pending, receiver }
     }
 
-    fn replay_after(&self, after: u64) -> VecDeque<EventRecord> {
+    pub(crate) fn replay_after(&self, after: u64) -> VecDeque<EventRecord> {
         replay_records(&mut self.inner.lock().unwrap(), after)
     }
 }
@@ -363,7 +515,7 @@ fn resync_record(inner: &mut EventHubInner) -> VecDeque<EventRecord> {
 }
 
 #[derive(Clone)]
-struct QuestionBroker {
+pub(crate) struct QuestionBroker {
     pending: Arc<Mutex<HashMap<String, PendingQuestion>>>,
 }
 
@@ -728,9 +880,9 @@ impl RunEventMapper {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
-    message: String,
+    pub(crate) message: String,
 }
 
 impl ApiError {
@@ -821,7 +973,7 @@ enum SecretMutation {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PromptDocuments {
+pub(crate) struct PromptDocuments {
     #[serde(default)]
     personas: Vec<PromptDocument>,
     #[serde(default)]
@@ -834,7 +986,31 @@ struct PromptDocument {
     name: String,
     content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_image_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    starter_prompts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     original_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PersonaMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_image_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    board_subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    starter_prompts: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -846,6 +1022,17 @@ struct ConfigResponse {
     multimodal_models: Vec<SafeModel>,
     display: WebDisplayConfig,
     context: ContextSnapshot,
+    persona: PersonaIdentity,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PersonaIdentity {
+    name: String,
+    avatar_url: Option<String>,
+    board_image_url: Option<String>,
+    board_title: String,
+    board_subtitle: String,
+    starter_prompts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -867,6 +1054,7 @@ struct BootstrapResponse {
     current_session_id: String,
     /// Every turn currently running, across all sessions.
     runs: Vec<Value>,
+    persona: PersonaIdentity,
 }
 
 #[derive(Serialize)]
@@ -887,7 +1075,7 @@ struct WebDisplayConfig {
 }
 
 #[derive(Clone, Serialize)]
-struct SafeQueuedPrompt {
+pub(crate) struct SafeQueuedPrompt {
     id: String,
     content: String,
     submitted_at: String,
@@ -965,11 +1153,11 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let password = resolve_web_password(&args)?;
     AppConfig::init_files(&paths)?;
     let config = AppConfig::load_or_default(&paths)?;
-    crate::models_cache::try_load_active(&paths, &config);
-    crate::models_cache::spawn_background_refresh_active(paths.clone(), config.clone());
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
-    state_store.adopt_sessions_for_persona(&config.active_persona_scope())?;
+    let persona = config.active_persona_scope();
+    state_store.adopt_sessions_for_persona(&persona)?;
+    ensure_local_current_session(&state_store, &persona)?;
     // Subagent audit sessions are kept for a week, cleaned at startup and
     // then daily while the daemon runs.
     const SUBAGENT_AUDIT_RETENTION_DAYS: i64 = 7;
@@ -985,29 +1173,30 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
             }
         });
     }
-    let client = OpenAiCompatibleClient::from_config(&config, &paths)?;
-    let registry = build_tool_registry(&config, &paths, AgentMode::Normal, true)?;
-    let mut agent = Agent::new(
-        config.clone(),
-        &paths,
-        state_store.clone(),
-        client,
-        registry,
-        AgentMode::Normal,
-    )?;
-    agent.prepare_for_turn()?;
-    let context = ContextSnapshot {
-        tokens: agent.effective_context_tokens()?,
-        window: agent.context_window(),
-        cumulative_tokens: agent.conversation_usage_tokens()?,
-    };
+    let context = cold_context(&config, &state_store)?;
 
     // Listen on all interfaces so the WebUI is reachable from the LAN;
     // access URLs for every local address are printed below.
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, args.port))
-        .await
-        .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port))?;
+    let listener = match tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, args.port)).await {
+        Ok(listener) => listener,
+        Err(error)
+            if args.port == ipc::DEFAULT_WEB_PORT
+                && error.kind() == std::io::ErrorKind::AddrInUse =>
+        {
+            tracing::warn!(
+                requested_port = args.port,
+                "Miyu WebUI default port is occupied; selecting an ephemeral port"
+            );
+            tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, 0))
+                .await
+                .context("binding Miyu WebUI to an ephemeral fallback port")?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port));
+        }
+    };
     let port = listener.local_addr()?.port();
     let boot_id: Arc<str> = random_id("boot", 18).into();
     let events = EventHub::new();
@@ -1017,18 +1206,23 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         active_runs: HashMap::new(),
         admin_busy: false,
         context,
+        persona_session_ids: HashMap::from([(
+            config.active_persona_scope(),
+            state_store.session_id().to_string(),
+        )]),
     }));
+    let turn_engine = TurnEngineState::default();
     let (actor_tx, actor_join) = spawn_actor(
-        agent,
         config,
         paths.clone(),
         state_store.clone(),
         manager.clone(),
         events.clone(),
         questions.clone(),
+        turn_engine.clone(),
     )?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
-    let state = WebState {
+    let state = DaemonState {
         auth: WebAuth::new(password.as_deref()),
         boot_id,
         web_port: port,
@@ -1040,10 +1234,18 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         questions,
         actor_tx: actor_tx.clone(),
         shutdown_tx,
+        turn_engine,
         platforms: PlatformRuntime::new()?,
     };
+    let initial_qq = state.manager.lock().unwrap().config.platforms.qq.clone();
+    state
+        .platforms
+        .qq_listener
+        .prepare(&state, None, &initial_qq)
+        .await?
+        .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
-    let app = router(state);
+    let app = router(state.clone());
     let urls = ipc::web_access_urls(port);
     for url in &urls {
         println!("Miyu WebUI: {url}");
@@ -1062,6 +1264,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         _ = shutdown_rx.recv() => Ok(()),
     };
     let _ = actor_tx.send(ActorCommand::Shutdown);
+    state.platforms.qq_listener.shutdown(&state);
     ipc_task.abort();
     let _ = ipc_task.await;
     drop(ipc_lease);
@@ -1073,14 +1276,51 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     actor_result
 }
 
-struct IpcRunGuard {
-    manager: Arc<Mutex<ManagerState>>,
-    run_id: String,
-    finished: bool,
+/// Old WebUI versions could make a platform-owned conversation the global
+/// current session. Repair that pointer before constructing the local agent
+/// so QQ history can never become the WebUI/CLI startup conversation.
+fn ensure_local_current_session(state_store: &StateStore, persona: &str) -> Result<()> {
+    let current_session_id = state_store.session_id();
+    if is_available_local_session(state_store, &current_session_id, persona)? {
+        return Ok(());
+    }
+
+    let target_session_id = match state_store
+        .list_local_sessions(persona, false)?
+        .into_iter()
+        .next()
+    {
+        Some(overview) => overview.record.session_id,
+        None => {
+            state_store
+                .create_session(persona, "", "user", None)?
+                .session_id
+        }
+    };
+    state_store.switch_session(&target_session_id)
+}
+
+fn is_available_local_session(
+    state_store: &StateStore,
+    session_id: &str,
+    persona: &str,
+) -> Result<bool> {
+    let usable = state_store
+        .session_record(session_id)?
+        .is_some_and(|record| {
+            record.persona == persona && record.kind == "user" && !record.archived
+        });
+    Ok(usable && !state_store.is_platform_session(session_id)?)
+}
+
+pub(crate) struct IpcRunGuard {
+    pub(crate) manager: Arc<Mutex<ManagerState>>,
+    pub(crate) run_id: String,
+    pub(crate) finished: bool,
 }
 
 impl IpcRunGuard {
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         self.finished = true;
     }
 }
@@ -1096,7 +1336,9 @@ impl Drop for IpcRunGuard {
     }
 }
 
-fn start_ipc_server(state: &WebState) -> Result<(crate::ipc::WebCoreLease, TokioJoinHandle<()>)> {
+fn start_ipc_server(
+    state: &DaemonState,
+) -> Result<(crate::ipc::WebCoreLease, TokioJoinHandle<()>)> {
     let lease = ipc::acquire_web_core(&state.paths)
         .context("another Miyu core is already running or starting")?;
     let socket_path = state.paths.ipc_socket();
@@ -1131,7 +1373,10 @@ fn start_ipc_server(state: &WebState) -> Result<(crate::ipc::WebCoreLease, Tokio
     Ok((lease, task))
 }
 
-async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStream) -> Result<()> {
+async fn handle_ipc_connection(
+    state: DaemonState,
+    mut stream: tokio::net::UnixStream,
+) -> Result<()> {
     let Some(request) = tokio::time::timeout(
         Duration::from_secs(5),
         ipc::receive::<IpcRequest>(&mut stream),
@@ -1174,39 +1419,78 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
             let _ = state.shutdown_tx.send(());
         }
         IpcCommand::GetStatus => {
+            let qq_enabled = state.manager.lock().unwrap().config.platforms.qq.enabled;
+            let qq_port = state.platforms.qq_listener.active_port();
+            let connected_accounts = state.platforms.onebot.lock().unwrap().connected_accounts();
             ipc::send(
                 &mut stream,
                 &IpcFrame::AdminResult {
                     state: session_state(&state.manager, &state.state_store)?,
-                    data: json!({}),
+                    data: json!({
+                        "runtime": {
+                            "turn_engine": state.turn_engine.label(),
+                        },
+                        "platforms": {
+                            "qq": {
+                                "enabled": qq_enabled,
+                                "listen_port": qq_port,
+                                "connected_accounts": connected_accounts,
+                            }
+                        }
+                    }),
                 },
             )
             .await?;
         }
         IpcCommand::ReloadConfig => {
+            let current_config = state.manager.lock().unwrap().config.clone();
             let next_config = AppConfig::load_or_default(&state.paths)?;
             let prompts = read_prompt_documents(&next_config, &state.paths)?;
-            let reset_conversation = {
-                let current = state.manager.lock().unwrap().config.clone();
-                prompt_configuration_changed(&current, &next_config)
+            let qq_listener = match state
+                .platforms
+                .qq_listener
+                .prepare(
+                    &state,
+                    Some(&current_config.platforms.qq),
+                    &next_config.platforms.qq,
+                )
+                .await
+            {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = current_config.save(&state.paths);
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::Error {
+                            message: format!(
+                                "Tencent QQ listener configuration failed: {}",
+                                safe_error_message(error)
+                            ),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             reserve_admin(&state.manager).map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
                 .send(ActorCommand::ApplyConfig {
-                    config: next_config,
+                    config: Box::new(next_config),
                     prompts,
-                    reset_conversation,
+                    reset_conversation: false,
                     reply,
                 })
                 .is_err()
             {
                 release_admin(&state.manager);
+                let _ = current_config.save(&state.paths);
                 anyhow::bail!("Miyu core worker is unavailable");
             }
             match receiver.await {
                 Ok(Ok(())) => {
+                    qq_listener.commit();
                     ipc::send(
                         &mut stream,
                         &IpcFrame::AdminResult {
@@ -1217,16 +1501,19 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
                     .await?
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+                    let _ = current_config.save(&state.paths);
                     ipc::send(&mut stream, &IpcFrame::Error { message }).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
+                    let _ = current_config.save(&state.paths);
                     anyhow::bail!("Miyu core stopped while reloading configuration");
                 }
             }
         }
         IpcCommand::ResetConversation { all } => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
@@ -1257,7 +1544,8 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
             }
         }
         IpcCommand::Undo => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state.actor_tx.send(ActorCommand::Undo { reply }).is_err() {
                 release_admin(&state.manager);
@@ -1284,7 +1572,8 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
             }
         }
         IpcCommand::Pop { turn_ids } => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
@@ -1315,7 +1604,8 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
             }
         }
         IpcCommand::Compact => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id()).map_err(|error| anyhow::anyhow!(error.message))?;
+            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
@@ -1357,7 +1647,10 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
         IpcCommand::Cancel { run_id } => {
             let cancelled = {
                 let manager = state.manager.lock().unwrap();
-                manager.active_runs.get(&run_id).map(RunInfo::request_cancel)
+                manager
+                    .active_runs
+                    .get(&run_id)
+                    .map(RunInfo::request_cancel)
             };
             if cancelled.is_some() {
                 ipc::send(&mut stream, &IpcFrame::Ack).await?;
@@ -1403,21 +1696,19 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
                 .await?;
             }
         },
-        session_command => {
-            match handle_session_command(&state, session_command).await {
-                Ok(data) => {
-                    ipc::send(
-                        &mut stream,
-                        &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
-                            data,
-                        },
-                    )
-                    .await?
-                }
-                Err(message) => ipc::send(&mut stream, &IpcFrame::Error { message }).await?,
+        session_command => match handle_session_command(&state, session_command).await {
+            Ok(data) => {
+                ipc::send(
+                    &mut stream,
+                    &IpcFrame::AdminResult {
+                        state: session_state(&state.manager, &state.state_store)?,
+                        data,
+                    },
+                )
+                .await?
             }
-        }
+            Err(message) => ipc::send(&mut stream, &IpcFrame::Error { message }).await?,
+        },
     }
     Ok(())
 }
@@ -1425,7 +1716,7 @@ async fn handle_ipc_connection(state: WebState, mut stream: tokio::net::UnixStre
 /// Handles the session-management IPC commands. Returns the `AdminResult`
 /// payload on success or a user-facing error message.
 async fn handle_session_command(
-    state: &WebState,
+    state: &DaemonState,
     command: IpcCommand,
 ) -> std::result::Result<Value, String> {
     let store = &state.state_store;
@@ -1445,9 +1736,7 @@ async fn handle_session_command(
         IpcCommand::CreateSession { name, switch } => {
             // No explicit name: leave it empty; the session is auto-named
             // from the first prompt when its first turn completes.
-            let name = name
-                .map(|name| name.trim().to_string())
-                .unwrap_or_default();
+            let name = name.map(|name| name.trim().to_string()).unwrap_or_default();
             let record = store
                 .create_session(&persona, &name, "user", None)
                 .map_err(|error| safe_error_message(&error))?;
@@ -1541,9 +1830,10 @@ async fn handle_session_command(
             store
                 .delete_session(&record.session_id)
                 .map_err(|error| safe_error_message(&error))?;
-            state
-                .events
-                .publish("session.deleted", json!({ "session_id": record.session_id }));
+            state.events.publish(
+                "session.deleted",
+                json!({ "session_id": record.session_id }),
+            );
             Ok(json!({}))
         }
         IpcCommand::SetWorkspace { target, path } => {
@@ -1574,12 +1864,36 @@ async fn handle_session_command(
     }
 }
 
-fn active_persona_scope(state: &WebState) -> String {
+fn active_persona_scope(state: &DaemonState) -> String {
     state.manager.lock().unwrap().config.active_persona_scope()
 }
 
 fn session_api_error(message: String) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+
+fn require_local_web_session(
+    state: &DaemonState,
+    session_id: &str,
+) -> std::result::Result<crate::state::SessionRecord, ApiError> {
+    let record = state
+        .state_store
+        .session_record(session_id)
+        .map_err(ApiError::internal)?;
+    let is_platform = state
+        .state_store
+        .is_platform_session(session_id)
+        .map_err(ApiError::internal)?;
+    match record {
+        Some(record)
+            if !is_platform
+                && record.kind == "user"
+                && record.persona == active_persona_scope(state) =>
+        {
+            Ok(record)
+        }
+        _ => Err(ApiError::new(StatusCode::NOT_FOUND, "session not found")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1589,19 +1903,22 @@ struct SessionsQuery {
 }
 
 async fn list_sessions_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Query(query): Query<SessionsQuery>,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
-    let data = handle_session_command(
-        &state,
-        IpcCommand::ListSessions {
-            include_archived: query.include_archived,
-        },
-    )
-    .await
-    .map_err(session_api_error)?;
+    let current = state.state_store.session_id();
+    let persona = active_persona_scope(&state);
+    let sessions = state
+        .state_store
+        .list_local_sessions(&persona, query.include_archived)
+        .map_err(ApiError::internal)?;
+    let sessions = sessions
+        .iter()
+        .map(|overview| session_overview_json(overview, &current))
+        .collect::<Vec<_>>();
+    let data = json!({ "current": &*current, "sessions": sessions });
     Ok(Json(data).into_response())
 }
 
@@ -1614,7 +1931,7 @@ struct CreateSessionRequest {
 }
 
 async fn create_session_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> std::result::Result<Response, ApiError> {
@@ -1632,11 +1949,12 @@ async fn create_session_http(
 }
 
 async fn activate_session_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
     let data = handle_session_command(
         &state,
         IpcCommand::SwitchSession {
@@ -1660,12 +1978,13 @@ struct UpdateSessionRequest {
 }
 
 async fn update_session_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(request): Json<UpdateSessionRequest>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
     let target = || ipc::SessionRef::Id {
         id: session_id.clone(),
     };
@@ -1710,19 +2029,12 @@ async fn update_session_http(
 /// turns, queued follow-ups, and its currently running turns. Does not touch
 /// the global current-session pointer.
 async fn session_turns_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
-    if state
-        .state_store
-        .session_record(&session_id)
-        .map_err(ApiError::internal)?
-        .is_none()
-    {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "session not found"));
-    }
+    require_local_web_session(&state, &session_id)?;
     let store = state.state_store.pinned(&session_id);
     let mut assets_by_turn = HashMap::<String, Vec<ImageAsset>>::new();
     for asset in store.load_image_assets().map_err(ApiError::internal)? {
@@ -1783,11 +2095,12 @@ async fn session_turns_http(
 }
 
 async fn delete_session_http(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
     let data = handle_session_command(
         &state,
         IpcCommand::DeleteSession {
@@ -1800,7 +2113,7 @@ async fn delete_session_http(
 }
 
 fn resolve_session_ref(
-    state: &WebState,
+    state: &DaemonState,
     target: &ipc::SessionRef,
 ) -> std::result::Result<crate::state::SessionRecord, String> {
     let store = &state.state_store;
@@ -1820,14 +2133,11 @@ fn resolve_session_ref(
 
 /// Most recently updated other unarchived user session, or a fresh default
 /// session when none is left.
-fn fallback_session_id(
-    state: &WebState,
-    exclude: &str,
-) -> std::result::Result<String, String> {
+fn fallback_session_id(state: &DaemonState, exclude: &str) -> std::result::Result<String, String> {
     let persona = active_persona_scope(state);
     let sessions = state
         .state_store
-        .list_sessions(&persona, false)
+        .list_local_sessions(&persona, false)
         .map_err(|error| safe_error_message(&error))?;
     if let Some(overview) = sessions
         .iter()
@@ -1847,7 +2157,7 @@ fn fallback_session_id(
 }
 
 async fn switch_session_via_actor(
-    state: &WebState,
+    state: &DaemonState,
     session_id: String,
 ) -> std::result::Result<(), String> {
     reserve_admin_light(&state.manager).map_err(|error| error.message)?;
@@ -1893,7 +2203,7 @@ fn session_overview_json(overview: &crate::state::SessionOverview, current: &str
 /// Resolves an optional turn-target session id: validates existence and that
 /// it is a user session; `None` falls back to the global current session.
 fn resolve_turn_session(
-    state: &WebState,
+    state: &DaemonState,
     session_id: Option<String>,
 ) -> std::result::Result<Arc<str>, String> {
     match session_id {
@@ -1918,7 +2228,7 @@ fn resolve_turn_session(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_ipc_turn(
-    state: &WebState,
+    state: &DaemonState,
     stream: &mut tokio::net::UnixStream,
     content: String,
     mode: String,
@@ -2002,6 +2312,7 @@ async fn handle_ipc_turn(
             mode,
             images,
             cwd,
+            profile: None,
             cancel: cancel_rx,
         })
         .is_err()
@@ -2082,7 +2393,7 @@ async fn handle_ipc_turn(
     Ok(())
 }
 
-fn router(state: WebState) -> Router {
+fn router(state: DaemonState) -> Router {
     Router::new()
         .route("/", get(index_asset))
         .route("/styles.css", get(styles_asset))
@@ -2093,9 +2404,18 @@ fn router(state: WebState) -> Router {
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth_login))
         .route("/api/bootstrap", get(bootstrap))
+        .route("/api/persona/avatar", get(persona_avatar))
+        .route(
+            "/api/persona/assets",
+            post(upload_persona_asset).layer(DefaultBodyLimit::max(PERSONA_ASSET_LIMIT)),
+        )
         .route("/api/config", get(get_config).put(update_config))
         .route("/api/events", get(events))
         .route("/api/assets/{asset_id}", get(image_asset))
+        .route(
+            "/api/platform-assets/{token}",
+            get(platforms::platform_asset),
+        )
         .route(
             "/api/sessions",
             get(list_sessions_http).post(create_session_http),
@@ -2117,8 +2437,13 @@ fn router(state: WebState) -> Router {
         .route("/api/models/active", put(set_models))
         .route("/api/conversation/reset", post(reset_conversation))
         // OneBot v11 reverse-WS endpoint: NapCat connects here as a WS
-        // client. Gated by platforms.onebot config, not web auth.
-        .route("/onebot/v11/ws", get(platforms::onebot::onebot_ws))
+        // client. Gated by platforms.qq config, not web auth.
+        .route("/ws", get(platforms::onebot::onebot_ws_on_web_port))
+        // Backward-compatible endpoint used by earlier Miyu releases.
+        .route(
+            "/onebot/v11/ws",
+            get(platforms::onebot::onebot_ws_on_web_port),
+        )
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
 }
@@ -2134,7 +2459,7 @@ async fn styles_asset() -> Response {
 /// Optional MD3 token override generated by matugen from the wallpaper.
 /// Read from disk on every request (the file is tiny and regenerated at any
 /// time); 404 when absent so the WebUI falls back to the built-in palette.
-async fn theme_css(State(state): State<WebState>) -> Response {
+async fn theme_css(State(state): State<DaemonState>) -> Response {
     let path = state.paths.config_dir.join("webui-theme.css");
     match tokio::fs::read(&path).await {
         Ok(bytes) => finish_asset_response(bytes.into_response(), "text/css; charset=utf-8"),
@@ -2152,6 +2477,124 @@ async fn logo_asset() -> Response {
 
 async fn wallpaper_asset() -> Response {
     binary_asset(MIYU_WALLPAPER, "image/png")
+}
+
+async fn persona_avatar(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let (config, prompts) = {
+        let manager = state.manager.lock().unwrap();
+        let prompts =
+            read_prompt_documents(&manager.config, &state.paths).map_err(ApiError::internal)?;
+        (manager.config.clone(), prompts)
+    };
+    let path = if let Some(path) = query.get("path").filter(|p| !p.is_empty()) {
+        if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            state.paths.config_dir.join(path)
+        }
+    } else if query.contains_key("board") {
+        active_persona_board_path(&config, &prompts, &state.paths)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "persona board image not found"))?
+    } else if let Some(path) = active_persona_avatar_path(&config, &prompts, &state.paths) {
+        path
+    } else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "persona avatar not found",
+        ));
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "persona avatar not found"))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "persona avatar is too large",
+        ));
+    }
+    let format = image::guess_format(&bytes)
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "persona avatar is not an image"))?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Bmp => "image/bmp",
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "persona avatar format is unsupported",
+            ))
+        }
+    };
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    Ok(response)
+}
+
+async fn upload_persona_asset(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_mutation(&headers, &state)?;
+    if body.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "image is empty"));
+    }
+    if body.len() > PERSONA_ASSET_LIMIT {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "persona image is too large",
+        ));
+    }
+    let format = image::guess_format(&body)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "unsupported image format"))?;
+    let extension = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Gif => "gif",
+        image::ImageFormat::WebP => "webp",
+        image::ImageFormat::Bmp => "bmp",
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported image format",
+            ))
+        }
+    };
+    let hash = format!("{:x}", Sha256::digest(&body));
+    let relative = format!("persona-avatars/{hash}.{extension}");
+    let directory = state.paths.config_dir.join("persona-avatars");
+    let destination = state.paths.config_dir.join(&relative);
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(ApiError::internal)?;
+    if !destination.exists() {
+        tokio::fs::write(&destination, &body)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    let config = state.manager.lock().unwrap().config.clone();
+    if let Ok(prompts) = read_prompt_documents(&config, &state.paths) {
+        cleanup_persona_assets(&state.paths, &prompts, &prompts);
+    }
+    Ok(Json(json!({
+        "path": relative,
+        "preview_url": format!("/api/persona/avatar?path={relative}"),
+    })))
 }
 
 fn text_asset(content: &'static str, content_type: &'static str) -> Response {
@@ -2189,7 +2632,7 @@ fn finish_asset_response(mut response: Response, content_type: &'static str) -> 
 }
 
 async fn auth_login(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
@@ -2267,7 +2710,6 @@ fn resolve_web_password(args: &WebArgs) -> Result<Option<String>> {
     Ok(password)
 }
 
-
 async fn health() -> Json<Value> {
     Json(json!({
         "status": "ready",
@@ -2276,10 +2718,12 @@ async fn health() -> Json<Value> {
 }
 
 async fn bootstrap(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
+    let metadata_config = state.manager.lock().unwrap().config.clone();
+    crate::models_cache::ensure_active_metadata(&state.paths, &metadata_config);
     state
         .state_store
         .recover_stale_turns()
@@ -2359,11 +2803,15 @@ async fn bootstrap(
     let current_session_id = state.state_store.session_id().to_string();
     let sessions = state
         .state_store
-        .list_sessions(&config.active_persona_scope(), false)
+        .list_local_sessions(&config.active_persona_scope(), false)
         .map_err(ApiError::internal)?
         .iter()
         .map(|overview| session_overview_json(overview, &current_session_id))
         .collect();
+    let persona = persona_identity(
+        &config,
+        &read_prompt_documents(&config, &state.paths).map_err(ApiError::internal)?,
+    );
     let mut response = Json(BootstrapResponse {
         version: env!("CARGO_PKG_VERSION"),
         boot_id: state.boot_id.to_string(),
@@ -2385,6 +2833,7 @@ async fn bootstrap(
         sessions,
         current_session_id,
         runs,
+        persona,
     })
     .into_response();
     response
@@ -2394,7 +2843,7 @@ async fn bootstrap(
 }
 
 async fn get_config(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
@@ -2410,7 +2859,7 @@ async fn get_config(
 }
 
 async fn update_config(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Json(request): Json<UpdateConfigRequest>,
 ) -> std::result::Result<Json<ConfigResponse>, ApiError> {
@@ -2429,23 +2878,29 @@ async fn update_config(
     restore_config_secrets(&mut candidate, &current, &request.secrets)?;
     validate_config_candidate(&candidate)?;
     validate_prompt_documents(&candidate, &request.prompts)?;
-    let prompt_changed = prompt_configuration_changed(&current, &candidate)
-        || prompt_documents_changed(&current_prompts, &request.prompts);
-    if prompt_changed && !request.reset_conversation {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "prompt changes require explicit confirmation to reset the conversation",
-        ));
-    }
-
+    let qq_listener = state
+        .platforms
+        .qq_listener
+        .prepare(&state, Some(&current.platforms.qq), &candidate.platforms.qq)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Tencent QQ listener configuration failed: {}",
+                    safe_error_message(error)
+                ),
+            )
+        })?;
+    let requested_prompts = request.prompts.clone();
     reserve_admin(&state.manager)?;
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
         .send(ActorCommand::ApplyConfig {
-            config: candidate,
+            config: Box::new(candidate),
             prompts: request.prompts,
-            reset_conversation: prompt_changed,
+            reset_conversation: false,
             reply,
         })
         .is_err()
@@ -2457,7 +2912,7 @@ async fn update_config(
         ));
     }
     match receiver.await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => qq_listener.commit(),
         Ok(Err(AdminFailure::Invalid(message))) => {
             return Err(ApiError::new(StatusCode::BAD_REQUEST, message));
         }
@@ -2476,6 +2931,7 @@ async fn update_config(
             ));
         }
     }
+    cleanup_persona_assets(&state.paths, &current_prompts, &requested_prompts);
     let manager = state.manager.lock().unwrap();
     Ok(Json(config_response(
         &manager.config,
@@ -2484,8 +2940,65 @@ async fn update_config(
     )?))
 }
 
+fn cleanup_persona_assets(
+    paths: &MiyuPaths,
+    previous: &PromptDocuments,
+    current: &PromptDocuments,
+) {
+    let directory = paths.config_dir.join("persona-avatars");
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    let referenced = |prompts: &PromptDocuments| {
+        prompts
+            .personas
+            .iter()
+            .flat_map(|document| {
+                [
+                    document.avatar_path.as_deref(),
+                    document.board_image_path.as_deref(),
+                ]
+            })
+            .flatten()
+            .filter(|path| path.starts_with("persona-avatars/"))
+            .map(|path| path.trim_start_matches("persona-avatars/").to_string())
+            .collect::<HashSet<_>>()
+    };
+    let previous = referenced(previous);
+    let current = referenced(current);
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let bytes = name.as_bytes();
+        let managed_name = bytes.len() >= 68
+            && bytes[64] == b'.'
+            && bytes[..64].iter().all(u8::is_ascii_hexdigit)
+            && matches!(&bytes[65..], b"png" | b"jpg" | b"gif" | b"webp" | b"bmp");
+        if !managed_name || current.contains(&name) {
+            continue;
+        }
+        let old_reference = previous.contains(&name);
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
+        if old_reference || stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 async fn image_asset(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(asset_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
@@ -2527,7 +3040,7 @@ async fn image_asset(
 }
 
 async fn events(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Query(query): Query<EventsQuery>,
 ) -> std::result::Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>, ApiError>
@@ -2596,11 +3109,12 @@ fn record_to_sse(record: EventRecord) -> Event {
         .data(record.data)
 }
 
-fn enqueue_running_prompt(
-    state: &WebState,
+pub(crate) fn enqueue_running_prompt(
+    state: &DaemonState,
     store: &StateStore,
     session_id: &str,
     content: &str,
+    attachments: &[crate::state::QueuedPromptAttachment],
 ) -> std::result::Result<(Option<String>, Option<String>, SafeQueuedPrompt), ApiError> {
     let active_run_id = {
         let manager = state.manager.lock().unwrap();
@@ -2613,9 +3127,7 @@ fn enqueue_running_prompt(
         manager.run_in_session(session_id).cloned()
     };
     let prompt_id = random_id("queued", 18);
-    store
-        .recover_stale_turns()
-        .map_err(ApiError::internal)?;
+    store.recover_stale_turns().map_err(ApiError::internal)?;
     let target = store
         .running_turn_queue_target()
         .map_err(ApiError::internal)?
@@ -2632,7 +3144,7 @@ fn enqueue_running_prompt(
         ));
     }
     let prompt = store
-        .enqueue_prompt_for_target(&target, &prompt_id, content, content, &[])
+        .enqueue_prompt_for_target(&target, &prompt_id, content, content, attachments)
         .map_err(ApiError::internal)?;
     // Turns run with per-turn queue identities, so follow-ups always route
     // via the running turn's recorded queue target.
@@ -2643,8 +3155,8 @@ fn enqueue_running_prompt(
     ))
 }
 
-fn publish_queued_prompt(
-    state: &WebState,
+pub(crate) fn publish_queued_prompt(
+    state: &DaemonState,
     run_id: Option<&str>,
     turn_id: Option<&str>,
     prompt: &SafeQueuedPrompt,
@@ -2656,7 +3168,7 @@ fn publish_queued_prompt(
 }
 
 async fn create_turn(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Json(request): Json<CreateTurnRequest>,
 ) -> std::result::Result<Response, ApiError> {
@@ -2676,7 +3188,7 @@ async fn create_turn(
         .map_err(ApiError::internal)?
     {
         let (run_id, turn_id, prompt) =
-            enqueue_running_prompt(&state, &target_store, &session_id, &content)?;
+            enqueue_running_prompt(&state, &target_store, &session_id, &content, &[])?;
         publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &prompt);
         return Ok((
             StatusCode::ACCEPTED,
@@ -2717,6 +3229,7 @@ async fn create_turn(
             mode,
             images: Vec::new(),
             cwd: None,
+            profile: None,
             cancel: cancel_rx,
         })
         .is_err()
@@ -2731,22 +3244,22 @@ async fn create_turn(
 }
 
 async fn queue_prompt(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Json(request): Json<QueuePromptRequest>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
     let content = validate_content(request.content)?;
-    let session_id =
-        resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
+    let session_id = resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
     let store = state.state_store.pinned(&session_id);
-    let (run_id, turn_id, safe) = enqueue_running_prompt(&state, &store, &session_id, &content)?;
+    let (run_id, turn_id, safe) =
+        enqueue_running_prompt(&state, &store, &session_id, &content, &[])?;
     publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &safe);
     Ok((StatusCode::ACCEPTED, Json(safe)).into_response())
 }
 
 async fn remove_queue_prompt(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(prompt_id): Path<String>,
 ) -> std::result::Result<StatusCode, ApiError> {
@@ -2801,14 +3314,17 @@ async fn remove_queue_prompt(
 }
 
 async fn cancel_run(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
     let cancelled = {
         let manager = state.manager.lock().unwrap();
-        manager.active_runs.get(&run_id).map(RunInfo::request_cancel)
+        manager
+            .active_runs
+            .get(&run_id)
+            .map(RunInfo::request_cancel)
     };
     if cancelled.is_none() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "active run not found"));
@@ -2824,7 +3340,7 @@ async fn cancel_run(
 }
 
 async fn answer_question(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(question_id): Path<String>,
     Json(request): Json<AnswerQuestionRequest>,
@@ -2863,7 +3379,7 @@ async fn answer_question(
 }
 
 async fn set_models(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
     Json(request): Json<SetModelsRequest>,
 ) -> std::result::Result<Json<ModelResponse>, ApiError> {
@@ -2912,7 +3428,7 @@ async fn set_models(
 }
 
 async fn reset_conversation(
-    State(state): State<WebState>,
+    State(state): State<DaemonState>,
     headers: HeaderMap,
 ) -> std::result::Result<StatusCode, ApiError> {
     require_mutation(&headers, &state)?;
@@ -2962,53 +3478,55 @@ async fn reset_conversation(
 }
 
 fn spawn_actor(
-    agent: Agent,
     config: AppConfig,
     paths: MiyuPaths,
     state_store: StateStore,
     manager: Arc<Mutex<ManagerState>>,
     events: EventHub,
     questions: QuestionBroker,
+    turn_engine: TurnEngineState,
 ) -> Result<(mpsc::UnboundedSender<ActorCommand>, JoinHandle<Result<()>>)> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let join = std::thread::Builder::new()
-        .name("miyu-web-agent".to_string())
+        .name("miyu-daemon-core".to_string())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .context("building WebUI agent runtime")?;
+                .context("building daemon core runtime")?;
             // Turns are spawned as local tasks so several can run
             // concurrently on this thread (they are IO-bound); LocalSet
             // avoids imposing Send on the agent futures.
             let local = tokio::task::LocalSet::new();
             runtime.block_on(local.run_until(actor_loop(
-                agent,
                 config,
                 paths,
                 state_store,
                 manager,
                 events,
                 questions,
+                turn_engine,
                 receiver,
             )));
             Ok(())
         })
-        .context("starting WebUI agent thread")?;
+        .context("starting daemon core thread")?;
     Ok((sender, join))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn actor_loop(
-    mut agent: Agent,
     mut config: AppConfig,
     paths: MiyuPaths,
     state_store: StateStore,
     manager: Arc<Mutex<ManagerState>>,
     events: EventHub,
     questions: QuestionBroker,
+    turn_engine: TurnEngineState,
     mut receiver: mpsc::UnboundedReceiver<ActorCommand>,
 ) {
+    let mut agent: Option<Agent> = None;
+    let resource_cache = Arc::new(Mutex::new(TurnResourceCache::default()));
     while let Some(command) = receiver.recv().await {
         match command {
             ActorCommand::StartTurn {
@@ -3018,6 +3536,7 @@ async fn actor_loop(
                 mode,
                 images,
                 cwd,
+                profile,
                 cancel,
             } => {
                 // Serial turn-entry maintenance in the scheduler: stale-turn
@@ -3058,7 +3577,10 @@ async fn actor_loop(
                     content,
                     mode,
                     images,
+                    profile,
                     cancel,
+                    resource_cache.clone(),
+                    turn_engine.clone(),
                 );
                 tokio::task::spawn_local(crate::tools::workspace::with_workspace(
                     workspace,
@@ -3074,6 +3596,14 @@ async fn actor_loop(
                     &manager,
                     &models,
                 );
+                if result.is_ok() {
+                    resource_cache.lock().unwrap().clear();
+                    turn_engine.set(if agent.is_some() {
+                        TurnEngineState::READY
+                    } else {
+                        TurnEngineState::COLD
+                    });
+                }
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
@@ -3090,10 +3620,18 @@ async fn actor_loop(
                     &state_store,
                     &manager,
                     &events,
-                    next_config,
+                    *next_config,
                     &prompts,
                     reset_conversation,
                 );
+                if result.is_ok() {
+                    resource_cache.lock().unwrap().clear();
+                    turn_engine.set(if agent.is_some() {
+                        TurnEngineState::READY
+                    } else {
+                        TurnEngineState::COLD
+                    });
+                }
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
@@ -3111,8 +3649,14 @@ async fn actor_loop(
                 let _ = reply.send(result);
             }
             ActorCommand::SwitchSession { session_id, reply } => {
-                let result =
-                    switch_actor_session(&mut agent, &state_store, &manager, &events, &session_id);
+                let result = switch_actor_session(
+                    agent.as_ref(),
+                    &config,
+                    &state_store,
+                    &manager,
+                    &events,
+                    &session_id,
+                );
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
@@ -3135,7 +3679,7 @@ async fn actor_loop(
                     let (removed, prompt) = state_store
                         .undo_last_turn()
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = current_context(&agent)
+                    manager.lock().unwrap().context = actor_context(&agent, &config, &state_store)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     Ok(json!({ "removed": removed, "prompt": prompt }))
                 })();
@@ -3163,7 +3707,7 @@ async fn actor_loop(
                     let memory_config = config.memory_config();
                     archive_and_delete_visible_turns(&state_store, &memory, &selected)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = current_context(&agent)
+                    manager.lock().unwrap().context = actor_context(&agent, &config, &state_store)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     let data = json!({
                         "turns": selected.len(),
@@ -3176,12 +3720,19 @@ async fn actor_loop(
                 let _ = reply.send(result);
             }
             ActorCommand::Compact { reply } => {
-                let result = (|| async {
+                let result = async {
+                    let agent = ensure_actor_agent(
+                        &mut agent,
+                        &config,
+                        &paths,
+                        &state_store,
+                        &turn_engine,
+                    )?;
                     let compact = agent
                         .compact_now(|_| Ok(()))
                         .await
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = current_context(&agent)
+                    manager.lock().unwrap().context = current_context(agent)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     Ok::<Value, AdminFailure>(json!({
                         "compacted": compact.is_some(),
@@ -3191,7 +3742,7 @@ async fn actor_loop(
                             .map(|result| result.usage_estimated)
                             .unwrap_or(false)
                     }))
-                })()
+                }
                 .await;
                 release_admin(&manager);
                 let _ = reply.send(result);
@@ -3210,13 +3761,12 @@ fn trim_process_memory() {
 #[cfg(not(target_os = "linux"))]
 fn trim_process_memory() {}
 
-#[allow(clippy::too_many_arguments)]
 /// Executes one turn as a self-contained task. Multiple turn tasks run
 /// concurrently on the actor's LocalSet — each with its own Agent, a
 /// StateStore pinned to the turn's session, and an independent cancel signal.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_task(
-    config: AppConfig,
+    mut config: AppConfig,
     paths: MiyuPaths,
     store: StateStore,
     base_store: StateStore,
@@ -3228,8 +3778,23 @@ async fn run_turn_task(
     content: String,
     mode: AgentMode,
     images: Vec<Option<ImageAttachment>>,
+    profile: Option<platforms::TurnProfile>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    resource_cache: Arc<Mutex<TurnResourceCache>>,
+    turn_engine: TurnEngineState,
 ) {
+    if let Some(profile) = &profile {
+        if let Some(models) = &profile.text_models {
+            config.active_provider_models = Some(models.clone());
+        }
+        if let Some(models) = &profile.multimodal_models {
+            config.active_multimodal_provider_models = Some(models.clone());
+            // A conversation-specific multimodal pool is an explicit
+            // override of the global vision plugin's single-model choice.
+            config.plugins.vision.vision_provider_id.clear();
+            config.plugins.vision.vision_model.clear();
+        }
+    }
     let manager = &manager;
     let events = &events;
     let questions = &questions;
@@ -3239,32 +3804,79 @@ async fn run_turn_task(
         json!({ "run_id": run_id, "session_id": &*session_id, "mode": mode_name(mode) }),
     );
     let title_seed: String = content.chars().take(80).collect();
+    let warming = !turn_engine.is_ready();
+    if warming {
+        turn_engine.set(TurnEngineState::INITIALIZING);
+    }
     let setup = (|| -> Result<(Agent, AgentTurnControl)> {
-        let normal_tools = build_tool_registry(&config, &paths, AgentMode::Normal, true)?;
-        let plan_tools = build_tool_registry(&config, &paths, AgentMode::Plan, true)?;
-        let chat_tools = build_tool_registry(&config, &paths, AgentMode::Chat, true)?;
+        let platform_context = profile
+            .as_ref()
+            .and_then(|profile| profile.platform.as_deref());
+        let resources = resource_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("turn resource cache is poisoned"))?
+            .get_or_build(&config, &paths)?;
+        let restricted = platform_context.is_some_and(|context| !context.host_tools_allowed());
+        let mut normal_tools = if restricted {
+            resources.restricted_tools.clone()
+        } else {
+            resources.normal_tools.clone()
+        };
+        let mut plan_tools = if restricted {
+            resources.restricted_tools.clone()
+        } else {
+            resources.plan_tools.clone()
+        };
+        let mut chat_tools = if restricted {
+            resources.restricted_tools.clone()
+        } else {
+            resources.chat_tools.clone()
+        };
+        if platform_context.is_none() && config.tools.enabled {
+            tools::register_ask_question(&mut normal_tools);
+            tools::register_ask_question(&mut plan_tools);
+            tools::register_ask_question(&mut chat_tools);
+        }
+        if config.tools.enabled {
+            if let Some(context) = profile
+                .as_ref()
+                .and_then(|profile| profile.platform.clone())
+            {
+                platforms::register_platform_tools(&mut normal_tools, context.clone());
+                platforms::register_platform_tools(&mut plan_tools, context.clone());
+                platforms::register_platform_tools(&mut chat_tools, context);
+            }
+        }
         let active_tools = match mode {
             AgentMode::Normal => normal_tools.clone(),
             AgentMode::Plan => plan_tools.clone(),
             AgentMode::Chat => chat_tools.clone(),
         };
-        let client = OpenAiCompatibleClient::from_config(&config, &paths)?;
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             config.clone(),
             &paths,
             store.clone(),
-            client,
+            resources.client.clone(),
             active_tools,
             mode,
         )?;
+        if let Some(profile) = &profile {
+            agent.set_runtime_system_context(profile.system_context.clone())?;
+        }
         Ok((
             agent,
             AgentTurnControl::new(mode, normal_tools, plan_tools, chat_tools),
         ))
     })();
     let (mut agent, control) = match setup {
-        Ok(setup) => setup,
+        Ok(setup) => {
+            turn_engine.set(TurnEngineState::READY);
+            setup
+        }
         Err(error) => {
+            if warming {
+                turn_engine.set(TurnEngineState::FAILED);
+            }
             questions.cancel_run(run_id);
             finish_run(manager, run_id, None);
             let message = safe_error_message(&error);
@@ -3278,7 +3890,7 @@ async fn run_turn_task(
     };
     // The daemon-wide context snapshot tracks the *current* session; a turn
     // for another session must not overwrite it.
-    let updates_context = || &*base_store.session_id() == &*session_id;
+    let updates_context = || *base_store.session_id() == *session_id;
     let agent = &mut agent;
 
     let mapper = Arc::new(Mutex::new(RunEventMapper::new(
@@ -3497,9 +4109,7 @@ fn spawn_session_title_refinement(
         let result = client
             .chat_stream(
                 vec![
-                    crate::llm::ChatMessage::system(
-                        "你是会话标题生成器，只输出标题本身。",
-                    ),
+                    crate::llm::ChatMessage::system("你是会话标题生成器，只输出标题本身。"),
                     crate::llm::ChatMessage::plain("user", prompt),
                 ],
                 Vec::new(),
@@ -3541,7 +4151,19 @@ fn sanitize_session_title(raw: &str) -> String {
         .trim_matches(|c: char| {
             matches!(
                 c,
-                '"' | '\'' | '“' | '”' | '‘' | '’' | '「' | '」' | '《' | '》' | '。' | '.' | '，' | ','
+                '"' | '\''
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '「'
+                    | '」'
+                    | '《'
+                    | '》'
+                    | '。'
+                    | '.'
+                    | '，'
+                    | ','
             )
         })
         .split_whitespace()
@@ -3550,7 +4172,7 @@ fn sanitize_session_title(raw: &str) -> String {
     cleaned.chars().take(20).collect()
 }
 
-enum TurnOutcome {
+pub(crate) enum TurnOutcome {
     Finished(Result<ChatResult>),
     Cancelled,
 }
@@ -3562,7 +4184,7 @@ enum OverflowOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn rebuild_for_models(
-    agent: &mut Agent,
+    agent: &mut Option<Agent>,
     config: &mut AppConfig,
     paths: &MiyuPaths,
     state_store: &StateStore,
@@ -3576,21 +4198,29 @@ fn rebuild_for_models(
     if next_config.active_provider_models == config.active_provider_models {
         return Ok(());
     }
-    crate::models_cache::try_load_active(paths, &next_config);
-    let client = OpenAiCompatibleClient::from_config(&next_config, paths)
-        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-    let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)
-        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-    let next_agent = Agent::new(
-        next_config.clone(),
-        paths,
-        state_store.clone(),
-        client,
-        registry,
-        AgentMode::Normal,
-    )
-    .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-    let context = current_context(&next_agent)
+    let next_agent = if agent.is_some() {
+        crate::models_cache::ensure_active_metadata(paths, &next_config);
+        let client = OpenAiCompatibleClient::from_config(&next_config, paths)
+            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+        let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)
+            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+        Some(
+            Agent::new(
+                next_config.clone(),
+                paths,
+                state_store.clone(),
+                client,
+                registry,
+                AgentMode::Normal,
+            )
+            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?,
+        )
+    } else {
+        None
+    };
+    let context = next_agent
+        .as_ref()
+        .map_or_else(|| cold_context(&next_config, state_store), current_context)
         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     next_config
         .save(paths)
@@ -3604,8 +4234,42 @@ fn rebuild_for_models(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn session_for_persona(
+    state_store: &StateStore,
+    manager: &Arc<Mutex<ManagerState>>,
+    persona: &str,
+) -> Result<String> {
+    if let Some(session_id) = state_store.persona_current_session(persona)? {
+        if is_available_local_session(state_store, &session_id, persona)? {
+            return Ok(session_id);
+        }
+    }
+    let remembered = manager
+        .lock()
+        .unwrap()
+        .persona_session_ids
+        .get(persona)
+        .cloned();
+    if let Some(session_id) = remembered {
+        if is_available_local_session(state_store, &session_id, persona)? {
+            return Ok(session_id);
+        }
+    }
+    if let Some(overview) = state_store
+        .list_local_sessions(persona, false)?
+        .into_iter()
+        .next()
+    {
+        return Ok(overview.record.session_id);
+    }
+    Ok(state_store
+        .create_session(persona, "", "user", None)?
+        .session_id)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rebuild_for_config(
-    agent: &mut Agent,
+    agent: &mut Option<Agent>,
     config: &mut AppConfig,
     paths: &MiyuPaths,
     state_store: &StateStore,
@@ -3615,11 +4279,32 @@ fn rebuild_for_config(
     prompts: &PromptDocuments,
     reset_conversation: bool,
 ) -> std::result::Result<(), AdminFailure> {
+    let _ = reset_conversation;
     let mut next_config = next_config;
     // Models removed from the text models must leave the tier pools too.
     next_config.prune_subagent_tiers();
     let previous_prompts = read_prompt_documents(config, paths)
         .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+    let previous_scope = config.active_persona_scope();
+    let next_scope = next_config.active_persona_scope();
+    let persona_changed = previous_scope != next_scope;
+    let previous_session_id = state_store.session_id().to_string();
+    let target_session_id = if persona_changed {
+        session_for_persona(state_store, manager, &next_scope)
+            .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?
+    } else {
+        previous_session_id.clone()
+    };
+    if persona_changed {
+        state_store
+            .set_persona_current_session(&previous_scope, &previous_session_id)
+            .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+    }
+    let target_state_store = if persona_changed {
+        state_store.pinned(&target_session_id)
+    } else {
+        state_store.clone()
+    };
     let prompt_backups =
         apply_prompt_documents(config, &next_config, &previous_prompts, prompts, paths)
             .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
@@ -3646,27 +4331,34 @@ fn rebuild_for_config(
     });
 
     let build_agent = || -> Result<Agent> {
-        crate::models_cache::try_load_active(paths, &next_config);
+        crate::models_cache::ensure_active_metadata(paths, &next_config);
         let client = OpenAiCompatibleClient::from_config(&next_config, paths)?;
         let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)?;
         Agent::new(
             next_config.clone(),
             paths,
-            state_store.clone(),
+            target_state_store.clone(),
             client,
             registry,
             AgentMode::Normal,
         )
     };
-    let mut next_agent = match build_agent() {
-        Ok(agent) => agent,
-        Err(error) => {
-            restore_file_backups(&prompt_backups);
-            restore_persona_scope_backups(&scope_backups);
-            return Err(AdminFailure::Invalid(safe_error_message(error)));
+    let next_agent = if agent.is_some() {
+        match build_agent() {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                restore_file_backups(&prompt_backups);
+                restore_persona_scope_backups(&scope_backups);
+                return Err(AdminFailure::Invalid(safe_error_message(error)));
+            }
         }
+    } else {
+        None
     };
-    let mut context = match current_context(&next_agent) {
+    let context = match next_agent.as_ref().map_or_else(
+        || cold_context(&next_config, &target_state_store),
+        current_context,
+    ) {
         Ok(context) => context,
         Err(error) => {
             restore_file_backups(&prompt_backups);
@@ -3684,19 +4376,8 @@ fn rebuild_for_config(
         return Err(AdminFailure::Internal(safe_error_message(error)));
     }
 
-    if reset_conversation {
-        let reset = (|| -> Result<()> {
-            state_store.reset_conversation()?;
-            let memory = MemoryStore::new(&next_config, paths);
-            memory.clear_evicted_context()?;
-            memory.clear_pending_events()?;
-            tools::clear_aur_review_state(paths)?;
-            next_agent.reset_memory()?;
-            next_agent.prepare_for_turn()?;
-            context = current_context(&next_agent)?;
-            Ok(())
-        })();
-        if let Err(error) = reset {
+    if persona_changed {
+        if let Err(error) = state_store.switch_session(&target_session_id) {
             restore_file_backups(&prompt_backups);
             restore_persona_scope_backups(&scope_backups);
             restore_file_backups(std::slice::from_ref(&config_backup));
@@ -3705,16 +4386,31 @@ fn rebuild_for_config(
             }
             return Err(AdminFailure::Internal(safe_error_message(error)));
         }
+        if let Err(error) = state_store.set_persona_current_session(&next_scope, &target_session_id)
+        {
+            return Err(AdminFailure::Internal(safe_error_message(error)));
+        }
     }
 
     *agent = next_agent;
     *config = next_config.clone();
     let mut manager = manager.lock().unwrap();
+    if persona_changed {
+        manager
+            .persona_session_ids
+            .insert(previous_scope, previous_session_id);
+        manager
+            .persona_session_ids
+            .insert(next_scope, target_session_id.clone());
+    }
     manager.config = next_config;
     manager.context = context;
     drop(manager);
-    if reset_conversation {
-        events.publish("conversation.reset", json!({}));
+    if persona_changed {
+        events.publish(
+            "session.current_changed",
+            json!({ "session_id": target_session_id }),
+        );
     }
     finalize_persona_scope_backups(&scope_backups);
     Ok(())
@@ -3767,7 +4463,8 @@ fn session_title_from_prompt(prompt: &str) -> String {
 }
 
 fn switch_actor_session(
-    agent: &mut Agent,
+    agent: Option<&Agent>,
+    config: &AppConfig,
     state_store: &StateStore,
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
@@ -3779,10 +4476,19 @@ fn switch_actor_session(
     // here could wipe a session mid-turn.
     let switch = || -> Result<ContextSnapshot> {
         state_store.switch_session(session_id)?;
-        current_context(agent)
+        agent.map_or_else(|| cold_context(config, state_store), current_context)
     };
     let context = switch().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-    manager.lock().unwrap().context = context;
+    let mut manager_state = manager.lock().unwrap();
+    manager_state.context = context;
+    let persona_scope = manager_state.config.active_persona_scope();
+    manager_state
+        .persona_session_ids
+        .insert(persona_scope.clone(), session_id.to_string());
+    drop(manager_state);
+    state_store
+        .set_persona_current_session(&persona_scope, session_id)
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
     events.publish(
         "session.current_changed",
         json!({ "session_id": session_id }),
@@ -3791,7 +4497,7 @@ fn switch_actor_session(
 }
 
 fn reset_actor_conversation(
-    agent: &mut Agent,
+    agent: &mut Option<Agent>,
     config: &AppConfig,
     paths: &MiyuPaths,
     state_store: &StateStore,
@@ -3809,9 +4515,13 @@ fn reset_actor_conversation(
             memory.clear_pending_events()?;
         }
         tools::clear_aur_review_state(paths)?;
-        agent.reset_memory()?;
-        agent.prepare_for_turn()?;
-        current_context(agent)
+        if let Some(agent) = agent.as_mut() {
+            agent.reset_memory()?;
+            agent.prepare_for_turn()?;
+            current_context(agent)
+        } else {
+            cold_context(config, state_store)
+        }
     };
     let context = reset().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     manager.lock().unwrap().context = context;
@@ -3879,7 +4589,11 @@ fn finish_completed_with_context_error(
     publish_completed(events, run_id, session_id, result, context);
 }
 
-fn finish_run(manager: &Arc<Mutex<ManagerState>>, run_id: &str, context: Option<ContextSnapshot>) {
+pub(crate) fn finish_run(
+    manager: &Arc<Mutex<ManagerState>>,
+    run_id: &str,
+    context: Option<ContextSnapshot>,
+) {
     let mut manager = manager.lock().unwrap();
     if let Some(context) = context {
         manager.context = context;
@@ -3915,6 +4629,63 @@ fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
         tokens: agent.effective_context_tokens()?,
         window: agent.context_window(),
         cumulative_tokens: agent.conversation_usage_tokens()?,
+    })
+}
+
+fn build_actor_agent(config: &AppConfig, paths: &MiyuPaths, state: &StateStore) -> Result<Agent> {
+    crate::models_cache::ensure_active_metadata(paths, config);
+    let client = OpenAiCompatibleClient::from_config(config, paths)?;
+    let registry = build_tool_registry(config, paths, AgentMode::Normal, true)?;
+    let mut agent = Agent::new(
+        config.clone(),
+        paths,
+        state.clone(),
+        client,
+        registry,
+        AgentMode::Normal,
+    )?;
+    agent.prepare_for_turn()?;
+    Ok(agent)
+}
+
+fn ensure_actor_agent<'a>(
+    agent: &'a mut Option<Agent>,
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    state: &StateStore,
+    turn_engine: &TurnEngineState,
+) -> std::result::Result<&'a mut Agent, AdminFailure> {
+    if agent.is_none() {
+        turn_engine.set(TurnEngineState::INITIALIZING);
+        match build_actor_agent(config, paths, state) {
+            Ok(next) => {
+                *agent = Some(next);
+                turn_engine.set(TurnEngineState::READY);
+            }
+            Err(error) => {
+                turn_engine.set(TurnEngineState::FAILED);
+                return Err(AdminFailure::Internal(safe_error_message(error)));
+            }
+        }
+    }
+    Ok(agent.as_mut().expect("actor agent was initialized"))
+}
+
+fn actor_context(
+    agent: &Option<Agent>,
+    config: &AppConfig,
+    state: &StateStore,
+) -> Result<ContextSnapshot> {
+    agent
+        .as_ref()
+        .map_or_else(|| cold_context(config, state), current_context)
+}
+
+fn cold_context(config: &AppConfig, state_store: &StateStore) -> Result<ContextSnapshot> {
+    Ok(ContextSnapshot {
+        tokens: 0,
+        window: config.active_context_window()?,
+        cumulative_tokens: state_store.usage_snapshot()?.conversation_tokens,
     })
 }
 
@@ -4040,10 +4811,10 @@ fn config_response(
     );
     redacted.plugins.exchange_rate.api_key.clear();
     secret_states.insert(
-        "platforms.onebot.access_token".to_string(),
-        !redacted.platforms.onebot.access_token.trim().is_empty(),
+        "platforms.qq.access_token".to_string(),
+        !redacted.platforms.qq.access_token.trim().is_empty(),
     );
-    redacted.platforms.onebot.access_token.clear();
+    redacted.platforms.qq.access_token.clear();
     redact_secret_list(
         &mut secret_states,
         "plugins.image_generation.api_keys",
@@ -4057,6 +4828,7 @@ fn config_response(
         );
     }
     let prompts = read_prompt_documents(config, paths).map_err(ApiError::internal)?;
+    let persona = persona_identity(config, &prompts);
     Ok(ConfigResponse {
         config: config_value,
         secret_states,
@@ -4065,6 +4837,107 @@ fn config_response(
         multimodal_models: safe_multimodal_models(config),
         display: web_display_config(config),
         context,
+        persona,
+    })
+}
+
+fn persona_identity(config: &AppConfig, prompts: &PromptDocuments) -> PersonaIdentity {
+    let active = config.prompt.active_persona.trim();
+    if active.is_empty() {
+        return PersonaIdentity {
+            name: "Miyu".to_string(),
+            avatar_url: Some("/assets/miyu-logo.png".to_string()),
+            board_image_url: Some("/assets/miyuwallpaper.png".to_string()),
+            board_title: DEFAULT_BOARD_TITLE.to_string(),
+            board_subtitle: DEFAULT_BOARD_SUBTITLE.to_string(),
+            starter_prompts: DEFAULT_STARTER_PROMPTS.map(str::to_string).to_vec(),
+        };
+    }
+    let document = prompts
+        .personas
+        .iter()
+        .find(|document| document.name == active);
+    let avatar_url = document
+        .and_then(|document| document.avatar_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|_| Some("/api/persona/avatar".to_string()));
+    let board_image_url = if document
+        .and_then(|document| document.board_image_path.as_deref())
+        .is_some_and(|path| !path.trim().is_empty())
+    {
+        Some("/api/persona/avatar?board=1".to_string())
+    } else {
+        None
+    };
+    let board_title = document
+        .and_then(|document| document.board_title.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_BOARD_TITLE)
+        .to_string();
+    let board_subtitle = document
+        .and_then(|document| document.board_subtitle.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_BOARD_SUBTITLE)
+        .to_string();
+    let configured_prompts = document.and_then(|document| document.starter_prompts.as_deref());
+    let starter_prompts = DEFAULT_STARTER_PROMPTS
+        .iter()
+        .enumerate()
+        .map(|(index, fallback)| {
+            configured_prompts
+                .and_then(|values| values.get(index))
+                .filter(|value| !value.trim().is_empty())
+                .map_or_else(|| (*fallback).to_string(), Clone::clone)
+        })
+        .collect();
+    PersonaIdentity {
+        name: active.strip_suffix(".md").unwrap_or(active).to_string(),
+        avatar_url,
+        board_image_url,
+        board_title,
+        board_subtitle,
+        starter_prompts,
+    }
+}
+
+fn active_persona_avatar_path(
+    config: &AppConfig,
+    prompts: &PromptDocuments,
+    paths: &MiyuPaths,
+) -> Option<PathBuf> {
+    let active = config.prompt.active_persona.trim();
+    if active.is_empty() {
+        return None;
+    }
+    let value = prompts
+        .personas
+        .iter()
+        .find(|document| document.name == active)
+        .and_then(|document| document.avatar_path.as_deref())?;
+    let path = PathBuf::from(value.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        paths.config_dir.join(path)
+    })
+}
+
+fn active_persona_board_path(
+    config: &AppConfig,
+    prompts: &PromptDocuments,
+    paths: &MiyuPaths,
+) -> Option<PathBuf> {
+    let active = config.prompt.active_persona.trim();
+    let value = prompts
+        .personas
+        .iter()
+        .find(|document| document.name == active)
+        .and_then(|document| document.board_image_path.as_deref())?;
+    let path = PathBuf::from(value.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        paths.config_dir.join(path)
     })
 }
 
@@ -4144,14 +5017,14 @@ fn restore_config_secrets(
         None => current.plugins.exchange_rate.api_key.clone(),
     };
 
-    let onebot_token_key = "platforms.onebot.access_token";
+    let onebot_token_key = "platforms.qq.access_token";
     recognized.insert(onebot_token_key.to_string());
-    candidate.platforms.onebot.access_token = match mutations.get(onebot_token_key) {
+    candidate.platforms.qq.access_token = match mutations.get(onebot_token_key) {
         Some(SecretMutation::Set(value)) => {
             normalize_single_secret(value, onebot_token_key)?.unwrap_or_default()
         }
         Some(SecretMutation::Clear) => String::new(),
-        None => current.platforms.onebot.access_token.clone(),
+        None => current.platforms.qq.access_token.clone(),
     };
 
     if let Some(key) = mutations.keys().find(|key| !recognized.contains(*key)) {
@@ -4240,7 +5113,7 @@ fn validate_config_candidate(config: &AppConfig) -> std::result::Result<(), ApiE
             .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, safe_error_message(error)))?;
     }
     if let Some(active) = &config.active_multimodal_provider_models {
-        let choices = config.provider_model_choices();
+        let choices = config.multimodal_provider_model_choices();
         let mut seen = HashSet::with_capacity(active.len());
         for model in active {
             if !seen.insert((&model.provider_id, &model.model))
@@ -4320,6 +5193,44 @@ fn validate_prompt_document_list(
                 format!("{kind} document is too large: {}", document.name),
             ));
         }
+        for (field, value) in [
+            ("avatar", document.avatar_path.as_deref()),
+            ("board image", document.board_image_path.as_deref()),
+        ] {
+            if value.is_some_and(|path| {
+                path.len() > 4_096 || path.contains('\0') || path.trim() != path
+            }) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid {kind} {field} path: {}", document.name),
+                ));
+            }
+        }
+        for (field, value) in [
+            ("board title", document.board_title.as_deref()),
+            ("board subtitle", document.board_subtitle.as_deref()),
+        ] {
+            if value.is_some_and(|text| {
+                text.chars().count() > 200 || text.chars().any(char::is_control)
+            }) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid {kind} {field}: {}", document.name),
+                ));
+            }
+        }
+        if let Some(prompts) = document.starter_prompts.as_deref() {
+            if prompts.len() > 4
+                || prompts
+                    .iter()
+                    .any(|text| text.chars().count() > 200 || text.chars().any(char::is_control))
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid {kind} starter prompts: {}", document.name),
+                ));
+            }
+        }
         if let Some(original) = document.original_name.as_deref() {
             validate_prompt_document_name(original, kind)?;
             if !original_names.insert(original) {
@@ -4356,12 +5267,15 @@ fn validate_prompt_document_name(name: &str, kind: &str) -> std::result::Result<
 
 fn read_prompt_documents(config: &AppConfig, paths: &MiyuPaths) -> Result<PromptDocuments> {
     Ok(PromptDocuments {
-        personas: read_prompt_document_dir(&config.prompts_dir_path(paths))?,
-        identities: read_prompt_document_dir(&config.identities_dir_path(paths))?,
+        personas: read_prompt_document_dir(&config.prompts_dir_path(paths), true)?,
+        identities: read_prompt_document_dir(&config.identities_dir_path(paths), false)?,
     })
 }
 
-fn read_prompt_document_dir(dir: &FilePath) -> Result<Vec<PromptDocument>> {
+fn read_prompt_document_dir(
+    dir: &FilePath,
+    with_avatar_metadata: bool,
+) -> Result<Vec<PromptDocument>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -4376,14 +5290,29 @@ fn read_prompt_document_dir(dir: &FilePath) -> Result<Vec<PromptDocument>> {
             continue;
         }
         let content = std::fs::read_to_string(entry.path())?;
+        let metadata = with_avatar_metadata
+            .then(|| read_prompt_metadata(&entry.path()))
+            .flatten()
+            .unwrap_or_default();
         documents.push(PromptDocument {
             original_name: Some(name.clone()),
             name,
             content,
+            avatar_path: metadata.avatar_path,
+            board_image_path: metadata.board_image_path,
+            board_title: metadata.board_title,
+            board_subtitle: metadata.board_subtitle,
+            starter_prompts: metadata.starter_prompts,
         });
     }
     documents.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(documents)
+}
+
+fn read_prompt_metadata(path: &FilePath) -> Option<PersonaMetadata> {
+    let sidecar = path.with_extension("json");
+    let raw = std::fs::read_to_string(sidecar).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn prompt_configuration_changed(current: &AppConfig, candidate: &AppConfig) -> bool {
@@ -4432,6 +5361,7 @@ fn apply_prompt_documents(
         &current_config.prompts_dir_path(paths),
         &next_config.prompts_dir_path(paths),
         &mut mutations,
+        true,
     );
     collect_prompt_file_mutations(
         &current.identities,
@@ -4439,6 +5369,7 @@ fn apply_prompt_documents(
         &current_config.identities_dir_path(paths),
         &next_config.identities_dir_path(paths),
         &mut mutations,
+        false,
     );
     let backups = mutations
         .keys()
@@ -4584,6 +5515,7 @@ fn collect_prompt_file_mutations(
     current_dir: &FilePath,
     next_dir: &FilePath,
     mutations: &mut HashMap<PathBuf, Option<Vec<u8>>>,
+    with_avatar_metadata: bool,
 ) {
     for document in next {
         let content = document.content.trim_end();
@@ -4593,6 +5525,56 @@ fn collect_prompt_file_mutations(
             format!("{content}\n").into_bytes()
         };
         mutations.insert(next_dir.join(&document.name), Some(content));
+        if with_avatar_metadata {
+            let metadata_path = next_dir.join(&document.name).with_extension("json");
+            let metadata = PersonaMetadata {
+                avatar_path: document
+                    .avatar_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string),
+                board_image_path: document
+                    .board_image_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string),
+                board_title: document
+                    .board_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                board_subtitle: document
+                    .board_subtitle
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                starter_prompts: document.starter_prompts.clone(),
+            };
+            let metadata = if metadata.avatar_path.is_none()
+                && metadata.board_image_path.is_none()
+                && metadata.board_title.is_none()
+                && metadata.board_subtitle.is_none()
+                && metadata.starter_prompts.is_none()
+            {
+                None
+            } else {
+                Some(
+                    serde_json::to_vec_pretty(&metadata)
+                        .expect("serializing persona metadata cannot fail"),
+                )
+            };
+            mutations.insert(
+                metadata_path,
+                metadata.map(|mut bytes| {
+                    bytes.push(b'\n');
+                    bytes
+                }),
+            );
+        }
     }
     for document in current {
         let represented = next.iter().find(|next_document| {
@@ -4605,6 +5587,11 @@ fn collect_prompt_file_mutations(
             .unwrap_or(false);
         if !retained_at_same_path {
             mutations.entry(old_path).or_insert(None);
+            if with_avatar_metadata {
+                mutations
+                    .entry(current_dir.join(&document.name).with_extension("json"))
+                    .or_insert(None);
+            }
         }
     }
 }
@@ -4810,7 +5797,7 @@ fn normalize_answers(
     Ok(answers)
 }
 
-fn validate_content(content: String) -> std::result::Result<String, ApiError> {
+pub(crate) fn validate_content(content: String) -> std::result::Result<String, ApiError> {
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err(ApiError::new(
@@ -4918,7 +5905,7 @@ fn real_tool_name(event_name: &str) -> &str {
     }
 }
 
-fn require_auth(headers: &HeaderMap, state: &WebState) -> std::result::Result<(), ApiError> {
+fn require_auth(headers: &HeaderMap, state: &DaemonState) -> std::result::Result<(), ApiError> {
     if state
         .auth
         .is_authenticated(cookie_value(headers, AUTH_COOKIE))
@@ -4932,7 +5919,7 @@ fn require_auth(headers: &HeaderMap, state: &WebState) -> std::result::Result<()
     }
 }
 
-fn require_mutation(headers: &HeaderMap, state: &WebState) -> std::result::Result<(), ApiError> {
+fn require_mutation(headers: &HeaderMap, state: &DaemonState) -> std::result::Result<(), ApiError> {
     require_auth(headers, state)?;
     if origin_is_allowed(headers) {
         Ok(())
@@ -4993,11 +5980,11 @@ fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(buffer)
 }
 
-fn random_id(prefix: &str, bytes: usize) -> String {
+pub(crate) fn random_id(prefix: &str, bytes: usize) -> String {
     format!("{prefix}_{}", random_token(bytes))
 }
 
-fn safe_error_message(error: impl std::fmt::Display) -> String {
+pub(crate) fn safe_error_message(error: impl std::fmt::Display) -> String {
     let message = error
         .to_string()
         .chars()
@@ -5019,6 +6006,158 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::question::{QuestionOption, QuestionPrompt};
+    use crate::state::PlatformSessionBindingKey;
+
+    fn test_paths(root: &FilePath) -> MiyuPaths {
+        MiyuPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.jsonc"),
+            skills_dir: root.join("config/skills"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            pictures_dir: root.join("pictures"),
+            fish_hook_file: root.join("fish"),
+            bash_hook_file: root.join("bash"),
+            zsh_hook_file: root.join("zsh"),
+            scripts_dir: root.join("scripts"),
+            system_scripts_dir: root.join("system-scripts"),
+        }
+    }
+
+    #[test]
+    fn startup_repairs_a_platform_owned_current_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let qq_session = store
+            .create_session("miyu", "QQ group 20000", "user", None)
+            .unwrap();
+        store
+            .bind_platform_session(
+                &PlatformSessionBindingKey {
+                    platform: "onebot".to_string(),
+                    account_id: "10000".to_string(),
+                    conversation_kind: "group".to_string(),
+                    conversation_id: "20000".to_string(),
+                    participant_id: None,
+                    persona: "miyu".to_string(),
+                },
+                &qq_session.session_id,
+            )
+            .unwrap();
+        store.switch_session(&qq_session.session_id).unwrap();
+
+        ensure_local_current_session(&store, "miyu").unwrap();
+
+        let repaired = store.session_id();
+        assert_ne!(&*repaired, qq_session.session_id);
+        assert!(!store.is_platform_session(&repaired).unwrap());
+        assert_eq!(
+            store.session_record(&repaired).unwrap().unwrap().persona,
+            "miyu"
+        );
+    }
+
+    #[test]
+    fn actor_commands_keep_large_configuration_off_the_inline_queue_item() {
+        assert!(std::mem::size_of::<ActorCommand>() <= 512);
+    }
+
+    #[test]
+    fn prompt_sidecar_reads_avatar_path_without_touching_prompt_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = temp.path().join("Alice.md");
+        std::fs::write(&prompt, "You are Alice.\n").unwrap();
+        std::fs::write(
+            temp.path().join("Alice.json"),
+            r#"{"avatar_path":"avatars/alice.png","board_image_path":"persona-avatars/board.png","board_title":"欢迎","board_subtitle":"从这里开始","starter_prompts":["天气","问题"]}"#,
+        )
+        .unwrap();
+
+        let documents = read_prompt_document_dir(temp.path(), true).unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].name, "Alice.md");
+        assert_eq!(documents[0].content, "You are Alice.\n");
+        assert_eq!(
+            documents[0].avatar_path.as_deref(),
+            Some("avatars/alice.png")
+        );
+        assert_eq!(
+            documents[0].board_image_path.as_deref(),
+            Some("persona-avatars/board.png")
+        );
+        assert_eq!(documents[0].board_title.as_deref(), Some("欢迎"));
+        assert_eq!(documents[0].starter_prompts.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn malformed_prompt_sidecar_falls_back_to_no_avatar() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Alice.md"), "prompt").unwrap();
+        std::fs::write(temp.path().join("Alice.json"), "not json").unwrap();
+
+        let documents = read_prompt_document_dir(temp.path(), true).unwrap();
+        assert_eq!(documents[0].avatar_path, None);
+    }
+
+    #[test]
+    fn persona_file_mutations_include_avatar_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut mutations = HashMap::new();
+        let documents = vec![PromptDocument {
+            name: "Alice.md".to_string(),
+            content: "prompt".to_string(),
+            avatar_path: Some("avatars/alice.png".to_string()),
+            board_image_path: None,
+            board_title: None,
+            board_subtitle: None,
+            starter_prompts: None,
+            original_name: None,
+        }];
+        collect_prompt_file_mutations(
+            &[],
+            &documents,
+            temp.path(),
+            temp.path(),
+            &mut mutations,
+            true,
+        );
+
+        let metadata = mutations
+            .get(&temp.path().join("Alice.json"))
+            .and_then(Option::as_deref)
+            .unwrap();
+        let metadata: Value = serde_json::from_slice(metadata).unwrap();
+        assert_eq!(metadata["avatar_path"], "avatars/alice.png");
+    }
+
+    #[test]
+    fn persona_identity_uses_default_and_custom_values() {
+        let mut config = AppConfig::default();
+        let prompts = PromptDocuments::default();
+        let default = persona_identity(&config, &prompts);
+        assert_eq!(default.name, "Miyu");
+        assert_eq!(default.avatar_url.as_deref(), Some("/assets/miyu-logo.png"));
+
+        config.prompt.active_persona = "Alice.md".to_string();
+        let prompts = PromptDocuments {
+            personas: vec![PromptDocument {
+                name: "Alice.md".to_string(),
+                content: "prompt".to_string(),
+                avatar_path: Some("avatars/alice.png".to_string()),
+                board_image_path: None,
+                board_title: None,
+                board_subtitle: None,
+                starter_prompts: None,
+                original_name: None,
+            }],
+            identities: Vec::new(),
+        };
+        let custom = persona_identity(&config, &prompts);
+        assert_eq!(custom.name, "Alice");
+        assert_eq!(custom.avatar_url.as_deref(), Some("/api/persona/avatar"));
+    }
 
     #[test]
     fn sanitize_session_title_cleans_llm_output() {
@@ -5036,10 +6175,7 @@ mod tests {
 
     fn manager_with_run(
         run_id: &str,
-    ) -> (
-        Arc<Mutex<ManagerState>>,
-        tokio::sync::watch::Receiver<bool>,
-    ) {
+    ) -> (Arc<Mutex<ManagerState>>, tokio::sync::watch::Receiver<bool>) {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let manager = Arc::new(Mutex::new(ManagerState {
             config: AppConfig::default(),
@@ -5057,6 +6193,7 @@ mod tests {
                 window: None,
                 cumulative_tokens: 0,
             },
+            persona_session_ids: HashMap::new(),
         }));
         (manager, cancel_rx)
     }

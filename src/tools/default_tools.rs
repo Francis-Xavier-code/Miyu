@@ -603,8 +603,11 @@ async fn read_command_output(
     }
     if truncated {
         output.extend_from_slice(
-            crate::i18n::text("\n[output truncated at the 8MB cap]", "\n[输出超出 8MB 上限，已截断]")
-                .as_bytes(),
+            crate::i18n::text(
+                "\n[output truncated at the 8MB cap]",
+                "\n[输出超出 8MB 上限，已截断]",
+            )
+            .as_bytes(),
         );
     }
     Ok(output)

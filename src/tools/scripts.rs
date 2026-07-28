@@ -543,19 +543,17 @@ async fn run_script(
     // without bounds, so a runaway script could exhaust memory.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let (status, stdout_bytes, stderr_bytes) = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        async {
+    let (status, stdout_bytes, stderr_bytes) =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
             let (stdout_bytes, stderr_bytes, status) = tokio::join!(
                 read_capped_stream(stdout_pipe),
                 read_capped_stream(stderr_pipe),
                 child.wait(),
             );
             status.map(|status| (status, stdout_bytes, stderr_bytes))
-        },
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("script timed out after {timeout_secs}s"))??;
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("script timed out after {timeout_secs}s"))??;
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);

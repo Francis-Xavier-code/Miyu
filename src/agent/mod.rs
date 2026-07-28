@@ -17,7 +17,7 @@ use crate::question::{
 use crate::render::wait_spinner::SPINNER_INTERVAL;
 use crate::state::{QueuedPrompt, QueuedPromptAttachment, StateStore};
 use crate::tools::{self, memes, vision, ToolPermission, ToolRegistry};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Local;
 use serde_json::Value;
@@ -256,6 +256,9 @@ pub struct Agent {
     state: StateStore,
     client: OpenAiCompatibleClient,
     system_prompt: String,
+    /// Per-run system additions supplied by a transport/plugin. They are
+    /// intentionally excluded from prompt-change hashing and persistence.
+    runtime_system_context: Vec<String>,
     trim_at_ratio: f32,
     trim_batch_ratio: f32,
     tools_enabled: bool,
@@ -305,6 +308,7 @@ impl Agent {
             state,
             client,
             system_prompt,
+            runtime_system_context: Vec::new(),
             trim_at_ratio: config.context.trim_at_ratio,
             trim_batch_ratio: config.context.trim_batch_ratio,
             tools_enabled,
@@ -324,8 +328,20 @@ impl Agent {
             self.state.reset_if_prompt_changed(&base_system_prompt)?;
             self.state.recover_stale_turns()?;
         }
-        self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
+        self.system_prompt = with_runtime_system_context(
+            with_mode_reminder(base_system_prompt, self.mode),
+            &self.runtime_system_context,
+        );
         Ok(())
+    }
+
+    pub fn set_runtime_system_context(&mut self, context: Vec<String>) -> Result<()> {
+        self.runtime_system_context = context
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        self.refresh_system_prompt()
     }
 
     /// Runs a batch's `task` tool calls concurrently, in waves bounded by
@@ -380,8 +396,7 @@ impl Agent {
                 let tools = self.tools.lock().unwrap();
                 for &call_index in wave {
                     let call = &calls[call_index];
-                    let event_name =
-                        tool_event_name(&call.function.name, &call.function.arguments);
+                    let event_name = tool_event_name(&call.function.name, &call.function.arguments);
                     on_event(AgentEvent::ToolCall {
                         name: event_name.clone(),
                         arguments: call.function.arguments.clone(),
@@ -405,10 +420,13 @@ impl Agent {
                                 ok: false,
                                 output: output.clone(),
                             })?;
-                            outputs.insert(call_index, GroupTaskOutput {
-                                output,
-                                report: None,
-                            });
+                            outputs.insert(
+                                call_index,
+                                GroupTaskOutput {
+                                    output,
+                                    report: None,
+                                },
+                            );
                         }
                     }
                 }
@@ -475,10 +493,13 @@ impl Agent {
                                     ok: false,
                                     output: output.clone(),
                                 })?;
-                                outputs.insert(call_index, GroupTaskOutput {
-                                    output,
-                                    report: None,
-                                });
+                                outputs.insert(
+                                    call_index,
+                                    GroupTaskOutput {
+                                        output,
+                                        report: None,
+                                    },
+                                );
                             }
                         }
                     }
@@ -494,7 +515,10 @@ impl Agent {
     /// turn that is running).
     fn refresh_system_prompt(&mut self) -> Result<()> {
         let base_system_prompt = self.config.system_prompt(&self.paths)?;
-        self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
+        self.system_prompt = with_runtime_system_context(
+            with_mode_reminder(base_system_prompt, self.mode),
+            &self.runtime_system_context,
+        );
         Ok(())
     }
 
@@ -829,14 +853,15 @@ impl Agent {
             .filter_map(|path| path.clone())
             .collect::<Vec<_>>();
         let input = rewrite_image_placeholders_with_paths(&input, &absolute_image_paths);
-        let content = if !binary_images.is_empty() && !self.current_model_supports_vision() {
+        let current_model_supports_vision = self.current_model_supports_vision();
+        let content = if !binary_images.is_empty() && !current_model_supports_vision {
             self.describe_images_with_vision_provider(&input, &binary_images)
                 .await?
         } else {
             input
         };
 
-        let message = if !binary_images.is_empty() && self.current_model_supports_vision() {
+        let message = if !binary_images.is_empty() && current_model_supports_vision {
             let mut parts = vec![ChatContentPart::Text {
                 text: content.clone(),
             }];
@@ -1044,14 +1069,7 @@ impl Agent {
     }
 
     fn current_model_supports_vision(&self) -> bool {
-        let provider = match self.config.provider(None) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        match provider.supports_vision(&provider.default_model) {
-            Some(true) => true,
-            _ => false,
-        }
+        should_use_active_text_pool_for_images(&self.config)
     }
 
     async fn describe_images_with_vision_provider(
@@ -1063,6 +1081,11 @@ impl Agent {
         if !vision_cfg.enabled {
             return Ok(input.to_string());
         }
+        let strict_pool = self
+            .config
+            .active_multimodal_provider_models
+            .as_ref()
+            .is_some_and(|pool| !pool.is_empty());
         let mut descriptions = Vec::new();
         for (i, img) in images.iter().enumerate() {
             let prompt = if input.trim().is_empty() {
@@ -1081,8 +1104,16 @@ impl Agent {
                 Ok(desc) => {
                     descriptions.push(format!("[Image {} 的描述]\n{}", i + 1, desc.trim()));
                 }
-                Err(e) => {
-                    descriptions.push(format!("[Image {} 识图失败: {}]", i + 1, e));
+                Err(error) if strict_pool => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "configured multimodal model pool failed for image {}",
+                            i + 1
+                        )
+                    });
+                }
+                Err(error) => {
+                    descriptions.push(format!("[Image {} 识图失败: {}]", i + 1, error));
                 }
             }
         }
@@ -1256,14 +1287,13 @@ impl Agent {
             let defer_sibling_tools = question_call_count == 1 && result.tool_calls.len() > 1;
             // Multiple `task` calls in one batch run concurrently (subagents
             // are independent by design); everything else stays serial.
-            let mut parallel_task_outputs = if defer_sibling_tools
-                || matches!(self.mode, AgentMode::Plan | AgentMode::Chat)
-            {
-                std::collections::HashMap::new()
-            } else {
-                self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
-                    .await?
-            };
+            let mut parallel_task_outputs =
+                if defer_sibling_tools || matches!(self.mode, AgentMode::Plan | AgentMode::Chat) {
+                    std::collections::HashMap::new()
+                } else {
+                    self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
+                        .await?
+                };
             for (call_index, call) in result.tool_calls.into_iter().enumerate() {
                 if let Some(group_output) = parallel_task_outputs.remove(&call_index) {
                     // Executed in the parallel group; events already emitted.
@@ -2391,6 +2421,31 @@ fn with_mode_reminder(system_prompt: String, mode: AgentMode) -> String {
     prompt
 }
 
+fn with_runtime_system_context(mut system_prompt: String, context: &[String]) -> String {
+    for item in context
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !item.is_empty())
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(item);
+    }
+    system_prompt
+}
+
+fn active_text_pool_supports_vision(config: &AppConfig) -> bool {
+    let choices = config.active_provider_model_choices();
+    !choices.is_empty()
+        && choices.iter().all(|choice| {
+            config.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+        })
+}
+
+fn should_use_active_text_pool_for_images(config: &AppConfig) -> bool {
+    config.plugins.vision.prefer_current_multimodal_model
+        && active_text_pool_supports_vision(config)
+}
+
 #[derive(Default)]
 struct ReasoningTitleFilter {
     pending: String,
@@ -2706,7 +2761,7 @@ fn strip_tagged_sections(mut text: String, tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, ProviderConfig};
+    use crate::config::{ActiveProviderModelConfig, AppConfig, ProviderConfig};
     use crate::paths::MiyuPaths;
     use crate::tools::{empty_parameters, ToolSpec};
     use std::path::PathBuf;
@@ -3111,6 +3166,80 @@ mod tests {
     }
 
     #[test]
+    fn runtime_system_context_refreshes_the_effective_prompt_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        agent
+            .set_runtime_system_context(vec!["  platform-only notice  ".to_string()])
+            .unwrap();
+        assert!(agent.system_prompt.contains("platform-only notice"));
+        assert_eq!(
+            agent.runtime_system_context,
+            vec!["platform-only notice".to_string()]
+        );
+    }
+
+    #[test]
+    fn vision_support_requires_every_effective_text_pool_model() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        provider.default_model = "vision-model".to_string();
+        provider.models = vec!["vision-model".to_string(), "text-model".to_string()];
+        provider.model_modalities.insert(
+            "vision-model".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        provider
+            .model_modalities
+            .insert("text-model".to_string(), vec!["text".to_string()]);
+        let provider_id = provider.id.clone();
+
+        config.active_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "vision-model".to_string(),
+        }]);
+        assert!(active_text_pool_supports_vision(&config));
+
+        config
+            .active_provider_models
+            .as_mut()
+            .unwrap()
+            .push(ActiveProviderModelConfig {
+                provider_id,
+                model: "text-model".to_string(),
+            });
+        assert!(!active_text_pool_supports_vision(&config));
+    }
+
+    #[test]
+    fn vision_preference_controls_direct_image_delivery_to_the_text_pool() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        provider.model_modalities.insert(
+            provider.default_model.clone(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+
+        assert!(should_use_active_text_pool_for_images(&config));
+        config.plugins.vision.prefer_current_multimodal_model = false;
+        assert!(!should_use_active_text_pool_for_images(&config));
+    }
+
+    #[test]
     fn effective_context_tokens_include_tool_definitions() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
@@ -3239,7 +3368,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 Ok(format!(
                     "done:{}",
-                    args.get("n").and_then(serde_json::Value::as_str).unwrap_or("?")
+                    args.get("n")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
                 ))
             },
         ));

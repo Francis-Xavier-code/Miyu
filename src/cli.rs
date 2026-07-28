@@ -29,8 +29,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::ffi::OsString;
 use std::io::Cursor;
-use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -543,7 +543,12 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Show, bind, or unbind the session workspace",
             "查看、绑定或解绑会话工作目录",
         ),
-        ("web", "Start the local Miyu WebUI", "启动本地 Miyu WebUI"),
+        ("web", "Open the local Miyu WebUI", "访问本地 Miyu WebUI"),
+        (
+            "daemon",
+            "Manage the unified Miyu background service",
+            "管理 Miyu 统一后台服务",
+        ),
     ];
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
@@ -559,7 +564,8 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         .mut_subcommand("skills", localize_skills_command)
         .mut_subcommand("config", localize_config_command)
         .mut_subcommand("reset", localize_reset_command)
-        .mut_subcommand("web", localize_web_command);
+        .mut_subcommand("web", localize_web_command)
+        .mut_subcommand("daemon", localize_daemon_command);
     command
 }
 
@@ -640,6 +646,43 @@ fn localize_web_command(command: clap::Command) -> clap::Command {
                 "从文件读取 WebUI 访问密码",
             ))
         })
+}
+
+fn localize_daemon_command(mut command: clap::Command) -> clap::Command {
+    let descriptions = [
+        (
+            "start",
+            "Start all configured Miyu interfaces",
+            "启动所有已配置的 Miyu 接口",
+        ),
+        (
+            "stop",
+            "Stop the Miyu background service",
+            "停止 Miyu 后台服务",
+        ),
+        (
+            "restart",
+            "Restart the Miyu background service",
+            "重启 Miyu 后台服务",
+        ),
+        (
+            "status",
+            "Show daemon and interface status",
+            "显示 daemon 与接口状态",
+        ),
+        ("logs", "Follow daemon logs", "持续查看 daemon 日志"),
+    ];
+    for (name, en, zh) in descriptions {
+        command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
+    }
+    command.mut_subcommand("logs", |subcommand| {
+        subcommand.mut_arg("lines", |arg| {
+            arg.help(t(
+                "Print only the most recent N lines and exit",
+                "仅输出最近 N 行后退出",
+            ))
+        })
+    })
 }
 
 fn localize_kb_command(mut command: clap::Command) -> clap::Command {
@@ -763,7 +806,7 @@ pub enum Command {
     /// Internal: run as the Miyu daemon (spawned by the CLI via
     /// `current_exe`, replacing the former separate `miyud` binary).
     #[command(name = "__daemon", hide = true)]
-    Daemon(WebArgs),
+    DaemonWorker(WebArgs),
     Ask(MessageArgs),
     Init,
     Paths,
@@ -788,6 +831,7 @@ pub enum Command {
     Delete(SessionTargetArgs),
     Workspace(WorkspaceArgs),
     Web(WebArgs),
+    Daemon(DaemonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -823,11 +867,7 @@ pub struct ResetArgs {
 
 #[derive(Args)]
 pub struct WebArgs {
-    /// stop | status | restart（缺省为启动 daemon）
-    #[arg(value_enum)]
-    pub action: Option<WebAction>,
-
-    #[arg(long, default_value_t = 8300)]
+    #[arg(long, default_value_t = ipc::DEFAULT_WEB_PORT)]
     pub port: u16,
 
     #[arg(short = 'p', long, num_args = 0..=1, default_missing_value = "")]
@@ -836,26 +876,29 @@ pub struct WebArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
-    /// 兼容旧写法，等价于 `miyu web stop`
-    #[arg(long, hide = true, conflicts_with = "status")]
-    pub stop: bool,
-
-    /// 兼容旧写法，等价于 `miyu web status`
-    #[arg(long, hide = true, conflicts_with = "stop")]
-    pub status: bool,
-
     #[arg(long)]
     pub public: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum WebAction {
-    /// 停止 daemon
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    Start,
     Stop,
-    /// 查看 daemon 状态
-    Status,
-    /// 重启 daemon（按本次参数重新启动）
     Restart,
+    Status,
+    Logs(DaemonLogsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonLogsArgs {
+    #[arg(short = 'n', long, value_name = "N")]
+    pub lines: Option<usize>,
 }
 
 impl std::fmt::Debug for WebArgs {
@@ -865,8 +908,6 @@ impl std::fmt::Debug for WebArgs {
             .field("port", &self.port)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("password_file", &self.password_file)
-            .field("stop", &self.stop)
-            .field("status", &self.status)
             .field("public", &self.public)
             .finish()
     }
@@ -1120,9 +1161,9 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
 
     match cli.command {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
-        Some(Command::Daemon(args)) => {
+        Some(Command::DaemonWorker(args)) => {
             let _logging_guard = crate::logging::init(&paths, cli.debug).ok();
-            crate::web::run(paths, args).await
+            crate::daemon::run(paths, args).await
         }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
@@ -1146,8 +1187,24 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
             Ok(())
         }
         Some(Command::Config(args)) => {
-            run_config(&paths, args).await?;
-            reload_daemon_if_running(&paths).await
+            let saved = run_config(&paths, args).await?;
+            if ipc::daemon_info(&paths).await.is_some() {
+                reload_daemon_if_running(&paths).await
+            } else {
+                if saved {
+                    let config = AppConfig::load_or_default(&paths)?;
+                    if config.platforms.qq.enabled {
+                        println!(
+                            "{}",
+                            t(
+                                "Tencent QQ is enabled; run `miyu daemon start` to begin listening.",
+                                "腾讯 QQ 已启用；执行 `miyu daemon start` 后开始监听。",
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            }
         }
         Some(Command::Models(args)) => {
             initialize_models_cache(&paths);
@@ -1195,7 +1252,8 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::Archive) => run_session_archive(&paths).await,
         Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
         Some(Command::Workspace(args)) => run_workspace_command(&paths, args).await,
-        Some(Command::Web(args)) => run_web_daemon(&paths, args).await,
+        Some(Command::Web(args)) => run_web(&paths, args).await,
+        Some(Command::Daemon(args)) => run_daemon_command(&paths, args).await,
         None => {
             let message = join_message(cli.message);
             if message.is_empty() && io::stdin().is_terminal() {
@@ -1229,42 +1287,7 @@ fn initialize_models_cache(paths: &MiyuPaths) {
     }
 }
 
-async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
-    let action = args.action.or_else(|| {
-        if args.stop {
-            Some(WebAction::Stop)
-        } else if args.status {
-            Some(WebAction::Status)
-        } else {
-            None
-        }
-    });
-    if action == Some(WebAction::Status) {
-        if let Some(info) = ipc::daemon_info(paths).await {
-            println!(
-                "Miyu daemon: running (pid {}, WebUI {})",
-                info.pid,
-                ipc::web_access_urls(info.web_port).join(" ")
-            );
-        } else {
-            println!("Miyu daemon: stopped");
-        }
-        return Ok(());
-    }
-    if matches!(action, Some(WebAction::Stop) | Some(WebAction::Restart)) {
-        if ipc::daemon_info(paths).await.is_some() {
-            send_ipc_command(paths, IpcCommand::Shutdown).await?;
-            ipc::wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
-            println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
-        } else {
-            println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
-        }
-        if action == Some(WebAction::Stop) {
-            return Ok(());
-        }
-        // Restart falls through to the normal start path with this
-        // invocation's port/password arguments.
-    }
+async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
     if args.public && args.password.is_none() && args.password_file.is_none() {
         bail!(
             "{}",
@@ -1315,6 +1338,242 @@ async fn run_web_daemon(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
         println!("Miyu WebUI: {url}");
     }
     Ok(())
+}
+
+async fn run_daemon_command(paths: &MiyuPaths, args: DaemonArgs) -> Result<()> {
+    match args.command {
+        DaemonCommand::Start => {
+            ipc::ensure_daemon(paths, &[]).await?;
+            print_daemon_status(paths).await
+        }
+        DaemonCommand::Stop => stop_daemon(paths).await,
+        DaemonCommand::Restart => {
+            if ipc::daemon_info(paths).await.is_some() {
+                stop_daemon(paths).await?;
+            }
+            ipc::ensure_daemon(paths, &[]).await?;
+            print_daemon_status(paths).await
+        }
+        DaemonCommand::Status => print_daemon_status(paths).await,
+        DaemonCommand::Logs(args) => run_daemon_logs(paths, args).await,
+    }
+}
+
+async fn stop_daemon(paths: &MiyuPaths) -> Result<()> {
+    if ipc::daemon_info(paths).await.is_none() {
+        println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
+        return Ok(());
+    }
+    send_ipc_command(paths, IpcCommand::Shutdown).await?;
+    ipc::wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
+    println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
+    Ok(())
+}
+
+async fn print_daemon_status(paths: &MiyuPaths) -> Result<()> {
+    let Some(info) = ipc::daemon_info(paths).await else {
+        println!("{}", t("Miyu daemon: stopped", "Miyu daemon：已停止"));
+        return Ok(());
+    };
+    let (_, data) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
+    println!(
+        "{} {} (PID {})",
+        t("Miyu daemon:", "Miyu daemon："),
+        t("running", "运行中"),
+        info.pid,
+    );
+    for line in
+        daemon_web_status_lines(t("WebUI:", "WebUI："), &ipc::web_access_urls(info.web_port))
+    {
+        println!("{line}");
+    }
+    let engine = data
+        .pointer("/runtime/turn_engine")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ready");
+    println!("{} {}", t("Turn engine:", "TurnEngine："), engine);
+
+    let qq = data.pointer("/platforms/qq");
+    let enabled = qq
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        println!(
+            "{} {}",
+            t("Tencent QQ:", "腾讯 QQ："),
+            t("disabled", "未启用")
+        );
+        return Ok(());
+    }
+    let port = qq
+        .and_then(|value| value.get("listen_port"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let accounts = qq
+        .and_then(|value| value.get("connected_accounts"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_i64)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let connection = if accounts.is_empty() {
+        t("not connected", "尚未连接").to_string()
+    } else {
+        format!("{}: {}", t("connected", "已连接"), accounts.join(", "))
+    };
+    println!(
+        "{} ws://localhost:{port}/ws · {connection}",
+        t("Tencent QQ:", "腾讯 QQ：")
+    );
+    Ok(())
+}
+
+fn daemon_web_status_lines(label: &str, urls: &[String]) -> Vec<String> {
+    let Some((first, remaining)) = urls.split_first() else {
+        return vec![label.to_string()];
+    };
+    let indent = " ".repeat(visible_width(label).saturating_add(1));
+    std::iter::once(format!("{label} {first}"))
+        .chain(remaining.iter().map(|url| format!("{indent}{url}")))
+        .collect()
+}
+
+async fn run_daemon_logs(paths: &MiyuPaths, args: DaemonLogsArgs) -> Result<()> {
+    if let Some(lines) = args.lines {
+        if !(1..=100_000).contains(&lines) {
+            bail!(
+                "{}",
+                t(
+                    "--lines must be between 1 and 100000",
+                    "--lines 必须在 1 到 100000 之间"
+                )
+            );
+        }
+        for line in recent_daemon_log_lines(paths, lines)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    for line in recent_daemon_log_lines(paths, 50)? {
+        println!("{line}");
+    }
+    if ipc::daemon_info(paths).await.is_none() {
+        bail!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
+    }
+    follow_daemon_log(paths).await
+}
+
+fn daemon_log_files(paths: &MiyuPaths) -> Result<Vec<PathBuf>> {
+    let mut files = match std::fs::read_dir(paths.logs_dir()) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("miyu.") && name.ends_with(".log"))
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    files.sort();
+    if files.is_empty() {
+        let fallback = paths.logs_dir().join("daemon.log");
+        if fallback.is_file() {
+            files.push(fallback);
+        }
+    }
+    Ok(files)
+}
+
+fn recent_daemon_log_lines(paths: &MiyuPaths, limit: usize) -> Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut lines = Vec::with_capacity(limit.min(1024));
+    for path in daemon_log_files(paths)?.into_iter().rev() {
+        let remaining = limit.saturating_sub(lines.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut file_lines = tail_file_lines(&path, remaining)?;
+        file_lines.extend(lines);
+        lines = file_lines;
+    }
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
+    Ok(lines)
+}
+
+fn tail_file_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+    const CHUNK: usize = 8192;
+    let mut file = std::fs::File::open(path)?;
+    let mut position = file.seek(SeekFrom::End(0))?;
+    let mut bytes = Vec::new();
+    let mut newline_count = 0usize;
+    while position > 0 && newline_count <= limit {
+        let read_len = usize::try_from(position.min(CHUNK as u64)).unwrap_or(CHUNK);
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0_u8; read_len];
+        file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunk.extend(bytes);
+        bytes = chunk;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
+    Ok(lines)
+}
+
+async fn follow_daemon_log(paths: &MiyuPaths) -> Result<()> {
+    let mut current = daemon_log_files(paths)?.into_iter().last();
+    let mut offset = current
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |metadata| metadata.len());
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = interval.tick() => {
+                let latest = daemon_log_files(paths)?.into_iter().last();
+                if latest != current {
+                    current = latest;
+                    offset = 0;
+                }
+                let Some(path) = current.as_ref() else { continue };
+                let mut file = std::fs::File::open(path)?;
+                let len = file.metadata()?.len();
+                if len < offset {
+                    offset = 0;
+                }
+                if len == offset {
+                    if ipc::daemon_info(paths).await.is_none() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::with_capacity(usize::try_from(len - offset).unwrap_or(0));
+                file.read_to_end(&mut bytes)?;
+                offset = len;
+                print!("{}", String::from_utf8_lossy(&bytes));
+                io::stdout().flush()?;
+            }
+        }
+    }
 }
 
 async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
@@ -2589,7 +2848,7 @@ impl Drop for InlineRawMode {
     }
 }
 
-async fn run_config(paths: &MiyuPaths, args: ConfigArgs) -> Result<()> {
+async fn run_config(paths: &MiyuPaths, args: ConfigArgs) -> Result<bool> {
     match args.command {
         Some(ConfigCommand::Validate) => {
             AppConfig::load(paths)?;
@@ -2598,11 +2857,11 @@ async fn run_config(paths: &MiyuPaths, args: ConfigArgs) -> Result<()> {
                 t("config is valid", "配置有效"),
                 paths.config_file.display()
             );
-            Ok(())
+            Ok(false)
         }
         Some(ConfigCommand::Paths) => {
             paths.print();
-            Ok(())
+            Ok(false)
         }
         Some(ConfigCommand::PromptSource) => {
             let config = AppConfig::load(paths)?;
@@ -2650,7 +2909,7 @@ async fn run_config(paths: &MiyuPaths, args: ConfigArgs) -> Result<()> {
                 system_prompt.lines().next().unwrap_or("")
             );
             println!("system_prompt_chars: {}", system_prompt.chars().count());
-            Ok(())
+            Ok(false)
         }
         None => crate::config_tui::run(paths),
     }
@@ -3011,8 +3270,7 @@ async fn append_stdin_if_piped(message: String) -> String {
                 break;
             }
             let mut chunk = [0u8; 8192];
-            let count =
-                unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
             if count < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
@@ -3883,7 +4141,10 @@ fn print_session_list(data: &serde_json::Value) {
             .unwrap_or_default();
         let marker = if entry.is_current { "*" } else { " " };
         let turns_label = t("turns", "轮");
-        println!("{marker}{:>3}. {name}  \x1b[2m{turns} {turns_label}  {snippet}{workspace}\x1b[0m", index + 1);
+        println!(
+            "{marker}{:>3}. {name}  \x1b[2m{turns} {turns_label}  {snippet}{workspace}\x1b[0m",
+            index + 1
+        );
     }
     println!();
 }
@@ -4035,7 +4296,10 @@ async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Resu
 async fn run_session_rename(paths: &MiyuPaths, args: SessionRenameArgs) -> Result<()> {
     let name = args.name.trim().to_string();
     if name.is_empty() {
-        bail!("{}", t("usage: miyu rename <name>", "用法：miyu rename <新名称>"));
+        bail!(
+            "{}",
+            t("usage: miyu rename <name>", "用法：miyu rename <新名称>")
+        );
     }
     session_admin(
         paths,
@@ -4545,19 +4809,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             )?;
                             continue;
                         }
-                        let lines = entries
-                            .iter()
-                            .map(session_select_line)
-                            .collect::<Vec<_>>();
+                        let lines = entries.iter().map(session_select_line).collect::<Vec<_>>();
                         let search = entries
                             .iter()
                             .map(session_select_search)
                             .collect::<Vec<_>>();
-                        let Some(index) = inline_single_select(
-                            t("Select session", "选择会话"),
-                            &lines,
-                            &search,
-                        )?
+                        let Some(index) =
+                            inline_single_select(t("Select session", "选择会话"), &lines, &search)?
                         else {
                             continue;
                         };
@@ -4570,12 +4828,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             None => continue,
                         }
                     };
-                    let Some((state, _)) = repl_ipc_admin(
-                        paths,
-                        &mut live_repl,
-                        IpcCommand::SwitchSession { target },
-                    )
-                    .await?
+                    let Some((state, _)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::SwitchSession { target })
+                            .await?
                     else {
                         continue;
                     };
@@ -4635,10 +4890,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     };
                     repl_note(
                         &mut live_repl,
-                        &format!(
-                            "\x1b[2m{}\x1b[0m",
-                            t("session archived", "当前会话已归档")
-                        ),
+                        &format!("\x1b[2m{}\x1b[0m", t("session archived", "当前会话已归档")),
                     )?;
                     apply_session_switch(
                         paths,
@@ -4672,12 +4924,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         )?;
                         continue;
                     }
-                    let Some((state, _)) = repl_ipc_admin(
-                        paths,
-                        &mut live_repl,
-                        IpcCommand::DeleteSession { target },
-                    )
-                    .await?
+                    let Some((state, _)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::DeleteSession { target })
+                            .await?
                     else {
                         continue;
                     };
@@ -4862,10 +5111,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             footer.update_context_window(state.context_window);
                             repl_note(
                                 &mut live_repl,
-                                &format!(
-                                    "{}\n",
-                                    t("thinking variants updated", "已更新思考档位")
-                                ),
+                                &format!("{}\n", t("thinking variants updated", "已更新思考档位")),
                             )?;
                         }
                         VariantOutcome::Cancelled => {}
@@ -4977,10 +5223,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     {
                         repl_note(
                             &mut live_repl,
-                            &format!(
-                                "\x1b[2m{}\x1b[0m\n",
-                                t("context compacted", "上下文已压缩")
-                            ),
+                            &format!("\x1b[2m{}\x1b[0m\n", t("context compacted", "上下文已压缩")),
                         )?;
                         let result = ChatResult {
                             content: String::new(),
@@ -5089,6 +5332,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     summary.context_window,
                     Some(cumulative_tokens),
                 );
+                live_repl.refresh_footer(footer.clone())?;
             }
             Ok(None) => bail!(
                 "{}",
@@ -5505,6 +5749,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                         continue;
                     }
                 }
+                live.refresh_footer(footer.clone())?;
                 show_shortcut_hint = false;
             }
             Ok(None) => {
@@ -6021,7 +6266,14 @@ fn print_repl_help() {
     println!("{}", t("commands:", "命令:"));
     let width = REPL_COMMAND_TABLE
         .iter()
-        .map(|spec| spec.name.len() + if spec.arg_hint.is_empty() { 0 } else { spec.arg_hint.len() + 1 })
+        .map(|spec| {
+            spec.name.len()
+                + if spec.arg_hint.is_empty() {
+                    0
+                } else {
+                    spec.arg_hint.len() + 1
+                }
+        })
         .max()
         .unwrap_or(0);
     for spec in REPL_COMMAND_TABLE {
@@ -6828,6 +7080,17 @@ impl LiveReplTail {
 
     fn set_footer(&mut self, footer: ReplFooterStatus) {
         self.footer = footer;
+    }
+
+    /// Replaces the footer and redraws the live editor immediately when it is
+    /// already on screen. Without the redraw, token/context updates remain
+    /// invisible until the next input event causes the editor to render.
+    fn refresh_footer(&mut self, footer: ReplFooterStatus) -> Result<()> {
+        self.set_footer(footer);
+        if self.rendered {
+            synchronized_terminal_update(CursorAfterUpdate::Shown, || self.redraw())?;
+        }
+        Ok(())
     }
 
     fn suspend(&mut self) -> Result<()> {
@@ -9138,10 +9401,7 @@ fn parse_repl_input(input: &str) -> ReplInput<'_> {
     }
     let (name, args) = split_repl_command(input);
     let lowered = name.to_ascii_lowercase();
-    if let Some(spec) = REPL_COMMAND_TABLE
-        .iter()
-        .find(|spec| spec.name == lowered)
-    {
+    if let Some(spec) = REPL_COMMAND_TABLE.iter().find(|spec| spec.name == lowered) {
         return ReplInput::Slash(spec.command, args);
     }
     let mut matches = REPL_COMMAND_TABLE
@@ -9363,60 +9623,29 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
-                action: None,
                 port: 4100,
                 password: None,
                 password_file: None,
-                stop: false,
-                status: false,
                 public: false,
             }))
         ));
 
-        for (arg, expected) in [
-            ("stop", WebAction::Stop),
-            ("status", WebAction::Status),
-            ("restart", WebAction::Restart),
-        ] {
-            let cli = parse_args(["miyu", "web", arg].map(OsString::from).to_vec()).unwrap();
-            match cli.command {
-                Some(Command::Web(args)) => assert!(args.action == Some(expected)),
-                other => panic!("unexpected command: {other:?}"),
-            }
+        for arg in ["stop", "status", "restart", "--status", "--stop"] {
+            assert!(parse_args(["miyu", "web", arg].map(OsString::from).to_vec()).is_err());
         }
-
-        let cli = parse_args(["miyu", "web", "--status"].map(OsString::from).to_vec()).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web(WebArgs { status: true, .. }))
-        ));
-
-        let cli = parse_args(["miyu", "web", "--stop"].map(OsString::from).to_vec()).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web(WebArgs { stop: true, .. }))
-        ));
 
         let cli = parse_args(["miyu", "web"].map(OsString::from).to_vec()).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
-                action: None,
                 port: 8300,
                 password: None,
                 password_file: None,
-                stop: false,
-                status: false,
                 public: false,
             }))
         ));
 
-        let cli = parse_args(
-            ["miyu", "web", "-p", "secret"]
-                .map(OsString::from)
-                .to_vec(),
-        )
-        .unwrap();
+        let cli = parse_args(["miyu", "web", "-p", "secret"].map(OsString::from).to_vec()).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
@@ -9438,6 +9667,77 @@ mod repl_input_tests {
                 ..
             })) if password.is_empty()
         ));
+    }
+
+    #[test]
+    fn daemon_owns_lifecycle_and_log_commands() {
+        for (arg, expected) in [
+            ("start", "start"),
+            ("stop", "stop"),
+            ("restart", "restart"),
+            ("status", "status"),
+        ] {
+            let cli = parse_args(["miyu", "daemon", arg].map(OsString::from).to_vec()).unwrap();
+            let actual = match cli.command {
+                Some(Command::Daemon(DaemonArgs {
+                    command: DaemonCommand::Start,
+                })) => "start",
+                Some(Command::Daemon(DaemonArgs {
+                    command: DaemonCommand::Stop,
+                })) => "stop",
+                Some(Command::Daemon(DaemonArgs {
+                    command: DaemonCommand::Restart,
+                })) => "restart",
+                Some(Command::Daemon(DaemonArgs {
+                    command: DaemonCommand::Status,
+                })) => "status",
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+
+        let cli = parse_args(["miyu", "daemon", "logs"].map(OsString::from).to_vec()).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonArgs {
+                command: DaemonCommand::Logs(DaemonLogsArgs { lines: None }),
+            }))
+        ));
+
+        let cli = parse_args(
+            ["miyu", "daemon", "logs", "-n", "25"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonArgs {
+                command: DaemonCommand::Logs(DaemonLogsArgs { lines: Some(25) }),
+            }))
+        ));
+    }
+
+    #[test]
+    fn daemon_web_urls_are_rendered_on_separate_aligned_lines() {
+        let urls = vec![
+            "http://127.0.0.1:8300".to_string(),
+            "http://192.168.1.2:8300".to_string(),
+        ];
+        assert_eq!(
+            daemon_web_status_lines("WebUI:", &urls),
+            [
+                "WebUI: http://127.0.0.1:8300",
+                "       http://192.168.1.2:8300",
+            ]
+        );
+        assert_eq!(
+            daemon_web_status_lines("WebUI：", &urls),
+            [
+                "WebUI： http://127.0.0.1:8300",
+                "        http://192.168.1.2:8300",
+            ]
+        );
     }
 
     #[test]
@@ -9584,6 +9884,37 @@ mod repl_input_tests {
 
         footer.reset_token_usage(0, None);
         assert_eq!(footer.token_usage.context_window, None);
+    }
+
+    #[test]
+    fn footer_turn_completion_updates_the_rendered_token_accounting() {
+        let config = AppConfig::default();
+        let mut footer = ReplFooterStatus::from_config(&config, 0, None);
+        let result = ChatResult {
+            content: "reply".to_string(),
+            reasoning: None,
+            usage: Some(Usage {
+                prompt_tokens: 80,
+                completion_tokens: 20,
+                total_tokens: 100,
+            }),
+            usage_estimated: false,
+            tool_calls: Vec::new(),
+            provider_id: None,
+            model: None,
+        };
+
+        footer.update_token_usage(&result, 240, Some(200_000), Some(100));
+
+        assert_eq!(footer.token_usage.turn_tokens, 100);
+        assert_eq!(footer.token_usage.session_tokens, 240);
+        assert_eq!(footer.token_usage.cumulative_tokens, Some(100));
+        assert_eq!(
+            strip_terminal_control_sequences(&repl_footer_line(AgentMode::Normal, &footer, 80))
+                .split_whitespace()
+                .last(),
+            Some("Σ100")
+        );
     }
 
     #[test]

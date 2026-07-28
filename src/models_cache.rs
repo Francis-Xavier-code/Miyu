@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -104,6 +105,7 @@ struct Cache {
 static CACHE: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
 static PROVIDER_API_CACHE: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
 static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ACTIVE_METADATA_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn cache_lock() -> &'static Mutex<Option<Cache>> {
     CACHE.get_or_init(|| Mutex::new(None))
@@ -132,7 +134,7 @@ fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, HashMap<String, Mode
 }
 
 fn parse_api_response(text: &str) -> Result<HashMap<String, HashMap<String, ModelInfo>>> {
-    let api: ApiResponse = serde_json::from_str(&text).context("failed to parse models cache")?;
+    let api: ApiResponse = serde_json::from_str(text).context("failed to parse models cache")?;
     let mut result = HashMap::new();
     for (provider_id, provider) in api.0 {
         let mut models = HashMap::new();
@@ -313,6 +315,18 @@ pub fn spawn_background_refresh_active(
     });
 }
 
+pub fn ensure_active_metadata(paths: &crate::paths::MiyuPaths, config: &crate::config::AppConfig) {
+    if !is_loaded() {
+        try_load_active(paths, config);
+    }
+    if ACTIVE_METADATA_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        spawn_background_refresh_active(paths.clone(), config.clone());
+    }
+}
+
 fn retain_configured_models(
     data: &mut HashMap<String, HashMap<String, ModelInfo>>,
     config: &crate::config::AppConfig,
@@ -328,11 +342,19 @@ fn retain_configured_models(
             selected_model_ids.insert(provider.default_model.clone());
         }
     }
+    let platform_models = config.platforms.qq.conversations.iter().flat_map(|route| {
+        route
+            .text_models
+            .iter()
+            .flatten()
+            .chain(route.multimodal_models.iter().flatten())
+    });
     for choice in config
         .active_provider_models
         .iter()
         .flatten()
         .chain(config.active_multimodal_provider_models.iter().flatten())
+        .chain(platform_models)
     {
         selected
             .entry(choice.provider_id.clone())
@@ -709,6 +731,50 @@ mod tests {
         assert!(!data.contains_key("unused-provider"));
         assert!(data[&provider.id].contains_key(&provider.default_model));
         assert!(!data[&provider.id].contains_key("unused-model"));
+    }
+
+    #[test]
+    fn compact_cache_retains_models_used_only_by_platform_routes() {
+        let mut config = crate::config::AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0]
+            .models
+            .extend(["route-text".to_string(), "route-vision".to_string()]);
+        config
+            .platforms
+            .qq
+            .conversations
+            .push(crate::config::PlatformModelRoute {
+                conversation: crate::config::PlatformConversationConfig {
+                    kind: crate::config::PlatformConversationKind::Group,
+                    id: "20000".to_string(),
+                },
+                text_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "route-text".to_string(),
+                }]),
+                multimodal_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "route-vision".to_string(),
+                }]),
+                extra_prompt: String::new(),
+            });
+        let mut data = HashMap::from([(
+            provider_id.clone(),
+            HashMap::from([
+                (config.providers[0].default_model.clone(), model(128_000)),
+                ("route-text".to_string(), model(64_000)),
+                ("route-vision".to_string(), model(96_000)),
+                ("unused-model".to_string(), model(32_000)),
+            ]),
+        )]);
+
+        retain_configured_models(&mut data, &config);
+
+        let retained = &data[&provider_id];
+        assert!(retained.contains_key("route-text"));
+        assert!(retained.contains_key("route-vision"));
+        assert!(!retained.contains_key("unused-model"));
     }
 
     #[test]

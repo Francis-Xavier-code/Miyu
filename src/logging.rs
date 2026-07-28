@@ -41,7 +41,8 @@ pub fn init(paths: &MiyuPaths, cli_debug: bool) -> Result<LoggingGuard> {
         .finish(appender);
     let targets = Targets::new()
         .with_default(LevelFilter::OFF)
-        .with_target("miyu", level);
+        .with_target("miyu", level)
+        .with_target("miyu::qq", qq_level(level, cli_debug, env_value.is_some()));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
@@ -66,6 +67,14 @@ pub fn init(paths: &MiyuPaths, cli_debug: bool) -> Result<LoggingGuard> {
     Ok(LoggingGuard {
         _worker: Some(worker),
     })
+}
+
+fn qq_level(level: LevelFilter, cli_debug: bool, explicit_env: bool) -> LevelFilter {
+    if level == LevelFilter::OFF || explicit_env || cli_debug {
+        level
+    } else {
+        LevelFilter::INFO
+    }
 }
 
 fn selected_level(cli_debug: bool, env_value: Option<&str>) -> (LevelFilter, bool) {
@@ -109,6 +118,10 @@ mod tests {
     #[test]
     fn default_level_only_records_errors() {
         assert_eq!(selected_level(false, None), (LevelFilter::ERROR, false));
+        assert_eq!(
+            qq_level(LevelFilter::ERROR, false, false),
+            LevelFilter::INFO
+        );
     }
 
     #[test]
@@ -121,6 +134,10 @@ mod tests {
         assert_eq!(
             selected_level(true, Some("info")),
             (LevelFilter::INFO, false)
+        );
+        assert_eq!(
+            qq_level(LevelFilter::ERROR, false, true),
+            LevelFilter::ERROR
         );
     }
 

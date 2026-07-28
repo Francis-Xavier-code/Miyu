@@ -51,13 +51,20 @@ miyu config
 
 ### 后台服务
 
-`miyu` 会按需以自身进程启动 daemon（同一个可执行文件，无需额外安装）。daemon 是唯一持有模型客户端、工具和会话状态的进程，REPL、shell hook 与 WebUI 都通过本地 Unix socket 使用它。重新编译后无需手动重启：客户端通过构建指纹发现旧 daemon 会自动将其替换。
+`miyu` 使用一个统一的 daemon（由同一个可执行文件启动，无需额外安装）承载本地 IPC、WebUI 和所有已启用的通讯平台。daemon 在 WebUI 与通讯平台监听端口都绑定成功后才会报告就绪；REPL、shell hook、终端客户端和 WebUI 共用其中的会话与运行状态。重新编译后无需手动重启：客户端通过构建指纹发现旧 daemon 会自动将其替换。
+
+模型客户端、工具注册表和 MCP 等较重的 AI 运行资源不会随 daemon 冷启动加载，而是在第一次 AI 请求时按需初始化；初始化后会在 daemon 生命周期内按有效配置复用，配置热重载时自动清理。`miyu web` 没有独立的启动或停止状态，它只会确保统一 daemon 正在运行，然后显示 WebUI 地址。
+
+daemon 的 WebUI 默认优先监听 `8300`；仅当 `8300` 已被占用时，才会自动选择一个空闲端口。`miyu daemon start` 和 `miyu daemon status` 会逐行显示全部实际访问地址与端口。
 
 ```text
-miyu web          # 启动 daemon 并显示 WebUI 地址
-miyu web status   # 查看 daemon 状态
-miyu web stop     # 停止 daemon
-miyu web restart  # 重启 daemon
+miyu daemon start        # 启动 daemon 并显示整体状态
+miyu daemon stop         # 停止 daemon
+miyu daemon restart      # 重启 daemon
+miyu daemon status       # 查看 IPC、WebUI、AI 引擎和通讯平台状态
+miyu daemon logs         # 先显示最近 50 行日志，再持续跟随
+miyu daemon logs -n 200  # 仅显示最近 200 行并退出
+miyu web                 # 确保 daemon 已启动并显示 WebUI 地址
 ```
 
 设置 `MIYU_DIRECT=1` 可临时绕过 daemon，使用原有单进程模式。
@@ -104,28 +111,76 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 }
 ```
 
-### 接入通讯平台（QQ / OneBot）
+### 接入通讯平台（腾讯 QQ）
 
-Miyu 可以通过 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11 协议）接入 QQ，实现用 QQ 远程与 Miyu 对话——支持私聊、群聊（@我 或前缀触发）、收发图片、接收文件。每个 QQ 会话映射到一个独立的专属会话（如 `qq:private:12345`），上下文长期连续，与本地对话互不干扰。
+Miyu 可以通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot v11 反向 WebSocket 接入腾讯 QQ，支持私聊、群聊、图片和文件。每个 QQ 私聊或群聊映射到稳定的专属会话，群内所有成员共享群会话；QQ 历史不会出现在 WebUI 的会话列表中。
 
-配置入口：`miyu config` → “接入通讯平台”，或 WebUI 的 设置 → 通讯平台。NapCat 侧在网络配置中新建「**WebSocket 客户端**」（即反向 WS），地址填 `ws://<Miyu 所在机器>:<端口>/onebot/v11/ws`（端口即 WebUI 端口，默认 8300），消息格式选 **Array**，token 与 Miyu 配置中的 Access Token 保持一致（同机部署可留空）。
+配置入口：`miyu config` → “接入通讯平台” → “腾讯 QQ”。最小配置只需启用并确认端口。NapCat 侧在网络配置中新建“WebSocket 客户端”，地址填 `ws://<Miyu 所在机器>:<端口>/ws`，本机默认是 `ws://localhost:8300/ws`，消息格式选 **Array**。旧地址 `/onebot/v11/ws` 仅为兼容保留。
 
-安全模型：私聊/群白名单留空表示放行所有人，由**限流**兜底（默认每人 6 条/分钟、全局 30 条/分钟，均可配）；建议在白名单里填上自己的 QQ 号。启停与参数修改保存后即刻生效，无需重启 daemon。
+反向 WebSocket Token 留空时只接受本机回环连接；NapCat 与 Miyu 跨机器部署时必须设置 Token，并在 NapCat 填入同一个值。端口、Token 和启用状态保存后立即生效；新端口绑定失败时会保留原监听器。
+
+QQ 的访问规则如下：管理员绕过私聊/群聊准入和限流，并始终可以使用完整电脑工具；群里仍需 @ 机器人或使用额外触发关键词。私聊白名单不受限流，非白名单私聊使用各自的每会话限流。白名单群和非白名单群分别使用按群共享的限流。`allow_non_admin_host_tools` 只允许私聊白名单中的非管理员使用完整电脑工具，其他非管理员仅获得通讯平台安全工具。
+
+“私聊/群聊专属配置”按对方 QQ 号或群号设置文本模型池、多模态模型池和额外提示词，不再需要填写机器人 QQ 号。任一模型池留空即继承终端/WebUI 的全局模型池；两个池都继承时该会话配置也会正常保存。额外提示词只进入对应 QQ 会话，不影响终端和 WebUI。多模态池中的模型必须声明支持 `image` 输入。
+
+“QQ 插件配置”目前提供 Rust 原生、编译进 Miyu 的“回复处理”插件。默认在回复超过 300 字时转成长图，并移除最后一个可见文本段末尾的中文句号，也可切换为 OneBot 合并转发。以下命令仅管理员可用，设置只覆盖当前 QQ 会话：
+
+```text
+/回复处理 状态
+/回复处理 阈值 500
+/回复处理 阈值 开
+/回复处理 阈值 关
+/回复处理 模式 图片
+/回复处理 模式 转发
+/回复处理 恢复默认
+```
+
+Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user` 工具，可发送文本、本地图片和文件，不能借此向其他 QQ 或群发送消息。
 
 ```jsonc
 "platforms": {
-  "onebot": {
+  "qq": {
     "enabled": true,
+    "reverse_ws_port": 8300,
     "access_token": "与 NapCat 一致",
-    "allowed_users": [ 12345678 ],          // 留空 = 允许所有人
-    "allow_groups": true,
-    "allowed_groups": [ 87654321 ],
-    "group_trigger": "at",                  // at | prefix | at_or_prefix
-    "rate_per_sender_per_min": 6,
-    "rate_global_per_min": 30
+    "admin_users": [ 12345678 ],
+    "allow_non_admin_host_tools": false,
+    "private_chats": {
+      "whitelist": [ 12345678 ],
+      "allow_non_whitelist": true,
+      "non_whitelist_rate_per_minute": 3
+    },
+    "group_chats": {
+      "whitelist": [ 87654321 ],
+      "trigger_keywords": [ "/miyu" ],
+      "whitelist_rate_per_minute": 30,
+      "allow_non_whitelist": true,
+      "non_whitelist_rate_per_minute": 10
+    },
+    "conversations": [
+      {
+        "conversation": { "kind": "group", "id": "87654321" },
+        "text_models": [ { "provider_id": "openai", "model": "gpt-5" } ],
+        "multimodal_models": [ { "provider_id": "openai", "model": "gpt-5" } ],
+        "extra_prompt": "这是一个 QQ 群聊，请保持回复简洁自然。"
+      },
+      {
+        "conversation": { "kind": "private", "id": "12345678" }
+      }
+    ],
+    "plugins": {
+      "reply_processor": {
+        "enabled": true,
+        "settings": { "threshold": 300, "mode": "image" }
+      }
+    },
+    "asset_base_url": "http://192.168.1.2:8300", // NapCat 获取大文件的地址；同机通常可留空
+    "max_reply_chars": 3000
   }
 }
 ```
+
+跨机器发送文件时，`asset_base_url` 必须是 NapCat 能访问到的 Miyu HTTP 地址。Miyu 使用短期随机 URL 流式提供最大 50 MiB 的文件；URL 获取失败时，16 MiB 以内会自动改用 base64 发送。
 
 ### 内置插件
 

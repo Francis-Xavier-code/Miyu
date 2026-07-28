@@ -411,6 +411,30 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     registry
 }
 
+/// Tools exposed to an untrusted messaging-platform conversation. This list
+/// deliberately excludes shell, filesystem, local-image inspection, memory,
+/// knowledge-base, MCP, scripts, and tools that persist arbitrary downloads.
+pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    web::register_fetch(&mut registry);
+    weather::register(&mut registry);
+    caniplayonlinux_query::register(&mut registry);
+    protondb_query::register(&mut registry);
+    exchange_rate::register(&mut registry, config.plugins.exchange_rate.clone());
+    xuanxue::register(&mut registry);
+    moegirl::register(&mut registry);
+    hash_codec::register(&mut registry);
+    calculator::register(&mut registry);
+    deepseek_status::register(&mut registry);
+    if config.plugins.web.enabled {
+        web::register(&mut registry, config.plugins.web.clone());
+    }
+    if config.plugins.memes.enabled {
+        memes::register_chat(&mut registry, config.clone(), paths.clone());
+    }
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +496,32 @@ mod tests {
 
         assert_eq!(english, chinese);
     }
+
+    #[test]
+    fn restricted_platform_registry_has_no_host_or_write_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let registry = restricted_platform_registry(&AppConfig::default(), &paths);
+        let names = registry.tool_names();
+
+        for forbidden in [
+            "run_command",
+            "read_file",
+            "write_file",
+            "apply_patch",
+            "vision_analyze",
+            "load_tools",
+            "task",
+        ] {
+            assert!(!names.iter().any(|name| name == forbidden), "{forbidden}");
+        }
+        for name in names {
+            assert_eq!(
+                registry.permission(&name).unwrap(),
+                ToolPermission::ReadOnly
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -486,9 +536,16 @@ mod tier_schema_probe {
         let paths = crate::paths::MiyuPaths::new().unwrap();
         let registry = super::builtin_registry(&config, &paths);
         let defs = registry.definitions();
-        let task = defs.iter().find(|d| d.function.name == "task").expect("task registered");
+        let task = defs
+            .iter()
+            .find(|d| d.function.name == "task")
+            .expect("task registered");
         let props = task.function.parameters.get("properties").unwrap();
-        assert!(props.get("tier").is_some(), "tier missing: {}", task.function.parameters);
+        assert!(
+            props.get("tier").is_some(),
+            "tier missing: {}",
+            task.function.parameters
+        );
         // Unconfigured pools are announced as falling back to main.
         assert!(task.function.description.contains("cheap=["));
     }
@@ -514,7 +571,10 @@ mod tier_schema_probe {
         let defs = registry.definitions();
         let task = defs.iter().find(|d| d.function.name == "task").unwrap();
         assert!(task.function.description.contains("cheap=[mini-a]"));
-        assert!(task.function.description.contains("balanced=[mini-a, mini-b]"));
+        assert!(task
+            .function
+            .description
+            .contains("balanced=[mini-a, mini-b]"));
         assert!(task.function.description.contains("strong=["));
     }
 }

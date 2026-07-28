@@ -1,5 +1,5 @@
 use super::{ToolRegistry, ToolSpec};
-use crate::config::{AppConfig, PrintImagePluginConfig, ProviderConfig, VisionPluginConfig};
+use crate::config::{AppConfig, PrintImagePluginConfig};
 use crate::i18n::agent_text as t;
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
@@ -226,8 +226,7 @@ pub async fn analyze_image_url_with_prompt(
     if !vision.enabled {
         bail!("vision plugin is disabled")
     }
-    let provider = vision_provider(&config, vision)?;
-    let client = OpenAiCompatibleClient::new(&provider, &config, &paths)?;
+    let client = vision_client(config, paths)?;
     let result = client
         .chat_stream(
             vec![
@@ -244,7 +243,22 @@ pub async fn analyze_image_url_with_prompt(
     Ok(result.content)
 }
 
-fn vision_provider(config: &AppConfig, _vision: &VisionPluginConfig) -> Result<ProviderConfig> {
+fn vision_client(config: &AppConfig, paths: &MiyuPaths) -> Result<OpenAiCompatibleClient> {
+    // An explicit global vision provider preserves its existing precedence.
+    // Platform turns with a conversation override clear that single-provider
+    // field in their private config clone, exposing the full routed pool here.
+    if config.plugins.vision.vision_provider_id.trim().is_empty() {
+        let choices = config
+            .active_multimodal_provider_model_choices()
+            .into_iter()
+            .filter(|choice| {
+                config.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+            })
+            .collect::<Vec<_>>();
+        if !choices.is_empty() {
+            return OpenAiCompatibleClient::from_choices(config, paths, &choices);
+        }
+    }
     let (provider_id, model) = config.vision_provider_choice()?;
     let mut provider = config.provider(Some(&provider_id))?.clone();
     provider.default_model = model;
@@ -255,7 +269,7 @@ fn vision_provider(config: &AppConfig, _vision: &VisionPluginConfig) -> Result<P
     {
         provider.models.push(provider.default_model.clone());
     }
-    Ok(provider)
+    OpenAiCompatibleClient::new(&provider, config, paths)
 }
 
 fn local_image_data_url(value: &str) -> Result<String> {

@@ -21,9 +21,9 @@
     <aside class="sidebar" id="sidebar" aria-label="会话">
       <header class="brand-row">
         <div class="brand-identity">
-          <img src="/assets/miyu-logo.png" alt="Miyu" class="brand-avatar">
+          <img src="/assets/miyu-logo.png" alt="Miyu" class="brand-avatar" id="brandAvatar">
           <div>
-            <strong>Miyu</strong>
+            <strong id="brandName">Miyu</strong>
             <span><i class="status-dot is-connecting" id="sidebarStatusDot"></i><span id="sidebarConnectionStatus">连接中</span></span>
           </div>
         </div>
@@ -123,38 +123,37 @@
           <div class="timeline" id="timeline" hidden></div>
 
           <section class="empty-state" id="emptyState" aria-labelledby="emptyTitle" hidden>
-            <div class="empty-visual">
-              <img src="/assets/miyuwallpaper.png" alt="Miyu 坐在窗边的书桌前">
+            <div class="empty-visual" id="emptyVisual">
+              <img id="emptyBoardImage" src="/assets/miyuwallpaper.png" alt="Miyu 看板图片">
             </div>
             <div class="empty-copy">
-              <span class="empty-kicker"><i class="status-dot"></i>Miyu 在这里</span>
+              <span class="empty-kicker"><i class="status-dot"></i><span id="emptyKickerName">Miyu</span></span>
               <h1 id="emptyTitle">今天想聊些什么？</h1>
-              <p>从一个问题、计划或此刻的想法开始。</p>
+              <p id="emptySubtitle">从一个问题、计划或此刻的想法开始。</p>
             </div>
             <div class="prompt-grid" id="promptGrid">
-              <button type="button" data-prompt="帮我整理一下今天的安排">
-                <span class="icon-slot" data-icon="list-todo" aria-hidden="true"><span class="icon-fallback">✓</span></span>
-                <span>整理今天的安排</span>
+              <button type="button" data-prompt="查询今天的天气">
+                <span class="icon-slot" data-icon="cloud-sun" aria-hidden="true"><span class="icon-fallback">☀</span></span>
+                <span>查询今天的天气</span>
               </button>
-              <button type="button" data-prompt="和我一起分析一个问题">
+              <button type="button" data-prompt="分析一个问题">
                 <span class="icon-slot" data-icon="lightbulb" aria-hidden="true"><span class="icon-fallback">?</span></span>
                 <span>分析一个问题</span>
               </button>
-              <button type="button" data-prompt="帮我制定一个清晰的执行计划">
-                <span class="icon-slot" data-icon="route" aria-hidden="true"><span class="icon-fallback">→</span></span>
-                <span>制定执行计划</span>
+              <button type="button" data-prompt="发表情包打个招呼吧">
+                <span class="icon-slot" data-icon="smile" aria-hidden="true"><span class="icon-fallback">☺</span></span>
+                <span>发表情包打个招呼吧</span>
               </button>
-              <button type="button" data-prompt="陪我聊聊现在的想法">
-                <span class="icon-slot" data-icon="messages-square" aria-hidden="true"><span class="icon-fallback">…</span></span>
-                <span>聊聊现在的想法</span>
+              <button type="button" data-prompt="搜索一张图片">
+                <span class="icon-slot" data-icon="image-search" aria-hidden="true"><span class="icon-fallback">⌕</span></span>
+                <span>搜索一张图片</span>
               </button>
             </div>
           </section>
         </div>
 
-        <button class="jump-bottom-button" id="jumpBottomButton" type="button" hidden>
+        <button class="jump-bottom-button" id="jumpBottomButton" type="button" title="回到底部" aria-label="回到底部" hidden>
           <span class="icon-slot" data-icon="arrow-down" aria-hidden="true"><span class="icon-fallback">↓</span></span>
-          <span>回到底部</span>
         </button>
 
         <footer class="composer-dock" id="composerDock">
@@ -172,6 +171,7 @@
                 <span class="composer-state" id="composerState">正在载入</span>
               </div>
               <div class="composer-submit">
+                <div class="live-stop-rail" id="liveStopRail" aria-label="正在运行的回复" hidden></div>
                 <div class="composer-context">
                   <div class="context-heading">
                     <span>上下文</span>
@@ -203,12 +203,11 @@
       <div class="settings-layout">
         <nav class="settings-nav" aria-label="设置分类">
           <button class="active" type="button" data-settings-view="interface">界面</button>
-          <button type="button" data-settings-view="platforms">通讯平台</button>
+          <button type="button" data-settings-view="prompts">提示词</button>
           <button type="button" data-settings-view="general">全局</button>
           <button type="button" data-settings-view="providers">供应商</button>
           <button type="button" data-settings-view="models">模型池</button>
           <button type="button" data-settings-view="plugins">插件</button>
-          <button type="button" data-settings-view="prompts">提示词</button>
           <button type="button" data-settings-view="advanced">高级</button>
         </nav>
         <div class="settings-content">
@@ -261,10 +260,9 @@
           <h2>关于</h2>
           <div class="about-row"><span>Miyu WebUI</span><span id="versionLabel">--</span></div>
           </section>
-          <section class="settings-section settings-panel" data-settings-panel="platforms" hidden>
-          <h2>接入通讯平台</h2>
-          <p class="settings-description">让 NapCat 以「反向 WebSocket 客户端」连接 <code>ws://本机地址:端口/onebot/v11/ws</code>，即可通过 QQ 与 Miyu 对话。</p>
-          <div class="config-form" id="platformsConfigForm"></div>
+          <section class="settings-section settings-panel" data-settings-panel="prompts" hidden>
+          <h2>自定义提示词</h2>
+          <div class="prompt-editor" id="promptEditor"></div>
           </section>
           <section class="settings-section settings-panel" data-settings-panel="general" hidden>
           <h2>全局设置</h2>
@@ -281,10 +279,6 @@
           <section class="settings-section settings-panel" data-settings-panel="plugins" hidden>
           <h2>插件配置</h2>
           <div class="plugin-editor" id="pluginEditor"></div>
-          </section>
-          <section class="settings-section settings-panel" data-settings-panel="prompts" hidden>
-          <h2>自定义提示词</h2>
-          <div class="prompt-editor" id="promptEditor"></div>
           </section>
           <section class="settings-section settings-panel" data-settings-panel="advanced" hidden>
           <h2>完整配置</h2>

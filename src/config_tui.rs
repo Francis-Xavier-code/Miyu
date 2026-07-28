@@ -1,4 +1,7 @@
-use crate::config::{AppConfig, ProviderConfig, MAX_COMMAND_OUTPUT_LINES};
+use crate::config::{
+    ActiveProviderModelConfig, AppConfig, PlatformConversationConfig, PlatformConversationKind,
+    PlatformModelRoute, ProviderConfig, MAX_COMMAND_OUTPUT_LINES,
+};
 use crate::default_kb;
 use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
 use crate::i18n::{is_zh, text as t};
@@ -9,7 +12,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -17,7 +20,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-pub fn run(paths: &MiyuPaths) -> Result<()> {
+pub fn run(paths: &MiyuPaths) -> Result<bool> {
     AppConfig::init_files(paths)?;
     crate::models_cache::try_load(paths);
     crate::models_cache::spawn_background_refresh(paths.clone());
@@ -37,12 +40,11 @@ impl TerminalSession {
         Ok(Self { stdout })
     }
 
-    fn run(mut self, paths: &MiyuPaths, mut config: AppConfig) -> Result<()> {
+    fn run(mut self, paths: &MiyuPaths, mut config: AppConfig) -> Result<bool> {
         let result = run_main_menu(&mut self.stdout, paths, &mut config);
         execute!(self.stdout, Show, LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
-        let _ = result?;
-        Ok(())
+        result
     }
 }
 
@@ -440,14 +442,17 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
         2 => vec![
             Field::boolean(t("Enabled", "启用"), config.plugins.vision.enabled),
             Field::boolean(
-                t("Prefer current multimodal model", "优先当前多模态模型"),
+                t(
+                    "Prefer current chat model for images",
+                    "优先使用当前对话模型识图",
+                ),
                 config.plugins.vision.prefer_current_multimodal_model,
             ),
             Field::new(
                 t("Vision provider/model", "识图 Provider/模型"),
                 vision_provider_value(config),
             )
-            .choices_owned(provider_model_choice_values(config, true)),
+            .choices_owned(vision_provider_model_choice_values(config)),
         ],
         3 => vec![
             Field::boolean(
@@ -1626,15 +1631,7 @@ impl<'a> ProviderBrowser<'a> {
             return;
         }
         let removed = self.config.providers.remove(self.provider_idx);
-        self.config.prune_subagent_tiers();
-        if self.config.active_provider == removed.id {
-            self.config.active_provider = self
-                .config
-                .providers
-                .first()
-                .map(|provider| provider.id.clone())
-                .unwrap_or_default();
-        }
+        self.config.remove_provider_references(&removed.id);
         self.provider_idx = self
             .provider_idx
             .min(self.config.providers.len().saturating_sub(1));
@@ -1651,11 +1648,16 @@ impl<'a> ProviderBrowser<'a> {
                         if self.config.active_provider == old_id {
                             self.config.active_provider = provider.id.clone();
                         }
+                        if old_id != provider.id {
+                            self.config
+                                .rename_provider_references(&old_id, &provider.id);
+                        }
                         self.refresh_models();
                     }
                 }
             }
             2 => {
+                let mut model_updated = false;
                 if let Some(model) = self.models.get(self.model_idx).cloned() {
                     if let Some(provider) = self.config.providers.get_mut(self.provider_idx) {
                         auto_configure_model_tags(self.paths, provider, &model.full);
@@ -1663,6 +1665,7 @@ impl<'a> ProviderBrowser<'a> {
                     if let Some(provider) = self.config.providers.get_mut(self.provider_idx) {
                         if edit_model_form(stdout, provider, &model.full)? {
                             self.config.active_provider = provider.id.clone();
+                            model_updated = true;
                             self.status = if is_zh() {
                                 format!("已更新模型设置: {}", model.full)
                             } else {
@@ -1670,6 +1673,9 @@ impl<'a> ProviderBrowser<'a> {
                             };
                         }
                     }
+                }
+                if model_updated {
+                    self.config.prune_model_references();
                 }
             }
             _ => {}
@@ -2010,12 +2016,14 @@ fn select_active_provider(stdout: &mut io::Stdout, config: &mut AppConfig) -> Re
 }
 
 fn subagent_tiers_label(config: &AppConfig) -> String {
-    let counts = crate::config::ModelTier::ALL
-        .map(|tier| config.subagent_tier_choices(tier).len());
+    let counts = crate::config::ModelTier::ALL.map(|tier| config.subagent_tier_choices(tier).len());
     if counts.iter().all(|count| *count == 0) {
         t("not configured", "未配置").to_string()
     } else {
-        format!("cheap:{} balanced:{} strong:{}", counts[0], counts[1], counts[2])
+        format!(
+            "cheap:{} balanced:{} strong:{}",
+            counts[0], counts[1], counts[2]
+        )
     }
 }
 
@@ -2069,7 +2077,9 @@ fn select_subagent_tiers(stdout: &mut io::Stdout, config: &mut AppConfig) -> Res
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => select_subagent_tier_models(stdout, config, ModelTier::ALL[selected])?,
+            KeyCode::Enter => {
+                select_subagent_tier_models(stdout, config, ModelTier::ALL[selected])?
+            }
             _ => {}
         }
     }
@@ -2094,7 +2104,11 @@ fn select_subagent_tier_models(
         return Ok(());
     }
     let mut selected = 0usize;
-    let title = format!(" {} · {} ", t("TIER POOL", "档位池"), tier_display_name(tier));
+    let title = format!(
+        " {} · {} ",
+        t("TIER POOL", "档位池"),
+        tier_display_name(tier)
+    );
     loop {
         let options = choices
             .iter()
@@ -2132,24 +2146,22 @@ fn select_subagent_tier_models(
 }
 
 fn platforms_label(config: &AppConfig) -> String {
-    if config.platforms.onebot.enabled {
-        t("OneBot enabled", "OneBot 已启用").to_string()
+    if config.platforms.qq.enabled {
+        t("Tencent QQ enabled", "腾讯 QQ 已启用").to_string()
     } else {
         t("disabled", "未启用").to_string()
     }
 }
 
-/// Platform list submenu; each platform opens its own form. Later
-/// phases (Telegram, QQ official, WeChat) append entries here.
 fn select_platforms(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
     let mut selected = 0usize;
     loop {
-        let onebot_state = if config.platforms.onebot.enabled {
+        let state = if config.platforms.qq.enabled {
             t("enabled", "已启用")
         } else {
             t("disabled", "未启用")
         };
-        let options = [format!("OneBot v11 (QQ / NapCat): {onebot_state}")];
+        let options = [format!("{}: {state}", t("Tencent QQ", "腾讯 QQ"))];
         draw_menu(
             stdout,
             t(" IM PLATFORMS ", " 接入通讯平台 "),
@@ -2164,79 +2176,1191 @@ fn select_platforms(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<(
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => edit_onebot(stdout, config)?,
+            KeyCode::Enter => edit_qq(stdout, config)?,
             _ => {}
         }
     }
 }
 
-fn edit_onebot(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
-    let onebot = &config.platforms.onebot;
+fn enabled_label(value: bool) -> &'static str {
+    if value {
+        t("enabled", "已启用")
+    } else {
+        t("disabled", "已禁用")
+    }
+}
+
+fn edit_qq(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let qq = &config.platforms.qq;
+        let options = vec![
+            format!(
+                "{}: {}",
+                t("Enabled", "是否启用"),
+                enabled_label(qq.enabled)
+            ),
+            format!(
+                "{}: {}",
+                t("Reverse WebSocket port", "反向 WebSocket 端口"),
+                qq.reverse_ws_port
+            ),
+            format!(
+                "{}: {}",
+                t("Reverse WebSocket token", "反向 WebSocket 验证 Token"),
+                if qq.access_token.is_empty() {
+                    t("empty", "未设置")
+                } else {
+                    "********"
+                }
+            ),
+            format!(
+                "{}: {}",
+                t("Administrator QQ ids", "管理员 QQ 号"),
+                qq.admin_users.len()
+            ),
+            format!(
+                "{}: {}",
+                t(
+                    "Allow non-admin computer access",
+                    "是否允许非管理员使用电脑"
+                ),
+                enabled_label(qq.allow_non_admin_host_tools)
+            ),
+            format!(
+                "{}: {}",
+                t("Private whitelist", "私聊白名单"),
+                qq.private_chats.whitelist.len()
+            ),
+            format!(
+                "{}: {}",
+                t("Allow non-whitelist private chats", "是否允许非白名单私聊"),
+                enabled_label(qq.private_chats.allow_non_whitelist)
+            ),
+            format!(
+                "{}: {}",
+                t(
+                    "Non-whitelist private messages/min",
+                    "非白名单私聊限流（每分钟）"
+                ),
+                qq.private_chats.non_whitelist_rate_per_minute
+            ),
+            format!(
+                "{}: {}",
+                t("Group whitelist", "群聊白名单"),
+                qq.group_chats.whitelist.len()
+            ),
+            format!(
+                "{}: {}",
+                t("Additional group wake keywords", "额外群聊触发关键词"),
+                qq.group_chats.trigger_keywords.len()
+            ),
+            format!(
+                "{}: {}",
+                t("Whitelist-group messages/min", "白名单群聊限流（每分钟）"),
+                qq.group_chats.whitelist_rate_per_minute
+            ),
+            format!(
+                "{}: {}",
+                t("Allow non-whitelist groups", "是否允许非白名单群聊"),
+                enabled_label(qq.group_chats.allow_non_whitelist)
+            ),
+            format!(
+                "{}: {}",
+                t(
+                    "Non-whitelist-group messages/min",
+                    "非白名单群聊限流（每分钟）"
+                ),
+                qq.group_chats.non_whitelist_rate_per_minute
+            ),
+            format!(
+                "{}: {}",
+                t("Private/group conversation settings", "私聊/群聊专属配置"),
+                qq.conversations.len()
+            ),
+            t("QQ plugins", "QQ 插件配置").to_string(),
+            t("Advanced settings", "高级设置").to_string(),
+        ];
+        draw_menu(
+            stdout,
+            t(" TENCENT QQ ", " 腾讯 QQ "),
+            &options,
+            selected,
+            t(
+                "@-mentions always wake group chats; computer access applies only to private-whitelist users",
+                "群聊始终支持 @ 触发；非管理员电脑权限仅对私聊白名单用户生效",
+            ),
+        )?;
+        let key = read_key()?;
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter | KeyCode::Char(' ') => match selected {
+                0 => config.platforms.qq.enabled = !config.platforms.qq.enabled,
+                1 if matches!(key, KeyCode::Enter) => {
+                    if let Some(value) = edit_u16_value(
+                        stdout,
+                        t("Reverse WebSocket port", "反向 WebSocket 端口"),
+                        config.platforms.qq.reverse_ws_port,
+                    )? {
+                        if value == 0 {
+                            message(
+                                stdout,
+                                t(
+                                    "Port must be between 1 and 65535.",
+                                    "端口必须在 1 到 65535 之间。",
+                                ),
+                            )?;
+                        } else {
+                            config.platforms.qq.reverse_ws_port = value;
+                        }
+                    }
+                }
+                2 if matches!(key, KeyCode::Enter) => edit_qq_token(stdout, config)?,
+                3 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                    stdout,
+                    t(" ADMINISTRATORS ", " 管理员 QQ 号 "),
+                    t("QQ id", "QQ 号"),
+                    &mut config.platforms.qq.admin_users,
+                )?,
+                4 => {
+                    config.platforms.qq.allow_non_admin_host_tools =
+                        !config.platforms.qq.allow_non_admin_host_tools
+                }
+                5 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                    stdout,
+                    t(" PRIVATE WHITELIST ", " 私聊白名单 "),
+                    t("QQ id", "QQ 号"),
+                    &mut config.platforms.qq.private_chats.whitelist,
+                )?,
+                6 => {
+                    config.platforms.qq.private_chats.allow_non_whitelist =
+                        !config.platforms.qq.private_chats.allow_non_whitelist
+                }
+                7 if matches!(key, KeyCode::Enter) => {
+                    if let Some(value) = edit_u32_value(
+                        stdout,
+                        t(
+                            "Messages per minute (0 = unlimited)",
+                            "每分钟消息上限（0 = 不限）",
+                        ),
+                        config
+                            .platforms
+                            .qq
+                            .private_chats
+                            .non_whitelist_rate_per_minute,
+                    )? {
+                        config
+                            .platforms
+                            .qq
+                            .private_chats
+                            .non_whitelist_rate_per_minute = value;
+                    }
+                }
+                8 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                    stdout,
+                    t(" GROUP WHITELIST ", " 群聊白名单 "),
+                    t("Group id", "群号"),
+                    &mut config.platforms.qq.group_chats.whitelist,
+                )?,
+                9 if matches!(key, KeyCode::Enter) => edit_keyword_list(
+                    stdout,
+                    &mut config.platforms.qq.group_chats.trigger_keywords,
+                )?,
+                10 if matches!(key, KeyCode::Enter) => {
+                    if let Some(value) = edit_u32_value(
+                        stdout,
+                        t(
+                            "Messages per minute (0 = unlimited)",
+                            "每分钟消息上限（0 = 不限）",
+                        ),
+                        config.platforms.qq.group_chats.whitelist_rate_per_minute,
+                    )? {
+                        config.platforms.qq.group_chats.whitelist_rate_per_minute = value;
+                    }
+                }
+                11 => {
+                    config.platforms.qq.group_chats.allow_non_whitelist =
+                        !config.platforms.qq.group_chats.allow_non_whitelist
+                }
+                12 if matches!(key, KeyCode::Enter) => {
+                    if let Some(value) = edit_u32_value(
+                        stdout,
+                        t(
+                            "Messages per minute (0 = unlimited)",
+                            "每分钟消息上限（0 = 不限）",
+                        ),
+                        config
+                            .platforms
+                            .qq
+                            .group_chats
+                            .non_whitelist_rate_per_minute,
+                    )? {
+                        config
+                            .platforms
+                            .qq
+                            .group_chats
+                            .non_whitelist_rate_per_minute = value;
+                    }
+                }
+                13 if matches!(key, KeyCode::Enter) => {
+                    select_platform_model_routes(stdout, config)?
+                }
+                14 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
+                15 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn edit_u16_value(
+    stdout: &mut io::Stdout,
+    label: &'static str,
+    current: u16,
+) -> Result<Option<u16>> {
+    let mut fields = vec![Field::new(label, current.to_string())];
+    if !run_form(stdout, t(" EDIT VALUE ", " 编辑数值 "), &mut fields)? {
+        return Ok(None);
+    }
+    match fields[0].value.trim().parse() {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            message(stdout, t("Invalid number.", "数值无效。"))?;
+            Ok(None)
+        }
+    }
+}
+
+fn edit_u32_value(
+    stdout: &mut io::Stdout,
+    label: &'static str,
+    current: u32,
+) -> Result<Option<u32>> {
+    let mut fields = vec![Field::new(label, current.to_string())];
+    if !run_form(stdout, t(" EDIT VALUE ", " 编辑数值 "), &mut fields)? {
+        return Ok(None);
+    }
+    match fields[0].value.trim().parse() {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            message(stdout, t("Invalid number.", "数值无效。"))?;
+            Ok(None)
+        }
+    }
+}
+
+fn edit_qq_token(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    if let Some(value) = edit_inline_value(
+        stdout,
+        t(" REVERSE WEBSOCKET TOKEN ", " 反向 WebSocket 验证 Token "),
+        &config.platforms.qq.access_token,
+        true,
+    )? {
+        config.platforms.qq.access_token = value.trim().to_string();
+    }
+    Ok(())
+}
+
+fn parse_positive_id(value: &str) -> std::result::Result<i64, String> {
+    value
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            t(
+                "QQ/group id must be a positive integer.",
+                "QQ 号/群号必须是正整数。",
+            )
+            .to_string()
+        })
+}
+
+fn parse_id_lines(value: &str) -> std::result::Result<Vec<i64>, String> {
+    let mut parsed = Vec::new();
+    for (index, line) in value.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id = parse_positive_id(line)
+            .map_err(|error| format!("{} {}: {error}", t("Line", "第"), index + 1))?;
+        if !parsed.contains(&id) {
+            parsed.push(id);
+        }
+    }
+    Ok(parsed)
+}
+
+fn prompt_single_id(
+    stdout: &mut io::Stdout,
+    item_label: &str,
+    current: Option<i64>,
+) -> Result<Option<i64>> {
+    let action = if current.is_some() {
+        t("Edit", "编辑")
+    } else {
+        t("Add", "新增")
+    };
+    let title = format!(" {action} {item_label} ");
+    let Some(value) = edit_inline_value(
+        stdout,
+        &title,
+        &current.map(|id| id.to_string()).unwrap_or_default(),
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+    match parse_positive_id(&value) {
+        Ok(id) => Ok(Some(id)),
+        Err(error) => {
+            message(stdout, &error)?;
+            Ok(None)
+        }
+    }
+}
+
+fn edit_qq_id_list(
+    stdout: &mut io::Stdout,
+    title: &'static str,
+    item_label: &'static str,
+    ids: &mut Vec<i64>,
+) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let mut options = vec![
+            t("+ Add one", "+ 新增一项").to_string(),
+            t("+ Add multiple", "+ 批量新增").to_string(),
+        ];
+        options.extend(ids.iter().map(ToString::to_string));
+        draw_menu(
+            stdout,
+            title,
+            &options,
+            selected,
+            t(
+                "[Enter]add/edit [Delete]remove [j/k]move [q]back",
+                "[Enter]新增/编辑 [Delete]删除 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter if selected == 0 => {
+                if let Some(id) = prompt_single_id(stdout, item_label, None)? {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            KeyCode::Enter if selected == 1 => {
+                let mut value = String::new();
+                loop {
+                    edit_textarea(stdout, &mut value)?;
+                    match parse_id_lines(&value) {
+                        Ok(additions) => {
+                            for id in additions {
+                                if !ids.contains(&id) {
+                                    ids.push(id);
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) => message(stdout, &error)?,
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let index = selected - 2;
+                if let Some(id) = prompt_single_id(stdout, item_label, ids.get(index).copied())? {
+                    if ids
+                        .iter()
+                        .enumerate()
+                        .any(|(other, item)| other != index && *item == id)
+                    {
+                        message(stdout, t("That id already exists.", "该号码已存在。"))?;
+                    } else if let Some(item) = ids.get_mut(index) {
+                        *item = id;
+                    }
+                }
+            }
+            KeyCode::Delete | KeyCode::Backspace if selected >= 2 => {
+                ids.remove(selected - 2);
+                selected = selected.min(ids.len() + 1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_keyword_lines(value: &str) -> std::result::Result<Vec<String>, String> {
+    let mut parsed = Vec::new();
+    for (index, line) in value.lines().enumerate() {
+        let keyword = line.trim();
+        if keyword.is_empty() {
+            continue;
+        }
+        if keyword.chars().count() > 128 || keyword.chars().any(char::is_control) {
+            return Err(format!(
+                "{} {}: {}",
+                t("Line", "第"),
+                index + 1,
+                t("keyword is invalid or too long", "关键词无效或过长")
+            ));
+        }
+        if !parsed.iter().any(|item| item == keyword) {
+            parsed.push(keyword.to_string());
+        }
+    }
+    Ok(parsed)
+}
+
+fn edit_keyword_list(stdout: &mut io::Stdout, keywords: &mut Vec<String>) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let mut options = vec![
+            t("+ Add one", "+ 新增一项").to_string(),
+            t("+ Add multiple", "+ 批量新增").to_string(),
+        ];
+        options.extend(keywords.iter().cloned());
+        draw_menu(
+            stdout,
+            t(" GROUP WAKE KEYWORDS ", " 群聊触发关键词 "),
+            &options,
+            selected,
+            t(
+                "Keywords match only at the start of a message; @ always works",
+                "关键词仅匹配消息开头；@ 始终有效",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter if selected == 0 => {
+                if let Some(value) =
+                    edit_inline_value(stdout, t(" ADD KEYWORD ", " 新增关键词 "), "", false)?
+                {
+                    match parse_keyword_lines(&value) {
+                        Ok(additions) if additions.len() == 1 => {
+                            let keyword = additions.into_iter().next().unwrap();
+                            if !keywords.contains(&keyword) {
+                                keywords.push(keyword);
+                            }
+                        }
+                        _ => message(
+                            stdout,
+                            t("Enter exactly one valid keyword.", "请输入一个有效关键词。"),
+                        )?,
+                    }
+                }
+            }
+            KeyCode::Enter if selected == 1 => {
+                let mut value = String::new();
+                loop {
+                    edit_textarea(stdout, &mut value)?;
+                    match parse_keyword_lines(&value) {
+                        Ok(additions) => {
+                            for keyword in additions {
+                                if !keywords.contains(&keyword) {
+                                    keywords.push(keyword);
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) => message(stdout, &error)?,
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let index = selected - 2;
+                if let Some(value) = edit_inline_value(
+                    stdout,
+                    t(" EDIT KEYWORD ", " 编辑关键词 "),
+                    &keywords[index],
+                    false,
+                )? {
+                    match parse_keyword_lines(&value) {
+                        Ok(values) if values.len() == 1 => {
+                            let value = values[0].clone();
+                            if keywords
+                                .iter()
+                                .enumerate()
+                                .any(|(other, item)| other != index && item == &value)
+                            {
+                                message(
+                                    stdout,
+                                    t("That keyword already exists.", "该关键词已存在。"),
+                                )?;
+                            } else {
+                                keywords[index] = value;
+                            }
+                        }
+                        _ => message(
+                            stdout,
+                            t("Enter exactly one valid keyword.", "请输入一个有效关键词。"),
+                        )?,
+                    }
+                }
+            }
+            KeyCode::Delete | KeyCode::Backspace if selected >= 2 => {
+                keywords.remove(selected - 2);
+                selected = selected.min(keywords.len() + 1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn edit_qq_advanced(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let qq = &config.platforms.qq;
     let mut fields = vec![
-        Field::boolean(t("Enabled", "启用"), onebot.enabled),
-        Field::new(
-            t("Access token (empty = no check)", "Access Token（空 = 不校验）"),
-            onebot.access_token.clone(),
-        )
-        .sensitive(),
-        Field::boolean(t("Allow private chats", "允许私聊"), onebot.allow_private),
         Field::new(
             t(
-                "Private whitelist QQ ids (comma separated, empty = everyone)",
-                "私聊白名单 QQ 号（逗号分隔，空 = 允许所有人）",
+                "Asset base URL (empty = automatic)",
+                "文件访问基础 URL（空 = 自动推导）",
             ),
-            format_id_list(&onebot.allowed_users),
+            qq.asset_base_url.clone(),
         ),
-        Field::boolean(t("Allow group chats", "允许群聊"), onebot.allow_groups),
         Field::new(
             t(
-                "Group whitelist ids (comma separated, empty = all groups)",
-                "群白名单（逗号分隔，空 = 允许所有群）",
+                "Max reply chars per message (0 = no split)",
+                "单条回复最大字数（0 = 不分段）",
             ),
-            format_id_list(&onebot.allowed_groups),
-        ),
-        Field::new(
-            t("Group wake trigger", "群聊触发方式"),
-            onebot.group_trigger.clone(),
-        )
-        .choices(&["at", "prefix", "at_or_prefix"]),
-        Field::new(t("Wake prefix", "触发前缀"), onebot.trigger_prefix.clone()),
-        Field::boolean(
-            t(
-                "Isolated session per group member",
-                "群内按人隔离会话",
-            ),
-            onebot.group_session_per_user,
-        ),
-        Field::new(
-            t("Max reply chars per message (0 = no split)", "单条回复最大字数（0 = 不分段）"),
-            onebot.max_reply_chars.to_string(),
-        ),
-        Field::new(
-            t("Per-sender messages/min (0 = unlimited)", "每人每分钟消息上限（0 = 不限）"),
-            onebot.rate_per_sender_per_min.to_string(),
-        ),
-        Field::new(
-            t("Global messages/min (0 = unlimited)", "全局每分钟消息上限（0 = 不限）"),
-            onebot.rate_global_per_min.to_string(),
+            qq.max_reply_chars.to_string(),
         ),
     ];
-    run_form_without_buttons(stdout, t(" ONEBOT v11 (NAPCAT) ", " ONEBOT v11（NAPCAT）"), &mut fields)?;
-    let onebot = &mut config.platforms.onebot;
-    onebot.enabled = parse_bool_field(&fields[0].value)?;
-    onebot.access_token = fields[1].value.trim().to_string();
-    onebot.allow_private = parse_bool_field(&fields[2].value)?;
-    onebot.allowed_users = parse_id_list(&fields[3].value)?;
-    onebot.allow_groups = parse_bool_field(&fields[4].value)?;
-    onebot.allowed_groups = parse_id_list(&fields[5].value)?;
-    onebot.group_trigger = crate::config::GroupTrigger::from_str(&fields[6].value)
-        .label()
-        .to_string();
-    onebot.trigger_prefix = fields[7].value.trim().to_string();
-    onebot.group_session_per_user = parse_bool_field(&fields[8].value)?;
-    onebot.max_reply_chars = fields[9].value.trim().parse::<usize>()?;
-    onebot.rate_per_sender_per_min = fields[10].value.trim().parse::<u32>()?;
-    onebot.rate_global_per_min = fields[11].value.trim().parse::<u32>()?;
+    if run_form(stdout, t(" QQ ADVANCED ", " QQ 高级设置 "), &mut fields)? {
+        config.platforms.qq.asset_base_url =
+            fields[0].value.trim().trim_end_matches('/').to_string();
+        config.platforms.qq.max_reply_chars = fields[1].value.trim().parse().map_err(|_| {
+            anyhow::anyhow!(t("Invalid maximum reply length.", "单条回复最大字数无效。"))
+        })?;
+    }
+    Ok(())
+}
+
+fn select_platform_model_routes(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let mut options = Vec::with_capacity(config.platforms.qq.conversations.len() + 1);
+        options.push(t("+ Add conversation", "+ 新增会话配置").to_string());
+        options.extend(
+            config
+                .platforms
+                .qq
+                .conversations
+                .iter()
+                .map(platform_model_route_label),
+        );
+        selected = selected.min(options.len().saturating_sub(1));
+        draw_menu(
+            stdout,
+            t(" QQ CONVERSATIONS ", " 私聊/群聊专属配置 "),
+            &options,
+            selected,
+            t(
+                "[Enter]add/edit [d]delete [j/k]move [q]back",
+                "[Enter]新增/编辑 [d]删除 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(options.len().saturating_sub(1));
+            }
+            KeyCode::Enter if selected == 0 => edit_platform_model_route(stdout, config, None)?,
+            KeyCode::Enter => edit_platform_model_route(stdout, config, Some(selected - 1))?,
+            KeyCode::Char('d') | KeyCode::Delete if selected > 0 => {
+                config.platforms.qq.conversations.remove(selected - 1);
+                selected = selected.min(config.platforms.qq.conversations.len());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn platform_model_route_label(route: &PlatformModelRoute) -> String {
+    let kind = match route.conversation.kind {
+        PlatformConversationKind::Private => t("private", "私聊"),
+        PlatformConversationKind::Group => t("group", "群聊"),
+    };
+    let text_count = route.text_models.as_ref().map_or(0, Vec::len);
+    let multimodal_count = route.multimodal_models.as_ref().map_or(0, Vec::len);
+    let inherited = t("inherit", "继承");
+    let text = if route.text_models.is_none() {
+        inherited.to_string()
+    } else {
+        text_count.to_string()
+    };
+    let multimodal = if route.multimodal_models.is_none() {
+        inherited.to_string()
+    } else {
+        multimodal_count.to_string()
+    };
+    let prompt = if route.extra_prompt.is_empty() {
+        t("none", "无")
+    } else {
+        t("set", "已设置")
+    };
+    format!(
+        "{kind} {} · {}:{text} {}:{multimodal} · {}:{prompt}",
+        route.conversation.id,
+        t("text", "文本"),
+        t("media", "多模态"),
+        t("prompt", "提示词")
+    )
+}
+
+fn edit_platform_model_route(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+    route_index: Option<usize>,
+) -> Result<()> {
+    let mut route = route_index
+        .and_then(|index| config.platforms.qq.conversations.get(index).cloned())
+        .unwrap_or_else(|| PlatformModelRoute {
+            conversation: PlatformConversationConfig {
+                kind: PlatformConversationKind::Private,
+                id: String::new(),
+            },
+            text_models: None,
+            multimodal_models: None,
+            extra_prompt: String::new(),
+        });
+    let mut selected = 0usize;
+    loop {
+        let kind_label = platform_conversation_kind_label(route.conversation.kind);
+        let id_label = platform_conversation_id_label(route.conversation.kind);
+        let options = [
+            format!("{}: {}", t("Conversation type", "会话类型"), kind_label,),
+            format!(
+                "{id_label}: {}",
+                if route.conversation.id.is_empty() {
+                    t("not set", "未设置")
+                } else {
+                    route.conversation.id.as_str()
+                },
+            ),
+            format!(
+                "{}: {}",
+                t("Text model pool", "文本模型池"),
+                route_pool_summary(route.text_models.as_deref())
+            ),
+            format!(
+                "{}: {}",
+                t("Multimodal model pool", "多模态模型池"),
+                route_pool_summary(route.multimodal_models.as_deref())
+            ),
+            format!(
+                "{}: {}",
+                t("Extra prompt", "额外提示词"),
+                if route.extra_prompt.is_empty() {
+                    t("none", "未设置")
+                } else {
+                    t("set", "已设置")
+                }
+            ),
+            t("Save", "保存").to_string(),
+            t("Cancel", "取消").to_string(),
+        ];
+        draw_menu(
+            stdout,
+            t(" EDIT QQ CONVERSATION ", " 编辑 QQ 会话配置 "),
+            &options,
+            selected,
+            t(
+                "Empty pools inherit the global configuration",
+                "空模型池会继承全局配置",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => match selected {
+                0 => select_platform_conversation_kind(stdout, &mut route.conversation.kind)?,
+                1 => {
+                    let title = format!(" {id_label} ");
+                    if let Some(value) =
+                        edit_inline_value(stdout, &title, &route.conversation.id, false)?
+                    {
+                        route.conversation.id = value.trim().to_string();
+                    }
+                }
+                2 => select_platform_route_models(stdout, config, &mut route.text_models, false)?,
+                3 => select_platform_route_models(
+                    stdout,
+                    config,
+                    &mut route.multimodal_models,
+                    true,
+                )?,
+                4 => edit_conversation_extra_prompt(stdout, &mut route.extra_prompt)?,
+                5 => {
+                    route.normalize();
+                    if let Err(error) = config.validate_platform_model_route(&route) {
+                        message(stdout, &error.to_string())?;
+                        continue;
+                    }
+                    if config.platforms.qq.conversations.iter().enumerate().any(
+                        |(index, existing)| {
+                            Some(index) != route_index && existing.identity() == route.identity()
+                        },
+                    ) {
+                        message(
+                            stdout,
+                            t(
+                                "A configuration for this QQ conversation already exists.",
+                                "该 QQ 会话的配置已存在。",
+                            ),
+                        )?;
+                        continue;
+                    }
+                    match route_index {
+                        Some(index) => config.platforms.qq.conversations[index] = route,
+                        None => config.platforms.upsert_model_route(route),
+                    }
+                    return Ok(());
+                }
+                6 => return Ok(()),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn platform_conversation_kind_label(kind: PlatformConversationKind) -> &'static str {
+    match kind {
+        PlatformConversationKind::Private => t("Private chat", "私聊"),
+        PlatformConversationKind::Group => t("Group chat", "群聊"),
+    }
+}
+
+fn platform_conversation_id_label(kind: PlatformConversationKind) -> &'static str {
+    match kind {
+        PlatformConversationKind::Private => t("QQ id", "QQ 号"),
+        PlatformConversationKind::Group => t("Group id", "群号"),
+    }
+}
+
+fn select_platform_conversation_kind(
+    stdout: &mut io::Stdout,
+    kind: &mut PlatformConversationKind,
+) -> Result<()> {
+    let choices = [
+        platform_conversation_kind_label(PlatformConversationKind::Private).to_string(),
+        platform_conversation_kind_label(PlatformConversationKind::Group).to_string(),
+    ];
+    let current = platform_conversation_kind_label(*kind);
+    let selected = select_choice(
+        stdout,
+        t("Conversation type", "会话类型"),
+        current,
+        &choices,
+        "",
+    )?;
+    *kind = if selected == choices[1] {
+        PlatformConversationKind::Group
+    } else {
+        PlatformConversationKind::Private
+    };
+    Ok(())
+}
+
+fn edit_conversation_extra_prompt(stdout: &mut io::Stdout, prompt: &mut String) -> Result<()> {
+    edit_textarea(stdout, prompt)?;
+    Ok(())
+}
+
+fn route_pool_summary(pool: Option<&[ActiveProviderModelConfig]>) -> String {
+    match pool {
+        None | Some([]) => t("inherit global", "继承全局").to_string(),
+        Some(entries) if entries.len() == 1 => {
+            format!("{} / {}", entries[0].provider_id, entries[0].model)
+        }
+        Some(entries) => format!("{} {}", entries.len(), t("models", "个模型")),
+    }
+}
+
+fn select_platform_route_models(
+    stdout: &mut io::Stdout,
+    config: &AppConfig,
+    pool: &mut Option<Vec<ActiveProviderModelConfig>>,
+    multimodal: bool,
+) -> Result<()> {
+    let choices = if multimodal {
+        config.multimodal_provider_model_choices()
+    } else {
+        config.text_provider_model_choices()
+    };
+    let mut selected = 0usize;
+    loop {
+        let mut options = Vec::with_capacity(choices.len() + 1);
+        let inherit_marker = if pool.as_ref().is_none_or(Vec::is_empty) {
+            "[*] "
+        } else {
+            "[ ] "
+        };
+        options.push(format!(
+            "{inherit_marker}{}",
+            t("Inherit global model pool", "继承全局模型池")
+        ));
+        options.extend(choices.iter().map(|choice| {
+            let active = pool.as_ref().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.provider_id == choice.provider_id && entry.model == choice.model
+                })
+            });
+            let marker = if active { "[*] " } else { "[ ] " };
+            format!("{marker}{}", choice.label())
+        }));
+        draw_menu(
+            stdout,
+            if multimodal {
+                t(" SESSION MULTIMODAL MODELS ", " 会话多模态模型 ")
+            } else {
+                t(" SESSION TEXT MODELS ", " 会话文本模型 ")
+            },
+            &options,
+            selected,
+            t(
+                "[Tab]add/remove [Enter/q]confirm",
+                "[Tab]加入/移出 [Enter/q]确认",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Tab if selected == 0 => *pool = None,
+            KeyCode::Tab => {
+                let choice = &choices[selected - 1];
+                let entries = pool.get_or_insert_with(Vec::new);
+                if let Some(index) = entries.iter().position(|entry| {
+                    entry.provider_id == choice.provider_id && entry.model == choice.model
+                }) {
+                    entries.remove(index);
+                } else {
+                    entries.push(ActiveProviderModelConfig {
+                        provider_id: choice.provider_id.clone(),
+                        model: choice.model.clone(),
+                    });
+                }
+                if entries.is_empty() {
+                    *pool = None;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+const REPLY_PROCESSOR_PLUGIN_ID: &str = "reply_processor";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct ReplyProcessorSettingsForm {
+    default_enabled: bool,
+    threshold: usize,
+    mode: String,
+    followup_mention: bool,
+    strip_period: bool,
+    theme: String,
+    max_height: u32,
+    font_size: u32,
+    code_font_size: u32,
+    padding: u32,
+    context_notice: bool,
+    ttl_hours: u64,
+    max_records: usize,
+    send_tool_intercept: bool,
+    font: String,
+    title_font: String,
+    code_font: String,
+    emoji_font: String,
+}
+
+impl Default for ReplyProcessorSettingsForm {
+    fn default() -> Self {
+        Self {
+            default_enabled: true,
+            threshold: 300,
+            mode: "image".to_string(),
+            followup_mention: true,
+            strip_period: true,
+            theme: "paper".to_string(),
+            max_height: 2600,
+            font_size: 36,
+            code_font_size: 30,
+            padding: 64,
+            context_notice: true,
+            ttl_hours: 24,
+            max_records: 3,
+            send_tool_intercept: true,
+            font: String::new(),
+            title_font: String::new(),
+            code_font: String::new(),
+            emoji_font: String::new(),
+        }
+    }
+}
+
+fn select_platform_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let enabled = config
+            .platforms
+            .qq
+            .plugins
+            .get(REPLY_PROCESSOR_PLUGIN_ID)
+            .map(|plugin| plugin.enabled_or(true))
+            .unwrap_or(true);
+        let state = if enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
+        let options = [format!("{}: {state}", t("Reply processor", "回复处理"))];
+        draw_menu(
+            stdout,
+            t(" TENCENT QQ PLUGINS ", " QQ 插件配置 "),
+            &options,
+            selected,
+            t(
+                "[Enter]configure [j/k]move [q]back",
+                "[Enter]配置 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => edit_reply_processor(stdout, config)?,
+            _ => {}
+        }
+    }
+}
+
+fn reply_processor_values(config: &AppConfig) -> Result<(bool, ReplyProcessorSettingsForm)> {
+    let Some(instance) = config.platforms.qq.plugins.get(REPLY_PROCESSOR_PLUGIN_ID) else {
+        return Ok((true, ReplyProcessorSettingsForm::default()));
+    };
+    let settings = serde_json::from_value(serde_json::Value::Object(instance.settings.clone()))?;
+    Ok((instance.enabled_or(true), settings))
+}
+
+fn apply_reply_processor_values(
+    config: &mut AppConfig,
+    enabled: bool,
+    settings: &ReplyProcessorSettingsForm,
+) -> Result<()> {
+    let serialized = serde_json::to_value(settings)?;
+    let serde_json::Value::Object(known_settings) = serialized else {
+        bail!("reply processor settings must serialize as an object");
+    };
+    let instance = config
+        .platforms
+        .qq
+        .plugins
+        .entry(REPLY_PROCESSOR_PLUGIN_ID.to_string())
+        .or_default();
+    instance.enabled = (!enabled).then_some(false);
+    for (key, value) in known_settings {
+        instance.settings.insert(key, value);
+    }
+    Ok(())
+}
+
+fn edit_reply_processor(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let (mut plugin_enabled, mut settings) = reply_processor_values(config)?;
+    loop {
+        let mut fields = vec![
+            Field::boolean(t("Plugin enabled", "启用插件"), plugin_enabled),
+            Field::boolean(
+                t("Enabled for new conversations", "新会话默认启用"),
+                settings.default_enabled,
+            ),
+            Field::new(
+                t("Long reply threshold (characters)", "长回复阈值（字符）"),
+                settings.threshold.to_string(),
+            ),
+            Field::new(t("Long reply mode", "长回复模式"), settings.mode.clone())
+                .choices(&["image", "forward"]),
+            Field::boolean(
+                t("Mention sender after forwarding", "转发后艾特发起者"),
+                settings.followup_mention,
+            ),
+            Field::boolean(
+                t("Strip trailing Chinese period", "移除末尾中文句号"),
+                settings.strip_period,
+            ),
+            Field::new(t("Image theme", "长图主题"), settings.theme.clone())
+                .choices(&["paper", "light", "dark"]),
+            Field::new(
+                t("Image maximum height", "长图最大高度"),
+                settings.max_height.to_string(),
+            ),
+            Field::new(
+                t("Body font size", "正文字号"),
+                settings.font_size.to_string(),
+            ),
+            Field::new(
+                t("Code font size", "代码字号"),
+                settings.code_font_size.to_string(),
+            ),
+            Field::new(t("Image padding", "长图边距"), settings.padding.to_string()),
+            Field::boolean(
+                t("Add image context notice", "注入长图上下文提示"),
+                settings.context_notice,
+            ),
+            Field::new(
+                t("Context notice TTL (hours)", "上下文提示保留小时"),
+                settings.ttl_hours.to_string(),
+            ),
+            Field::new(
+                t("Maximum context records", "上下文提示最大条数"),
+                settings.max_records.to_string(),
+            ),
+            Field::boolean(
+                t("Intercept send-message tool", "接管发送消息工具"),
+                settings.send_tool_intercept,
+            ),
+            Field::new(
+                t("Body font (empty = auto)", "正文字体（空 = 自动）"),
+                settings.font.clone(),
+            ),
+            Field::new(
+                t("Title font (empty = auto)", "标题字体（空 = 自动）"),
+                settings.title_font.clone(),
+            ),
+            Field::new(
+                t("Code font (empty = auto)", "代码字体（空 = 自动）"),
+                settings.code_font.clone(),
+            ),
+            Field::new(
+                t("Emoji font (empty = auto)", "Emoji 字体（空 = 自动）"),
+                settings.emoji_font.clone(),
+            ),
+        ];
+        if !run_form(stdout, t(" REPLY PROCESSOR ", " 回复处理 "), &mut fields)? {
+            return Ok(());
+        }
+        plugin_enabled = parse_bool_field(&fields[0].value)?;
+        settings = match parse_reply_processor_fields(&fields) {
+            Ok(settings) => settings,
+            Err(error) => {
+                message(stdout, &error)?;
+                continue;
+            }
+        };
+        apply_reply_processor_values(config, plugin_enabled, &settings)?;
+        return Ok(());
+    }
+}
+
+fn parse_reply_processor_fields(
+    fields: &[Field],
+) -> std::result::Result<ReplyProcessorSettingsForm, String> {
+    let bool_at =
+        |index: usize| parse_bool_field(&fields[index].value).map_err(|error| error.to_string());
+    let settings = ReplyProcessorSettingsForm {
+        default_enabled: bool_at(1)?,
+        threshold: parse_reply_processor_value(fields, 2, t("threshold", "阈值"))?,
+        mode: fields[3].value.trim().to_string(),
+        followup_mention: bool_at(4)?,
+        strip_period: bool_at(5)?,
+        theme: fields[6].value.trim().to_string(),
+        max_height: parse_reply_processor_value(fields, 7, t("maximum height", "最大高度"))?,
+        font_size: parse_reply_processor_value(fields, 8, t("font size", "字号"))?,
+        code_font_size: parse_reply_processor_value(fields, 9, t("code font size", "代码字号"))?,
+        padding: parse_reply_processor_value(fields, 10, t("padding", "边距"))?,
+        context_notice: bool_at(11)?,
+        ttl_hours: parse_reply_processor_value(fields, 12, "TTL")?,
+        max_records: parse_reply_processor_value(fields, 13, t("maximum records", "最大条数"))?,
+        send_tool_intercept: bool_at(14)?,
+        font: fields[15].value.trim().to_string(),
+        title_font: fields[16].value.trim().to_string(),
+        code_font: fields[17].value.trim().to_string(),
+        emoji_font: fields[18].value.trim().to_string(),
+    };
+    validate_reply_processor_settings(&settings)?;
+    Ok(settings)
+}
+
+fn parse_reply_processor_value<T>(
+    fields: &[Field],
+    index: usize,
+    label: &str,
+) -> std::result::Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    fields[index]
+        .value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{}: {label}", t("Invalid value", "无效值")))
+}
+
+fn validate_reply_processor_settings(
+    settings: &ReplyProcessorSettingsForm,
+) -> std::result::Result<(), String> {
+    if settings.threshold == 0 || settings.threshold > 100_000 {
+        return Err(t(
+            "Threshold must be between 1 and 100000.",
+            "阈值必须在 1 到 100000 之间。",
+        )
+        .to_string());
+    }
+    if !matches!(settings.mode.as_str(), "image" | "forward") {
+        return Err(t(
+            "Mode must be image or forward.",
+            "模式必须是 image 或 forward。",
+        )
+        .to_string());
+    }
+    if !matches!(settings.theme.as_str(), "paper" | "light" | "dark") {
+        return Err(t(
+            "Theme must be paper, light, or dark.",
+            "主题必须是 paper、light 或 dark。",
+        )
+        .to_string());
+    }
+    if !(1000..=5000).contains(&settings.max_height) {
+        return Err(t(
+            "Image maximum height must be between 1000 and 5000.",
+            "长图最大高度必须在 1000 到 5000 之间。",
+        )
+        .to_string());
+    }
+    if !(24..=56).contains(&settings.font_size) || !(20..=46).contains(&settings.code_font_size) {
+        return Err(t(
+            "Body font size must be 24-56 and code font size must be 20-46.",
+            "正文字号必须为 24-56，代码字号必须为 20-46。",
+        )
+        .to_string());
+    }
+    if !(36..=120).contains(&settings.padding) {
+        return Err(t(
+            "Image padding must be between 36 and 120.",
+            "长图边距必须在 36 到 120 之间。",
+        )
+        .to_string());
+    }
+    if !(1..=168).contains(&settings.ttl_hours) || !(1..=10).contains(&settings.max_records) {
+        return Err(t(
+            "Context TTL must be 1-168 hours and maximum records must be 1-10.",
+            "上下文保留时间必须为 1-168 小时，最大条数必须为 1-10。",
+        )
+        .to_string());
+    }
     Ok(())
 }
 
@@ -2253,8 +3377,16 @@ fn parse_id_list(value: &str) -> Result<Vec<i64>> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(|item| {
-            item.parse::<i64>()
-                .map_err(|_| anyhow::anyhow!(t("invalid id: {}", "无效的号码：{}").replace("{}", item)))
+            let id = item.parse::<i64>().map_err(|_| {
+                anyhow::anyhow!(t("invalid id: {}", "无效的号码：{}").replace("{}", item))
+            })?;
+            if id <= 0 {
+                bail!(t(
+                    "QQ and group ids must be positive",
+                    "QQ 号和群号必须为正数"
+                ));
+            }
+            Ok(id)
         })
         .collect()
 }
@@ -2361,7 +3493,7 @@ fn edit_provider_form(
             model_modalities: provider.model_modalities.clone(),
             default_model,
             timeout_seconds: timeout,
-            temperature: temperature,
+            temperature,
             anthropic_max_tokens: provider.anthropic_max_tokens,
             extra_body,
         }));
@@ -2495,7 +3627,7 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             t("When context reaches its limit", "上下文到达上限后"),
             config.context.on_overflow.clone(),
         )
-        .choices(&["pop", "compact"]),
+        .choices(&["compact", "pop"]),
     ];
     run_form_without_buttons(stdout, t(" GLOBAL SETTINGS ", " 全局设置 "), &mut fields)?;
     config.tools.enabled = parse_bool_field(&fields[0].value)?;
@@ -2577,10 +3709,9 @@ struct FcitxState {
 
 impl FcitxState {
     fn new() -> Self {
+        let last_state = fcitx5_state();
         run_fcitx5_remote("-c");
-        Self {
-            last_state: Some('1'),
-        }
+        Self { last_state }
     }
 
     fn enter_editing(&mut self) {
@@ -2602,6 +3733,89 @@ fn fcitx5_state() -> Option<char> {
 
 fn run_fcitx5_remote(arg: &str) {
     let _ = Command::new("fcitx5-remote").arg(arg).spawn();
+}
+
+fn edit_inline_value(
+    stdout: &mut io::Stdout,
+    title: &str,
+    current: &str,
+    sensitive: bool,
+) -> Result<Option<String>> {
+    let mut value = current.to_string();
+    let mut cursor = value.chars().count();
+    let mut fcitx = FcitxState::new();
+    fcitx.enter_editing();
+    loop {
+        draw_inline_editor(stdout, title, &value, cursor, sensitive)?;
+        match read_key()? {
+            KeyCode::Esc => {
+                fcitx.leave_editing();
+                execute!(stdout, Hide)?;
+                return Ok(None);
+            }
+            KeyCode::Enter => {
+                fcitx.leave_editing();
+                execute!(stdout, Hide)?;
+                return Ok(Some(value));
+            }
+            KeyCode::Left => cursor = cursor.saturating_sub(1),
+            KeyCode::Right => cursor = (cursor + 1).min(value.chars().count()),
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = value.chars().count(),
+            KeyCode::Backspace if cursor > 0 => remove_char_before_cursor(&mut value, &mut cursor),
+            KeyCode::Delete => remove_char_at_cursor(&mut value, cursor),
+            KeyCode::Char(ch) => insert_char_at_cursor(&mut value, &mut cursor, ch),
+            _ => {}
+        }
+    }
+}
+
+fn draw_inline_editor(
+    stdout: &mut io::Stdout,
+    title: &str,
+    value: &str,
+    cursor: usize,
+    sensitive: bool,
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let width = 72_u16.min(cols.saturating_sub(2)).max(12);
+    let height = 6_u16.min(rows.max(6));
+    let x = cols.saturating_sub(width) / 2;
+    let y = rows.saturating_sub(height) / 2;
+    let capacity = width.saturating_sub(4) as usize;
+    let chars = value.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let start = cursor
+        .saturating_sub(capacity.saturating_sub(1))
+        .min(chars.len().saturating_sub(capacity));
+    let end = (start + capacity).min(chars.len());
+    let visible = if sensitive {
+        "*".repeat(end.saturating_sub(start))
+    } else {
+        chars[start..end].iter().collect::<String>()
+    };
+
+    queue!(stdout, Hide, Clear(ClearType::All))?;
+    draw_box(stdout, x, y, width, height, title)?;
+    queue!(
+        stdout,
+        MoveTo(x + 2, y + 2),
+        Print(pad(&visible, capacity)),
+        MoveTo(x + 2, y + 4),
+        SetAttribute(Attribute::Dim),
+        Print(truncate(
+            t("[Enter]save  [Esc]cancel", "[Enter]保存  [Esc]取消"),
+            capacity,
+        )),
+        SetAttribute(Attribute::Reset),
+        MoveTo(
+            x + 2 + u16::try_from(cursor.saturating_sub(start)).unwrap_or(u16::MAX),
+            y + 2,
+        ),
+        Show,
+    )?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn run_form(stdout: &mut io::Stdout, title: &str, fields: &mut [Field]) -> Result<bool> {
@@ -2980,6 +4194,22 @@ fn provider_model_choice_values(config: &AppConfig, include_current: bool) -> Ve
     choices
 }
 
+fn vision_provider_model_choice_values(config: &AppConfig) -> Vec<String> {
+    let mut choices = vec![
+        String::new(),
+        format!("{OPENCODE_PROVIDER_ID}\t{OPENCODE_DEFAULT_VISION_MODEL}"),
+    ];
+    choices.extend(
+        config
+            .multimodal_provider_model_choices()
+            .into_iter()
+            .map(|choice| choice.value()),
+    );
+    choices.sort();
+    choices.dedup();
+    choices
+}
+
 fn active_multimodal_label(config: &AppConfig) -> String {
     let choices = config.active_multimodal_provider_model_choices();
     if choices.is_empty() {
@@ -3023,8 +4253,8 @@ fn select_active_multimodal_provider(
         message(
             stdout,
             t(
-                "No models are marked as multimodal. Configure Supported input under Edit model first.",
-                "没有已标记为多模态的模型，请先在编辑模型里配置支持输入。",
+                "No models support image input. Configure Supported input under Edit model first.",
+                "没有支持图片输入的模型，请先在编辑模型里配置支持输入。",
             ),
         )?;
         return Ok(());
@@ -3697,9 +4927,14 @@ impl Field {
 #[cfg(test)]
 mod tests {
     use super::{
-        field_display_value, language_choice_label, language_choice_value, parse_extra_body, t,
-        Field,
+        apply_reply_processor_values, field_display_value, language_choice_label,
+        language_choice_value, parse_extra_body, parse_id_lines, parse_id_list,
+        parse_keyword_lines, platform_conversation_id_label, platform_conversation_kind_label,
+        reply_processor_values, route_pool_summary, t, validate_reply_processor_settings,
+        vision_provider_model_choice_values, Field, ReplyProcessorSettingsForm,
+        REPLY_PROCESSOR_PLUGIN_ID,
     };
+    use crate::config::{AppConfig, PlatformConversationKind, PlatformPluginInstanceConfig};
 
     #[test]
     fn sensitive_field_is_masked_until_actively_edited() {
@@ -3774,5 +5009,161 @@ mod tests {
             .unwrap();
         assert_eq!(parsed["enable_thinking"], false);
         assert!(parse_extra_body("  ").unwrap().is_none());
+    }
+
+    #[test]
+    fn reply_processor_defaults_match_platform_contract() {
+        let config = AppConfig::default();
+        let (enabled, settings) = reply_processor_values(&config).unwrap();
+
+        assert!(enabled);
+        assert!(settings.default_enabled);
+        assert_eq!(settings.threshold, 300);
+        assert_eq!(settings.mode, "image");
+        assert!(settings.followup_mention);
+        assert!(settings.strip_period);
+        assert_eq!(settings.theme, "paper");
+        assert_eq!(settings.max_height, 2600);
+        assert_eq!(settings.font_size, 36);
+        assert_eq!(settings.code_font_size, 30);
+        assert_eq!(settings.padding, 64);
+        assert!(settings.context_notice);
+        assert_eq!(settings.ttl_hours, 24);
+        assert_eq!(settings.max_records, 3);
+        assert!(settings.send_tool_intercept);
+        assert!(settings.font.is_empty());
+        assert!(settings.title_font.is_empty());
+        assert!(settings.code_font.is_empty());
+        assert!(settings.emoji_font.is_empty());
+    }
+
+    #[test]
+    fn reply_processor_settings_use_generic_map_and_preserve_unknown_keys() {
+        let mut config = AppConfig::default();
+        let mut instance = PlatformPluginInstanceConfig {
+            enabled: Some(false),
+            ..PlatformPluginInstanceConfig::default()
+        };
+        instance
+            .settings
+            .insert("future_option".to_string(), serde_json::json!({"value": 1}));
+        config
+            .platforms
+            .qq
+            .plugins
+            .insert(REPLY_PROCESSOR_PLUGIN_ID.to_string(), instance);
+        let settings = ReplyProcessorSettingsForm {
+            threshold: 512,
+            mode: "forward".to_string(),
+            ..ReplyProcessorSettingsForm::default()
+        };
+
+        apply_reply_processor_values(&mut config, true, &settings).unwrap();
+
+        let instance = &config.platforms.qq.plugins[REPLY_PROCESSOR_PLUGIN_ID];
+        assert_eq!(instance.enabled, None);
+        assert_eq!(instance.settings["threshold"], 512);
+        assert_eq!(instance.settings["mode"], "forward");
+        assert_eq!(instance.settings["future_option"]["value"], 1);
+        let (enabled, reparsed) = reply_processor_values(&config).unwrap();
+        assert!(enabled);
+        assert_eq!(reparsed, settings);
+    }
+
+    #[test]
+    fn reply_processor_range_validation_rejects_unsafe_render_settings() {
+        assert!(validate_reply_processor_settings(&ReplyProcessorSettingsForm::default()).is_ok());
+        assert!(
+            validate_reply_processor_settings(&ReplyProcessorSettingsForm {
+                threshold: 0,
+                ..ReplyProcessorSettingsForm::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_reply_processor_settings(&ReplyProcessorSettingsForm {
+                max_height: 999,
+                ..ReplyProcessorSettingsForm::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_reply_processor_settings(&ReplyProcessorSettingsForm {
+                ttl_hours: 169,
+                ..ReplyProcessorSettingsForm::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn route_pool_and_id_helpers_express_inheritance_and_positive_ids() {
+        assert_eq!(route_pool_summary(None), t("inherit global", "继承全局"));
+        assert_eq!(
+            route_pool_summary(Some(&[])),
+            t("inherit global", "继承全局")
+        );
+        assert_eq!(parse_id_list("123, 456").unwrap(), vec![123, 456]);
+        assert!(parse_id_list("0").is_err());
+        assert!(parse_id_list("-1").is_err());
+        assert_eq!(parse_id_lines("123\n456\n123\n").unwrap(), vec![123, 456]);
+        assert!(parse_id_lines("123\ninvalid\n456").is_err());
+        assert_eq!(
+            parse_keyword_lines("Miyu\n 小羽 \nMiyu").unwrap(),
+            vec!["Miyu", "小羽"]
+        );
+    }
+
+    #[test]
+    fn qq_batch_inputs_are_line_based_trimmed_and_deduplicated() {
+        assert_eq!(
+            parse_id_lines(" 123 \r\n\r\n456\n123\n").unwrap(),
+            vec![123, 456]
+        );
+        assert!(parse_id_lines("123,456").is_err());
+        assert_eq!(
+            parse_keyword_lines(" Miyu \r\n\r\n小羽\nMiyu\n").unwrap(),
+            vec!["Miyu", "小羽"]
+        );
+    }
+
+    #[test]
+    fn qq_conversation_labels_are_localized_and_id_label_tracks_type() {
+        assert_eq!(
+            platform_conversation_kind_label(PlatformConversationKind::Private),
+            t("Private chat", "私聊")
+        );
+        assert_eq!(
+            platform_conversation_kind_label(PlatformConversationKind::Group),
+            t("Group chat", "群聊")
+        );
+        assert_eq!(
+            platform_conversation_id_label(PlatformConversationKind::Private),
+            t("QQ id", "QQ 号")
+        );
+        assert_eq!(
+            platform_conversation_id_label(PlatformConversationKind::Group),
+            t("Group id", "群号")
+        );
+    }
+
+    #[test]
+    fn explicit_vision_choices_only_include_image_capable_models() {
+        let mut config = AppConfig::default();
+        let provider = &mut config.providers[0];
+        provider.models = vec!["text-only".to_string(), "vision".to_string()];
+        provider
+            .model_modalities
+            .insert("text-only".to_string(), vec!["text".to_string()]);
+        provider.model_modalities.insert(
+            "vision".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        let provider_id = provider.id.clone();
+
+        let choices = vision_provider_model_choice_values(&config);
+
+        assert!(choices.contains(&format!("{provider_id}\tvision")));
+        assert!(!choices.contains(&format!("{provider_id}\ttext-only")));
     }
 }

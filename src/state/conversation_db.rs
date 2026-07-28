@@ -4,6 +4,7 @@ use crate::question::QuestionExchange;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -129,6 +130,31 @@ pub struct SessionOverview {
     pub last_user_content: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlatformSessionBindingKey {
+    pub platform: String,
+    pub account_id: String,
+    pub conversation_kind: String,
+    pub conversation_id: String,
+    pub participant_id: Option<String>,
+    pub persona: String,
+}
+
+impl PlatformSessionBindingKey {
+    fn normalized_participant_id(&self) -> &str {
+        self.participant_id.as_deref().unwrap_or("")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlatformPluginScopeKey {
+    pub plugin_id: String,
+    pub platform: String,
+    pub account_id: String,
+    pub conversation_kind: String,
+    pub conversation_id: String,
+}
+
 const SESSION_COLUMNS: &str = "session_id, persona, name, kind, parent_session_id, workspace, archived, created_at, updated_at";
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -244,6 +270,39 @@ impl ConversationDb {
         Ok(())
     }
 
+    pub fn persona_current_session(&self, persona: &str) -> Result<Option<String>> {
+        let key = format!("current_session_persona:{persona}");
+        let conn = self.conn.lock().unwrap();
+        let session_id = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let valid = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND persona = ?2 AND kind = 'user' AND archived = 0)",
+                params![session_id, persona],
+                |row| row.get::<_, bool>(0),
+            )?;
+        Ok(valid.then_some(session_id))
+    }
+
+    pub fn set_persona_current_session(&self, persona: &str, session_id: &str) -> Result<()> {
+        let key = format!("current_session_persona:{persona}");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Claims persona-less sessions (schema-v2 migrated rows) for the given
     /// persona scope. Called once at daemon startup with the active persona.
     pub fn adopt_sessions_for_persona(&self, persona: &str) -> Result<()> {
@@ -273,6 +332,26 @@ impl ConversationDb {
         persona: &str,
         include_archived: bool,
     ) -> Result<Vec<SessionOverview>> {
+        self.list_sessions_filtered(persona, include_archived, false)
+    }
+
+    /// Local user sessions suitable for CLI/WebUI navigation. Sessions
+    /// owned by a messaging-platform binding keep their history but are not
+    /// exposed as local conversations.
+    pub fn list_local_sessions(
+        &self,
+        persona: &str,
+        include_archived: bool,
+    ) -> Result<Vec<SessionOverview>> {
+        self.list_sessions_filtered(persona, include_archived, true)
+    }
+
+    fn list_sessions_filtered(
+        &self,
+        persona: &str,
+        include_archived: bool,
+        local_only: bool,
+    ) -> Result<Vec<SessionOverview>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {SESSION_COLUMNS},
@@ -285,9 +364,13 @@ impl ConversationDb {
                       ORDER BY seq DESC LIMIT 1) AS last_user_content
              FROM sessions
              WHERE persona = ?1 AND kind = 'user' AND (?2 OR archived = 0)
+               AND (?3 = 0 OR NOT EXISTS (
+                    SELECT 1 FROM platform_session_bindings
+                    WHERE platform_session_bindings.session_id = sessions.session_id
+               ))
              ORDER BY updated_at DESC"
         ))?;
-        let rows = stmt.query_map(params![persona, include_archived], |row| {
+        let rows = stmt.query_map(params![persona, include_archived, local_only], |row| {
             Ok(SessionOverview {
                 record: session_record_from_row(row)?,
                 turn_count: row.get("turn_count")?,
@@ -295,6 +378,17 @@ impl ConversationDb {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn is_platform_session(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM platform_session_bindings WHERE session_id = ?1
+            )",
+            params![session_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn create_session(
@@ -368,11 +462,7 @@ impl ConversationDb {
         Ok(())
     }
 
-    pub fn find_session_by_name(
-        &self,
-        persona: &str,
-        name: &str,
-    ) -> Result<Option<SessionRecord>> {
+    pub fn find_session_by_name(&self, persona: &str, name: &str) -> Result<Option<SessionRecord>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
@@ -385,6 +475,377 @@ impl ConversationDb {
                 session_record_from_row,
             )
             .optional()?)
+    }
+
+    pub fn find_platform_session_binding(
+        &self,
+        key: &PlatformSessionBindingKey,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT session_id FROM platform_session_bindings
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND conversation_kind = ?3 AND conversation_id = ?4
+                   AND participant_id = ?5 AND persona = ?6",
+                params![
+                    key.platform,
+                    key.account_id,
+                    key.conversation_kind,
+                    key.conversation_id,
+                    key.normalized_participant_id(),
+                    key.persona,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Binds an external conversation identity to a session in one immediate
+    /// transaction. A key may be reassigned, but a session already owned by a
+    /// different key is never stolen.
+    pub fn bind_platform_session(
+        &self,
+        key: &PlatformSessionBindingKey,
+        session_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if !session_exists {
+            bail!("session not found: {session_id}");
+        }
+
+        let owned_by_another_key: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM platform_session_bindings
+                 WHERE session_id = ?7
+                   AND NOT (
+                       platform = ?1 AND account_id = ?2
+                       AND conversation_kind = ?3 AND conversation_id = ?4
+                       AND participant_id = ?5 AND persona = ?6
+                   )
+             )",
+            params![
+                key.platform,
+                key.account_id,
+                key.conversation_kind,
+                key.conversation_id,
+                key.normalized_participant_id(),
+                key.persona,
+                session_id,
+            ],
+            |row| row.get(0),
+        )?;
+        if owned_by_another_key {
+            bail!("session is already bound to another platform conversation: {session_id}");
+        }
+
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO platform_session_bindings (
+                platform, account_id, conversation_kind, conversation_id,
+                participant_id, persona, session_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT (
+                platform, account_id, conversation_kind, conversation_id,
+                participant_id, persona
+             ) DO UPDATE SET
+                session_id = excluded.session_id,
+                updated_at = excluded.updated_at",
+            params![
+                key.platform,
+                key.account_id,
+                key.conversation_kind,
+                key.conversation_id,
+                key.normalized_participant_id(),
+                key.persona,
+                session_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Claims an unbound external key without replacing an existing binding.
+    /// Returns the winning session id so concurrent first messages converge
+    /// on one history instead of creating two active sessions.
+    pub fn claim_platform_session(
+        &self,
+        key: &PlatformSessionBindingKey,
+        candidate_session_id: &str,
+    ) -> Result<String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT session_id FROM platform_session_bindings
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND conversation_kind = ?3 AND conversation_id = ?4
+                   AND participant_id = ?5 AND persona = ?6",
+                params![
+                    key.platform,
+                    key.account_id,
+                    key.conversation_kind,
+                    key.conversation_id,
+                    key.normalized_participant_id(),
+                    key.persona,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let session_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
+            params![candidate_session_id],
+            |row| row.get(0),
+        )?;
+        if !session_exists {
+            bail!("session not found: {candidate_session_id}");
+        }
+        let already_owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM platform_session_bindings WHERE session_id = ?1)",
+            params![candidate_session_id],
+            |row| row.get(0),
+        )?;
+        if already_owned {
+            bail!(
+                "session is already bound to another platform conversation: {candidate_session_id}"
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO platform_session_bindings (
+                platform, account_id, conversation_kind, conversation_id,
+                participant_id, persona, session_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                key.platform,
+                key.account_id,
+                key.conversation_kind,
+                key.conversation_id,
+                key.normalized_participant_id(),
+                key.persona,
+                candidate_session_id,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(candidate_session_id.to_string())
+    }
+
+    pub fn unbind_platform_session(&self, key: &PlatformSessionBindingKey) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM platform_session_bindings
+             WHERE platform = ?1 AND account_id = ?2
+               AND conversation_kind = ?3 AND conversation_id = ?4
+               AND participant_id = ?5 AND persona = ?6",
+            params![
+                key.platform,
+                key.account_id,
+                key.conversation_kind,
+                key.conversation_id,
+                key.normalized_participant_id(),
+                key.persona,
+            ],
+        )?;
+        Ok(deleted != 0)
+    }
+
+    pub fn plugin_get_json<T: DeserializeOwned>(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let conn = self.conn.lock().unwrap();
+        let value_json = conn
+            .query_row(
+                "SELECT value_json FROM platform_plugin_kv
+                 WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+                   AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+                params![
+                    scope.plugin_id,
+                    scope.platform,
+                    scope.account_id,
+                    scope.conversation_kind,
+                    scope.conversation_id,
+                    key,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        drop(conn);
+        value_json
+            .map(|value| serde_json::from_str(&value).context("invalid platform plugin JSON state"))
+            .transpose()
+    }
+
+    pub fn plugin_put_json<T: Serialize + ?Sized>(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        let value_json =
+            serde_json::to_string(value).context("failed to serialize platform plugin state")?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO platform_plugin_kv (
+                plugin_id, platform, account_id, conversation_kind,
+                conversation_id, key, value_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (
+                plugin_id, platform, account_id, conversation_kind,
+                conversation_id, key
+             ) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at",
+            params![
+                scope.plugin_id,
+                scope.platform,
+                scope.account_id,
+                scope.conversation_kind,
+                scope.conversation_id,
+                key,
+                value_json,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically replaces one plugin value. Returning `None` deletes it.
+    /// The callback runs inside an immediate transaction and must not re-enter
+    /// this database connection.
+    pub fn plugin_update_json<T, F>(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+        update: F,
+    ) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Serialize,
+        F: FnOnce(Option<T>) -> Result<Option<T>>,
+    {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value_json = tx
+            .query_row(
+                "SELECT value_json FROM platform_plugin_kv
+                 WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+                   AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+                params![
+                    scope.plugin_id,
+                    scope.platform,
+                    scope.account_id,
+                    scope.conversation_kind,
+                    scope.conversation_id,
+                    key,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let current = value_json
+            .map(|value| serde_json::from_str(&value).context("invalid platform plugin JSON state"))
+            .transpose()?;
+        let current_json = current
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize platform plugin state")?;
+        let next = update(current)?;
+        let next_json = next
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize platform plugin state")?;
+        if next_json == current_json {
+            tx.commit()?;
+            return Ok(next);
+        }
+        if let Some(value_json) = next_json {
+            tx.execute(
+                "INSERT INTO platform_plugin_kv (
+                    plugin_id, platform, account_id, conversation_kind,
+                    conversation_id, key, value_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (
+                    plugin_id, platform, account_id, conversation_kind,
+                    conversation_id, key
+                 ) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    scope.plugin_id,
+                    scope.platform,
+                    scope.account_id,
+                    scope.conversation_kind,
+                    scope.conversation_id,
+                    key,
+                    value_json,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM platform_plugin_kv
+                 WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+                   AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+                params![
+                    scope.plugin_id,
+                    scope.platform,
+                    scope.account_id,
+                    scope.conversation_kind,
+                    scope.conversation_id,
+                    key,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(next)
+    }
+
+    pub fn plugin_delete_key(&self, scope: &PlatformPluginScopeKey, key: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM platform_plugin_kv
+             WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+               AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+            params![
+                scope.plugin_id,
+                scope.platform,
+                scope.account_id,
+                scope.conversation_kind,
+                scope.conversation_id,
+                key,
+            ],
+        )?;
+        Ok(deleted != 0)
+    }
+
+    pub fn plugin_delete_scope(&self, scope: &PlatformPluginScopeKey) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM platform_plugin_kv
+             WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+               AND conversation_kind = ?4 AND conversation_id = ?5",
+            params![
+                scope.plugin_id,
+                scope.platform,
+                scope.account_id,
+                scope.conversation_kind,
+                scope.conversation_id,
+            ],
+        )?)
     }
 
     /// Records the model identity and token usage a subagent session actually
@@ -910,7 +1371,11 @@ impl ConversationDb {
     }
 
     #[allow(dead_code)]
-    pub fn load_turns_excluding(&self, session_id: &str, exclude_turn_id: &str) -> Result<Vec<Turn>> {
+    pub fn load_turns_excluding(
+        &self,
+        session_id: &str,
+        exclude_turn_id: &str,
+    ) -> Result<Vec<Turn>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, user_timestamp, assistant_content,
@@ -1228,7 +1693,10 @@ impl ConversationDb {
             "DELETE FROM queued_prompts WHERE session_id = ?1",
             params![session_id],
         )?;
-        conn.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id])?;
+        conn.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            params![session_id],
+        )?;
         conn.execute(
             "DELETE FROM session_loaded_items WHERE session_id = ?1",
             params![session_id],
@@ -1238,7 +1706,10 @@ impl ConversationDb {
 
     pub fn reset_history(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id])?;
+        conn.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            params![session_id],
+        )?;
         conn.execute(
             "DELETE FROM session_loaded_items WHERE session_id = ?1",
             params![session_id],
@@ -1526,7 +1997,16 @@ impl ConversationDb {
                         "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp,
                          assistant_content, assistant_reasoning, assistant_timestamp, status)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed')",
-                        params![turn_id, session_id, seq, user_content, user_ts, content, reasoning, now],
+                        params![
+                            turn_id,
+                            session_id,
+                            seq,
+                            user_content,
+                            user_ts,
+                            content,
+                            reasoning,
+                            now
+                        ],
                     )?;
                     drop(conn);
                     migrated += 1;
@@ -1799,4 +2279,3 @@ fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> 
     }
     Ok(())
 }
-

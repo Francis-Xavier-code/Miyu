@@ -1,0 +1,2294 @@
+use anyhow::{anyhow, bail, Context, Result};
+use cosmic_text::{
+    Align as TextAlign, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping,
+    Style as FontStyle, SwashCache, Weight, Wrap,
+};
+use image::codecs::png::PngEncoder;
+use image::{ColorType, ImageEncoder, Pixel as _, Rgba, RgbaImage};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use unicode_segmentation::UnicodeSegmentation;
+
+const MAX_INPUT_CHARS: usize = 20_000;
+const MAX_PAGE_PIXELS: u64 = 20_000_000;
+const MAX_TOTAL_PAGE_PIXELS: u64 = 48_000_000;
+const MAX_PAGE_PNG_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TOTAL_PNG_BYTES: usize = 48 * 1024 * 1024;
+const MIN_CONFIGURED_HEIGHT: u32 = 1000;
+const MIN_RENDERED_HEIGHT: u32 = 360;
+const MAX_PAGE_HEIGHT: u32 = 5000;
+const MAX_CACHED_GLYPHS: usize = 8192;
+const COLUMN_WIDTH: u32 = 960;
+const COLUMN_GAP: u32 = 32;
+const TABLE_CELL_PADDING: u32 = 14;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RenderConfig {
+    pub(crate) theme: String,
+    pub(crate) max_height: u32,
+    pub(crate) font_size: u32,
+    pub(crate) code_font_size: u32,
+    pub(crate) padding: u32,
+    pub(crate) font: String,
+    pub(crate) title_font: String,
+    pub(crate) code_font: String,
+    pub(crate) emoji_font: String,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            theme: "paper".to_string(),
+            max_height: 2600,
+            font_size: 36,
+            code_font_size: 30,
+            padding: 64,
+            font: String::new(),
+            title_font: String::new(),
+            code_font: String::new(),
+            emoji_font: String::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderedImage {
+    pub(crate) mime: String,
+    pub(crate) png: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct MarkdownImageRenderer {
+    inner: Arc<Mutex<RendererState>>,
+}
+
+struct RendererState {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    resolved_fonts: HashMap<String, Option<String>>,
+}
+
+impl MarkdownImageRenderer {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(RendererState {
+                font_system: FontSystem::new(),
+                swash_cache: SwashCache::new(),
+                resolved_fonts: HashMap::new(),
+            })),
+        })
+    }
+
+    pub(crate) fn render(
+        &self,
+        markdown: &str,
+        config: &RenderConfig,
+    ) -> Result<Vec<RenderedImage>> {
+        validate_markdown(markdown)?;
+        let config = NormalizedConfig::new(config);
+        let blocks = collect_blocks(markdown);
+        let palette = Palette::for_theme(&config.theme);
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("Markdown image renderer lock is poisoned"))?;
+        state.render(blocks, &config, palette)
+    }
+}
+
+impl RendererState {
+    fn render(
+        &mut self,
+        blocks: Vec<Block>,
+        config: &NormalizedConfig,
+        palette: Palette,
+    ) -> Result<Vec<RenderedImage>> {
+        if self.swash_cache.image_cache.len() > MAX_CACHED_GLYPHS {
+            self.swash_cache.image_cache.clear();
+        }
+        let fonts = self.resolve_config_fonts(config);
+        let layouts = layout_blocks(&mut self.font_system, blocks, config, palette, &fonts)?;
+        let columns = plan_columns(&layouts, config)?;
+        let rendered = render_pages(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &layouts,
+            &columns,
+            config,
+            palette,
+        );
+        if self.swash_cache.image_cache.len() > MAX_CACHED_GLYPHS {
+            self.swash_cache.image_cache.clear();
+        }
+        rendered
+    }
+
+    fn resolve_config_fonts(&mut self, config: &NormalizedConfig) -> ResolvedFonts {
+        let body = self.resolve_font(&config.font);
+        let title = if config.title_font.trim().is_empty() {
+            body.clone()
+        } else {
+            self.resolve_font(&config.title_font)
+        };
+        ResolvedFonts {
+            body,
+            title,
+            code: self.resolve_font(&config.code_font),
+            emoji: self.resolve_font(&config.emoji_font),
+        }
+    }
+
+    fn resolve_font(&mut self, configured: &str) -> Option<String> {
+        let configured = configured.trim();
+        if configured.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(configured);
+        if !path.is_file() {
+            return Some(configured.to_string());
+        }
+        let path = path.canonicalize().unwrap_or(path);
+        let cache_key = path.to_string_lossy().into_owned();
+        if let Some(cached) = self.resolved_fonts.get(&cache_key) {
+            return cached.clone();
+        }
+
+        let previous_faces = self.font_system.db().faces().count();
+        let resolved = self
+            .font_system
+            .db_mut()
+            .load_font_file(&path)
+            .ok()
+            .and_then(|()| {
+                self.font_system
+                    .db()
+                    .faces()
+                    .skip(previous_faces)
+                    .find_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            });
+        self.resolved_fonts.insert(cache_key, resolved.clone());
+        resolved
+    }
+}
+
+#[derive(Clone)]
+struct NormalizedConfig {
+    theme: String,
+    max_height: u32,
+    font_size: u32,
+    code_font_size: u32,
+    padding: u32,
+    font: String,
+    title_font: String,
+    code_font: String,
+    emoji_font: String,
+}
+
+impl NormalizedConfig {
+    fn new(config: &RenderConfig) -> Self {
+        Self {
+            theme: config.theme.trim().to_ascii_lowercase(),
+            max_height: config
+                .max_height
+                .clamp(MIN_CONFIGURED_HEIGHT, MAX_PAGE_HEIGHT),
+            font_size: config.font_size.clamp(14, 56),
+            code_font_size: config.code_font_size.clamp(12, 52),
+            padding: config.padding.clamp(24, 160),
+            font: config.font.clone(),
+            title_font: config.title_font.clone(),
+            code_font: config.code_font.clone(),
+            emoji_font: config.emoji_font.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedFonts {
+    body: Option<String>,
+    title: Option<String>,
+    code: Option<String>,
+    emoji: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    background: [u8; 4],
+    text: [u8; 4],
+    heading: [u8; 4],
+    muted: [u8; 4],
+    link: [u8; 4],
+    code_background: [u8; 4],
+    quote_background: [u8; 4],
+    quote_bar: [u8; 4],
+    table_background: [u8; 4],
+    border: [u8; 4],
+    rule: [u8; 4],
+}
+
+impl Palette {
+    fn for_theme(theme: &str) -> Self {
+        match theme {
+            "dark" => Self {
+                background: [28, 29, 32, 255],
+                text: [231, 232, 235, 255],
+                heading: [255, 255, 255, 255],
+                muted: [164, 168, 176, 255],
+                link: [104, 179, 255, 255],
+                code_background: [19, 20, 23, 255],
+                quote_background: [37, 40, 45, 255],
+                quote_bar: [93, 168, 143, 255],
+                table_background: [34, 36, 40, 255],
+                border: [72, 76, 84, 255],
+                rule: [83, 87, 95, 255],
+            },
+            "light" => Self {
+                background: [250, 250, 248, 255],
+                text: [30, 34, 40, 255],
+                heading: [18, 20, 24, 255],
+                muted: [92, 96, 104, 255],
+                link: [48, 101, 190, 255],
+                code_background: [238, 240, 244, 255],
+                quote_background: [244, 247, 255, 255],
+                quote_bar: [74, 116, 214, 255],
+                table_background: [246, 247, 249, 255],
+                border: [218, 222, 230, 255],
+                rule: [218, 222, 230, 255],
+            },
+            _ => Self {
+                background: [244, 239, 229, 255],
+                text: [48, 46, 41, 255],
+                heading: [37, 34, 29, 255],
+                muted: [104, 98, 88, 255],
+                link: [112, 82, 43, 255],
+                code_background: [232, 226, 215, 255],
+                quote_background: [236, 229, 214, 255],
+                quote_bar: [134, 101, 54, 255],
+                table_background: [239, 233, 222, 255],
+                border: [211, 201, 184, 255],
+                rule: [211, 201, 184, 255],
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockKind {
+    Paragraph,
+    Heading(u8),
+    ListItem { depth: u8 },
+    Quote,
+    Code,
+    Table,
+    Rule,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InlineStyle {
+    bold: bool,
+    italic: bool,
+    code: bool,
+    link: bool,
+    muted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RichSpan {
+    text: String,
+    style: InlineStyle,
+}
+
+#[derive(Clone, Debug)]
+struct Block {
+    kind: BlockKind,
+    spans: Vec<RichSpan>,
+    table: Option<TableBlock>,
+    task: Option<bool>,
+}
+
+impl Block {
+    fn new(kind: BlockKind) -> Self {
+        Self {
+            kind,
+            spans: Vec::new(),
+            table: None,
+            task: None,
+        }
+    }
+
+    fn push(&mut self, text: &str, style: InlineStyle) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.spans.last_mut().filter(|last| last.style == style) {
+            last.text.push_str(text);
+        } else {
+            self.spans.push(RichSpan {
+                text: text.to_string(),
+                style,
+            });
+        }
+    }
+
+    fn has_content(&self) -> bool {
+        self.kind == BlockKind::Rule
+            || self.spans.iter().any(|span| !span.text.is_empty())
+            || self.table.as_ref().is_some_and(TableBlock::has_content)
+            || self.task.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TableBlock {
+    alignments: Vec<Alignment>,
+    header: Vec<Vec<RichSpan>>,
+    rows: Vec<Vec<Vec<RichSpan>>>,
+}
+
+impl TableBlock {
+    fn has_content(&self) -> bool {
+        !self.header.is_empty() || !self.rows.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct TableBuilder {
+    alignments: Vec<Alignment>,
+    header: Vec<Vec<RichSpan>>,
+    rows: Vec<Vec<Vec<RichSpan>>>,
+    current_row: Vec<Vec<RichSpan>>,
+    current_cell: Vec<RichSpan>,
+    in_cell: bool,
+}
+
+impl TableBuilder {
+    fn push(&mut self, text: &str, style: InlineStyle) {
+        if text.is_empty() || !self.in_cell {
+            return;
+        }
+        if let Some(last) = self
+            .current_cell
+            .last_mut()
+            .filter(|last| last.style == style)
+        {
+            last.text.push_str(text);
+        } else {
+            self.current_cell.push(RichSpan {
+                text: text.to_string(),
+                style,
+            });
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.current_row.clear();
+        self.current_cell.clear();
+        self.in_cell = false;
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell.clear();
+        self.in_cell = true;
+    }
+
+    fn finish_cell(&mut self) {
+        if self.in_cell {
+            self.current_row
+                .push(std::mem::take(&mut self.current_cell));
+            self.in_cell = false;
+        }
+    }
+
+    fn finish_row(&mut self, header: bool) {
+        self.finish_cell();
+        let row = std::mem::take(&mut self.current_row);
+        if row.is_empty() {
+            return;
+        }
+        if header {
+            self.header = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+
+    fn finish(mut self) -> TableBlock {
+        self.finish_cell();
+        TableBlock {
+            alignments: self.alignments,
+            header: self.header,
+            rows: self.rows,
+        }
+    }
+}
+
+struct ListState {
+    ordered: bool,
+    next: u64,
+    in_item: bool,
+    prefix_used: bool,
+}
+
+#[derive(Default)]
+struct MarkdownCollector {
+    blocks: Vec<Block>,
+    current: Option<Block>,
+    lists: Vec<ListState>,
+    quote_depth: usize,
+    heading: Option<u8>,
+    code_block: bool,
+    table: Option<TableBuilder>,
+    table_header: bool,
+    strong_depth: usize,
+    emphasis_depth: usize,
+    link_depth: usize,
+    strike_depth: usize,
+}
+
+impl MarkdownCollector {
+    fn collect(mut self, markdown: &str) -> Vec<Block> {
+        let options =
+            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        for event in Parser::new_ext(markdown, options) {
+            self.event(event);
+        }
+        self.finish_current();
+        self.blocks
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) => self.push_text(&text, self.style()),
+            Event::Code(text) => {
+                let mut style = self.style();
+                style.code = true;
+                self.push_text(&text, style);
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                let mut style = self.style();
+                style.code = true;
+                self.push_text(&text, style);
+            }
+            Event::SoftBreak => {
+                let separator = if self.code_block || self.table.is_some() {
+                    "\n"
+                } else {
+                    " "
+                };
+                self.push_text(separator, self.style());
+            }
+            Event::HardBreak => self.push_text("\n", self.style()),
+            Event::Rule => {
+                self.finish_current();
+                self.blocks.push(Block::new(BlockKind::Rule));
+            }
+            Event::TaskListMarker(done) => {
+                self.mark_task(done);
+            }
+            Event::FootnoteReference(label) => {
+                self.push_text(&format!("[{label}]"), self.style());
+            }
+            Event::Html(text) | Event::InlineHtml(text) => {
+                self.push_text(&text, self.style());
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => self.ensure_current(),
+            Tag::Heading { level, .. } => {
+                self.finish_current();
+                let level = level as u8;
+                self.heading = Some(level);
+                self.current = Some(Block::new(BlockKind::Heading(level)));
+            }
+            Tag::BlockQuote(_) => {
+                self.finish_current();
+                self.quote_depth = self.quote_depth.saturating_add(1);
+            }
+            Tag::CodeBlock(_) => {
+                self.finish_current();
+                self.code_block = true;
+                self.current = Some(Block::new(BlockKind::Code));
+            }
+            Tag::List(start) => {
+                self.finish_current();
+                self.lists.push(ListState {
+                    ordered: start.is_some(),
+                    next: start.unwrap_or(1),
+                    in_item: false,
+                    prefix_used: false,
+                });
+            }
+            Tag::Item => {
+                self.finish_current();
+                if let Some(list) = self.lists.last_mut() {
+                    list.in_item = true;
+                    list.prefix_used = false;
+                }
+                self.ensure_current();
+            }
+            Tag::Table(alignments) => {
+                self.finish_current();
+                self.table = Some(TableBuilder {
+                    alignments,
+                    ..TableBuilder::default()
+                });
+                self.table_header = false;
+            }
+            Tag::TableHead => {
+                self.table_header = true;
+                if let Some(table) = self.table.as_mut() {
+                    table.start_row();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.start_row();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.start_cell();
+                }
+            }
+            Tag::Strong => self.strong_depth = self.strong_depth.saturating_add(1),
+            Tag::Emphasis => self.emphasis_depth = self.emphasis_depth.saturating_add(1),
+            Tag::Strikethrough => self.strike_depth = self.strike_depth.saturating_add(1),
+            Tag::Link { .. } | Tag::Image { .. } => {
+                self.link_depth = self.link_depth.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                if !self.code_block && self.table.is_none() && self.heading.is_none() {
+                    self.finish_current();
+                }
+            }
+            TagEnd::Heading(_) => {
+                self.finish_current();
+                self.heading = None;
+            }
+            TagEnd::BlockQuote(_) => {
+                self.finish_current();
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+            }
+            TagEnd::CodeBlock => {
+                self.finish_current();
+                self.code_block = false;
+            }
+            TagEnd::List(_) => {
+                self.finish_current();
+                self.lists.pop();
+            }
+            TagEnd::Item => {
+                self.finish_current();
+                if let Some(list) = self.lists.last_mut() {
+                    list.in_item = false;
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    let mut block = Block::new(BlockKind::Table);
+                    block.table = Some(table.finish());
+                    if block.has_content() {
+                        self.blocks.push(block);
+                    }
+                }
+                self.table_header = false;
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row(true);
+                }
+                self.table_header = false;
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row(self.table_header);
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_cell();
+                }
+            }
+            TagEnd::Strong => self.strong_depth = self.strong_depth.saturating_sub(1),
+            TagEnd::Emphasis => self.emphasis_depth = self.emphasis_depth.saturating_sub(1),
+            TagEnd::Strikethrough => self.strike_depth = self.strike_depth.saturating_sub(1),
+            TagEnd::Link | TagEnd::Image => self.link_depth = self.link_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn ensure_current(&mut self) {
+        if self.current.is_some() {
+            return;
+        }
+        if self.code_block {
+            self.current = Some(Block::new(BlockKind::Code));
+            return;
+        }
+        if self.table.is_some() {
+            return;
+        }
+        if let Some(level) = self.heading {
+            self.current = Some(Block::new(BlockKind::Heading(level)));
+            return;
+        }
+
+        if let Some(index) = self.lists.iter().rposition(|list| list.in_item) {
+            let depth = u8::try_from(index + 1).unwrap_or(u8::MAX);
+            let list = &mut self.lists[index];
+            let prefix = if list.prefix_used {
+                "    ".to_string()
+            } else if list.ordered {
+                let number = list.next;
+                list.next = list.next.saturating_add(1);
+                list.prefix_used = true;
+                format!("{number}. ")
+            } else {
+                list.prefix_used = true;
+                "• ".to_string()
+            };
+            let mut block = Block::new(BlockKind::ListItem { depth });
+            block.push(&prefix, InlineStyle::default());
+            self.current = Some(block);
+        } else if self.quote_depth > 0 {
+            self.current = Some(Block::new(BlockKind::Quote));
+        } else {
+            self.current = Some(Block::new(BlockKind::Paragraph));
+        }
+    }
+
+    fn push_text(&mut self, text: &str, style: InlineStyle) {
+        if let Some(table) = self.table.as_mut() {
+            table.push(text, style);
+            return;
+        }
+        self.ensure_current();
+        if let Some(block) = self.current.as_mut() {
+            block.push(text, style);
+        }
+    }
+
+    fn mark_task(&mut self, done: bool) {
+        self.ensure_current();
+        let Some(block) = self.current.as_mut() else {
+            return;
+        };
+        if let Some(first) = block.spans.first_mut() {
+            if let Some(rest) = first.text.strip_prefix("• ") {
+                first.text = rest.to_string();
+                if first.text.is_empty() {
+                    block.spans.remove(0);
+                }
+            }
+        }
+        block.task = Some(done);
+    }
+
+    fn style(&self) -> InlineStyle {
+        InlineStyle {
+            bold: self.strong_depth > 0 || self.table_header,
+            italic: self.emphasis_depth > 0,
+            code: self.code_block,
+            link: self.link_depth > 0,
+            muted: self.strike_depth > 0,
+        }
+    }
+
+    fn finish_current(&mut self) {
+        let Some(block) = self.current.take() else {
+            return;
+        };
+        if block.has_content() {
+            self.blocks.push(block);
+        }
+    }
+}
+
+fn collect_blocks(markdown: &str) -> Vec<Block> {
+    MarkdownCollector::default().collect(markdown)
+}
+
+fn validate_markdown(markdown: &str) -> Result<()> {
+    let count = markdown.chars().take(MAX_INPUT_CHARS + 1).count();
+    if count > MAX_INPUT_CHARS {
+        bail!("Markdown image input exceeds the {MAX_INPUT_CHARS}-character limit");
+    }
+    Ok(())
+}
+
+struct LayoutBlock {
+    kind: BlockKind,
+    buffer: Option<Buffer>,
+    table: Option<LayoutTable>,
+    task: Option<TaskBox>,
+    total_height: u32,
+    vertical_padding: u32,
+    inset_left: u32,
+    boundaries: Vec<u32>,
+    margin_before: u32,
+    margin_after: u32,
+    default_color: Color,
+}
+
+struct LayoutTable {
+    rows: Vec<LayoutTableRow>,
+    header_height: u32,
+}
+
+struct LayoutTableRow {
+    cells: Vec<LayoutTableCell>,
+    source_start: u32,
+    source_end: u32,
+    header: bool,
+    stripe: bool,
+}
+
+struct LayoutTableCell {
+    buffer: Buffer,
+    x: u32,
+    width: u32,
+    default_color: Color,
+}
+
+#[derive(Clone, Copy)]
+struct TaskBox {
+    checked: bool,
+    x: u32,
+    y: u32,
+    size: u32,
+}
+
+fn layout_blocks(
+    font_system: &mut FontSystem,
+    blocks: Vec<Block>,
+    config: &NormalizedConfig,
+    palette: Palette,
+    fonts: &ResolvedFonts,
+) -> Result<Vec<LayoutBlock>> {
+    blocks
+        .into_iter()
+        .map(|block| layout_block(font_system, block, config, palette, fonts))
+        .collect()
+}
+
+fn layout_block(
+    font_system: &mut FontSystem,
+    block: Block,
+    config: &NormalizedConfig,
+    palette: Palette,
+    fonts: &ResolvedFonts,
+) -> Result<LayoutBlock> {
+    if block.kind == BlockKind::Rule {
+        return Ok(LayoutBlock {
+            kind: block.kind,
+            buffer: None,
+            table: None,
+            task: None,
+            total_height: 28,
+            vertical_padding: 0,
+            inset_left: 0,
+            boundaries: vec![28],
+            margin_before: 20,
+            margin_after: 20,
+            default_color: color(palette.text),
+        });
+    }
+
+    if block.kind == BlockKind::Table {
+        return layout_table(
+            font_system,
+            block
+                .table
+                .ok_or_else(|| anyhow!("Markdown table is missing its structured rows"))?,
+            config,
+            palette,
+            fonts,
+        );
+    }
+
+    let (mut inset_left, inset_right, vertical_padding) = block_insets(block.kind);
+    let task = block.task.map(|checked| {
+        let size = (config.font_size * 3 / 5).clamp(18, 30);
+        let marker_x = inset_left.saturating_add(4);
+        let marker_y = vertical_padding.saturating_add(
+            ((metrics_for(block.kind, InlineStyle::default(), config).line_height as u32)
+                .saturating_sub(size))
+                / 2,
+        );
+        inset_left = inset_left.saturating_add(size).saturating_add(16);
+        TaskBox {
+            checked,
+            x: marker_x,
+            y: marker_y,
+            size,
+        }
+    });
+    let content_width = COLUMN_WIDTH
+        .saturating_sub(inset_left)
+        .saturating_sub(inset_right)
+        .max(64);
+    let metrics = metrics_for(block.kind, InlineStyle::default(), config);
+    let default_attrs = attrs_for(
+        block.kind,
+        InlineStyle::default(),
+        false,
+        metrics,
+        palette,
+        fonts,
+    );
+    let expanded = expand_spans(&block.spans, fonts.emoji.is_some());
+    let rich_spans = expanded
+        .iter()
+        .map(|span| {
+            let metrics = metrics_for(block.kind, span.style, config);
+            let attrs = attrs_for(block.kind, span.style, span.emoji, metrics, palette, fonts);
+            (span.text.clone(), attrs)
+        })
+        .collect::<Vec<_>>();
+
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, Some(content_width as f32), None);
+    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
+    buffer.set_rich_text(
+        font_system,
+        rich_spans
+            .iter()
+            .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+        &default_attrs,
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, true);
+
+    let mut boundaries = Vec::new();
+    let mut text_height = 1_u32;
+    for run in buffer.layout_runs() {
+        let bottom = (run.line_top + run.line_height).ceil().max(1.0) as u32;
+        text_height = text_height.max(bottom);
+        let boundary = vertical_padding.saturating_add(bottom);
+        if boundaries.last().copied() != Some(boundary) {
+            boundaries.push(boundary);
+        }
+    }
+    let total_height = text_height.saturating_add(vertical_padding.saturating_mul(2));
+    if let Some(last) = boundaries.last_mut() {
+        *last = total_height;
+    } else {
+        boundaries.push(total_height);
+    }
+    let (margin_before, margin_after) = block_margins(block.kind, config.font_size);
+    Ok(LayoutBlock {
+        kind: block.kind,
+        buffer: Some(buffer),
+        table: None,
+        task,
+        total_height,
+        vertical_padding,
+        inset_left,
+        boundaries,
+        margin_before,
+        margin_after,
+        default_color: color(palette.text),
+    })
+}
+
+fn layout_table(
+    font_system: &mut FontSystem,
+    table: TableBlock,
+    config: &NormalizedConfig,
+    palette: Palette,
+    fonts: &ResolvedFonts,
+) -> Result<LayoutBlock> {
+    let column_count = table
+        .alignments
+        .len()
+        .max(table.header.len())
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+    if column_count == 0 {
+        bail!("Markdown table has no columns");
+    }
+    let column_count_u32 =
+        u32::try_from(column_count).context("too many Markdown table columns")?;
+    let base_width = COLUMN_WIDTH / column_count_u32;
+    let remainder = COLUMN_WIDTH % column_count_u32;
+    if base_width <= TABLE_CELL_PADDING.saturating_mul(2) {
+        bail!("Markdown table has too many columns to render safely");
+    }
+
+    let mut widths = Vec::with_capacity(column_count);
+    for index in 0..column_count_u32 {
+        widths.push(base_width + u32::from(index < remainder));
+    }
+
+    let mut rows = Vec::with_capacity(table.rows.len().saturating_add(1));
+    let mut source_y = 0_u32;
+    if !table.header.is_empty() {
+        let row = layout_table_row(
+            font_system,
+            &table.header,
+            &table.alignments,
+            &widths,
+            true,
+            false,
+            source_y,
+            config,
+            palette,
+            fonts,
+        )?;
+        source_y = row.source_end;
+        rows.push(row);
+    }
+    let header_height = source_y;
+    for (index, cells) in table.rows.iter().enumerate() {
+        let row = layout_table_row(
+            font_system,
+            cells,
+            &table.alignments,
+            &widths,
+            false,
+            index % 2 == 1,
+            source_y,
+            config,
+            palette,
+            fonts,
+        )?;
+        source_y = row.source_end;
+        rows.push(row);
+    }
+    let boundaries = rows.iter().map(|row| row.source_end).collect::<Vec<_>>();
+    let (margin_before, margin_after) = block_margins(BlockKind::Table, config.font_size);
+    Ok(LayoutBlock {
+        kind: BlockKind::Table,
+        buffer: None,
+        table: Some(LayoutTable {
+            rows,
+            header_height,
+        }),
+        task: None,
+        total_height: source_y,
+        vertical_padding: 0,
+        inset_left: 0,
+        boundaries,
+        margin_before,
+        margin_after,
+        default_color: color(palette.text),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_table_row(
+    font_system: &mut FontSystem,
+    cells: &[Vec<RichSpan>],
+    alignments: &[Alignment],
+    widths: &[u32],
+    header: bool,
+    stripe: bool,
+    source_start: u32,
+    config: &NormalizedConfig,
+    palette: Palette,
+    fonts: &ResolvedFonts,
+) -> Result<LayoutTableRow> {
+    let metrics = metrics_for(BlockKind::Table, InlineStyle::default(), config);
+    let mut x = 0_u32;
+    let mut row_height = metrics.line_height.ceil().max(1.0) as u32;
+    let mut laid_out = Vec::with_capacity(widths.len());
+    for (index, width) in widths.iter().copied().enumerate() {
+        let content_width = width.saturating_sub(TABLE_CELL_PADDING.saturating_mul(2));
+        let spans = cells.get(index).map(Vec::as_slice).unwrap_or(&[]);
+        let alignment = alignments.get(index).copied().unwrap_or(Alignment::None);
+        let (buffer, text_height, default_color) = layout_rich_buffer(
+            font_system,
+            spans,
+            BlockKind::Table,
+            content_width,
+            header,
+            alignment,
+            config,
+            palette,
+            fonts,
+        );
+        row_height = row_height.max(text_height);
+        laid_out.push(LayoutTableCell {
+            buffer,
+            x,
+            width,
+            default_color,
+        });
+        x = x
+            .checked_add(width)
+            .context("Markdown table width overflowed")?;
+    }
+    row_height = row_height.saturating_add(TABLE_CELL_PADDING.saturating_mul(2));
+    let source_end = source_start
+        .checked_add(row_height)
+        .context("Markdown table height overflowed")?;
+    Ok(LayoutTableRow {
+        cells: laid_out,
+        source_start,
+        source_end,
+        header,
+        stripe,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_rich_buffer(
+    font_system: &mut FontSystem,
+    spans: &[RichSpan],
+    kind: BlockKind,
+    width: u32,
+    force_bold: bool,
+    alignment: Alignment,
+    config: &NormalizedConfig,
+    palette: Palette,
+    fonts: &ResolvedFonts,
+) -> (Buffer, u32, Color) {
+    let metrics = metrics_for(kind, InlineStyle::default(), config);
+    let default_attrs = attrs_for(
+        kind,
+        InlineStyle {
+            bold: force_bold,
+            ..InlineStyle::default()
+        },
+        false,
+        metrics,
+        palette,
+        fonts,
+    );
+    let mut expanded = expand_spans(spans, fonts.emoji.is_some());
+    if expanded.is_empty() {
+        expanded.push(ExpandedSpan {
+            text: " ".to_string(),
+            style: InlineStyle::default(),
+            emoji: false,
+        });
+    }
+    let rich_spans = expanded
+        .iter()
+        .map(|span| {
+            let mut style = span.style;
+            style.bold |= force_bold;
+            let metrics = metrics_for(kind, style, config);
+            let attrs = attrs_for(kind, style, span.emoji, metrics, palette, fonts);
+            (span.text.clone(), attrs)
+        })
+        .collect::<Vec<_>>();
+    let alignment = match alignment {
+        Alignment::Right => Some(TextAlign::Right),
+        Alignment::Center => Some(TextAlign::Center),
+        Alignment::Left => Some(TextAlign::Left),
+        Alignment::None => None,
+    };
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, Some(width.max(1) as f32), None);
+    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
+    buffer.set_rich_text(
+        font_system,
+        rich_spans
+            .iter()
+            .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+        &default_attrs,
+        Shaping::Advanced,
+        alignment,
+    );
+    buffer.shape_until_scroll(font_system, true);
+    let text_height = buffer
+        .layout_runs()
+        .map(|run| (run.line_top + run.line_height).ceil().max(1.0) as u32)
+        .max()
+        .unwrap_or_else(|| metrics.line_height.ceil().max(1.0) as u32);
+    (buffer, text_height, color(palette.text))
+}
+
+#[derive(Clone)]
+struct ExpandedSpan {
+    text: String,
+    style: InlineStyle,
+    emoji: bool,
+}
+
+fn expand_spans(spans: &[RichSpan], split_emoji: bool) -> Vec<ExpandedSpan> {
+    let mut expanded: Vec<ExpandedSpan> = Vec::new();
+    for span in spans {
+        if !split_emoji {
+            expanded.push(ExpandedSpan {
+                text: span.text.clone(),
+                style: span.style,
+                emoji: false,
+            });
+            continue;
+        }
+        for grapheme in span.text.graphemes(true) {
+            let emoji = grapheme_is_emoji(grapheme);
+            if let Some(last) = expanded
+                .last_mut()
+                .filter(|last| last.style == span.style && last.emoji == emoji)
+            {
+                last.text.push_str(grapheme);
+            } else {
+                expanded.push(ExpandedSpan {
+                    text: grapheme.to_string(),
+                    style: span.style,
+                    emoji,
+                });
+            }
+        }
+    }
+    expanded
+}
+
+fn grapheme_is_emoji(grapheme: &str) -> bool {
+    grapheme.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x1F000..=0x1FAFF
+                | 0x2300..=0x23FF
+                | 0x2600..=0x27BF
+                | 0x2B00..=0x2BFF
+                | 0xFE0F
+                | 0x200D
+        )
+    })
+}
+
+fn attrs_for<'a>(
+    kind: BlockKind,
+    style: InlineStyle,
+    emoji: bool,
+    metrics: Metrics,
+    palette: Palette,
+    fonts: &'a ResolvedFonts,
+) -> Attrs<'a> {
+    let named = if emoji {
+        fonts.emoji.as_deref()
+    } else if style.code || matches!(kind, BlockKind::Code) {
+        fonts.code.as_deref()
+    } else if matches!(kind, BlockKind::Heading(_)) {
+        fonts.title.as_deref().or(fonts.body.as_deref())
+    } else {
+        fonts.body.as_deref()
+    };
+    let fallback = if style.code || matches!(kind, BlockKind::Code) {
+        Family::Monospace
+    } else {
+        Family::SansSerif
+    };
+    let family = named.map(Family::Name).unwrap_or(fallback);
+    let foreground = if style.link {
+        palette.link
+    } else if style.muted {
+        palette.muted
+    } else if matches!(kind, BlockKind::Heading(_)) {
+        palette.heading
+    } else {
+        palette.text
+    };
+    let mut attrs = Attrs::new()
+        .family(family)
+        .color(color(foreground))
+        .metrics(metrics);
+    if style.bold || matches!(kind, BlockKind::Heading(_)) {
+        attrs = attrs.weight(Weight::BOLD);
+    }
+    if style.italic {
+        attrs = attrs.style(FontStyle::Italic);
+    }
+    attrs
+}
+
+fn metrics_for(kind: BlockKind, style: InlineStyle, config: &NormalizedConfig) -> Metrics {
+    let body = config.font_size as f32;
+    let code = config.code_font_size as f32;
+    let size = match kind {
+        BlockKind::Heading(level) => {
+            let scale = match level {
+                1 => 1.55,
+                2 => 1.35,
+                3 => 1.20,
+                4 => 1.10,
+                _ => 1.0,
+            };
+            (body * scale).min(76.0)
+        }
+        BlockKind::Code => code,
+        BlockKind::Table => (body * 0.92).max(14.0),
+        _ if style.code => code,
+        _ => body,
+    };
+    Metrics::new(size, (size * 1.42).ceil())
+}
+
+fn block_insets(kind: BlockKind) -> (u32, u32, u32) {
+    match kind {
+        BlockKind::Code => (24, 24, 18),
+        BlockKind::Table => (20, 20, 16),
+        BlockKind::Quote => (32, 14, 12),
+        BlockKind::ListItem { depth } => {
+            (u32::from(depth.saturating_sub(1)).saturating_mul(18), 0, 0)
+        }
+        _ => (0, 0, 0),
+    }
+}
+
+fn block_margins(kind: BlockKind, font_size: u32) -> (u32, u32) {
+    let small = (font_size / 4).max(6);
+    match kind {
+        BlockKind::Heading(1) => (font_size, font_size / 2),
+        BlockKind::Heading(_) => (font_size / 2, small),
+        BlockKind::Code | BlockKind::Table => (font_size / 2, font_size / 2),
+        BlockKind::Rule => (font_size / 2, font_size / 2),
+        BlockKind::Quote => (small, small),
+        BlockKind::ListItem { .. } => (small / 2, small / 2),
+        BlockKind::Paragraph => (small, small),
+    }
+}
+
+#[derive(Default)]
+struct ColumnPlan {
+    placements: Vec<Placement>,
+    used_height: u32,
+}
+
+struct Placement {
+    block_index: usize,
+    source_start: u32,
+    source_end: u32,
+    y: u32,
+}
+
+fn plan_columns(layouts: &[LayoutBlock], config: &NormalizedConfig) -> Result<Vec<ColumnPlan>> {
+    let usable_height = config
+        .max_height
+        .saturating_sub(config.padding.saturating_mul(2));
+    if usable_height < 128 {
+        bail!("page height leaves too little room for rendered content");
+    }
+    let mut columns = vec![ColumnPlan::default()];
+
+    for (block_index, block) in layouts.iter().enumerate() {
+        if let Some(table) = block.table.as_ref() {
+            if table.header_height > usable_height {
+                bail!("a Markdown table header exceeds the usable image height");
+            }
+            for row in table.rows.iter().filter(|row| !row.header) {
+                let row_height = row.source_end.saturating_sub(row.source_start);
+                if table.header_height.saturating_add(row_height) > usable_height {
+                    bail!("a Markdown table row exceeds the usable image height");
+                }
+            }
+        }
+        let mut source_start = 0;
+        let mut first_fragment = true;
+        while source_start < block.total_height {
+            if source_start > 0 {
+                if let Some(table) = block
+                    .table
+                    .as_ref()
+                    .filter(|table| table.header_height > 0 && source_start >= table.header_height)
+                {
+                    let column = columns
+                        .last_mut()
+                        .ok_or_else(|| anyhow!("renderer column planner lost its active column"))?;
+                    if column.used_height == 0 {
+                        column.placements.push(Placement {
+                            block_index,
+                            source_start: 0,
+                            source_end: table.header_height,
+                            y: 0,
+                        });
+                        column.used_height = table.header_height;
+                    }
+                }
+            }
+            let column = columns
+                .last_mut()
+                .ok_or_else(|| anyhow!("renderer column planner lost its active column"))?;
+            let margin = if first_fragment && column.used_height > 0 {
+                block.margin_before
+            } else {
+                0
+            };
+            let remaining = block.total_height.saturating_sub(source_start);
+            let available = usable_height
+                .saturating_sub(column.used_height)
+                .saturating_sub(margin);
+
+            if first_fragment && column.used_height > 0 {
+                if let Some(table) = block.table.as_ref() {
+                    let first_body_height = table
+                        .rows
+                        .iter()
+                        .find(|row| !row.header)
+                        .map(|row| row.source_end.saturating_sub(row.source_start))
+                        .unwrap_or(0);
+                    let first_table_chunk = table.header_height.saturating_add(first_body_height);
+                    if first_table_chunk > available && first_table_chunk <= usable_height {
+                        push_column(&mut columns)?;
+                        continue;
+                    }
+                }
+            }
+
+            if first_fragment
+                && block.kind != BlockKind::Code
+                && block.total_height <= usable_height
+                && remaining > available
+                && column.used_height > 0
+            {
+                push_column(&mut columns)?;
+                continue;
+            }
+            if available == 0 {
+                push_column(&mut columns)?;
+                continue;
+            }
+
+            let limit = source_start.saturating_add(available);
+            let source_end = if remaining <= available {
+                block.total_height
+            } else {
+                block
+                    .boundaries
+                    .iter()
+                    .copied()
+                    .take_while(|boundary| *boundary <= limit)
+                    .last()
+                    .unwrap_or(source_start)
+            };
+            if source_end <= source_start {
+                if column.used_height == 0 {
+                    bail!("a rendered text line exceeds the usable page height");
+                }
+                push_column(&mut columns)?;
+                continue;
+            }
+
+            let y = column.used_height.saturating_add(margin);
+            column.placements.push(Placement {
+                block_index,
+                source_start,
+                source_end,
+                y,
+            });
+            column.used_height = y.saturating_add(source_end.saturating_sub(source_start));
+            source_start = source_end;
+            first_fragment = false;
+            if source_start < block.total_height {
+                push_column(&mut columns)?;
+            } else {
+                column.used_height = column
+                    .used_height
+                    .saturating_add(block.margin_after)
+                    .min(usable_height);
+            }
+        }
+    }
+    Ok(columns)
+}
+
+fn push_column(columns: &mut Vec<ColumnPlan>) -> Result<()> {
+    columns
+        .len()
+        .checked_add(1)
+        .context("rendered Markdown column count overflowed")?;
+    columns.push(ColumnPlan::default());
+    Ok(())
+}
+
+fn render_pages(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    layouts: &[LayoutBlock],
+    columns: &[ColumnPlan],
+    config: &NormalizedConfig,
+    palette: Palette,
+) -> Result<Vec<RenderedImage>> {
+    let column_count = u32::try_from(columns.len()).context("too many image columns")?;
+    let columns_width = COLUMN_WIDTH
+        .checked_mul(column_count)
+        .context("rendered image width overflowed")?;
+    let gaps_width = COLUMN_GAP
+        .checked_mul(column_count.saturating_sub(1))
+        .context("rendered image gap width overflowed")?;
+    let width = config
+        .padding
+        .checked_mul(2)
+        .and_then(|padding| padding.checked_add(columns_width))
+        .and_then(|width| width.checked_add(gaps_width))
+        .context("rendered image width overflowed")?;
+    let content_height = columns
+        .iter()
+        .map(|column| column.used_height)
+        .max()
+        .unwrap_or(0);
+    let height = content_height
+        .saturating_add(config.padding.saturating_mul(2))
+        .clamp(MIN_RENDERED_HEIGHT, config.max_height);
+    validate_page_dimensions(width, height)?;
+    let pixels = u64::from(width) * u64::from(height);
+    checked_total_page_pixels(0, pixels)?;
+
+    let mut image = RgbaImage::from_pixel(width, height, Rgba(palette.background));
+    for (column_index, column) in columns.iter().enumerate() {
+        let column_index =
+            u32::try_from(column_index).context("image column index does not fit in u32")?;
+        let column_x = config
+            .padding
+            .saturating_add(column_index.saturating_mul(COLUMN_WIDTH.saturating_add(COLUMN_GAP)));
+        for placement in &column.placements {
+            let block = layouts
+                .get(placement.block_index)
+                .ok_or_else(|| anyhow!("renderer placement references a missing block"))?;
+            let destination_y = config.padding.saturating_add(placement.y);
+            if block.table.is_some() {
+                draw_table_fragment(
+                    &mut image,
+                    font_system,
+                    swash_cache,
+                    block,
+                    placement,
+                    column_x,
+                    destination_y,
+                    palette,
+                );
+                continue;
+            }
+            draw_decoration(
+                &mut image,
+                block,
+                placement,
+                column_x,
+                destination_y,
+                palette,
+            );
+            draw_text_fragment(
+                &mut image,
+                font_system,
+                swash_cache,
+                block,
+                placement,
+                column_x,
+                destination_y,
+            );
+        }
+    }
+
+    let png_limit = MAX_PAGE_PNG_BYTES.min(MAX_TOTAL_PNG_BYTES);
+    let mut writer = CappedVecWriter::new(png_limit);
+    let encoded = PngEncoder::new(&mut writer).write_image(
+        image.as_raw(),
+        width,
+        height,
+        ColorType::Rgba8.into(),
+    );
+    if let Err(error) = encoded {
+        if writer.exceeded() {
+            bail!("rendered image exceeds the {png_limit}-byte PNG limit");
+        }
+        return Err(error).context("failed to encode rendered Markdown as PNG");
+    }
+    let png = writer.into_inner();
+    Ok(vec![RenderedImage {
+        mime: "image/png".to_string(),
+        png,
+        width,
+        height,
+    }])
+}
+
+struct CappedVecWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CappedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for CappedVecWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("rendered PNG byte budget exceeded"));
+        };
+        if next_len > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("rendered PNG byte budget exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_page_dimensions(width: u32, height: u32) -> Result<()> {
+    if width == 0 {
+        bail!("rendered image width must be non-zero");
+    }
+    if !(MIN_RENDERED_HEIGHT..=MAX_PAGE_HEIGHT).contains(&height) {
+        bail!("rendered image height {height} is outside the supported range");
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MAX_PAGE_PIXELS {
+        bail!("rendered image would exceed the {MAX_PAGE_PIXELS}-pixel limit");
+    }
+    Ok(())
+}
+
+fn checked_total_page_pixels(current: u64, page: u64) -> Result<u64> {
+    let total = current
+        .checked_add(page)
+        .context("rendered page pixel count overflowed")?;
+    if total > MAX_TOTAL_PAGE_PIXELS {
+        bail!("rendered Markdown exceeds the {MAX_TOTAL_PAGE_PIXELS}-pixel total limit");
+    }
+    Ok(total)
+}
+
+fn draw_decoration(
+    image: &mut RgbaImage,
+    block: &LayoutBlock,
+    placement: &Placement,
+    x: u32,
+    y: u32,
+    palette: Palette,
+) {
+    let height = placement.source_end.saturating_sub(placement.source_start);
+    match block.kind {
+        BlockKind::Code => {
+            fill_rect(image, x, y, COLUMN_WIDTH, height, palette.code_background);
+            outline_fragment(
+                image,
+                x,
+                y,
+                COLUMN_WIDTH,
+                height,
+                palette.border,
+                placement.source_start == 0,
+                placement.source_end == block.total_height,
+            );
+        }
+        BlockKind::Quote => {
+            fill_rect(image, x, y, COLUMN_WIDTH, height, palette.quote_background);
+            fill_rect(image, x, y, 6, height, palette.quote_bar);
+        }
+        BlockKind::Rule => {
+            let line_y = y.saturating_add(height / 2);
+            fill_rect(image, x, line_y, COLUMN_WIDTH, 2, palette.rule);
+        }
+        BlockKind::Heading(1) if placement.source_end == block.total_height => {
+            let line_y = y.saturating_add(height).saturating_sub(2);
+            fill_rect(image, x, line_y, COLUMN_WIDTH, 2, palette.rule);
+        }
+        _ => {}
+    }
+    if placement.source_start == 0 {
+        if let Some(task) = block.task {
+            draw_checkbox(
+                image,
+                x.saturating_add(task.x),
+                y.saturating_add(task.y),
+                task.size,
+                task.checked,
+                palette.text,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_table_fragment(
+    image: &mut RgbaImage,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    block: &LayoutBlock,
+    placement: &Placement,
+    column_x: u32,
+    destination_y: u32,
+    palette: Palette,
+) {
+    let Some(table) = block.table.as_ref() else {
+        return;
+    };
+    for row in table.rows.iter().filter(|row| {
+        row.source_start >= placement.source_start && row.source_end <= placement.source_end
+    }) {
+        let row_y =
+            destination_y.saturating_add(row.source_start.saturating_sub(placement.source_start));
+        let row_height = row.source_end.saturating_sub(row.source_start);
+        let background = if row.header {
+            palette.code_background
+        } else if row.stripe {
+            palette.quote_background
+        } else {
+            palette.table_background
+        };
+        fill_rect(image, column_x, row_y, COLUMN_WIDTH, row_height, background);
+        fill_rect(image, column_x, row_y, COLUMN_WIDTH, 1, palette.border);
+        fill_rect(
+            image,
+            column_x,
+            row_y.saturating_add(row_height.saturating_sub(1)),
+            COLUMN_WIDTH,
+            1,
+            palette.border,
+        );
+        for cell in &row.cells {
+            let cell_x = column_x.saturating_add(cell.x);
+            fill_rect(image, cell_x, row_y, 1, row_height, palette.border);
+            if cell.x.saturating_add(cell.width) == COLUMN_WIDTH {
+                fill_rect(
+                    image,
+                    cell_x.saturating_add(cell.width.saturating_sub(1)),
+                    row_y,
+                    1,
+                    row_height,
+                    palette.border,
+                );
+            }
+            draw_table_cell_text(
+                image,
+                font_system,
+                swash_cache,
+                cell,
+                cell_x.saturating_add(TABLE_CELL_PADDING),
+                row_y.saturating_add(TABLE_CELL_PADDING),
+                cell_x.saturating_add(cell.width.saturating_sub(TABLE_CELL_PADDING)),
+                row_y.saturating_add(row_height.saturating_sub(TABLE_CELL_PADDING)),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_table_cell_text(
+    image: &mut RgbaImage,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    cell: &LayoutTableCell,
+    origin_x: u32,
+    origin_y: u32,
+    clip_x_end: u32,
+    clip_y_end: u32,
+) {
+    for run in cell.buffer.layout_runs() {
+        for glyph in run.glyphs {
+            if swash_cache.image_cache.len() >= MAX_CACHED_GLYPHS {
+                swash_cache.image_cache.clear();
+            }
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            let glyph_color = glyph.color_opt.unwrap_or(cell.default_color);
+            swash_cache.with_pixels(
+                font_system,
+                physical.cache_key,
+                glyph_color,
+                |pixel_x, pixel_y, pixel_color| {
+                    let global_x = i64::from(origin_x) + i64::from(physical.x) + i64::from(pixel_x);
+                    let global_y = i64::from(origin_y)
+                        + run.line_y as i64
+                        + i64::from(physical.y)
+                        + i64::from(pixel_y);
+                    let (Ok(global_x), Ok(global_y)) =
+                        (u32::try_from(global_x), u32::try_from(global_y))
+                    else {
+                        return;
+                    };
+                    if global_x < origin_x
+                        || global_x >= clip_x_end
+                        || global_y < origin_y
+                        || global_y >= clip_y_end
+                    {
+                        return;
+                    }
+                    if let Some(destination) = image.get_pixel_mut_checked(global_x, global_y) {
+                        destination.blend(&Rgba(pixel_color.as_rgba()));
+                    }
+                },
+            );
+        }
+    }
+}
+
+fn draw_checkbox(image: &mut RgbaImage, x: u32, y: u32, size: u32, checked: bool, color: [u8; 4]) {
+    if size < 4 {
+        return;
+    }
+    fill_rect(image, x, y, size, 2, color);
+    fill_rect(
+        image,
+        x,
+        y.saturating_add(size.saturating_sub(2)),
+        size,
+        2,
+        color,
+    );
+    fill_rect(image, x, y, 2, size, color);
+    fill_rect(
+        image,
+        x.saturating_add(size.saturating_sub(2)),
+        y,
+        2,
+        size,
+        color,
+    );
+    if checked {
+        draw_line(
+            image,
+            x.saturating_add(size / 5),
+            y.saturating_add(size / 2),
+            x.saturating_add(size * 2 / 5),
+            y.saturating_add(size * 3 / 4),
+            3,
+            color,
+        );
+        draw_line(
+            image,
+            x.saturating_add(size * 2 / 5),
+            y.saturating_add(size * 3 / 4),
+            x.saturating_add(size * 4 / 5),
+            y.saturating_add(size / 4),
+            3,
+            color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    image: &mut RgbaImage,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    width: u32,
+    color: [u8; 4],
+) {
+    let dx = i64::from(x1).saturating_sub(i64::from(x0));
+    let dy = i64::from(y1).saturating_sub(i64::from(y0));
+    let steps = dx.unsigned_abs().max(dy.unsigned_abs()).max(1);
+    for step in 0..=steps {
+        let x = i64::from(x0).saturating_add(
+            dx.saturating_mul(step as i64)
+                .checked_div(steps as i64)
+                .unwrap_or(0),
+        );
+        let y = i64::from(y0).saturating_add(
+            dy.saturating_mul(step as i64)
+                .checked_div(steps as i64)
+                .unwrap_or(0),
+        );
+        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+            continue;
+        };
+        fill_rect(image, x, y, width, width, color);
+    }
+}
+
+fn draw_text_fragment(
+    image: &mut RgbaImage,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    block: &LayoutBlock,
+    placement: &Placement,
+    column_x: u32,
+    destination_y: u32,
+) {
+    let Some(buffer) = block.buffer.as_ref() else {
+        return;
+    };
+    let clip_x_end = column_x.saturating_add(COLUMN_WIDTH);
+    let clip_y_end =
+        destination_y.saturating_add(placement.source_end.saturating_sub(placement.source_start));
+    for run in buffer.layout_runs() {
+        let run_top = block.vertical_padding as f32 + run.line_top;
+        let run_bottom = run_top + run.line_height;
+        if run_bottom <= placement.source_start as f32 || run_top >= placement.source_end as f32 {
+            continue;
+        }
+        for glyph in run.glyphs {
+            if swash_cache.image_cache.len() >= MAX_CACHED_GLYPHS {
+                swash_cache.image_cache.clear();
+            }
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            let glyph_color = glyph.color_opt.unwrap_or(block.default_color);
+            swash_cache.with_pixels(
+                font_system,
+                physical.cache_key,
+                glyph_color,
+                |pixel_x, pixel_y, pixel_color| {
+                    let global_x = i64::from(column_x)
+                        + i64::from(block.inset_left)
+                        + i64::from(physical.x)
+                        + i64::from(pixel_x);
+                    let global_block_y = i64::from(block.vertical_padding)
+                        + run.line_y as i64
+                        + i64::from(physical.y)
+                        + i64::from(pixel_y);
+                    if global_block_y < i64::from(placement.source_start)
+                        || global_block_y >= i64::from(placement.source_end)
+                    {
+                        return;
+                    }
+                    let global_y = i64::from(destination_y) + global_block_y
+                        - i64::from(placement.source_start);
+                    let (Ok(global_x), Ok(global_y)) =
+                        (u32::try_from(global_x), u32::try_from(global_y))
+                    else {
+                        return;
+                    };
+                    if global_x < column_x
+                        || global_x >= clip_x_end
+                        || global_y < destination_y
+                        || global_y >= clip_y_end
+                    {
+                        return;
+                    }
+                    if let Some(destination) = image.get_pixel_mut_checked(global_x, global_y) {
+                        destination.blend(&Rgba(pixel_color.as_rgba()));
+                    }
+                },
+            );
+        }
+    }
+}
+
+fn fill_rect(image: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32, color: [u8; 4]) {
+    let end_x = x.saturating_add(width).min(image.width());
+    let end_y = y.saturating_add(height).min(image.height());
+    for py in y.min(end_y)..end_y {
+        for px in x.min(end_x)..end_x {
+            if let Some(pixel) = image.get_pixel_mut_checked(px, py) {
+                *pixel = Rgba(color);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn outline_fragment(
+    image: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: [u8; 4],
+    draw_top: bool,
+    draw_bottom: bool,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    if draw_top {
+        fill_rect(image, x, y, width, 1, color);
+    }
+    if draw_bottom {
+        fill_rect(
+            image,
+            x,
+            y.saturating_add(height.saturating_sub(1)),
+            width,
+            1,
+            color,
+        );
+    }
+    fill_rect(image, x, y, 1, height, color);
+    fill_rect(
+        image,
+        x.saturating_add(width.saturating_sub(1)),
+        y,
+        1,
+        height,
+        color,
+    );
+}
+
+fn color(rgba: [u8; 4]) -> Color {
+    Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn renderer() -> MarkdownImageRenderer {
+        static RENDERER: OnceLock<MarkdownImageRenderer> = OnceLock::new();
+        RENDERER
+            .get_or_init(|| MarkdownImageRenderer::new().unwrap())
+            .clone()
+    }
+
+    #[test]
+    fn renderer_and_config_satisfy_spawn_blocking_bounds() {
+        fn assert_send_static<T: Send + 'static>() {}
+        fn assert_renderer<T: Clone + Send + Sync + 'static>() {}
+        assert_send_static::<RenderConfig>();
+        assert_send_static::<RenderedImage>();
+        assert_renderer::<MarkdownImageRenderer>();
+    }
+
+    #[test]
+    fn renders_supported_markdown_and_unicode_to_nonempty_png() {
+        let markdown = r#"# Miyu 长回复 🚀
+
+普通中文段落，包含 **粗体**、*斜体*、`inline code` 和 [链接文字](https://example.com)。
+
+> 引用内容支持中文和 Emoji 😀。
+
+- 第一项
+- 第二项
+
+1. ordered one
+2. ordered two
+
+```rust
+fn main() {
+    println!("hello");
+}
+```
+
+| 名称 | 状态 |
+| --- | --- |
+| renderer | ready |
+
+---
+
+结束。"#;
+        let pages = renderer()
+            .render(markdown, &RenderConfig::default())
+            .unwrap();
+        assert_eq!(pages.len(), 1);
+        for page in pages {
+            assert_eq!(page.mime, "image/png");
+            assert!(page.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert!((MIN_RENDERED_HEIGHT..=MAX_PAGE_HEIGHT).contains(&page.height));
+            assert!(u64::from(page.width) * u64::from(page.height) <= MAX_PAGE_PIXELS);
+            let decoded = image::load_from_memory(&page.png).unwrap().to_rgba8();
+            assert_eq!(decoded.dimensions(), (page.width, page.height));
+            let background = decoded.get_pixel(0, 0);
+            assert!(decoded.pixels().any(|pixel| pixel != background));
+        }
+    }
+
+    #[test]
+    fn input_limit_is_measured_in_unicode_characters() {
+        let accepted = "界".repeat(MAX_INPUT_CHARS);
+        let rejected = "界".repeat(MAX_INPUT_CHARS + 1);
+        assert!(validate_markdown(&accepted).is_ok());
+        assert!(validate_markdown(&rejected).is_err());
+    }
+
+    #[test]
+    fn total_pixel_and_png_writers_enforce_hard_budgets() {
+        assert_eq!(
+            checked_total_page_pixels(MAX_TOTAL_PAGE_PIXELS - 1, 1).unwrap(),
+            MAX_TOTAL_PAGE_PIXELS
+        );
+        assert!(checked_total_page_pixels(MAX_TOTAL_PAGE_PIXELS, 1).is_err());
+
+        let mut writer = CappedVecWriter::new(3);
+        writer.write_all(b"abc").unwrap();
+        assert!(writer.write_all(b"d").is_err());
+        assert!(writer.exceeded());
+        assert_eq!(writer.into_inner(), b"abc");
+    }
+
+    #[test]
+    fn html_only_output_is_not_rendered_as_a_blank_page() {
+        let blocks = collect_blocks("<div>visible</div>");
+        assert!(blocks
+            .iter()
+            .any(|block| { block.spans.iter().any(|span| span.text.contains("visible")) }));
+    }
+
+    #[test]
+    fn extreme_config_values_are_clamped_and_missing_fonts_fall_back() {
+        let config = RenderConfig {
+            theme: "unknown".to_string(),
+            max_height: 1,
+            font_size: 0,
+            code_font_size: u32::MAX,
+            padding: u32::MAX,
+            font: "/definitely/missing/body.ttf".to_string(),
+            title_font: "/definitely/missing/title.ttf".to_string(),
+            code_font: "/definitely/missing/code.ttf".to_string(),
+            emoji_font: "/definitely/missing/emoji.ttf".to_string(),
+        };
+        let pages = renderer().render("fallback 中文 😀", &config).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            NormalizedConfig::new(&config).max_height,
+            MIN_CONFIGURED_HEIGHT
+        );
+        assert_eq!(pages[0].height, MIN_RENDERED_HEIGHT);
+        assert!(!pages[0].png.is_empty());
+    }
+
+    #[test]
+    fn empty_markdown_produces_a_valid_blank_page() {
+        let pages = renderer().render("", &RenderConfig::default()).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].mime, "image/png");
+        assert_eq!(pages[0].height, MIN_RENDERED_HEIGHT);
+        assert!(image::load_from_memory(&pages[0].png).is_ok());
+    }
+
+    #[test]
+    fn task_list_markers_are_structured_instead_of_literal_text() {
+        let blocks = collect_blocks("- [ ] pending\n- [x] complete\n");
+        let tasks = blocks
+            .iter()
+            .filter_map(|block| block.task.map(|checked| (checked, block)))
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        assert!(!tasks[0].0);
+        assert!(tasks[1].0);
+        for (_, block) in tasks {
+            let text = block
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert!(!text.contains('•'));
+            assert!(!text.contains("[ ]"));
+            assert!(!text.contains("[x]"));
+        }
+    }
+
+    #[test]
+    fn checked_task_box_has_drawn_check_while_empty_box_does_not() {
+        let background = [255, 255, 255, 255];
+        let foreground = [1, 2, 3, 255];
+        let mut unchecked = RgbaImage::from_pixel(40, 40, Rgba(background));
+        let mut checked = unchecked.clone();
+        draw_checkbox(&mut unchecked, 5, 5, 24, false, foreground);
+        draw_checkbox(&mut checked, 5, 5, 24, true, foreground);
+        assert_eq!(*unchecked.get_pixel(17, 17), Rgba(background));
+        assert!(checked
+            .enumerate_pixels()
+            .any(|(x, y, pixel)| (9..27).contains(&x)
+                && (9..27).contains(&y)
+                && *pixel == Rgba(foreground)));
+    }
+
+    #[test]
+    fn table_parser_preserves_cells_rows_and_alignment() {
+        let blocks =
+            collect_blocks("| Left | Center | Right |\n| :--- | :---: | ---: |\n| a | b | c |\n");
+        let table = blocks
+            .iter()
+            .find_map(|block| block.table.as_ref())
+            .expect("structured table");
+        assert_eq!(
+            table.alignments,
+            vec![Alignment::Left, Alignment::Center, Alignment::Right]
+        );
+        assert_eq!(table.header.len(), 3);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].len(), 3);
+        assert!(table.header[0].iter().all(|span| span.style.bold));
+    }
+
+    #[test]
+    fn code_block_uses_remaining_column_space_before_continuing() {
+        let mut markdown = String::from("```text\n");
+        for line in 0..8 {
+            markdown.push_str(&format!("first {line}\n"));
+        }
+        markdown.push_str("```\n\n```text\n");
+        for line in 0..12 {
+            markdown.push_str(&format!("second {line}\n"));
+        }
+        markdown.push_str("```\n");
+
+        let config = NormalizedConfig::new(&RenderConfig {
+            max_height: MIN_CONFIGURED_HEIGHT,
+            ..RenderConfig::default()
+        });
+        let mut font_system = FontSystem::new();
+        let fonts = ResolvedFonts {
+            body: None,
+            title: None,
+            code: None,
+            emoji: None,
+        };
+        let layouts = layout_blocks(
+            &mut font_system,
+            collect_blocks(&markdown),
+            &config,
+            Palette::for_theme("paper"),
+            &fonts,
+        )
+        .unwrap();
+        assert_eq!(layouts.len(), 2);
+        let columns = plan_columns(&layouts, &config).unwrap();
+        let placement = columns[0]
+            .placements
+            .iter()
+            .find(|placement| placement.block_index == 1)
+            .expect("second code block should begin in the first column");
+        assert_eq!(placement.source_start, 0);
+        assert!(placement.y > 0);
+        assert!(placement.source_end < layouts[1].total_height);
+    }
+
+    #[test]
+    fn table_continuation_repeats_header_and_never_splits_rows() {
+        let mut markdown = String::from("| Name | Value |\n| --- | ---: |\n");
+        for row in 0..24 {
+            markdown.push_str(&format!("| row {row} | {row} |\n"));
+        }
+        let config = NormalizedConfig::new(&RenderConfig {
+            max_height: MIN_CONFIGURED_HEIGHT,
+            ..RenderConfig::default()
+        });
+        let mut font_system = FontSystem::new();
+        let fonts = ResolvedFonts {
+            body: None,
+            title: None,
+            code: None,
+            emoji: None,
+        };
+        let layouts = layout_blocks(
+            &mut font_system,
+            collect_blocks(&markdown),
+            &config,
+            Palette::for_theme("paper"),
+            &fonts,
+        )
+        .unwrap();
+        let table = layouts[0].table.as_ref().unwrap();
+        let columns = plan_columns(&layouts, &config).unwrap();
+        assert!(columns.len() > 1);
+        for column in columns.iter().skip(1) {
+            let header = column.placements.first().expect("repeated table header");
+            assert_eq!(header.source_start, 0);
+            assert_eq!(header.source_end, table.header_height);
+        }
+        for placement in columns.iter().flat_map(|column| &column.placements) {
+            assert!(
+                placement.source_start == 0
+                    || layouts[0].boundaries.contains(&placement.source_start)
+            );
+            assert!(layouts[0].boundaries.contains(&placement.source_end));
+        }
+    }
+
+    #[test]
+    fn rendered_table_has_grid_header_and_zebra_backgrounds() {
+        let markdown = "| A | B |\n| --- | --- |\n| one | two |\n| three | four |\n";
+        let raw_config = RenderConfig::default();
+        let config = NormalizedConfig::new(&raw_config);
+        let palette = Palette::for_theme("paper");
+        let mut font_system = FontSystem::new();
+        let fonts = ResolvedFonts {
+            body: None,
+            title: None,
+            code: None,
+            emoji: None,
+        };
+        let layouts = layout_blocks(
+            &mut font_system,
+            collect_blocks(markdown),
+            &config,
+            palette,
+            &fonts,
+        )
+        .unwrap();
+        let table = layouts[0].table.as_ref().unwrap();
+        let header = &table.rows[0];
+        let first = &table.rows[1];
+        let second = &table.rows[2];
+        let page = renderer().render(markdown, &raw_config).unwrap().remove(0);
+        let image = image::load_from_memory(&page.png).unwrap().to_rgba8();
+        let x = config.padding + COLUMN_WIDTH - 5;
+        assert_eq!(
+            *image.get_pixel(x, config.padding + 5),
+            Rgba(palette.code_background)
+        );
+        assert_eq!(
+            *image.get_pixel(x, config.padding + first.source_start + 5),
+            Rgba(palette.table_background)
+        );
+        assert_eq!(
+            *image.get_pixel(x, config.padding + second.source_start + 5),
+            Rgba(palette.quote_background)
+        );
+        let grid_x = config.padding + header.cells[0].width;
+        assert_eq!(
+            *image.get_pixel(grid_x, config.padding + header.source_end / 2),
+            Rgba(palette.border)
+        );
+    }
+
+    #[test]
+    fn long_content_grows_one_image_past_three_columns() {
+        let mut markdown = String::from("```text\n");
+        for line in 0..70 {
+            markdown.push_str(&format!("line {line:02}: rendered column content\n"));
+        }
+        markdown.push_str("```\n");
+        let config = RenderConfig {
+            max_height: MIN_CONFIGURED_HEIGHT,
+            ..RenderConfig::default()
+        };
+        let pages = renderer().render(&markdown, &config).unwrap();
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        let old_three_column_width = config.padding * 2 + COLUMN_WIDTH * 3 + COLUMN_GAP * 2;
+        assert!(page.width > old_three_column_width);
+        assert!((MIN_RENDERED_HEIGHT..=MIN_CONFIGURED_HEIGHT).contains(&page.height));
+        assert!(u64::from(page.width) * u64::from(page.height) <= MAX_PAGE_PIXELS);
+    }
+
+    #[test]
+    fn documents_over_the_pixel_budget_fail_instead_of_truncating() {
+        let mut markdown = String::from("```text\n");
+        for _ in 0..500 {
+            markdown.push_str("x\n");
+        }
+        markdown.push_str("```\n");
+        let config = RenderConfig {
+            max_height: MIN_CONFIGURED_HEIGHT,
+            font_size: 56,
+            code_font_size: 52,
+            padding: 160,
+            ..RenderConfig::default()
+        };
+        let error = renderer().render(&markdown, &config).unwrap_err();
+        assert!(error.to_string().contains("pixel limit"));
+    }
+}

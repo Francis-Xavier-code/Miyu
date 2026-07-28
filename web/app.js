@@ -5,6 +5,9 @@
   const MAX_CUSTOM_ANSWER_CHARS = 4_000;
   const MAX_TOOL_OUTPUT_CHARS = 200_000;
   const NEAR_BOTTOM_PX = 120;
+  const DEFAULT_BOARD_TITLE = "今天想聊些什么？";
+  const DEFAULT_BOARD_SUBTITLE = "从一个问题、计划或此刻的想法开始。";
+  const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const ICONS = {
@@ -17,10 +20,13 @@
     "circle-alert": [["circle", { cx: "12", cy: "12", r: "10" }], ["line", { x1: "12", x2: "12", y1: "8", y2: "12" }], ["line", { x1: "12", x2: "12.01", y1: "16", y2: "16" }]],
     "circle-help": [["circle", { cx: "12", cy: "12", r: "10" }], ["path", { d: "M9.09 9a3 3 0 1 1 5.83 1c0 2-3 3-3 3" }], ["path", { d: "M12 17h.01" }]],
     "circle-stop": [["circle", { cx: "12", cy: "12", r: "10" }], ["rect", { width: "6", height: "6", x: "9", y: "9", rx: "1" }]],
+    "cloud-sun": [["path", { d: "M12 2v2" }], ["path", { d: "m4.93 4.93 1.41 1.41" }], ["path", { d: "M20 12h2" }], ["path", { d: "m19.07 4.93-1.41 1.41" }], ["path", { d: "M16 6a4 4 0 0 0-3.46 6" }], ["path", { d: "M17.5 19H9a4 4 0 1 1 3.68-5.57A3 3 0 1 1 17.5 19Z" }]],
     copy: [["rect", { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }], ["path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }]],
     download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["polyline", { points: "7 10 12 15 17 10" }], ["line", { x1: "12", x2: "12", y1: "15", y2: "3" }]],
     ellipsis: [["circle", { cx: "12", cy: "12", r: "1" }], ["circle", { cx: "19", cy: "12", r: "1" }], ["circle", { cx: "5", cy: "12", r: "1" }]],
     "external-link": [["path", { d: "M15 3h6v6" }], ["path", { d: "M10 14 21 3" }], ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }]],
+    folder: [["path", { d: "M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" }]],
+    "trash-2": [["path", { d: "M3 6h18" }], ["path", { d: "M8 6V4h8v2" }], ["path", { d: "M19 6 18 20H6L5 6" }], ["path", { d: "M10 11v5" }], ["path", { d: "M14 11v5" }]],
     fileTerminal: [["path", { d: "M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" }], ["polyline", { points: "14 2 14 8 20 8" }], ["path", { d: "m8 13 2 2-2 2" }], ["path", { d: "M12 17h4" }]],
     lightbulb: [["path", { d: "M9 18h6" }], ["path", { d: "M10 22h4" }], ["path", { d: "M15.09 14c.18-.59.59-1.05 1.05-1.52A6 6 0 1 0 7.86 12.5c.45.44.85.9 1.03 1.5" }], ["path", { d: "M9 14h6v1a3 3 0 0 1-6 0v-1Z" }]],
     "list-todo": [["rect", { x: "3", y: "5", width: "6", height: "6", rx: "1" }], ["path", { d: "m3 17 2 2 4-4" }], ["path", { d: "M13 6h8" }], ["path", { d: "M13 12h8" }], ["path", { d: "M13 18h8" }]],
@@ -30,12 +36,15 @@
     "message-circle": [["path", { d: "M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" }]],
     "messages-square": [["path", { d: "M14 9a2 2 0 0 1-2 2H6l-4 4V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z" }], ["path", { d: "M18 9h2a2 2 0 0 1 2 2v10l-4-4h-6a2 2 0 0 1-2-2v-1" }]],
     moon: [["path", { d: "M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" }]],
+    "image-search": [["rect", { x: "3", y: "3", width: "14", height: "14", rx: "2" }], ["circle", { cx: "11", cy: "9", r: "2" }], ["path", { d: "m3 15 4-4 5 5" }], ["circle", { cx: "18", cy: "18", r: "3" }], ["path", { d: "m20.2 20.2 1.8 1.8" }]],
     "panel-left": [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }], ["path", { d: "M9 3v18" }]],
     "refresh-cw": [["path", { d: "M21 12a9 9 0 0 0-15.35-6.35L3 8" }], ["path", { d: "M3 3v5h5" }], ["path", { d: "M3 12a9 9 0 0 0 15.35 6.35L21 16" }], ["path", { d: "M16 16h5v5" }]],
     route: [["circle", { cx: "6", cy: "19", r: "3" }], ["path", { d: "M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" }], ["circle", { cx: "18", cy: "5", r: "3" }]],
     "settings-2": [["path", { d: "M20 7h-9" }], ["path", { d: "M14 17H5" }], ["circle", { cx: "17", cy: "17", r: "3" }], ["circle", { cx: "7", cy: "7", r: "3" }]],
     "sliders-horizontal": [["line", { x1: "21", x2: "14", y1: "4", y2: "4" }], ["line", { x1: "10", x2: "3", y1: "4", y2: "4" }], ["line", { x1: "21", x2: "12", y1: "12", y2: "12" }], ["line", { x1: "8", x2: "3", y1: "12", y2: "12" }], ["line", { x1: "21", x2: "16", y1: "20", y2: "20" }], ["line", { x1: "12", x2: "3", y1: "20", y2: "20" }], ["line", { x1: "14", x2: "14", y1: "2", y2: "6" }], ["line", { x1: "8", x2: "8", y1: "10", y2: "14" }], ["line", { x1: "16", x2: "16", y1: "18", y2: "22" }]],
     sparkles: [["path", { d: "m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z" }], ["path", { d: "M5 3v4" }], ["path", { d: "M19 17v4" }], ["path", { d: "M3 5h4" }], ["path", { d: "M17 19h4" }]],
+    smile: [["circle", { cx: "12", cy: "12", r: "9" }], ["path", { d: "M8 14s1.5 2 4 2 4-2 4-2" }], ["path", { d: "M9 9h.01" }], ["path", { d: "M15 9h.01" }]],
+    "stop-square": [["rect", { x: "6", y: "6", width: "12", height: "12", rx: "2", fill: "currentColor", stroke: "none" }]],
     "square-pen": [["path", { d: "M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" }], ["path", { d: "M18.37 2.63a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4Z" }]],
     sun: [["circle", { cx: "12", cy: "12", r: "4" }], ["path", { d: "M12 2v2" }], ["path", { d: "M12 20v2" }], ["path", { d: "m4.93 4.93 1.42 1.42" }], ["path", { d: "m17.66 17.66 1.41 1.41" }], ["path", { d: "M2 12h2" }], ["path", { d: "M20 12h2" }], ["path", { d: "m6.34 17.66-1.41 1.41" }], ["path", { d: "m19.07 4.93-1.41 1.41" }]],
     "sun-moon": [["path", { d: "M12 8a2.83 2.83 0 0 0 4 4 4 4 0 1 1-4-4" }], ["path", { d: "M12 2v2" }], ["path", { d: "M12 20v2" }], ["path", { d: "m4.9 4.9 1.4 1.4" }], ["path", { d: "m17.7 17.7 1.4 1.4" }], ["path", { d: "M2 12h2" }], ["path", { d: "M20 12h2" }], ["path", { d: "m6.3 17.7-1.4 1.4" }], ["path", { d: "m19.1 4.9-1.4 1.4" }]],
@@ -108,6 +117,8 @@
     contextBar: document.getElementById("contextBar"),
     settingsButton: document.getElementById("settingsButton"),
     sidebarThemeButton: document.getElementById("sidebarThemeButton"),
+    brandAvatar: document.getElementById("brandAvatar"),
+    brandName: document.getElementById("brandName"),
     conversationTitle: document.getElementById("conversationTitle"),
     conversationMeta: document.getElementById("conversationMeta"),
     modeSwitch: document.getElementById("modeSwitch"),
@@ -132,9 +143,15 @@
     retryBootstrapButton: document.getElementById("retryBootstrapButton"),
     timeline: document.getElementById("timeline"),
     emptyState: document.getElementById("emptyState"),
+    emptyVisual: document.getElementById("emptyVisual"),
+    emptyBoardImage: document.getElementById("emptyBoardImage"),
+    emptyKickerName: document.getElementById("emptyKickerName"),
+    emptyTitle: document.getElementById("emptyTitle"),
+    emptySubtitle: document.getElementById("emptySubtitle"),
     promptGrid: document.getElementById("promptGrid"),
     jumpBottomButton: document.getElementById("jumpBottomButton"),
     composerDock: document.getElementById("composerDock"),
+    liveStopRail: document.getElementById("liveStopRail"),
     questionDock: document.getElementById("questionDock"),
     composerForm: document.getElementById("composerForm"),
     composerInput: document.getElementById("composerInput"),
@@ -153,7 +170,6 @@
     capabilityList: document.getElementById("capabilityList"),
     versionLabel: document.getElementById("versionLabel"),
     generalConfigForm: document.getElementById("generalConfigForm"),
-    platformsConfigForm: document.getElementById("platformsConfigForm"),
     providerEditor: document.getElementById("providerEditor"),
     addProviderButton: document.getElementById("addProviderButton"),
     modelPoolEditor: document.getElementById("modelPoolEditor"),
@@ -179,6 +195,14 @@
     turns: [],
     queuedPrompts: [],
     models: [],
+    persona: {
+      name: "Miyu",
+      avatar_url: "/assets/miyu-logo.png",
+      board_image_url: "/assets/miyuwallpaper.png",
+      board_title: DEFAULT_BOARD_TITLE,
+      board_subtitle: DEFAULT_BOARD_SUBTITLE,
+      starter_prompts: DEFAULT_STARTER_PROMPTS
+    },
     sessions: [],
     currentSessionId: null,
     viewSessionId: null,
@@ -224,6 +248,7 @@
     resyncing: false,
     nearBottom: true,
     followOutput: true,
+    scrollRequestId: 0,
     programmaticScroll: false,
     settingsOpener: null,
     sidebarOpener: null,
@@ -245,6 +270,7 @@
     secretChanges: {},
     providerSecretStates: [],
     configMultimodalModels: [],
+    configInferredImageModels: [],
     invalidConfigFields: new Map()
   };
 
@@ -495,8 +521,83 @@
     return JSON.parse(JSON.stringify(value));
   }
 
+  function normalizePersona(value) {
+    const name = String(value?.name || "").trim() || "Miyu";
+    const avatarUrl = typeof value?.avatar_url === "string" && value.avatar_url ? value.avatar_url : null;
+    const boardImageUrl = typeof value?.board_image_url === "string" && value.board_image_url
+      ? value.board_image_url
+      : null;
+    const boardTitle = String(value?.board_title || "").trim() || DEFAULT_BOARD_TITLE;
+    const boardSubtitle = String(value?.board_subtitle || "").trim() || DEFAULT_BOARD_SUBTITLE;
+    const configuredPrompts = Array.isArray(value?.starter_prompts) ? value.starter_prompts : [];
+    const starterPrompts = DEFAULT_STARTER_PROMPTS.map((fallback, index) => String(configuredPrompts[index] || "").trim() || fallback);
+    return {
+      name,
+      avatar_url: avatarUrl,
+      board_image_url: boardImageUrl,
+      board_title: boardTitle,
+      board_subtitle: boardSubtitle,
+      starter_prompts: starterPrompts,
+      revision: `${Date.now()}`
+    };
+  }
+
+  function setPersonaAvatar(image) {
+    const url = state.persona?.avatar_url;
+    image.hidden = !url;
+    if (!url) {
+      image.removeAttribute("src");
+      return;
+    }
+    image.hidden = false;
+    const separator = url.includes("?") ? "&" : "?";
+    image.src = `${url}${separator}v=${encodeURIComponent(state.persona?.revision || "1")}`;
+    image.onerror = () => {
+      image.hidden = true;
+      image.removeAttribute("src");
+    };
+  }
+
+  function applyPersona(value) {
+    state.persona = normalizePersona(value);
+    elements.brandName.textContent = state.persona.name;
+    elements.brandAvatar.alt = state.persona.name;
+    setPersonaAvatar(elements.brandAvatar);
+    elements.emptyKickerName.textContent = state.persona.name;
+    elements.emptyTitle.textContent = state.persona.board_title;
+    elements.emptySubtitle.textContent = state.persona.board_subtitle;
+    const boardImageUrl = state.persona.board_image_url;
+    elements.emptyVisual.hidden = !boardImageUrl;
+    elements.emptyBoardImage.alt = `${state.persona.name} 看板图片`;
+    if (boardImageUrl) {
+      elements.emptyBoardImage.onerror = () => {
+        elements.emptyBoardImage.removeAttribute("src");
+        elements.emptyVisual.hidden = true;
+      };
+      elements.emptyBoardImage.src = `${boardImageUrl}${boardImageUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(state.persona.revision)}`;
+    } else {
+      elements.emptyBoardImage.removeAttribute("src");
+    }
+    elements.promptGrid.querySelectorAll("[data-prompt]").forEach((button, index) => {
+      const prompt = state.persona.starter_prompts[index] || DEFAULT_STARTER_PROMPTS[index];
+      button.dataset.prompt = prompt;
+      const label = button.querySelector("span:last-child");
+      if (label) label.textContent = prompt;
+    });
+    const refreshAssistant = (root) => root.querySelectorAll(".assistant-label").forEach((label) => {
+      const name = label.querySelector("strong");
+      const avatar = label.querySelector("img");
+      if (name) name.textContent = state.persona.name;
+      if (avatar) setPersonaAvatar(avatar);
+    });
+    refreshAssistant(elements.timeline);
+    for (const articles of state.finishedTurnArticles.values()) {
+      for (const entry of articles) refreshAssistant(entry.article);
+    }
+  }
+
   function setSettingsView(view) {
-    const selected = ["interface", "general", "providers", "models", "plugins", "prompts", "advanced"].includes(view) ? view : "interface";
+    const selected = ["interface", "prompts", "general", "providers", "models", "plugins", "advanced"].includes(view) ? view : "interface";
     state.settingsView = selected;
     elements.settingsNav.querySelectorAll("[data-settings-view]").forEach((button) => {
       const active = button.dataset.settingsView === selected;
@@ -736,30 +837,6 @@
     elements.advancedConfigEditor.value = JSON.stringify(state.configDraft, null, 2);
   }
 
-  function renderPlatformsConfig() {
-    if (!elements.platformsConfigForm) return;
-    elements.platformsConfigForm.replaceChildren(
-      configGroup("OneBot v11（QQ / NapCat）", [
-        booleanConfigField("启用", "platforms.onebot.enabled", "在 NapCat 网络配置里新建「WebSocket 客户端」，地址填 ws://<本机地址>:<端口>/onebot/v11/ws，消息格式选 Array"),
-        secretEditor("Access Token（空 = 不校验）", "platforms.onebot.access_token"),
-        booleanConfigField("允许私聊", "platforms.onebot.allow_private"),
-        textConfigField("私聊白名单 QQ 号", "platforms.onebot.allowed_users", { type: "numbers", placeholder: "逗号分隔；留空 = 允许所有人", description: "留空放行所有人，由下方限流兜底" }),
-        booleanConfigField("允许群聊", "platforms.onebot.allow_groups"),
-        textConfigField("群白名单", "platforms.onebot.allowed_groups", { type: "numbers", placeholder: "逗号分隔；留空 = 允许所有群" }),
-        selectConfigField("群聊触发方式", "platforms.onebot.group_trigger", [
-          { value: "at", label: "@我" },
-          { value: "prefix", label: "前缀" },
-          { value: "at_or_prefix", label: "@我或前缀" }
-        ]),
-        textConfigField("触发前缀", "platforms.onebot.trigger_prefix", { placeholder: "如 / 或 喵" }),
-        booleanConfigField("群内按人隔离会话", "platforms.onebot.group_session_per_user", "关闭时全群共享一个会话"),
-        textConfigField("单条回复最大字数", "platforms.onebot.max_reply_chars", { type: "number", integer: true, inputType: "number", min: 0, description: "超长回复按此长度分多条发送；0 = 不分段" }),
-        textConfigField("每人每分钟消息上限", "platforms.onebot.rate_per_sender_per_min", { type: "number", integer: true, inputType: "number", min: 0, description: "0 = 不限" }),
-        textConfigField("全局每分钟消息上限", "platforms.onebot.rate_global_per_min", { type: "number", integer: true, inputType: "number", min: 0, description: "0 = 不限" })
-      ])
-    );
-  }
-
   function renderGeneralConfig() {
     elements.generalConfigForm.replaceChildren(
       configGroup("工具", [
@@ -781,7 +858,7 @@
         )
       ]),
       configGroup("上下文", [
-        selectConfigField("到达上限后", "context.on_overflow", [{ value: "pop", label: "弹出旧消息" }, { value: "compact", label: "压缩上下文" }]),
+        selectConfigField("到达上限后", "context.on_overflow", [{ value: "compact", label: "压缩上下文" }, { value: "pop", label: "弹出旧消息" }]),
         textConfigField("开始裁剪比例", "context.trim_at_ratio", { type: "number", inputType: "number", min: 0.1, max: 1, step: 0.01 }),
         textConfigField("每批裁剪比例", "context.trim_batch_ratio", { type: "number", inputType: "number", min: 0.01, max: 0.9, step: 0.01 })
       ]),
@@ -878,6 +955,140 @@
     };
   }
 
+  const PLATFORM_MODEL_POOL_NAMES = ["text_models", "multimodal_models"];
+
+  function forEachPlatformModelPool(callback) {
+    const routes = state.configDraft?.platforms?.qq?.conversations;
+    if (!Array.isArray(routes)) return;
+    for (const route of routes) {
+      if (!route || typeof route !== "object") continue;
+      for (const poolName of PLATFORM_MODEL_POOL_NAMES) {
+        if (Array.isArray(route[poolName])) callback(route, poolName, route[poolName]);
+      }
+    }
+  }
+
+  function normalizePlatformModelRoutes() {
+    const qq = state.configDraft?.platforms?.qq;
+    if (!Array.isArray(qq?.conversations)) return;
+    for (const route of qq.conversations) {
+      if (!route || typeof route !== "object") continue;
+      for (const poolName of PLATFORM_MODEL_POOL_NAMES) {
+        if (Array.isArray(route[poolName]) && route[poolName].length === 0) delete route[poolName];
+      }
+    }
+  }
+
+  function replacePlatformProviderReferences(previousId, nextId) {
+    forEachPlatformModelPool((_route, _poolName, pool) => {
+      for (const item of pool) {
+        if (item?.provider_id === previousId) item.provider_id = nextId;
+      }
+    });
+  }
+
+  function removePlatformProviderReferences(providerId) {
+    forEachPlatformModelPool((route, poolName, pool) => {
+      route[poolName] = pool.filter((item) => item?.provider_id !== providerId);
+    });
+    normalizePlatformModelRoutes();
+  }
+
+  function providerHasConfiguredModel(provider, model) {
+    const normalizedModel = String(model || "").trim();
+    return Boolean(normalizedModel) && (
+      String(provider?.default_model || "") === normalizedModel
+      || (Array.isArray(provider?.models) && provider.models.includes(normalizedModel))
+    );
+  }
+
+  function forEachSubagentTierPool(callback) {
+    const tiers = state.configDraft?.subagent_tiers;
+    if (!tiers || typeof tiers !== "object") return;
+    for (const [tierName, pool] of Object.entries(tiers)) {
+      if (Array.isArray(pool)) callback(tiers, tierName, pool);
+    }
+  }
+
+  function pruneOptionalPool(owner, key, predicate) {
+    if (!owner || !Array.isArray(owner[key])) return;
+    const pool = owner[key].filter(predicate);
+    if (pool.length) owner[key] = pool;
+    else delete owner[key];
+  }
+
+  function providerModelSupportsMedia(provider, model) {
+    const normalizedModel = String(model || "").trim();
+    const declared = provider?.model_modalities;
+    if (declared && typeof declared === "object" && Object.prototype.hasOwnProperty.call(declared, normalizedModel)) {
+      return Array.isArray(declared[normalizedModel])
+        && declared[normalizedModel].includes("image");
+    }
+    return state.configInferredImageModels.some((item) => (
+      item?.provider_id === provider?.id && item?.model === normalizedModel
+    ));
+  }
+
+  function modelReferenceTarget(providersById, item) {
+    const provider = providersById.get(String(item?.provider_id || "").trim());
+    const model = String(item?.model || "").trim();
+    return provider && providerHasConfiguredModel(provider, model) ? { provider, model } : null;
+  }
+
+  function prunePlatformModelRoutes(providersById) {
+    forEachPlatformModelPool((route, poolName, pool) => {
+      route[poolName] = pool.filter((item) => {
+        const target = modelReferenceTarget(providersById, item);
+        return Boolean(target) && (
+          poolName !== "multimodal_models"
+          || providerModelSupportsMedia(target.provider, target.model)
+        );
+      });
+    });
+    normalizePlatformModelRoutes();
+  }
+
+  function clearInvalidPluginModelReferences(providersById) {
+    const vision = state.configDraft?.plugins?.vision;
+    if (vision?.vision_provider_id) {
+      const provider = providersById.get(String(vision.vision_provider_id).trim());
+      const configuredModel = String(vision.vision_model || "").trim();
+      const model = configuredModel || String(provider?.default_model || "").trim();
+      if (!provider || !providerHasConfiguredModel(provider, model) || !providerModelSupportsMedia(provider, model)) {
+        vision.vision_provider_id = "";
+        vision.vision_model = "";
+      }
+    }
+    const knowledgeBase = state.configDraft?.plugins?.knowledge_base;
+    if (knowledgeBase?.embedding_provider_id) {
+      const provider = providersById.get(String(knowledgeBase.embedding_provider_id).trim());
+      const configuredModel = String(knowledgeBase.embedding_model || "").trim();
+      const model = configuredModel || String(provider?.default_model || "").trim();
+      if (!provider || !providerHasConfiguredModel(provider, model)) {
+        knowledgeBase.embedding_provider_id = "";
+        knowledgeBase.embedding_model = "";
+      }
+    }
+  }
+
+  function pruneModelReferences() {
+    if (!state.configDraft) return;
+    const providers = Array.isArray(state.configDraft.providers) ? state.configDraft.providers : [];
+    const providersById = new Map(providers.map((provider) => [String(provider?.id || ""), provider]));
+    pruneOptionalPool(state.configDraft, "active_provider_models", (item) => (
+      Boolean(modelReferenceTarget(providersById, item))
+    ));
+    pruneOptionalPool(state.configDraft, "active_multimodal_provider_models", (item) => {
+      const target = modelReferenceTarget(providersById, item);
+      return Boolean(target) && providerModelSupportsMedia(target.provider, target.model);
+    });
+    forEachSubagentTierPool((tiers, tierName, pool) => {
+      tiers[tierName] = pool.filter((item) => Boolean(modelReferenceTarget(providersById, item)));
+    });
+    prunePlatformModelRoutes(providersById);
+    clearInvalidPluginModelReferences(providersById);
+  }
+
   function replaceProviderReferences(previousId, nextId) {
     if (!previousId || previousId === nextId || !state.configDraft) return;
     if (state.configDraft.active_provider === previousId) state.configDraft.active_provider = nextId;
@@ -892,12 +1103,26 @@
     if (state.configDraft.plugins?.knowledge_base?.embedding_provider_id === previousId) {
       state.configDraft.plugins.knowledge_base.embedding_provider_id = nextId;
     }
+    forEachSubagentTierPool((_tiers, _tierName, pool) => {
+      for (const item of pool) {
+        if (item?.provider_id === previousId) item.provider_id = nextId;
+      }
+    });
+    replacePlatformProviderReferences(previousId, nextId);
+    for (const models of [state.configMultimodalModels, state.configInferredImageModels]) {
+      for (const model of models) {
+        if (model?.provider_id === previousId) model.provider_id = nextId;
+      }
+    }
   }
 
   function removeProviderReferences(providerId) {
     if (!state.configDraft) return;
-    state.configDraft.active_provider_models = (state.configDraft.active_provider_models || []).filter((item) => item.provider_id !== providerId);
-    state.configDraft.active_multimodal_provider_models = (state.configDraft.active_multimodal_provider_models || []).filter((item) => item.provider_id !== providerId);
+    pruneOptionalPool(state.configDraft, "active_provider_models", (item) => item?.provider_id !== providerId);
+    pruneOptionalPool(state.configDraft, "active_multimodal_provider_models", (item) => item?.provider_id !== providerId);
+    forEachSubagentTierPool((tiers, tierName, pool) => {
+      tiers[tierName] = pool.filter((item) => item?.provider_id !== providerId);
+    });
     if (state.configDraft.plugins?.vision?.vision_provider_id === providerId) {
       state.configDraft.plugins.vision.vision_provider_id = "";
       state.configDraft.plugins.vision.vision_model = "";
@@ -906,12 +1131,16 @@
       state.configDraft.plugins.knowledge_base.embedding_provider_id = "";
       state.configDraft.plugins.knowledge_base.embedding_model = "";
     }
+    removePlatformProviderReferences(providerId);
+    state.configMultimodalModels = state.configMultimodalModels.filter((item) => item?.provider_id !== providerId);
+    state.configInferredImageModels = state.configInferredImageModels.filter((item) => item?.provider_id !== providerId);
   }
 
   function renderProviders() {
     elements.providerEditor.replaceChildren();
     const providers = Array.isArray(state.configDraft?.providers) ? state.configDraft.providers : [];
     providers.forEach((provider, index) => {
+      let referencedProviderId = String(provider.id || "");
       const card = document.createElement("details");
       card.className = "provider-card";
       card.open = index === 0;
@@ -922,7 +1151,10 @@
       const id = document.createElement("small");
       id.textContent = provider.id || "尚未命名";
       copy.append(name, id);
-      const remove = actionButton("删除", "text-button danger-text");
+      const remove = actionButton("", "icon-button danger-text");
+      remove.title = "删除";
+      remove.setAttribute("aria-label", "删除");
+      remove.appendChild(makeIconSlot("trash-2"));
       remove.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -931,8 +1163,11 @@
         state.providerSecretStates.splice(index, 1);
         refreshProviderSecretStates();
         clearProviderSecretChanges();
-        removeProviderReferences(provider.id);
-        if (state.configDraft.active_provider === provider.id) state.configDraft.active_provider = state.configDraft.providers[0]?.id || "";
+        const removedProviderId = referencedProviderId || provider.id;
+        removeProviderReferences(removedProviderId);
+        if (state.configDraft.active_provider === removedProviderId || state.configDraft.active_provider === provider.id) {
+          state.configDraft.active_provider = state.configDraft.providers[0]?.id || "";
+        }
         markConfigDirty();
         renderConfigEditors();
       });
@@ -951,7 +1186,11 @@
           const previousId = key === "id" ? String(provider.id || "") : "";
           provider[key] = input.value;
           if (key === "id" && previousId !== provider.id) {
-            replaceProviderReferences(previousId, provider.id);
+            const nextId = String(provider.id || "");
+            if (referencedProviderId && nextId && referencedProviderId !== nextId) {
+              replaceProviderReferences(referencedProviderId, nextId);
+            }
+            if (nextId) referencedProviderId = nextId;
             state.providerSecretStates[index] = false;
             delete state.secretChanges[`providers.${index}.api_key`];
             refreshProviderSecretStates();
@@ -971,6 +1210,7 @@
             if (provider.default_model && !provider.models.includes(provider.default_model)) {
               provider.models.push(provider.default_model);
             }
+            pruneModelReferences();
             renderModelPools();
             updateAdvancedConfigEditor();
           });
@@ -1039,6 +1279,14 @@
             updateSettingsControls();
           }
         });
+        if (key === "models" || key === "model_modalities") {
+          input.addEventListener("change", () => {
+            if (state.invalidConfigFields.has(input)) return;
+            pruneModelReferences();
+            renderModelPools();
+            updateAdvancedConfigEditor();
+          });
+        }
         body.appendChild(configField(label, input, description));
       }
       card.append(summary, body);
@@ -1153,33 +1401,11 @@
   function renderModelPools() {
     const providers = Array.isArray(state.configDraft?.providers) ? state.configDraft.providers : [];
     const choices = configuredModelChoices();
-    const declaredMultimodal = choices.filter((choice) => {
+    const multimodal = choices.filter((choice) => {
       const provider = providers.find((item) => item.id === choice.provider_id);
-      const modalities = provider?.model_modalities?.[choice.model];
-      return Array.isArray(modalities) && modalities.some((item) => ["image", "audio", "video", "pdf"].includes(item));
-    });
-    const multimodalKeys = new Set([
-      ...state.configMultimodalModels.map((model) => modelKey(model)),
-      ...declaredMultimodal.map((model) => modelKey(model))
-    ]);
-    const multimodal = choices.filter((choice) => multimodalKeys.has(modelKey(choice)));
-    const activeProvider = document.createElement("select");
-    activeProvider.className = "config-input";
-    for (const provider of providers) {
-      const option = document.createElement("option");
-      option.value = provider.id || "";
-      option.textContent = provider.display_name || provider.id || "未命名供应商";
-      option.selected = option.value === state.configDraft.active_provider;
-      activeProvider.appendChild(option);
-    }
-    activeProvider.addEventListener("change", () => {
-      state.configDraft.active_provider = activeProvider.value;
-      markConfigDirty();
-      updateAdvancedConfigEditor();
-      renderModelPools();
+      return providerModelSupportsMedia(provider, choice.model);
     });
     elements.modelPoolEditor.replaceChildren(
-      configGroup("默认供应商", [configField("未设置文本模型池时使用", activeProvider)]),
       renderModelPoolList("文本模型池", "active_provider_models", choices),
       renderModelPoolList("多模态模型池", "active_multimodal_provider_models", multimodal),
       renderSubagentTierList("子代理档位池 · cheap（简单任务）", "cheap", choices),
@@ -1262,6 +1488,90 @@
     return trimmed ? `${trimmed}.md` : "";
   }
 
+  function personaTextField(promptDocument, key, label, placeholder) {
+    const input = document.createElement("input");
+    input.className = "config-input";
+    input.type = "text";
+    input.maxLength = 200;
+    input.placeholder = placeholder;
+    input.value = String(promptDocument[key] || "");
+    input.addEventListener("input", () => {
+      promptDocument[key] = input.value.trim() || null;
+      markConfigDirty();
+    });
+    return configField(label, input);
+  }
+
+  function personaImageField(promptDocument, key, label, fallbackUrl) {
+    const pathInput = document.createElement("input");
+    pathInput.className = "config-input";
+    pathInput.type = "text";
+    pathInput.placeholder = "";
+    pathInput.value = String(promptDocument[key] || "");
+    const picker = document.createElement("input");
+    picker.type = "file";
+    picker.accept = "image/png,image/jpeg,image/webp,image/gif,image/bmp";
+    picker.hidden = true;
+    const pickButton = actionButton("", "icon-button");
+    pickButton.title = `选择${label.replace(/^自定义/, "")}`;
+    pickButton.setAttribute("aria-label", pickButton.title);
+    pickButton.appendChild(makeIconSlot("folder"));
+    pickButton.addEventListener("click", () => picker.click());
+    const preview = document.createElement("img");
+    preview.className = `persona-avatar-preview${key === "board_image_path" ? " persona-board-preview" : ""}`;
+    preview.alt = "";
+    preview.setAttribute("aria-hidden", "true");
+    const showStoredPreview = () => {
+      preview.classList.remove("is-missing");
+      preview.src = promptDocument[key]
+        ? `/api/persona/avatar?path=${encodeURIComponent(promptDocument[key])}`
+        : fallbackUrl || "";
+      if (!promptDocument[key] && !fallbackUrl) {
+        preview.removeAttribute("src");
+        preview.classList.add("is-missing");
+      }
+    };
+    preview.addEventListener("error", () => {
+      preview.removeAttribute("src");
+      preview.classList.add("is-missing");
+    });
+    showStoredPreview();
+    pathInput.addEventListener("input", () => {
+      promptDocument[key] = pathInput.value.trim() || null;
+      showStoredPreview();
+      markConfigDirty();
+    });
+    picker.addEventListener("change", async () => {
+      const file = picker.files?.[0];
+      if (!file) return;
+      if (file.size > 8 * 1024 * 1024) return showToast("图片不能超过 8 MiB", "error");
+      preview.src = URL.createObjectURL(file);
+      preview.classList.remove("is-missing");
+      pickButton.disabled = true;
+      try {
+        const response = await apiRequest("/api/persona/assets", {
+          method: "POST",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file
+        });
+        const result = await response.json();
+        promptDocument[key] = result.path;
+        pathInput.value = result.path;
+        preview.src = result.preview_url;
+        markConfigDirty();
+      } catch (error) {
+        showToast(error.message || "图片上传失败", "error");
+      } finally {
+        pickButton.disabled = false;
+        picker.value = "";
+      }
+    });
+    const row = document.createElement("div");
+    row.className = "avatar-path-row";
+    row.append(pathInput, pickButton, preview, picker);
+    return configField(label, row);
+  }
+
   function renderPromptCollection(kind, titleText, activePath) {
     const documents = state.promptDraft[kind];
     const group = configGroup(titleText);
@@ -1279,9 +1589,11 @@
       active.appendChild(option);
     }
     active.value = String(configValue(activePath, ""));
-    active.addEventListener("change", () => { setConfigValue(activePath, active.value); updateAdvancedConfigEditor(); });
+    active.addEventListener("change", () => { setConfigValue(activePath, active.value); renderPromptEditor(); updateAdvancedConfigEditor(); });
     body.appendChild(configField("当前使用", active));
+    const selected = documents.find((document) => document.name === active.value);
     for (const [index, promptDocument] of documents.entries()) {
+      if (promptDocument !== selected) continue;
       const card = document.createElement("section");
       card.className = "prompt-document";
       const header = document.createElement("header");
@@ -1298,7 +1610,7 @@
         renderPromptEditor();
         updateAdvancedConfigEditor();
       });
-      header.append(name, remove);
+      header.append(configField("名称", name), remove);
       const content = document.createElement("textarea");
       content.className = "config-input prompt-content";
       content.rows = 10;
@@ -1312,16 +1624,46 @@
         updateAdvancedConfigEditor();
       });
       content.addEventListener("input", () => { promptDocument.content = content.value; markConfigDirty(); });
-      card.append(header, content);
+      card.append(header, configField("内容", content));
+      if (kind === "personas") {
+        card.append(
+          personaImageField(promptDocument, "avatar_path", "自定义头像图片", null),
+          personaImageField(promptDocument, "board_image_path", "自定义看板图片", null),
+          personaTextField(promptDocument, "board_title", "自定义看板大字", DEFAULT_BOARD_TITLE),
+          personaTextField(promptDocument, "board_subtitle", "自定义看板小字", DEFAULT_BOARD_SUBTITLE)
+        );
+        const starterFields = document.createElement("div");
+        starterFields.className = "persona-starter-fields";
+        const values = Array.isArray(promptDocument.starter_prompts)
+          ? DEFAULT_STARTER_PROMPTS.map((_, index) => String(promptDocument.starter_prompts[index] || ""))
+          : DEFAULT_STARTER_PROMPTS.map(() => "");
+        values.forEach((value, promptIndex) => {
+          const input = document.createElement("input");
+          input.className = "config-input";
+          input.type = "text";
+          input.maxLength = 200;
+          input.value = value;
+          input.placeholder = DEFAULT_STARTER_PROMPTS[promptIndex];
+          input.setAttribute("aria-label", `预设问题 ${promptIndex + 1}`);
+          input.addEventListener("input", () => {
+            values[promptIndex] = input.value;
+            promptDocument.starter_prompts = values.some((item) => item.trim()) ? [...values] : null;
+            markConfigDirty();
+          });
+          starterFields.appendChild(input);
+        });
+        card.appendChild(configField("自定义预设问题", starterFields));
+      }
       body.appendChild(card);
     }
     const add = actionButton("添加", "secondary-button compact-button");
     add.addEventListener("click", () => {
-      const base = kind === "personas" ? "new-persona" : "new-identity";
+      const base = kind === "personas" ? "新建人格" : "新建身份";
       let name = `${base}.md`;
       let suffix = 2;
-      while (documents.some((document) => document.name === name)) name = `${base}-${suffix++}.md`;
-      documents.push({ name, content: "", original_name: null });
+      while (documents.some((document) => document.name === name)) name = `${base} ${suffix++}.md`;
+      documents.push({ name, content: "", avatar_path: null, original_name: null });
+      setConfigValue(activePath, name);
       markConfigDirty();
       renderPromptEditor();
     });
@@ -1339,7 +1681,6 @@
   function renderConfigEditors() {
     if (!state.configLoaded || !state.configDraft) return;
     state.invalidConfigFields.clear();
-    renderPlatformsConfig();
     renderGeneralConfig();
     renderProviders();
     renderModelPools();
@@ -1358,25 +1699,35 @@
     return states;
   }
 
-  // 配置文件对未动过的 platforms 段整体省略；把默认值补进草稿，
-  // 让表单显示真实生效值（如 allow_private=true、限流 6/30）。
+  // 配置文件会省略未修改的平台默认值；草稿仍需补齐真实语义，
+  // 以免 WebUI 保存其他设置时覆盖 Tencent QQ 的默认策略。
   function ensurePlatformDefaults(draft) {
     if (!draft || typeof draft !== "object") return;
     draft.platforms = Object.assign({}, draft.platforms);
-    draft.platforms.onebot = Object.assign({
+    const qq = Object.assign({
       enabled: false,
+      reverse_ws_port: 8300,
       access_token: "",
-      allow_private: true,
-      allowed_users: [],
-      allow_groups: false,
-      allowed_groups: [],
-      group_trigger: "at",
-      trigger_prefix: "",
-      group_session_per_user: false,
+      admin_users: [],
+      allow_non_admin_host_tools: false,
+      conversations: [],
+      plugins: {},
+      asset_base_url: "",
       max_reply_chars: 3000,
-      rate_per_sender_per_min: 6,
-      rate_global_per_min: 30
-    }, draft.platforms.onebot);
+    }, draft.platforms.qq);
+    qq.private_chats = Object.assign({
+      whitelist: [],
+      allow_non_whitelist: true,
+      non_whitelist_rate_per_minute: 3
+    }, qq.private_chats);
+    qq.group_chats = Object.assign({
+      whitelist: [],
+      trigger_keywords: [],
+      whitelist_rate_per_minute: 30,
+      allow_non_whitelist: true,
+      non_whitelist_rate_per_minute: 10
+    }, qq.group_chats);
+    draft.platforms.qq = qq;
   }
 
   function applyConfigPayload(payload) {
@@ -1392,8 +1743,19 @@
     state.invalidConfigFields.clear();
     if (Array.isArray(payload?.models)) state.models = payload.models;
     state.configMultimodalModels = Array.isArray(payload?.multimodal_models) ? payload.multimodal_models : [];
+    const providersById = new Map(
+      (Array.isArray(state.configDraft?.providers) ? state.configDraft.providers : [])
+        .map((provider) => [String(provider?.id || ""), provider])
+    );
+    state.configInferredImageModels = state.configMultimodalModels.filter((model) => {
+      const provider = providersById.get(String(model?.provider_id || ""));
+      const declared = provider?.model_modalities;
+      return !(declared && typeof declared === "object"
+        && Object.prototype.hasOwnProperty.call(declared, String(model?.model || "")));
+    });
     if (payload?.display && typeof payload.display === "object") state.display = payload.display;
     if (payload?.context && typeof payload.context === "object") state.context = payload.context;
+    if (payload?.persona) applyPersona(payload.persona);
     renderConfigEditors();
     renderModelMenu();
     updateContext();
@@ -1421,7 +1783,21 @@
     const promptKeys = ["prompt", "system_prompt_file", "system_prompt"];
     const current = Object.fromEntries(promptKeys.map((key) => [key, state.configDraft?.[key]]));
     const original = Object.fromEntries(promptKeys.map((key) => [key, state.configOriginal?.[key]]));
-    return JSON.stringify(current) !== JSON.stringify(original) || JSON.stringify(state.promptDraft) !== JSON.stringify(state.promptOriginal);
+    const withoutPersonaMetadata = (documents) => Object.fromEntries(
+      Object.entries(documents || {}).map(([kind, items]) => [
+        kind,
+        (Array.isArray(items) ? items : []).map(({
+          avatar_path: _avatarPath,
+          board_image_path: _BoardImagePath,
+          board_title: _BoardTitle,
+          board_subtitle: _BoardSubtitle,
+          starter_prompts: _StarterPrompts,
+          ...document
+        }) => document)
+      ])
+    );
+    return JSON.stringify(current) !== JSON.stringify(original)
+      || JSON.stringify(withoutPersonaMetadata(state.promptDraft)) !== JSON.stringify(withoutPersonaMetadata(state.promptOriginal));
   }
 
   function buildSecretMutations() {
@@ -1430,8 +1806,8 @@
 
   async function saveConfigDraft() {
     if (!state.configLoaded || state.configSaving || state.configLoading || conversationRunning() || state.invalidConfigFields.size) return;
-    const resetsConversation = promptStateChanged();
-    if (resetsConversation && !window.confirm("人格、身份或提示词文件已修改。保存后会清空当前会话并重建 Agent，继续吗？")) return;
+    const personaChanged = String(state.configDraft?.prompt?.active_persona || "")
+      !== String(state.configOriginal?.prompt?.active_persona || "");
     state.configSaving = true;
     state.adminBusy = true;
     updateSettingsControls();
@@ -1443,11 +1819,11 @@
           config: state.configDraft,
           secrets: buildSecretMutations(),
           prompts: state.promptDraft,
-          reset_conversation: resetsConversation
+          reset_conversation: false
         })
       });
       applyConfigPayload(await response.json());
-      if (resetsConversation) await loadBootstrap();
+      if (personaChanged) await loadBootstrap();
       showToast("配置已保存");
     } catch (error) {
       showToast(error.message || "配置保存失败", "error");
@@ -2221,10 +2597,14 @@
     }
   }
 
+  function setSessionBusy(value) {
+    state.sessionBusy = Boolean(value);
+    updateControlState();
+  }
+
   async function createSession() {
     if (state.blocked || state.sessionBusy || state.adminBusy || state.submitting) return;
-    state.sessionBusy = true;
-    updateControlState();
+    setSessionBusy(true);
     try {
       const response = await apiRequest("/api/sessions", {
         method: "POST",
@@ -2242,8 +2622,7 @@
     } catch (error) {
       showToast(error.message || "新建会话失败", "error");
     } finally {
-      state.sessionBusy = false;
-      updateControlState();
+      setSessionBusy(false);
     }
   }
 
@@ -2280,6 +2659,8 @@
   function disposeAllLiveRuns() {
     for (const live of state.liveRuns.values()) disposeLiveState(live);
     state.liveRuns.clear();
+    elements.liveStopRail.replaceChildren();
+    elements.liveStopRail.hidden = true;
   }
 
   function applySessionView(payload) {
@@ -2358,7 +2739,7 @@
 
   async function makeDefaultSession(sessionId) {
     if (!sessionId || state.sessionBusy) return;
-    state.sessionBusy = true;
+    setSessionBusy(true);
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/activate`, { method: "POST" });
       state.currentSessionId = sessionId;
@@ -2367,13 +2748,13 @@
     } catch (error) {
       showToast(error.message || "设为默认失败", "error");
     } finally {
-      state.sessionBusy = false;
+      setSessionBusy(false);
     }
   }
 
   async function archiveSession(sessionId) {
     if (state.sessionBusy) return;
-    state.sessionBusy = true;
+    setSessionBusy(true);
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
         method: "PATCH",
@@ -2387,13 +2768,13 @@
     } catch (error) {
       showToast(error.message || "归档失败", "error");
     } finally {
-      state.sessionBusy = false;
+      setSessionBusy(false);
     }
   }
 
   async function restoreSession(sessionId) {
     if (state.sessionBusy) return;
-    state.sessionBusy = true;
+    setSessionBusy(true);
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
         method: "PATCH",
@@ -2404,7 +2785,7 @@
     } catch (error) {
       showToast(error.message || "恢复失败", "error");
     } finally {
-      state.sessionBusy = false;
+      setSessionBusy(false);
     }
   }
 
@@ -2412,7 +2793,7 @@
     const session = findSession(sessionId) || findArchivedSession(sessionId);
     if (!window.confirm(`删除会话「${sessionDisplayName(session)}」？此操作无法撤销。`)) return;
     if (state.sessionBusy) return;
-    state.sessionBusy = true;
+    setSessionBusy(true);
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
       showToast("会话已删除");
@@ -2424,7 +2805,7 @@
     } catch (error) {
       showToast(error.message || "删除失败", "error");
     } finally {
-      state.sessionBusy = false;
+      setSessionBusy(false);
     }
   }
 
@@ -2432,6 +2813,7 @@
     const sessionId = String(data?.session_id || "");
     if (!sessionId) return;
     if (name === "session.created") {
+      if (data?.platform) return;
       if (!findSession(sessionId) && !findArchivedSession(sessionId)) {
         state.sessions.unshift({
           session_id: sessionId,
@@ -2570,13 +2952,26 @@
     return distance <= NEAR_BOTTOM_PX;
   }
 
+  function isAtBottom() {
+    const distance = elements.chatScroll.scrollHeight - elements.chatScroll.scrollTop - elements.chatScroll.clientHeight;
+    return distance <= 2;
+  }
+
+  function suspendOutputFollowing() {
+    state.followOutput = false;
+    state.scrollRequestId += 1;
+    elements.jumpBottomButton.hidden = false;
+  }
+
   function scrollToBottom({ force = false, smooth = false } = {}) {
     if (!force && !state.followOutput) {
       elements.jumpBottomButton.hidden = false;
       return;
     }
     if (force) state.followOutput = true;
+    const requestId = ++state.scrollRequestId;
     window.requestAnimationFrame(() => {
+      if (!force && (!state.followOutput || requestId !== state.scrollRequestId)) return;
       state.programmaticScroll = true;
       elements.chatScroll.scrollTo({ top: elements.chatScroll.scrollHeight, behavior: smooth ? "smooth" : "auto" });
       state.nearBottom = true;
@@ -3234,17 +3629,17 @@
     const header = document.createElement("header");
     header.className = "assistant-label";
     const avatar = document.createElement("img");
-    avatar.src = "/assets/miyu-logo.png";
     avatar.alt = "";
     avatar.setAttribute("aria-hidden", "true");
+    setPersonaAvatar(avatar);
     const identity = document.createElement("div");
     const name = document.createElement("strong");
-    name.textContent = "Miyu";
+    name.textContent = state.persona.name;
     const time = document.createElement("span");
     time.textContent = formatTime(timestamp) || "";
     time.title = formatDateTime(timestamp);
     identity.append(name, time);
-    header.append(avatar, identity);
+    header.append(avatar, identity, stop);
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content";
     const blocks = document.createElement("div");
@@ -3545,6 +3940,7 @@
 
   function disposeLiveState(live) {
     if (!live) return;
+    removeLiveStopButton(live);
     if (live.reasoningTimer) {
       window.clearInterval(live.reasoningTimer);
       live.reasoningTimer = null;
@@ -3631,6 +4027,7 @@
     if (!live.stopButton) return;
     live.stopButton.remove();
     live.stopButton = null;
+    elements.liveStopRail.hidden = elements.liveStopRail.childElementCount === 0;
   }
 
   async function cancelLiveRun(live) {
@@ -3672,29 +4069,38 @@
     const header = document.createElement("header");
     header.className = "assistant-label";
     const avatar = document.createElement("img");
-    avatar.src = "/assets/miyu-logo.png";
     avatar.alt = "";
     avatar.setAttribute("aria-hidden", "true");
+    setPersonaAvatar(avatar);
     const identity = document.createElement("div");
     const name = document.createElement("strong");
-    name.textContent = "Miyu";
+    name.textContent = state.persona.name;
     const status = document.createElement("span");
     status.className = "live-indicator";
     // 直播状态由三点弹跳/思考签表达,header 不再写「正在回复」;完成后写「刚刚」等
     status.textContent = "";
     identity.append(name, status);
-    // 停止键放在头像正下方(左列),与多条并行回复/排队设计兼容:每条回复自带停止
+    // Each running reply owns a compact stop control in its bubble corner.
     const stop = document.createElement("button");
     stop.type = "button";
     stop.className = "live-stop-button";
-    stop.appendChild(makeIconSlot("circle-stop"));
+    stop.dataset.runId = live.runId;
+    stop.appendChild(makeIconSlot("stop-square"));
     stop.addEventListener("click", () => cancelLiveRun(live));
     header.append(avatar, identity);
+    for (const existing of elements.liveStopRail.querySelectorAll(".live-stop-button")) {
+      if (existing.dataset.runId === live.runId) existing.remove();
+    }
+    elements.liveStopRail.appendChild(stop);
+    elements.liveStopRail.hidden = false;
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content is-slim";
     const blocks = document.createElement("div");
     blocks.className = "assistant-blocks";
     assistantContent.appendChild(blocks);
+    const bubble = document.createElement("div");
+    bubble.className = "assistant-bubble";
+    bubble.appendChild(assistantContent);
     const meta = document.createElement("div");
     meta.className = "assistant-meta";
     const endpoint = document.createElement("span");
@@ -3707,7 +4113,7 @@
     const copy = makeCopyButton(() => live.assistantText, "复制回复");
     copy.hidden = true;
     meta.append(endpoint, metaText, spacer, copy);
-    article.append(header, assistantContent, meta, stop);
+    article.append(header, bubble, meta);
     elements.timeline.appendChild(article);
     live.article = article;
     live.blocks = blocks;
@@ -5093,6 +5499,7 @@
     state.bootId = String(snapshot?.boot_id || "");
     state.latestEventId = Math.max(0, asFiniteNumber(snapshot?.latest_event_id));
     state.models = Array.isArray(snapshot?.models) ? snapshot.models : [];
+    applyPersona(snapshot?.persona);
     state.display = snapshot?.display && typeof snapshot.display === "object" ? snapshot.display : state.display;
     state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : { tokens: 0, window: null };
     state.usage = snapshot?.usage && typeof snapshot.usage === "object" ? snapshot.usage : {};
@@ -5571,23 +5978,33 @@
     elements.resetConfirmButton.addEventListener("click", resetConversation);
     elements.chatScroll.addEventListener("scroll", () => {
       state.nearBottom = isNearBottom();
-      if (state.nearBottom) {
+      if (state.programmaticScroll) return;
+      if (!state.followOutput && isAtBottom()) {
         state.followOutput = true;
         elements.jumpBottomButton.hidden = true;
-      } else if (!state.programmaticScroll) {
-        state.followOutput = false;
-        elements.jumpBottomButton.hidden = false;
+      } else if (!state.followOutput || !state.nearBottom) {
+        suspendOutputFollowing();
       }
     }, { passive: true });
     elements.chatScroll.addEventListener("wheel", (event) => {
-      if (event.deltaY < 0) state.followOutput = false;
+      if (event.deltaY < 0) suspendOutputFollowing();
     }, { passive: true });
     elements.chatScroll.addEventListener("touchmove", () => {
-      if (!isNearBottom()) state.followOutput = false;
+      suspendOutputFollowing();
     }, { passive: true });
     elements.jumpBottomButton.addEventListener("click", () => scrollToBottom({ force: true, smooth: true }));
     window.addEventListener("resize", updateJumpButtonOffset, { passive: true });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", syncAppHeight, { passive: true });
+      syncAppHeight();
+    }
     document.addEventListener("keydown", handleGlobalKeydown);
+  }
+
+  function syncAppHeight() {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    document.documentElement.style.setProperty("--app-height", `${Math.round(viewport.height * viewport.scale)}px`);
   }
 
   function initialize() {

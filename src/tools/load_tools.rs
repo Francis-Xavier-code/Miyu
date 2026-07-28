@@ -217,7 +217,10 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["note"], "nothing to load; every requested tool is already available");
+        assert_eq!(
+            value["note"],
+            "nothing to load; every requested tool is already available"
+        );
 
         // Entirely unknown names still error so the model can correct itself.
         assert!(registry

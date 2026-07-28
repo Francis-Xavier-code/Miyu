@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 pub const PROTOCOL_VERSION: u16 = 2;
+pub const DEFAULT_WEB_PORT: u16 = 8300;
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 
 /// Unique id of this build, stamped by build.rs. A daemon whose build id
@@ -396,12 +397,8 @@ fn start_daemon_process(paths: &MiyuPaths, args: &[OsString]) -> Result<()> {
         std::env::current_exe().context("resolving the Miyu executable to spawn the daemon")?;
     let mut command = std::process::Command::new(executable);
     command.arg("__daemon");
-    if args.is_empty() {
-        // Auto-spawned daemon: let the OS pick a free WebUI port.
-        command.args(["--port", "0"]);
-    }
+    append_daemon_process_args(&mut command, args);
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
@@ -420,6 +417,15 @@ fn start_daemon_process(paths: &MiyuPaths, args: &[OsString]) -> Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+fn append_daemon_process_args(command: &mut std::process::Command, args: &[OsString]) {
+    if args.is_empty() {
+        // The WebUI bind path falls back to an ephemeral port only when this
+        // default is occupied.
+        command.arg("--port").arg(DEFAULT_WEB_PORT.to_string());
+    }
+    command.args(args);
 }
 
 pub async fn send<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
@@ -471,6 +477,26 @@ mod tests {
         assert_eq!(value["pid"], 42);
         assert_eq!(value["web_port"], 4096);
         assert_eq!(value["web_public"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn daemon_process_prefers_the_default_web_port_unless_overridden() {
+        let mut default = std::process::Command::new("miyu");
+        append_daemon_process_args(&mut default, &[]);
+        let default_args = default
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(default_args, ["--port", "8300"]);
+
+        let supplied = [OsString::from("--port"), OsString::from("9400")];
+        let mut overridden = std::process::Command::new("miyu");
+        append_daemon_process_args(&mut overridden, &supplied);
+        let overridden_args = overridden
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(overridden_args, ["--port", "9400"]);
     }
 
     #[test]

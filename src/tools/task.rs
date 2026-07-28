@@ -184,7 +184,11 @@ fn tier_pool_status(config: &AppConfig) -> String {
     let describe = |tier: ModelTier| {
         let pool = config.subagent_tier_choices(tier);
         if pool.is_empty() {
-            t("not configured (falls back to the main model pool)", "未配置（回退主模型池）").to_string()
+            t(
+                "not configured (falls back to the main model pool)",
+                "未配置（回退主模型池）",
+            )
+            .to_string()
         } else {
             pool.iter()
                 .map(|choice| choice.model.as_str())
@@ -323,7 +327,14 @@ async fn run_task(
                     "error": err.to_string(),
                     "stats": SubagentStats::default().public(),
                 }))?;
-                record_subagent_audit(&context, &description, &prompt, &output, None, &model_choice);
+                record_subagent_audit(
+                    &context,
+                    &description,
+                    &prompt,
+                    &output,
+                    None,
+                    &model_choice,
+                );
                 return Ok(output);
             }
             Err(_) => {
@@ -338,7 +349,14 @@ async fn run_task(
                     "error": format!("subagent timed out after {total_timeout}s"),
                     "stats": SubagentStats::default().public(),
                 }))?;
-                record_subagent_audit(&context, &description, &prompt, &output, None, &model_choice);
+                record_subagent_audit(
+                    &context,
+                    &description,
+                    &prompt,
+                    &output,
+                    None,
+                    &model_choice,
+                );
                 return Ok(output);
             }
         };
@@ -368,7 +386,14 @@ async fn run_task(
         (Some(provider_id), Some(model)) => Some((provider_id.clone(), model.clone())),
         _ => model_choice,
     };
-    record_subagent_audit(&context, &description, &prompt, &output, Some(&stats), &model_choice);
+    record_subagent_audit(
+        &context,
+        &description,
+        &prompt,
+        &output,
+        Some(&stats),
+        &model_choice,
+    );
     Ok(output)
 }
 

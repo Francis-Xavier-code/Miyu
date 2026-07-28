@@ -31,10 +31,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions",
         apply: apply_v2_sessions,
     },
+    Migration {
+        version: 3,
+        name: "platform_sessions_and_plugin_state",
+        apply: apply_v3_platform_sessions_and_plugin_state,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 2;
+pub const LATEST_VERSION: i64 = 3;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -354,6 +359,48 @@ fn apply_v2_sessions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v3: stable platform-conversation bindings and platform plugin state.
+///
+/// Platform session bindings include the persona and optional participant so
+/// chat history can remain isolated, while plugin state deliberately excludes
+/// both dimensions and is shared by every persona in the external conversation.
+fn apply_v3_platform_sessions_and_plugin_state(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE platform_session_bindings (
+            platform          TEXT NOT NULL,
+            account_id        TEXT NOT NULL,
+            conversation_kind TEXT NOT NULL,
+            conversation_id   TEXT NOT NULL,
+            participant_id    TEXT NOT NULL DEFAULT '',
+            persona           TEXT NOT NULL,
+            session_id        TEXT NOT NULL UNIQUE
+                              REFERENCES sessions(session_id) ON DELETE CASCADE,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (
+                platform, account_id, conversation_kind, conversation_id,
+                participant_id, persona
+            )
+        );
+
+        CREATE TABLE platform_plugin_kv (
+            plugin_id         TEXT NOT NULL,
+            platform          TEXT NOT NULL,
+            account_id        TEXT NOT NULL,
+            conversation_kind TEXT NOT NULL,
+            conversation_id   TEXT NOT NULL,
+            key               TEXT NOT NULL,
+            value_json        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (
+                plugin_id, platform, account_id, conversation_kind,
+                conversation_id, key
+            )
+        );",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -515,5 +562,68 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    #[test]
+    fn v3_platform_tables_enforce_uniqueness_and_session_cascade() {
+        let conn = open_migrated();
+        assert_eq!(user_version(&conn).unwrap(), 3);
+        conn.execute(
+            "INSERT INTO sessions (session_id, persona, name, created_at, updated_at)
+             VALUES ('platform-session', 'miyu', 'platform', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO platform_session_bindings (
+                platform, account_id, conversation_kind, conversation_id,
+                persona, session_id, created_at, updated_at
+             ) VALUES ('onebot', '10000', 'private', '20000', 'miyu',
+                       'platform-session', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+
+        // A session cannot be attached to a second external identity.
+        assert!(conn
+            .execute(
+                "INSERT INTO platform_session_bindings (
+                    platform, account_id, conversation_kind, conversation_id,
+                    persona, session_id, created_at, updated_at
+                 ) VALUES ('onebot', '10000', 'private', 'other', 'miyu',
+                           'platform-session', 'now', 'now')",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO platform_plugin_kv (
+                plugin_id, platform, account_id, conversation_kind,
+                conversation_id, key, value_json, updated_at
+             ) VALUES ('reply_processor', 'onebot', '10000', 'private',
+                       '20000', 'recent_images', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = 'platform-session'",
+            [],
+        )
+        .unwrap();
+        let binding_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM platform_session_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let plugin_count: i64 = conn
+            .query_row("SELECT count(*) FROM platform_plugin_kv", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(binding_count, 0);
+        // Plugin state is scoped to the external conversation, not a session.
+        assert_eq!(plugin_count, 1);
     }
 }
