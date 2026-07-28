@@ -748,8 +748,15 @@ impl StateStore {
     }
 
     pub fn reset_conversation(&self) -> Result<()> {
-        self.conv_db.reset(&self.session())?;
+        self.clear_session_content()?;
         usage::reset_conversation(&self.usage_file())
+    }
+
+    /// Clears only the pinned session's conversation state. Platform commands
+    /// use this instead of `reset_conversation` so they cannot reset the
+    /// daemon-wide usage counters or another client's current session.
+    pub fn clear_session_content(&self) -> Result<()> {
+        self.conv_db.reset(&self.session())
     }
 
     pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
@@ -1658,6 +1665,64 @@ mod tests {
             .load_image_asset(&loaded.asset.asset_id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn clearing_pinned_session_content_is_isolated_and_preserves_usage_and_binding() {
+        let (_temp, store) = test_store();
+        let current_session = store.session_id();
+        store
+            .start_turn("local_turn", "local prompt", std::process::id())
+            .unwrap();
+        store
+            .complete_turn("local_turn", "local answer", None)
+            .unwrap();
+
+        let target_record = store
+            .create_session("miyu", "qq:10000:private:42", "user", None)
+            .unwrap();
+        let target = store.pinned(&target_record.session_id);
+        target
+            .start_turn("qq_turn", "QQ prompt", std::process::id())
+            .unwrap();
+        target.complete_turn("qq_turn", "QQ answer", None).unwrap();
+        target
+            .enqueue_prompt("qq_queue", "queued", "queued", &[])
+            .unwrap();
+        let binding = platform_binding_key("42", None, "miyu");
+        store
+            .bind_platform_session(&binding, &target_record.session_id)
+            .unwrap();
+
+        store
+            .add_usage(&Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            })
+            .unwrap();
+        let usage_before = store.usage_snapshot().unwrap();
+
+        target.clear_session_content().unwrap();
+
+        assert!(target.load_turns().unwrap().is_empty());
+        assert!(target.load_queued_prompts().unwrap().is_empty());
+        assert_eq!(store.load_turns().unwrap().len(), 1);
+        assert_eq!(store.session_id(), current_session);
+        assert!(store
+            .session_record(&target_record.session_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store.find_platform_session_binding(&binding).unwrap(),
+            Some(target_record.session_id)
+        );
+        let usage_after = store.usage_snapshot().unwrap();
+        assert_eq!(usage_after.total_tokens, usage_before.total_tokens);
+        assert_eq!(
+            usage_after.conversation_tokens,
+            usage_before.conversation_tokens
+        );
     }
 
     fn visible_snapshot(store: &StateStore) -> (i64, Vec<String>) {

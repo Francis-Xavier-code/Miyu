@@ -48,15 +48,60 @@ pub struct AppConfig {
 /// Messaging-platform settings. Public configuration is named after the
 /// product users connect to; transport protocols remain implementation
 /// details of each platform adapter.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub const DEFAULT_PLATFORM_COMMAND_PREFIX: &str = "/";
+pub const MAX_PLATFORM_COMMAND_PREFIX_CHARS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlatformsConfig {
+    #[serde(
+        default = "default_platform_command_prefix",
+        skip_serializing_if = "is_default_platform_command_prefix"
+    )]
+    pub command_prefix: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, PlatformCommandConfig>,
     #[serde(default, skip_serializing_if = "OneBotConfig::is_default")]
     pub qq: OneBotConfig,
 }
 
+impl Default for PlatformsConfig {
+    fn default() -> Self {
+        Self {
+            command_prefix: default_platform_command_prefix(),
+            commands: BTreeMap::new(),
+            qq: OneBotConfig::default(),
+        }
+    }
+}
+
 impl PlatformsConfig {
     pub fn is_empty(&self) -> bool {
-        self.qq.is_default()
+        self == &Self::default()
+    }
+
+    pub fn command_permission(
+        &self,
+        command: &str,
+        default: PlatformCommandPermission,
+    ) -> PlatformCommandPermission {
+        self.commands
+            .get(command)
+            .map(|config| config.permission)
+            .unwrap_or(default)
+    }
+
+    pub fn set_command_permission(
+        &mut self,
+        command: &str,
+        permission: PlatformCommandPermission,
+        default: PlatformCommandPermission,
+    ) {
+        if permission == default {
+            self.commands.remove(command);
+        } else {
+            self.commands
+                .insert(command.to_string(), PlatformCommandConfig { permission });
+        }
     }
 
     pub fn model_route(
@@ -111,6 +156,7 @@ impl PlatformsConfig {
     }
 
     pub fn normalize_model_routes(&mut self) {
+        self.command_prefix = self.command_prefix.trim().to_string();
         self.qq.admin_users.sort_unstable();
         self.qq.admin_users.dedup();
         self.qq.private_chats.whitelist.sort_unstable();
@@ -177,6 +223,28 @@ impl PlatformsConfig {
             route.rename_model_references(provider_id, old, new);
         }
     }
+}
+
+fn default_platform_command_prefix() -> String {
+    DEFAULT_PLATFORM_COMMAND_PREFIX.to_string()
+}
+
+fn is_default_platform_command_prefix(value: &String) -> bool {
+    value == DEFAULT_PLATFORM_COMMAND_PREFIX
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformCommandPermission {
+    Everyone,
+    #[default]
+    AdminOnly,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformCommandConfig {
+    #[serde(default)]
+    pub permission: PlatformCommandPermission,
 }
 
 pub type PlatformPluginsConfig = BTreeMap<String, PlatformPluginInstanceConfig>;
@@ -2035,6 +2103,32 @@ impl AppConfig {
     }
 
     fn validate_platforms(&self) -> Result<()> {
+        let command_prefix = &self.platforms.command_prefix;
+        if command_prefix.is_empty()
+            || command_prefix.trim() != command_prefix
+            || command_prefix.chars().count() > MAX_PLATFORM_COMMAND_PREFIX_CHARS
+            || command_prefix
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            bail!(
+                "platforms.command_prefix must be a trimmed, non-empty value of at most {MAX_PLATFORM_COMMAND_PREFIX_CHARS} characters without whitespace"
+            );
+        }
+        for command in self.platforms.commands.keys() {
+            if command.is_empty()
+                || command.len() > 64
+                || !command.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+            {
+                bail!(
+                    "platforms.commands keys must be lowercase ASCII command ids of at most 64 bytes"
+                );
+            }
+        }
         let qq = &self.platforms.qq;
         if qq.reverse_ws_port == 0 {
             bail!("platforms.qq.reverse_ws_port must be between 1 and 65535");
@@ -3658,6 +3752,10 @@ mod tests {
                 "active_provider": "opencode",
                 "providers": [],
                 "platforms": {
+                    "command_prefix": "!",
+                    "commands": {
+                        "reset": { "permission": "everyone" }
+                    },
                     "qq": {
                         "enabled": true,
                         "reverse_ws_port": 8400,
@@ -3682,6 +3780,13 @@ mod tests {
         )
         .unwrap();
         let qq = &parsed.platforms.qq;
+        assert_eq!(parsed.platforms.command_prefix, "!");
+        assert_eq!(
+            parsed
+                .platforms
+                .command_permission("reset", PlatformCommandPermission::AdminOnly),
+            PlatformCommandPermission::Everyone
+        );
         assert!(qq.enabled);
         assert_eq!(qq.reverse_ws_port, 8400);
         assert_eq!(qq.access_token, "secret");
@@ -3705,6 +3810,55 @@ mod tests {
         )
         .unwrap();
         assert!(!legacy.platforms.qq.enabled);
+        assert_eq!(legacy.platforms.command_prefix, "/");
+        assert!(legacy.platforms.commands.is_empty());
+    }
+
+    #[test]
+    fn platform_command_defaults_overrides_and_validation() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.platforms.command_prefix, "/");
+        assert_eq!(
+            config
+                .platforms
+                .command_permission("reset", PlatformCommandPermission::AdminOnly),
+            PlatformCommandPermission::AdminOnly
+        );
+        config.platforms.set_command_permission(
+            "reset",
+            PlatformCommandPermission::Everyone,
+            PlatformCommandPermission::AdminOnly,
+        );
+        assert_eq!(
+            config.platforms.commands["reset"].permission,
+            PlatformCommandPermission::Everyone
+        );
+        config.platforms.set_command_permission(
+            "reset",
+            PlatformCommandPermission::AdminOnly,
+            PlatformCommandPermission::AdminOnly,
+        );
+        assert!(config.platforms.commands.is_empty());
+
+        for invalid in [
+            "",
+            " ",
+            "/ reset",
+            "\n",
+            "/////////////////////////////////",
+        ] {
+            config.platforms.command_prefix = invalid.to_string();
+            assert!(
+                config.validate().is_err(),
+                "prefix should be invalid: {invalid:?}"
+            );
+        }
+        config.platforms.command_prefix = "/".to_string();
+        config
+            .platforms
+            .commands
+            .insert("Reset".to_string(), PlatformCommandConfig::default());
+        assert!(config.validate().is_err());
     }
 
     fn route_test_config() -> AppConfig {

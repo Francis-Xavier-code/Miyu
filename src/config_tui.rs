@@ -1,11 +1,13 @@
 use crate::config::{
-    ActiveProviderModelConfig, AppConfig, PlatformConversationConfig, PlatformConversationKind,
-    PlatformModelRoute, ProviderConfig, MAX_COMMAND_OUTPUT_LINES,
+    ActiveProviderModelConfig, AppConfig, PlatformCommandPermission, PlatformConversationConfig,
+    PlatformConversationKind, PlatformModelRoute, ProviderConfig, MAX_COMMAND_OUTPUT_LINES,
+    MAX_PLATFORM_COMMAND_PREFIX_CHARS,
 };
 use crate::default_kb;
 use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
 use crate::i18n::{is_zh, text as t};
 use crate::paths::MiyuPaths;
+use crate::platforms::commands::{self, PlatformCommandDescriptor};
 use anyhow::{bail, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
@@ -2161,7 +2163,19 @@ fn select_platforms(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<(
         } else {
             t("disabled", "未启用")
         };
-        let options = [format!("{}: {state}", t("Tencent QQ", "腾讯 QQ"))];
+        let options = vec![
+            format!("{}: {state}", t("Tencent QQ", "腾讯 QQ")),
+            format!(
+                "{}: {}",
+                t("Command trigger prefix", "命令触发前缀"),
+                config.platforms.command_prefix
+            ),
+            format!(
+                "{}: {}",
+                t("Command list", "命令列表"),
+                commands::BUILTIN_COMMANDS.len()
+            ),
+        ];
         draw_menu(
             stdout,
             t(" IM PLATFORMS ", " 接入通讯平台 "),
@@ -2176,7 +2190,133 @@ fn select_platforms(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<(
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => edit_qq(stdout, config)?,
+            KeyCode::Enter => match selected {
+                0 => edit_qq(stdout, config)?,
+                1 => edit_platform_command_prefix(stdout, config)?,
+                2 => select_platform_commands(stdout, config)?,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn edit_platform_command_prefix(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let Some(value) = edit_inline_value(
+        stdout,
+        t(" COMMAND TRIGGER PREFIX ", " 命令触发前缀 "),
+        &config.platforms.command_prefix,
+        false,
+    )?
+    else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > MAX_PLATFORM_COMMAND_PREFIX_CHARS
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        message(
+            stdout,
+            t(
+                "The prefix must be 1-32 characters and cannot contain whitespace.",
+                "前缀必须为 1 到 32 个字符，且不能包含空白字符。",
+            ),
+        )?;
+    } else {
+        config.platforms.command_prefix = value.to_string();
+    }
+    Ok(())
+}
+
+fn platform_command_permission_label(permission: PlatformCommandPermission) -> &'static str {
+    match permission {
+        PlatformCommandPermission::Everyone => t("Everyone", "所有人"),
+        PlatformCommandPermission::AdminOnly => t("Administrators only", "仅管理员"),
+    }
+}
+
+fn select_platform_commands(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let options = commands::BUILTIN_COMMANDS
+            .iter()
+            .map(|command| {
+                let permission = config
+                    .platforms
+                    .command_permission(command.id, command.default_permission);
+                format!(
+                    "{}: {}",
+                    command.id,
+                    platform_command_permission_label(permission)
+                )
+            })
+            .collect::<Vec<_>>();
+        draw_menu(
+            stdout,
+            t(" PLATFORM COMMANDS ", " 命令列表 "),
+            &options,
+            selected,
+            t(
+                "[Enter]set permission [j/k]move [q]back",
+                "[Enter]设置权限 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => {
+                edit_platform_command_permission(
+                    stdout,
+                    config,
+                    &commands::BUILTIN_COMMANDS[selected],
+                )?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn edit_platform_command_permission(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+    command: &PlatformCommandDescriptor,
+) -> Result<()> {
+    let permissions = [
+        PlatformCommandPermission::Everyone,
+        PlatformCommandPermission::AdminOnly,
+    ];
+    let current = config
+        .platforms
+        .command_permission(command.id, command.default_permission);
+    let mut selected = permissions
+        .iter()
+        .position(|permission| *permission == current)
+        .unwrap_or(0);
+    loop {
+        let options = permissions
+            .iter()
+            .map(|permission| platform_command_permission_label(*permission).to_string())
+            .collect::<Vec<_>>();
+        let title = format!(" {} · {} ", t("COMMAND PERMISSION", "命令权限"), command.id);
+        draw_menu(stdout, &title, &options, selected, "")?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(permissions.len() - 1)
+            }
+            KeyCode::Enter => {
+                config.platforms.set_command_permission(
+                    command.id,
+                    permissions[selected],
+                    command.default_permission,
+                );
+                return Ok(());
+            }
             _ => {}
         }
     }

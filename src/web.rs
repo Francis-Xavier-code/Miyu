@@ -125,6 +125,53 @@ impl DaemonState {
             platforms: PlatformRuntime::new()?,
         })
     }
+
+    pub(crate) fn for_test_with_actor(
+        paths: MiyuPaths,
+        web_port: u16,
+    ) -> Result<(Self, std::thread::JoinHandle<Result<()>>)> {
+        let state_store = StateStore::new(&paths)?;
+        let config = AppConfig::default();
+        let context = cold_context(&config, &state_store)?;
+        let manager = Arc::new(Mutex::new(ManagerState {
+            config: config.clone(),
+            active_runs: HashMap::new(),
+            admin_busy: false,
+            context,
+            persona_session_ids: HashMap::new(),
+        }));
+        let events = EventHub::new();
+        let questions = QuestionBroker::new();
+        let turn_engine = TurnEngineState::default();
+        let (actor_tx, actor_join) = spawn_actor(
+            config,
+            paths.clone(),
+            state_store.clone(),
+            manager.clone(),
+            events.clone(),
+            questions.clone(),
+            turn_engine.clone(),
+        )?;
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+        Ok((
+            Self {
+                auth: WebAuth::new(None),
+                boot_id: Arc::from("boot-test"),
+                web_port,
+                web_public: false,
+                paths,
+                manager,
+                state_store,
+                events,
+                questions,
+                actor_tx,
+                shutdown_tx,
+                turn_engine,
+                platforms: PlatformRuntime::new()?,
+            },
+            actor_join,
+        ))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -394,6 +441,10 @@ pub(crate) enum ActorCommand {
         all: bool,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
+    ClearSessionContent {
+        session_id: Arc<str>,
+        reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
+    },
     SwitchSession {
         session_id: String,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
@@ -414,6 +465,13 @@ pub(crate) enum ActorCommand {
 #[derive(Debug)]
 pub(crate) enum AdminFailure {
     Invalid(String),
+    Internal(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum PlatformSessionResetError {
+    Busy,
+    Unavailable,
     Internal(String),
 }
 
@@ -3648,6 +3706,17 @@ async fn actor_loop(
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
+            ActorCommand::ClearSessionContent { session_id, reply } => {
+                let result = clear_actor_session_content(
+                    &mut agent,
+                    &config,
+                    &state_store,
+                    &manager,
+                    &session_id,
+                );
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
             ActorCommand::SwitchSession { session_id, reply } => {
                 let result = switch_actor_session(
                     agent.as_ref(),
@@ -4529,6 +4598,36 @@ fn reset_actor_conversation(
     Ok(())
 }
 
+fn clear_actor_session_content(
+    agent: &mut Option<Agent>,
+    config: &AppConfig,
+    state_store: &StateStore,
+    manager: &Arc<Mutex<ManagerState>>,
+    session_id: &str,
+) -> std::result::Result<(), AdminFailure> {
+    let store = state_store.pinned(session_id);
+    store
+        .clear_session_content()
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+
+    // Platform sessions normally never become the daemon's current local
+    // session. Keep the in-memory context coherent if a legacy binding points
+    // at that session, without clearing persona-wide memory or usage totals.
+    if &*state_store.session_id() == session_id {
+        let context = if let Some(agent) = agent.as_mut() {
+            agent
+                .reset_memory()
+                .and_then(|()| agent.prepare_for_turn())
+                .and_then(|()| current_context(agent))
+        } else {
+            cold_context(config, &store)
+        }
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+        manager.lock().unwrap().context = context;
+    }
+    Ok(())
+}
+
 fn finish_cancelled_run(
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
@@ -4739,6 +4838,58 @@ fn reserve_admin_for_session(
     }
     manager.admin_busy = true;
     Ok(())
+}
+
+pub(crate) async fn clear_platform_session_content(
+    state: &DaemonState,
+    session_id: Arc<str>,
+) -> std::result::Result<(), PlatformSessionResetError> {
+    state
+        .state_store
+        .recover_stale_turns()
+        .map_err(|error| PlatformSessionResetError::Internal(safe_error_message(error)))?;
+    {
+        let mut manager = state.manager.lock().unwrap();
+        if manager.admin_busy || manager.session_has_runs(&session_id) {
+            return Err(PlatformSessionResetError::Busy);
+        }
+        manager.admin_busy = true;
+    }
+
+    let target = state.state_store.pinned(&session_id);
+    match target.has_running_turns() {
+        Ok(false) => {}
+        Ok(true) => {
+            release_admin(&state.manager);
+            return Err(PlatformSessionResetError::Busy);
+        }
+        Err(error) => {
+            release_admin(&state.manager);
+            return Err(PlatformSessionResetError::Internal(safe_error_message(
+                error,
+            )));
+        }
+    }
+
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::ClearSessionContent { session_id, reply })
+        .is_err()
+    {
+        release_admin(&state.manager);
+        return Err(PlatformSessionResetError::Unavailable);
+    }
+    match receiver.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+            Err(PlatformSessionResetError::Internal(message))
+        }
+        Err(_) => {
+            release_admin(&state.manager);
+            Err(PlatformSessionResetError::Unavailable)
+        }
+    }
 }
 
 /// Light admin reservation (session switching): serializes against other
@@ -6023,6 +6174,91 @@ mod tests {
             scripts_dir: root.join("scripts"),
             system_scripts_dir: root.join("system-scripts"),
         }
+    }
+
+    fn test_daemon_with_actor(
+        root: &FilePath,
+    ) -> (DaemonState, std::thread::JoinHandle<Result<()>>) {
+        DaemonState::for_test_with_actor(test_paths(root), 8300).unwrap()
+    }
+
+    #[tokio::test]
+    async fn platform_session_reset_is_serialized_per_target_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) = test_daemon_with_actor(temp.path());
+        let target = state
+            .state_store
+            .create_session("miyu", "qq target", "user", None)
+            .unwrap();
+        let other = state
+            .state_store
+            .create_session("miyu", "other", "user", None)
+            .unwrap();
+        let target_store = state.state_store.pinned(&target.session_id);
+        target_store
+            .start_turn("before_reset", "hello", std::process::id())
+            .unwrap();
+        target_store
+            .complete_turn("before_reset", "world", None)
+            .unwrap();
+
+        let (other_cancel, _other_cancel_rx) = tokio::sync::watch::channel(false);
+        state.manager.lock().unwrap().active_runs.insert(
+            "other_run".to_string(),
+            RunInfo {
+                session_id: other.session_id.clone().into(),
+                mode: AgentMode::Normal,
+                cancel: other_cancel,
+            },
+        );
+        assert!(
+            clear_platform_session_content(&state, target.session_id.clone().into())
+                .await
+                .is_ok()
+        );
+        assert!(target_store.load_turns().unwrap().is_empty());
+        assert!(!state.manager.lock().unwrap().admin_busy);
+
+        target_store
+            .start_turn("must_survive", "still here", std::process::id())
+            .unwrap();
+        target_store
+            .complete_turn("must_survive", "answer", None)
+            .unwrap();
+        let (target_cancel, _target_cancel_rx) = tokio::sync::watch::channel(false);
+        state.manager.lock().unwrap().active_runs.insert(
+            "target_run".to_string(),
+            RunInfo {
+                session_id: target.session_id.clone().into(),
+                mode: AgentMode::Normal,
+                cancel: target_cancel,
+            },
+        );
+        assert!(matches!(
+            clear_platform_session_content(&state, target.session_id.clone().into()).await,
+            Err(PlatformSessionResetError::Busy)
+        ));
+        assert_eq!(target_store.load_turns().unwrap().len(), 1);
+        assert!(!state.manager.lock().unwrap().admin_busy);
+
+        state.manager.lock().unwrap().active_runs.clear();
+        target_store
+            .start_turn("database_running", "working", std::process::id())
+            .unwrap();
+        assert!(matches!(
+            clear_platform_session_content(&state, target.session_id.clone().into()).await,
+            Err(PlatformSessionResetError::Busy)
+        ));
+        assert!(!state.manager.lock().unwrap().admin_busy);
+        target_store.interrupt_turn("database_running").unwrap();
+
+        state.actor_tx.send(ActorCommand::Shutdown).unwrap();
+        actor_join.join().unwrap().unwrap();
+        assert!(matches!(
+            clear_platform_session_content(&state, target.session_id.into()).await,
+            Err(PlatformSessionResetError::Unavailable)
+        ));
+        assert!(!state.manager.lock().unwrap().admin_busy);
     }
 
     #[test]

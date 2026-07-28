@@ -1688,19 +1688,21 @@ impl ConversationDb {
     }
 
     pub fn reset(&self, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM queued_prompts WHERE session_id = ?1",
             params![session_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM turns WHERE session_id = ?1",
             params![session_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_loaded_items WHERE session_id = ?1",
             params![session_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

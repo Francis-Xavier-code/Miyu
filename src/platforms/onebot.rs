@@ -10,7 +10,7 @@
 //! success hooks run, so transformations can safely persist delivery state.
 
 use super::{
-    download_capped, markdown_to_plain, resolve_platform_session, run_platform_turn,
+    commands, download_capped, markdown_to_plain, resolve_platform_session, run_platform_turn,
     sniff_image_mime, split_reply, ConversationKind, ForwardNode, OutboundBody, OutboundMessage,
     OutboundOrigin, OutboundSegment, PlatformAdapter, PlatformConversation, PlatformTurnContext,
     RateDecision, SendReceipt, TurnDispatch, TurnProfile,
@@ -18,7 +18,10 @@ use super::{
 use crate::config::OneBotConfig;
 use crate::i18n::text as t;
 use crate::ipc::ImageAttachment;
-use crate::web::{random_id, safe_error_message, DaemonState};
+use crate::web::{
+    clear_platform_session_content, random_id, safe_error_message, DaemonState,
+    PlatformSessionResetError,
+};
 use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -770,8 +773,23 @@ async fn handle_message(state: DaemonState, conn: ConnectionHandle, event: Value
     // Classify group traffic before charging rate limits. Busy groups often
     // produce many messages that do not wake Miyu and must not starve actual
     // mentions or prefix commands.
-    let command_response = context.handle_command(parsed.text.trim()).await;
-    if command_response.is_none() {
+    let parsed_command = commands::parse(&context.config.platforms, parsed.text.trim());
+    // Built-in commands own their registered names. Unknown prefixed input is
+    // offered to legacy plugin commands before the core reports it as unknown.
+    let plugin_command_response = if matches!(
+        parsed_command,
+        Some(commands::ParsedPlatformCommand::Reset { .. })
+    ) {
+        None
+    } else {
+        context.handle_command(parsed.text.trim()).await
+    };
+    let builtin_command = if plugin_command_response.is_none() {
+        parsed_command
+    } else {
+        None
+    };
+    if plugin_command_response.is_none() && builtin_command.is_none() {
         if let Target::Group { .. } = target {
             let Some(text) = group_trigger_text(&config, &parsed) else {
                 return;
@@ -794,7 +812,7 @@ async fn handle_message(state: DaemonState, conn: ConnectionHandle, event: Value
         text_chars = parsed.text.chars().count(),
         images = parsed.images.len(),
         files = parsed.files.len(),
-        command = command_response.is_some(),
+        command = plugin_command_response.is_some() || builtin_command.is_some(),
         "OneBot message accepted"
     );
 
@@ -845,11 +863,20 @@ async fn handle_message(state: DaemonState, conn: ConnectionHandle, event: Value
     }
 
     // Platform commands are independent of the LLM group wake trigger.
-    if let Some(response) = command_response {
+    if let Some(response) = plugin_command_response {
         if let Err(error) = context.send_bypass_plugins(response).await {
             tracing::warn!(target: "miyu::qq", error = %error, "OneBot plugin command response failed");
         } else {
             tracing::info!(target: "miyu::qq", self_id, sender_id = user_id, "OneBot plugin command response sent");
+        }
+        return;
+    }
+    if let Some(command) = builtin_command {
+        let response = execute_builtin_command(&state, &context, target, &event, command).await;
+        if let Err(error) = context.send_bypass_plugins(response).await {
+            tracing::warn!(target: "miyu::qq", error = %error, "OneBot built-in command response failed");
+        } else {
+            tracing::info!(target: "miyu::qq", self_id, sender_id = user_id, "OneBot built-in command response sent");
         }
         return;
     }
@@ -885,6 +912,76 @@ async fn handle_message(state: DaemonState, conn: ConnectionHandle, event: Value
                 .await;
         }
     }
+}
+
+async fn execute_builtin_command(
+    state: &DaemonState,
+    context: &PlatformTurnContext,
+    target: Target,
+    event: &Value,
+    command: commands::ParsedPlatformCommand,
+) -> OutboundMessage {
+    let response = match command {
+        commands::ParsedPlatformCommand::Unknown => {
+            commands::unknown_command_message(&context.config.platforms)
+        }
+        commands::ParsedPlatformCommand::Reset { has_arguments } => {
+            let descriptor = commands::descriptor(commands::RESET_COMMAND_ID)
+                .expect("the reset command descriptor is registered");
+            if !commands::is_allowed(&context.config.platforms, descriptor, context.is_admin) {
+                commands::permission_denied_message(&context.config.platforms, descriptor)
+            } else if has_arguments {
+                commands::reset_usage_message(&context.config.platforms)
+            } else {
+                match resolve_onebot_session(state, context, target, event) {
+                    Err(error) => {
+                        tracing::warn!(target: "miyu::qq", error = %error, "resolving the QQ session for reset failed");
+                        t(
+                            "The conversation could not be reset. Check the daemon logs for details.",
+                            "无法重置当前会话，请查看 daemon 日志。",
+                        )
+                        .to_string()
+                    }
+                    Ok(session_id) => {
+                        match clear_platform_session_content(state, session_id.clone()).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    target: "miyu::qq",
+                                    session_id = %session_id,
+                                    sender_id = %context.sender_id,
+                                    "QQ conversation reset"
+                                );
+                                t(
+                                    "The current conversation has been reset.",
+                                    "当前会话已重置。",
+                                )
+                                .to_string()
+                            }
+                            Err(PlatformSessionResetError::Busy) => t(
+                                "This conversation is replying right now. Try resetting it again after the reply finishes.",
+                                "当前会话正在回复，请在回复结束后重试。",
+                            )
+                            .to_string(),
+                            Err(PlatformSessionResetError::Unavailable) => t(
+                                "The Miyu core is unavailable, so the conversation was not reset.",
+                                "Miyu 核心当前不可用，会话未重置。",
+                            )
+                            .to_string(),
+                            Err(PlatformSessionResetError::Internal(error)) => {
+                                tracing::warn!(target: "miyu::qq", session_id = %session_id, error = %error, "resetting the QQ conversation failed");
+                                t(
+                                    "The conversation could not be reset. Check the daemon logs for details.",
+                                    "无法重置当前会话，请查看 daemon 日志。",
+                                )
+                                .to_string()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    OutboundMessage::text(OutboundOrigin::Command, response)
 }
 
 fn platform_turn_context(
@@ -1037,15 +1134,7 @@ async fn build_and_run_turn(
 
     let prepared = context.prepare_turn(content).await;
     let content = prepared.content;
-    let session_name = session_name_for(target, event);
-    let legacy_name = legacy_session_name_for(target);
-    let session_id = resolve_platform_session(
-        state,
-        &context.conversation,
-        None,
-        &session_name,
-        Some(&legacy_name),
-    )?;
+    let session_id = resolve_onebot_session(state, &context, target, event)?;
     let route = context.config.platforms.model_route(
         match context.conversation.kind {
             ConversationKind::Private => crate::config::PlatformConversationKind::Private,
@@ -1071,6 +1160,23 @@ async fn build_and_run_turn(
     };
     let dispatch = run_platform_turn(state, session_id, content, images, profile).await?;
     Ok(Some(dispatch))
+}
+
+fn resolve_onebot_session(
+    state: &DaemonState,
+    context: &PlatformTurnContext,
+    target: Target,
+    event: &Value,
+) -> Result<Arc<str>> {
+    let session_name = session_name_for(target, event);
+    let legacy_name = legacy_session_name_for(target);
+    resolve_platform_session(
+        state,
+        &context.conversation,
+        None,
+        &session_name,
+        Some(&legacy_name),
+    )
 }
 
 /// Session-name key for this conversation. Group history is always shared by
@@ -1322,6 +1428,38 @@ fn group_trigger_text(config: &OneBotConfig, parsed: &InboundMessage) -> Option<
     )
 }
 
+fn decode_cq_text(text: &str) -> String {
+    text.replace("&#91;", "[")
+        .replace("&#93;", "]")
+        .replace("&amp;", "&")
+}
+
+fn parse_cq_string(raw: &str, self_id: i64) -> InboundMessage {
+    let mut parsed = InboundMessage::default();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find("[CQ:") {
+        parsed.text.push_str(&decode_cq_text(&remaining[..start]));
+        let segment = &remaining[start + 4..];
+        let Some(end) = segment.find(']') else {
+            parsed.text.push_str(&decode_cq_text(&remaining[start..]));
+            return parsed;
+        };
+        let body = &segment[..end];
+        let mut fields = body.split(',');
+        if fields.next() == Some("at") {
+            let self_id = self_id.to_string();
+            parsed.at_self |= fields.any(|field| {
+                field
+                    .strip_prefix("qq=")
+                    .is_some_and(|qq| qq == self_id.as_str())
+            });
+        }
+        remaining = &segment[end + 1..];
+    }
+    parsed.text.push_str(&decode_cq_text(remaining));
+    parsed
+}
+
 /// Parses the OneBot `message` field (segment array, or raw string as a
 /// fallback when NapCat isn't configured for array format).
 fn parse_message(
@@ -1335,7 +1473,7 @@ fn parse_message(
             .and_then(Value::as_str)
             .or_else(|| raw_message.and_then(Value::as_str))
         {
-            parsed.text = raw.to_string();
+            return parse_cq_string(raw, self_id);
         }
         return parsed;
     };
@@ -1968,6 +2106,21 @@ mod tests {
         let raw = json!("raw 兜底");
         let parsed = parse_message(None, Some(&raw), 1);
         assert_eq!(parsed.text, "raw 兜底");
+
+        let reply_command = json!("[CQ:reply,id=5][CQ:at,qq=10001] /reset");
+        let parsed = parse_message(Some(&reply_command), None, 10001);
+        assert!(parsed.at_self);
+        assert_eq!(parsed.text, " /reset");
+        assert_eq!(
+            commands::parse(&crate::config::PlatformsConfig::default(), &parsed.text),
+            Some(commands::ParsedPlatformCommand::Reset {
+                has_arguments: false
+            })
+        );
+
+        let escaped_literal = json!("&#91;CQ:reply,id=5&#93;/reset");
+        let parsed = parse_message(Some(&escaped_literal), None, 1);
+        assert_eq!(parsed.text, "[CQ:reply,id=5]/reset");
     }
 
     #[test]
@@ -2105,6 +2258,123 @@ mod tests {
         config.group_chats.allow_non_whitelist = false;
         assert!(!admission_for(&config, Target::Private { user_id: 3 }, 100, 3).allowed);
         assert!(!admission_for(&config, Target::Group { group_id: 11 }, 100, 3).allowed);
+    }
+
+    #[tokio::test]
+    async fn reset_command_uses_configured_admins_and_clears_the_bound_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) =
+            DaemonState::for_test_with_actor(test_paths(temp.path()), 8300).unwrap();
+        let target = Target::Group { group_id: 99 };
+        let event = json!({
+            "self_id": 10000,
+            "user_id": 42,
+            "message_type": "group",
+            "group_id": 99,
+            "message_id": 7,
+            "message": [{ "type": "text", "data": { "text": "/reset extra" } }],
+            "sender": { "nickname": "Alice", "role": "owner" }
+        });
+        state.manager.lock().unwrap().config.platforms.qq.enabled = true;
+        let (connection, mut frames) = test_connection(None);
+        let persona = state.manager.lock().unwrap().config.active_persona_scope();
+        let sessions_before = state
+            .state_store
+            .list_sessions(&persona, true)
+            .unwrap()
+            .len();
+
+        // QQ group roles never grant Miyu command administration.
+        let denied = tokio::spawn(handle_message(
+            state.clone(),
+            connection.clone(),
+            event.clone(),
+        ));
+        let denied_frame: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(denied_frame["action"], "send_group_msg");
+        let expected_denial = commands::permission_denied_message(
+            &state.manager.lock().unwrap().config.platforms,
+            commands::descriptor(commands::RESET_COMMAND_ID).unwrap(),
+        );
+        assert_eq!(
+            denied_frame["params"]["message"][0]["data"]["text"],
+            expected_denial
+        );
+        route_api_response(
+            &connection,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": { "message_id": 70 },
+                "echo": denied_frame["echo"],
+            }),
+        );
+        denied.await.unwrap();
+        assert_eq!(
+            state
+                .state_store
+                .list_sessions(&persona, true)
+                .unwrap()
+                .len(),
+            sessions_before
+        );
+
+        state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .platforms
+            .qq
+            .admin_users
+            .push(42);
+        let context = platform_turn_context(
+            &state,
+            connection.clone(),
+            target,
+            &event,
+            state.manager.lock().unwrap().config.clone(),
+        )
+        .unwrap();
+        assert!(context.is_admin);
+        let session_id = resolve_onebot_session(&state, &context, target, &event).unwrap();
+        let store = state.state_store.pinned(&session_id);
+        store
+            .start_turn("qq_history", "hello", std::process::id())
+            .unwrap();
+        store.complete_turn("qq_history", "world", None).unwrap();
+
+        let mut raw_reset_event = event.clone();
+        raw_reset_event["message"] = json!("[CQ:reply,id=6]/reset");
+        let reset = tokio::spawn(handle_message(
+            state.clone(),
+            connection.clone(),
+            raw_reset_event,
+        ));
+        let reset_frame: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(reset_frame["action"], "send_group_msg");
+        route_api_response(
+            &connection,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": { "message_id": 71 },
+                "echo": reset_frame["echo"],
+            }),
+        );
+        reset.await.unwrap();
+        assert!(store.load_turns().unwrap().is_empty());
+        assert_eq!(
+            resolve_onebot_session(&state, &context, target, &event).unwrap(),
+            session_id
+        );
+        assert!(!state.manager.lock().unwrap().admin_busy);
+
+        state
+            .actor_tx
+            .send(crate::web::ActorCommand::Shutdown)
+            .unwrap();
+        actor_join.join().unwrap().unwrap();
     }
 
     #[test]

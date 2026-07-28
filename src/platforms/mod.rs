@@ -7,6 +7,7 @@
 //! reuse everything here without touching the web core.
 
 mod assets;
+pub(crate) mod commands;
 pub(crate) mod onebot;
 pub(crate) mod plugins;
 mod tool;

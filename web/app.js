@@ -1700,10 +1700,13 @@
   }
 
   // 配置文件会省略未修改的平台默认值；草稿仍需补齐真实语义，
-  // 以免 WebUI 保存其他设置时覆盖 Tencent QQ 的默认策略。
+  // 以免 WebUI 保存其他设置时覆盖通讯平台的默认策略。
   function ensurePlatformDefaults(draft) {
     if (!draft || typeof draft !== "object") return;
-    draft.platforms = Object.assign({}, draft.platforms);
+    draft.platforms = Object.assign({
+      command_prefix: "/",
+      commands: {}
+    }, draft.platforms);
     const qq = Object.assign({
       enabled: false,
       reverse_ws_port: 8300,
