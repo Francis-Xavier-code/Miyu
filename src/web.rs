@@ -5216,10 +5216,7 @@ async fn reset_conversation(
         .unwrap_or_else(|| state.state_store.session_id().to_string());
     require_local_web_session(&state, &session_id)?;
     let store = state.state_store.pinned(&session_id);
-    if store
-        .has_running_turns()
-        .map_err(ApiError::internal)?
-    {
+    if store.has_running_turns().map_err(ApiError::internal)? {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "a conversation turn is already running",
@@ -5638,25 +5635,18 @@ async fn actor_loop(
                         let compact = agent
                             .compact_now(|_| Ok(()))
                             .await
-                            .map_err(|error| {
-                                AdminFailure::Internal(safe_error_message(&error))
-                            })?;
-                        manager.lock().unwrap().context = current_context(agent).map_err(|error| {
-                            AdminFailure::Internal(safe_error_message(&error))
-                        })?;
+                            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                        manager.lock().unwrap().context = current_context(agent)
+                            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                         compact
                     } else {
                         let store = state_store.pinned(&session_id);
                         let target_agent = build_actor_agent(&config, &paths, &store)
-                            .map_err(|error| {
-                                AdminFailure::Internal(safe_error_message(&error))
-                            })?;
+                            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                         target_agent
                             .compact_now(|_| Ok(()))
                             .await
-                            .map_err(|error| {
-                                AdminFailure::Internal(safe_error_message(&error))
-                            })?
+                            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?
                     };
                     Ok::<Value, AdminFailure>(json!({
                         "compacted": compact.is_some(),

@@ -739,9 +739,7 @@ pub async fn ensure_daemon(
             pending_launch = recover_daemon_launch_if_missing(&active_paths, info.pid)?;
         }
         let previous_paths = active_paths.clone();
-        if let Err(error) =
-            restart_stale_daemon(&active_paths, &info).await
-        {
+        if let Err(error) = restart_stale_daemon(&active_paths, &info).await {
             if let Some(launch) = &pending_launch {
                 abandon_daemon_launch_candidate(&active_paths, launch);
             }
@@ -776,9 +774,7 @@ pub async fn ensure_daemon(
             pending_launch = recover_daemon_launch_if_missing(&active_paths, info.pid)?;
         }
         let previous_paths = active_paths.clone();
-        if let Err(error) =
-            restart_stale_daemon(&active_paths, &info).await
-        {
+        if let Err(error) = restart_stale_daemon(&active_paths, &info).await {
             if let Some(launch) = &pending_launch {
                 abandon_daemon_launch_candidate(&active_paths, launch);
             }
@@ -1304,9 +1300,7 @@ mod tests {
     #[test]
     fn parses_protocol_version_from_daemon_rejection() {
         assert_eq!(
-            expected_protocol_version(
-                "unsupported IPC protocol version 3; expected 2"
-            ),
+            expected_protocol_version("unsupported IPC protocol version 3; expected 2"),
             Some(2)
         );
         assert_eq!(expected_protocol_version("unrelated error"), None);

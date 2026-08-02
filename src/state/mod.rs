@@ -1271,10 +1271,7 @@ impl StateStore {
         let recoveries = self.conv_db.recover_stale_running_turns()?;
         for recovery in &recoveries {
             if recovery.restored_redo {
-                self.reconcile_managed_artifacts_for_turn(
-                    &recovery.session_id,
-                    &recovery.turn_id,
-                )?;
+                self.reconcile_managed_artifacts_for_turn(&recovery.session_id, &recovery.turn_id)?;
             } else {
                 self.recover_journal_assets(&recovery.session_id, &recovery.turn_id)?;
             }
@@ -1515,7 +1512,9 @@ impl StateStore {
                     ),
                 }
             } else {
-                let Ok(source_key) = path.canonicalize().map(|path| path.to_string_lossy().into_owned())
+                let Ok(source_key) = path
+                    .canonicalize()
+                    .map(|path| path.to_string_lossy().into_owned())
                 else {
                     continue;
                 };
@@ -1547,9 +1546,7 @@ impl StateStore {
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
             bail!("invalid session id for Artifact workspace recovery");
         }
-        let restored = self
-            .conv_db
-            .load_artifact_asset_data_for_turn(turn_id)?;
+        let restored = self.conv_db.load_artifact_asset_data_for_turn(turn_id)?;
         let session_dir = self.artifacts_dir.join(session_id);
         match std::fs::symlink_metadata(&session_dir) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -2213,7 +2210,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.recover_stale_turns().unwrap(), 1);
-        assert!(store.load_queued_prompts_for_target(&target).unwrap().is_empty());
+        assert!(store
+            .load_queued_prompts_for_target(&target)
+            .unwrap()
+            .is_empty());
         let turn = store.load_turns().unwrap().remove(0);
         assert_eq!(turn.status, TurnStatus::Interrupted);
         assert_eq!(turn.followups.len(), 1);
@@ -2231,15 +2231,22 @@ mod tests {
     #[test]
     fn finished_turn_cleanup_preserves_a_late_queued_prompt() {
         let (_temp, store) = test_store();
-        store.start_turn("turn_1", "initial", std::process::id()).unwrap();
+        store
+            .start_turn("turn_1", "initial", std::process::id())
+            .unwrap();
         store.complete_turn("turn_1", "answer", None).unwrap();
-        store.enqueue_prompt("late", "followup", "followup", &[]).unwrap();
+        store
+            .enqueue_prompt("late", "followup", "followup", &[])
+            .unwrap();
 
         assert_eq!(store.discard_queued_prompts().unwrap(), 1);
         let turn = store.load_turns().unwrap().remove(0);
         assert_eq!(turn.followups.len(), 1);
         assert_eq!(turn.followups[0].prompt_id, "late");
-        assert_eq!(turn.followups[0].preceding_assistant_content.as_deref(), Some("answer"));
+        assert_eq!(
+            turn.followups[0].preceding_assistant_content.as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]

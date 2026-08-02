@@ -4824,9 +4824,11 @@ async fn repl_get_session_state(
     live: &mut LiveReplTail,
     target: crate::ipc::SessionRef,
 ) -> Result<Option<ipc::SessionState>> {
-    Ok(repl_ipc_admin(paths, live, IpcCommand::GetSessionState { target })
-        .await?
-        .map(|(state, _)| state))
+    Ok(
+        repl_ipc_admin(paths, live, IpcCommand::GetSessionState { target })
+            .await?
+            .map(|(state, _)| state),
+    )
 }
 
 async fn repl_fallback_session_state(

@@ -3133,7 +3133,12 @@ impl ConversationDb {
             "INSERT INTO turn_journal_events
                 (turn_id, revision, segment_index, kind, text_payload, created_at)
              VALUES (?1, ?2, 0, 'redo_prefix_question_count', ?3, ?4)",
-            params![turn_id, redo_revision, prefix_question_count.to_string(), now],
+            params![
+                turn_id,
+                redo_revision,
+                prefix_question_count.to_string(),
+                now
+            ],
         )?;
         tx.commit()?;
         Ok(RedoStart {
@@ -3215,8 +3220,12 @@ impl ConversationDb {
                 params![
                     now,
                     turn_id,
-                    (index == 0).then_some(preceding_content.as_deref()).flatten(),
-                    (index == 0).then_some(assistant_reasoning.as_deref()).flatten(),
+                    (index == 0)
+                        .then_some(preceding_content.as_deref())
+                        .flatten(),
+                    (index == 0)
+                        .then_some(assistant_reasoning.as_deref())
+                        .flatten(),
                     prompt_id,
                 ],
             )?;
@@ -3238,7 +3247,13 @@ impl ConversationDb {
                 "INSERT INTO turn_journal_events
                     (turn_id, revision, segment_index, kind, text_payload, created_at)
                  VALUES (?1, ?2, ?3, 'queued_prompts_consumed', ?4, ?5)",
-                params![turn_id, revision, next_segment, serde_json::to_string(&prompt_ids)?, now],
+                params![
+                    turn_id,
+                    revision,
+                    next_segment,
+                    serde_json::to_string(&prompt_ids)?,
+                    now
+                ],
             )?;
         }
         tx.commit()?;
@@ -4303,7 +4318,7 @@ fn consume_stale_queued_prompts_locked(
         )?;
         let rows = stmt
             .query_map(params![queue_session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
@@ -4344,7 +4359,9 @@ fn consume_stale_queued_prompts_locked(
                 content,
                 (index == 0 && !preceding_content.trim().is_empty())
                     .then_some(preceding_content.as_str()),
-                (index == 0).then_some(preceding_reasoning.as_deref()).flatten(),
+                (index == 0)
+                    .then_some(preceding_reasoning.as_deref())
+                    .flatten(),
                 prompt_id,
                 queue_session_id,
             ],
@@ -4414,12 +4431,8 @@ fn interrupted_projection_locked(
     let Some(segment_index) = segment_index else {
         return Ok((INTERRUPTED_TEXT.to_string(), None));
     };
-    let (content, reasoning) = journal_segment_projection_locked(
-        tx,
-        turn_id,
-        revision,
-        segment_index,
-    )?;
+    let (content, reasoning) =
+        journal_segment_projection_locked(tx, turn_id, revision, segment_index)?;
     let content = if content.trim().is_empty() {
         INTERRUPTED_TEXT.to_string()
     } else {

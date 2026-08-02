@@ -317,7 +317,7 @@ fn load_skill(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result<Stri
                 .iter()
                 .map(|path| format!("  <file>{}</file>", xml_escape(&path.display().to_string())))
                 .collect::<Vec<_>>()
-            .join("\n")
+                .join("\n")
         )
     };
     let metadata = skill_metadata_xml(&loaded.metadata);
@@ -502,9 +502,8 @@ mod tests {
         .unwrap();
         assert!(loaded.contains("<license>MIT</license>"));
         assert!(loaded.contains("<compatibility>Miyu</compatibility>"));
-        assert!(loaded.contains(
-            "<allowed_tools grants_permissions=\"false\">run_command</allowed_tools>"
-        ));
+        assert!(loaded
+            .contains("<allowed_tools grants_permissions=\"false\">run_command</allowed_tools>"));
         assert!(loaded.contains("<entry key=\"author\">test</entry>"));
     }
 

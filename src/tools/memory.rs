@@ -98,9 +98,7 @@ pub(crate) fn register_readonly_with_context(
     if !config.memory_config().enabled {
         return;
     }
-    if config.memory_config().evicted_context_enabled
-        && config.context.on_overflow != "compact"
-    {
+    if config.memory_config().evicted_context_enabled && config.context.on_overflow != "compact" {
         registry.register(ToolSpec::new(
             "search_evicted_context",
             t("Search conversation turns that were moved out of the active context window. Use this when the current context appears to be missing earlier discussion.", "搜索已经移出当前上下文窗口的对话轮次。当当前上下文明显缺少早前讨论时使用。"),
