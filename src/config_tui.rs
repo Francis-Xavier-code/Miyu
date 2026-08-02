@@ -4961,7 +4961,7 @@ fn edit_real_context_reply_target(
             ),
             format!(
                 "{}: {}",
-                t("Mention after elapsed seconds", "和原消息间隔多少秒则艾特"),
+                t("Mention after elapsed seconds", "回复时间超过多少秒则艾特"),
                 settings.reply_target_mention_after_seconds
             ),
             format!(
@@ -5032,7 +5032,7 @@ fn edit_real_context_reply_target(
                 }
                 4 => edit_real_context_number(
                     stdout,
-                    t("Mention after elapsed seconds", "和原消息间隔多少秒则艾特"),
+                    t("Mention after elapsed seconds", "回复时间超过多少秒则艾特"),
                     settings.reply_target_mention_after_seconds,
                     settings,
                     |candidate, value| candidate.reply_target_mention_after_seconds = value,

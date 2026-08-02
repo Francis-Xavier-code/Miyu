@@ -188,21 +188,24 @@ impl AdaptiveResponseTargetPolicy {
         current: Option<PlatformMessagePosition>,
         now: Instant,
     ) -> Option<ResponseTarget> {
+        let other_messages = self.position.zip(current).map(|(start, current)| {
+            let total = current.total_messages.saturating_sub(start.total_messages);
+            let same_sender = current
+                .sender_messages
+                .saturating_sub(start.sender_messages);
+            total.saturating_sub(same_sender)
+        });
         if target.quote {
             target.quote = self.quote_after_other_messages == 0
-                || self.position.zip(current).is_some_and(|(start, current)| {
-                    let total = current.total_messages.saturating_sub(start.total_messages);
-                    let same_sender = current
-                        .sender_messages
-                        .saturating_sub(start.sender_messages);
-                    total.saturating_sub(same_sender) >= self.quote_after_other_messages
-                });
+                || other_messages.is_some_and(|count| count >= self.quote_after_other_messages);
         }
         if target.mention {
+            // Unknown activity preserves the original time-only mention behavior.
             target.mention = now
                 .checked_duration_since(self.received_at)
                 .unwrap_or_default()
-                >= self.mention_after;
+                >= self.mention_after
+                && other_messages.is_none_or(|count| count > 0);
         }
         target.is_effective().then_some(target)
     }
@@ -2530,6 +2533,65 @@ mod tests {
             .unwrap();
         assert!(both.quote);
         assert!(both.mention);
+    }
+
+    #[test]
+    fn adaptive_response_target_mention_uses_known_message_activity() {
+        let now = Instant::now();
+        let start = PlatformMessagePosition {
+            total_messages: 10,
+            sender_messages: 2,
+        };
+        let target = ResponseTarget {
+            message_id: "message-1".to_string(),
+            user_id: "alice".to_string(),
+            quote: false,
+            mention: true,
+        };
+        let policy = AdaptiveResponseTargetPolicy::new(Some(start), now, 5, 15);
+        let same_sender_message = PlatformMessagePosition {
+            total_messages: 11,
+            sender_messages: 3,
+        };
+        let other_sender_message = PlatformMessagePosition {
+            total_messages: 11,
+            sender_messages: 2,
+        };
+        let cases = [
+            ("before threshold without messages", Some(start), 14, false),
+            ("at threshold without messages", Some(start), 15, false),
+            (
+                "at threshold after same sender",
+                Some(same_sender_message),
+                15,
+                false,
+            ),
+            (
+                "before threshold after other sender",
+                Some(other_sender_message),
+                14,
+                false,
+            ),
+            (
+                "at threshold after other sender",
+                Some(other_sender_message),
+                15,
+                true,
+            ),
+            ("before threshold with unknown activity", None, 14, false),
+            ("at threshold with unknown activity", None, 15, true),
+        ];
+
+        for (case, current, elapsed_seconds, expected) in cases {
+            let mention = policy
+                .resolve(
+                    target.clone(),
+                    current,
+                    now + Duration::from_secs(elapsed_seconds),
+                )
+                .is_some_and(|target| target.mention);
+            assert_eq!(mention, expected, "{case}");
+        }
     }
 
     #[tokio::test]
