@@ -627,6 +627,7 @@ pub struct RealContextPluginSettings {
 
     pub active_reply_enable: bool,
     pub judge_include_persona: bool,
+    pub judge_persona_prompt: String,
     pub text_models: Option<Vec<ActiveProviderModelConfig>>,
     pub active_judge_probability: f64,
     pub reply_threshold: f64,
@@ -722,6 +723,7 @@ impl Default for RealContextPluginSettings {
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
+            judge_persona_prompt: String::new(),
             text_models: None,
             active_judge_probability: 0.05,
             reply_threshold: 0.8,
@@ -811,6 +813,7 @@ impl RealContextPluginSettings {
     }
 
     pub fn normalize(&mut self) {
+        self.judge_persona_prompt = self.judge_persona_prompt.trim().to_string();
         normalize_route_pool(&mut self.text_models);
         normalize_unique_strings(&mut self.moderation_keywords);
         self.active_reply_reaction_emoji_ids.retain(|id| *id > 0);
@@ -884,6 +887,9 @@ impl RealContextPluginSettings {
         )?;
         validate_real_context_count("judge_max_concurrency", self.judge_max_concurrency, 1, 64)?;
         validate_real_context_count("judge_max_retries", self.judge_max_retries, 0, 10)?;
+        if self.judge_persona_prompt.len() > 32_768 || self.judge_persona_prompt.contains('\0') {
+            bail!("platform plugin real_context.judge_persona_prompt is invalid");
+        }
         validate_real_context_count(
             "active_reply_supersede_window_seconds",
             self.active_reply_supersede_window_seconds as usize,
@@ -6463,6 +6469,8 @@ mod tests {
         assert!(settings.allow_cross_group_search);
         assert_eq!(settings.group_member_search_max_results, 200);
         assert!(settings.active_reply_enable);
+        assert!(settings.judge_include_persona);
+        assert!(settings.judge_persona_prompt.is_empty());
         assert!(settings.text_models.is_none());
         assert_eq!(settings.active_judge_probability, 0.05);
         assert_eq!(settings.reply_threshold, 0.8);
@@ -6634,6 +6642,52 @@ mod tests {
         for key in DEPRECATED_REAL_CONTEXT_SETTINGS {
             assert!(!instance.settings.contains_key(*key));
         }
+    }
+
+    #[test]
+    fn real_context_judge_persona_prompt_normalizes_validates_and_roundtrips() {
+        let legacy =
+            RealContextPluginSettings::from_instance(&PlatformPluginInstanceConfig::default())
+                .unwrap();
+        assert!(legacy.judge_persona_prompt.is_empty());
+
+        let mut settings = RealContextPluginSettings {
+            judge_persona_prompt: "  custom persona\n".to_string(),
+            ..RealContextPluginSettings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.judge_persona_prompt, "custom persona");
+        assert!(settings.validate().is_ok());
+
+        let mut instance = PlatformPluginInstanceConfig::default();
+        instance
+            .settings
+            .insert("future_option".to_string(), serde_json::json!(true));
+        merge_real_context_settings(&mut instance, &settings);
+        assert_eq!(instance.settings["judge_persona_prompt"], "custom persona");
+        assert_eq!(instance.settings["future_option"], true);
+        let reparsed = RealContextPluginSettings::from_instance(&instance).unwrap();
+        assert_eq!(reparsed.judge_persona_prompt, "custom persona");
+
+        let mut cleared = reparsed;
+        cleared.judge_persona_prompt = " \n ".to_string();
+        cleared.normalize();
+        merge_real_context_settings(&mut instance, &cleared);
+        assert!(!instance.settings.contains_key("judge_persona_prompt"));
+        assert_eq!(instance.settings["future_option"], true);
+
+        assert!(RealContextPluginSettings {
+            judge_persona_prompt: "bad\0prompt".to_string(),
+            ..RealContextPluginSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealContextPluginSettings {
+            judge_persona_prompt: "x".repeat(32_769),
+            ..RealContextPluginSettings::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

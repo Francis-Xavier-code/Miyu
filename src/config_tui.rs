@@ -4551,8 +4551,17 @@ fn edit_real_context_active_reply(
             ),
             format!(
                 "{}: {}",
-                t("Include persona in judgement", "判断时包含人格"),
+                t("Inherit persona during judgement", "判断时继承人格"),
                 boolean_label(settings.judge_include_persona)
+            ),
+            format!(
+                "{}: {}",
+                t("Custom prompt", "自定义提示词"),
+                if settings.judge_persona_prompt.trim().is_empty() {
+                    t("none", "未设置")
+                } else {
+                    t("set", "已设置")
+                }
             ),
             format!(
                 "{}: {}",
@@ -4628,32 +4637,33 @@ fn edit_real_context_active_reply(
                 1 => {
                     settings.judge_include_persona = select_bool(
                         stdout,
-                        t("Include persona in judgement", "判断时包含人格"),
+                        t("Inherit persona during judgement", "判断时继承人格"),
                         settings.judge_include_persona,
                     )?
                 }
-                2 => edit_real_context_number(
+                2 => edit_textarea(stdout, &mut settings.judge_persona_prompt)?,
+                3 => edit_real_context_number(
                     stdout,
                     t("Random judgement probability", "随机进入判断的概率"),
                     settings.active_judge_probability,
                     settings,
                     |candidate, value| candidate.active_judge_probability = value,
                 )?,
-                3 => edit_real_context_number(
+                4 => edit_real_context_number(
                     stdout,
                     t("Reply threshold", "回复阈值"),
                     settings.reply_threshold,
                     settings,
                     |candidate, value| candidate.reply_threshold = value,
                 )?,
-                4 => {
+                5 => {
                     settings.skip_pure_image_active_judge = select_bool(
                         stdout,
                         t("Skip image-only messages", "跳过纯图片消息"),
                         settings.skip_pure_image_active_judge,
                     )?
                 }
-                5 => {
+                6 => {
                     settings.active_reply_supersede_enable = select_bool(
                         stdout,
                         t(
@@ -4663,38 +4673,38 @@ fn edit_real_context_active_reply(
                         settings.active_reply_supersede_enable,
                     )?
                 }
-                6 => edit_real_context_number(
+                7 => edit_real_context_number(
                     stdout,
                     t("Supersede window (seconds)", "覆盖窗口（秒）"),
                     settings.active_reply_supersede_window_seconds,
                     settings,
                     |candidate, value| candidate.active_reply_supersede_window_seconds = value,
                 )?,
-                7 => {
+                8 => {
                     settings.reply_restraint_enable = select_bool(
                         stdout,
                         t("Reply restraint", "回复克制"),
                         settings.reply_restraint_enable,
                     )?
                 }
-                8 => edit_real_context_number(
+                9 => edit_real_context_number(
                     stdout,
                     t("Restraint recovery (minutes)", "克制恢复时间（分钟）"),
                     settings.reply_restraint_recover_minutes,
                     settings,
                     |candidate, value| candidate.reply_restraint_recover_minutes = value,
                 )?,
-                9 => edit_real_context_restraint_strength(stdout, settings)?,
-                10 => edit_real_context_number(
+                10 => edit_real_context_restraint_strength(stdout, settings)?,
+                11 => edit_real_context_number(
                     stdout,
                     t("Restraint multiplier", "克制倍率"),
                     settings.reply_restraint_multiplier,
                     settings,
                     |candidate, value| candidate.reply_restraint_multiplier = value,
                 )?,
-                11 => edit_real_context_continuation(stdout, settings)?,
-                12 => edit_real_context_triggers(stdout, settings)?,
-                13 => edit_real_context_judge_advanced(stdout, settings)?,
+                12 => edit_real_context_continuation(stdout, settings)?,
+                13 => edit_real_context_triggers(stdout, settings)?,
+                14 => edit_real_context_judge_advanced(stdout, settings)?,
                 _ => {}
             },
             _ => {}
@@ -7931,6 +7941,7 @@ mod tests {
         let settings = RealContextPluginSettings {
             reply_threshold: 0.9,
             context_messages: 42,
+            judge_persona_prompt: "judge persona".to_string(),
             ..RealContextPluginSettings::default()
         };
 
@@ -7940,6 +7951,7 @@ mod tests {
         assert_eq!(instance.enabled, Some(false));
         assert_eq!(instance.settings["reply_threshold"], 0.9);
         assert_eq!(instance.settings["context_messages"], 42);
+        assert_eq!(instance.settings["judge_persona_prompt"], "judge persona");
         assert_eq!(instance.settings["future_option"]["value"], 1);
         let (enabled, reparsed) = real_context_values(&config).unwrap();
         assert!(!enabled);
