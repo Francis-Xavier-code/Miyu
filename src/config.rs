@@ -1811,6 +1811,8 @@ pub struct OneBotConfig {
 pub struct QqPrivateChatsConfig {
     /// QQ ids whose private conversations bypass admission rate limits.
     pub whitelist: Vec<i64>,
+    /// Accept friend requests only from admins or private-whitelisted QQ ids.
+    pub friend_requests_require_private_whitelist: bool,
     pub allow_non_whitelist: bool,
     /// Per private conversation.
     pub non_whitelist_rate_limit: PlatformRateLimit,
@@ -1824,6 +1826,7 @@ impl Default for QqPrivateChatsConfig {
     fn default() -> Self {
         Self {
             whitelist: Vec::new(),
+            friend_requests_require_private_whitelist: true,
             allow_non_whitelist: true,
             non_whitelist_rate_limit: PlatformRateLimit {
                 max_messages: 1,
@@ -5835,6 +5838,7 @@ mod tests {
                         },
                         "private_chats": {
                             "whitelist": [12345],
+                            "friend_requests_require_private_whitelist": false,
                             "allow_non_whitelist": false,
                             "non_whitelist_rate_per_minute": 4
                         },
@@ -5868,6 +5872,7 @@ mod tests {
         assert!(!qq.memory.write_enabled);
         assert_eq!(qq.asset_base_url, "https://assets.example.test");
         assert_eq!(qq.private_chats.whitelist, vec![12345]);
+        assert!(!qq.private_chats.friend_requests_require_private_whitelist);
         assert!(!qq.private_chats.allow_non_whitelist);
         assert_eq!(
             qq.private_chats.non_whitelist_rate_limit,
@@ -5896,6 +5901,26 @@ mod tests {
         assert!(!legacy.platforms.qq.enabled);
         assert_eq!(legacy.platforms.command_prefix, "/");
         assert!(legacy.platforms.commands.is_empty());
+
+        let missing_friend_request_setting: AppConfig = serde_json::from_str(
+            r#"{
+                "active_provider": "opencode",
+                "providers": [],
+                "platforms": {
+                    "qq": {
+                        "private_chats": { "whitelist": [12345] }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            missing_friend_request_setting
+                .platforms
+                .qq
+                .private_chats
+                .friend_requests_require_private_whitelist
+        );
     }
 
     #[test]

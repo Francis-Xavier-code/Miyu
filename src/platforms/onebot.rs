@@ -900,6 +900,12 @@ async fn connection_loop(
                 let _connection_permit = connection_permit;
                 handle_message_recall(state, handle, frame).await;
             });
+        } else if is_friend_add_request(&frame) {
+            let state = state.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle_friend_add_request(state, handle, frame).await;
+            });
         } else if is_group_ban_notice(&frame) {
             update_group_ban_notice(&frame);
             let state = state.clone();
@@ -1650,6 +1656,41 @@ fn is_message_recall(event: &Value) -> bool {
         )
 }
 
+fn is_friend_add_request(event: &Value) -> bool {
+    event.get("post_type").and_then(Value::as_str) == Some("request")
+        && event.get("request_type").and_then(Value::as_str) == Some("friend")
+}
+
+fn friend_request_allowed(
+    config: &OneBotConfig,
+    state: &StateStore,
+    self_id: i64,
+    user_id: i64,
+) -> bool {
+    if !config
+        .private_chats
+        .friend_requests_require_private_whitelist
+    {
+        return true;
+    }
+    let account_id = self_id.to_string();
+    let user_id_text = user_id.to_string();
+    config.admin_users.contains(&user_id)
+        || has_dynamic_access(
+            state,
+            &account_id,
+            AccessPermission::Administrator,
+            &user_id_text,
+        )
+        || config.private_chats.whitelist.contains(&user_id)
+        || has_dynamic_access(
+            state,
+            &account_id,
+            AccessPermission::PrivateWhitelist,
+            &user_id_text,
+        )
+}
+
 fn is_group_ban_notice(event: &Value) -> bool {
     event.get("post_type").and_then(Value::as_str) == Some("notice")
         && event.get("notice_type").and_then(Value::as_str) == Some("group_ban")
@@ -1796,6 +1837,63 @@ async fn handle_group_management_notice(state: DaemonState, conn: ConnectionHand
         Err(error) => {
             tracing::warn!(target: "miyu::qq", error = %error, "{}", t("OneBot group notice observer initialization failed", "OneBot 群通知观察器初始化失败"))
         }
+    }
+}
+
+async fn handle_friend_add_request(state: DaemonState, conn: ConnectionHandle, event: Value) {
+    let app_config = state.manager.lock().unwrap().config.clone();
+    let config = &app_config.platforms.qq;
+    if !config.enabled {
+        return;
+    }
+    let self_id = event.get("self_id").and_then(value_i64).unwrap_or(0);
+    let user_id = event.get("user_id").and_then(value_i64).unwrap_or(0);
+    let flag = event
+        .get("flag")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|flag| !flag.is_empty())
+        .map(str::to_string);
+    let Some(flag) = flag else {
+        tracing::warn!(target: "miyu::qq", "{}", t("OneBot friend request is missing flag", "OneBot 好友请求缺少 flag"));
+        return;
+    };
+    if self_id == 0 || user_id == 0 {
+        tracing::warn!(target: "miyu::qq", self_id, user_id, "{}", t("OneBot friend request has invalid ids", "OneBot 好友请求包含无效 QQ 号"));
+        return;
+    }
+    if !friend_request_allowed(config, &state.state_store, self_id, user_id) {
+        tracing::info!(
+            target: "miyu::qq",
+            self_id,
+            user_id,
+            "{}",
+            t("OneBot friend request left pending", "OneBot 好友请求已保持待处理")
+        );
+        return;
+    }
+    match conn
+        .call_api(
+            "set_friend_add_request",
+            json!({ "flag": flag, "approve": true }),
+        )
+        .await
+    {
+        Ok(_) => tracing::info!(
+            target: "miyu::qq",
+            self_id,
+            user_id,
+            "{}",
+            t("OneBot friend request accepted", "OneBot 好友请求已通过")
+        ),
+        Err(error) => tracing::warn!(
+            target: "miyu::qq",
+            self_id,
+            user_id,
+            error = %error,
+            "{}",
+            t("OneBot friend request could not be accepted", "OneBot 好友请求无法通过")
+        ),
     }
 }
 
@@ -5205,6 +5303,16 @@ mod tests {
         config
     }
 
+    fn friend_request_event(user_id: i64, flag: &str) -> Value {
+        json!({
+            "post_type": "request",
+            "request_type": "friend",
+            "self_id": 10000,
+            "user_id": user_id,
+            "flag": flag,
+        })
+    }
+
     struct BlockingObserverPlugin {
         observed: mpsc::UnboundedSender<String>,
         release_first: Arc<tokio::sync::Notify>,
@@ -6702,6 +6810,123 @@ mod tests {
             config.group_chats.whitelist_rate_limit
         );
         assert_eq!(group_whitelist.rate_key.as_deref(), Some("qq:999:group:10"));
+    }
+
+    #[test]
+    fn friend_request_access_uses_admins_private_whitelist_and_dynamic_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let state = StateStore::new(&paths).unwrap();
+        let actor = crate::state::PlatformAccessActor {
+            platform: "onebot".to_string(),
+            account_id: "100".to_string(),
+            user_id: "42".to_string(),
+            conversation_kind: "private".to_string(),
+            conversation_id: "42".to_string(),
+            message_id: "message-1".to_string(),
+        };
+        for (permission, target_id) in [
+            (
+                crate::platforms::access_control::AccessPermission::Administrator,
+                "3",
+            ),
+            (
+                crate::platforms::access_control::AccessPermission::PrivateWhitelist,
+                "4",
+            ),
+        ] {
+            state
+                .add_platform_access_grant(
+                    &crate::platforms::access_control::global_grant_key(permission, target_id),
+                    &actor,
+                )
+                .unwrap();
+        }
+        let mut config = OneBotConfig::default();
+        config.admin_users.push(1);
+        config.private_chats.whitelist.push(2);
+
+        assert!(friend_request_allowed(&config, &state, 999, 1));
+        assert!(friend_request_allowed(&config, &state, 999, 2));
+        assert!(friend_request_allowed(&config, &state, 100, 3));
+        assert!(friend_request_allowed(&config, &state, 100, 4));
+        assert!(!friend_request_allowed(&config, &state, 100, 5));
+
+        config
+            .private_chats
+            .friend_requests_require_private_whitelist = false;
+        assert!(friend_request_allowed(&config, &state, 100, 5));
+    }
+
+    #[tokio::test]
+    async fn friend_request_handler_accepts_allowed_requests_and_leaves_others_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_web_state(temp.path(), 8300);
+        {
+            let mut manager = state.manager.lock().unwrap();
+            manager.config.platforms.qq.enabled = true;
+            manager.config.platforms.qq.private_chats.whitelist.push(42);
+        }
+        let (handle, mut frames) = test_connection(None);
+
+        let task = tokio::spawn(handle_friend_add_request(
+            state.clone(),
+            handle.clone(),
+            friend_request_event(42, "flag-42"),
+        ));
+        let request: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(request["action"], "set_friend_add_request");
+        assert_eq!(request["params"]["flag"], "flag-42");
+        assert_eq!(request["params"]["approve"], true);
+        route_api_response(
+            &handle,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": null,
+                "echo": request["echo"],
+            }),
+        );
+        task.await.unwrap();
+        assert!(frames.try_recv().is_err());
+
+        handle_friend_add_request(
+            state.clone(),
+            handle.clone(),
+            friend_request_event(43, "flag-43"),
+        )
+        .await;
+        assert!(frames.try_recv().is_err());
+
+        state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .platforms
+            .qq
+            .private_chats
+            .friend_requests_require_private_whitelist = false;
+        let task = tokio::spawn(handle_friend_add_request(
+            state,
+            handle.clone(),
+            friend_request_event(44, "flag-44"),
+        ));
+        let request: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(request["action"], "set_friend_add_request");
+        assert_eq!(request["params"]["flag"], "flag-44");
+        assert_eq!(request["params"]["approve"], true);
+        route_api_response(
+            &handle,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": null,
+                "echo": request["echo"],
+            }),
+        );
+        task.await.unwrap();
+        assert!(frames.try_recv().is_err());
     }
 
     #[tokio::test]

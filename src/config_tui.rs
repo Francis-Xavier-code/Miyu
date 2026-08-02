@@ -2984,6 +2984,14 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
             ),
             format!(
                 "{}: {}",
+                t(
+                    "Only private whitelist can add friends",
+                    "只有私聊白名单里的人允许加好友"
+                ),
+                enabled_label(qq.private_chats.friend_requests_require_private_whitelist)
+            ),
+            format!(
+                "{}: {}",
                 t("Allow non-whitelist private chats", "是否允许非白名单私聊"),
                 enabled_label(qq.private_chats.allow_non_whitelist)
             ),
@@ -3092,49 +3100,60 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                     &mut config.platforms.qq.private_chats.whitelist,
                 )?,
                 11 => {
+                    config
+                        .platforms
+                        .qq
+                        .private_chats
+                        .friend_requests_require_private_whitelist = !config
+                        .platforms
+                        .qq
+                        .private_chats
+                        .friend_requests_require_private_whitelist
+                }
+                12 => {
                     config.platforms.qq.private_chats.allow_non_whitelist =
                         !config.platforms.qq.private_chats.allow_non_whitelist
                 }
-                12 if matches!(key, KeyCode::Enter) => {
+                13 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.private_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                13 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                14 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
                     stdout,
                     t(" GROUP WHITELIST ", " 群聊白名单 "),
                     t("Group id", "群号"),
                     &mut config.platforms.qq.group_chats.whitelist,
                 )?,
-                14 if matches!(key, KeyCode::Enter) => edit_keyword_list(
+                15 if matches!(key, KeyCode::Enter) => edit_keyword_list(
                     stdout,
                     &mut config.platforms.qq.group_chats.trigger_keywords,
                 )?,
-                15 if matches!(key, KeyCode::Enter) => {
+                16 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.whitelist_rate_limit,
                     )?;
                 }
-                16 => {
+                17 => {
                     config.platforms.qq.group_chats.allow_non_whitelist =
                         !config.platforms.qq.group_chats.allow_non_whitelist
                 }
-                17 if matches!(key, KeyCode::Enter) => {
+                18 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                18 if matches!(key, KeyCode::Enter) => {
+                19 if matches!(key, KeyCode::Enter) => {
                     edit_platform_session_limits(stdout, &mut config.platforms.qq.session_limits)?
                 }
-                19 if matches!(key, KeyCode::Enter) => {
+                20 if matches!(key, KeyCode::Enter) => {
                     select_platform_model_routes(stdout, paths, config)?
                 }
-                20 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
-                21 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
+                21 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
+                22 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
                 _ => {}
             },
             _ => {}
