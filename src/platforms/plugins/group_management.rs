@@ -309,13 +309,10 @@ impl GroupManagementPlugin {
 
     async fn ban(&self, args: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
         let settings = settings(&context)?;
-        let mut duration = args
+        let duration = args
             .get("duration")
             .and_then(Value::as_u64)
             .unwrap_or(settings.default_duration_seconds);
-        if settings.max_duration_seconds > 0 {
-            duration = duration.min(settings.max_duration_seconds);
-        }
         let reason = bounded_reason(&args, &settings)?;
         let targets = resolve_targets(&args, &context)?;
         if let Some(prompt) = require_ai_confirmation(
@@ -1144,7 +1141,6 @@ mod tests {
     fn astrbot_defaults_are_preserved() {
         let settings = Settings::default();
         assert_eq!(settings.default_duration_seconds, 600);
-        assert_eq!(settings.max_duration_seconds, 3600);
         assert_eq!(settings.max_reason_length, 500);
         assert_eq!(settings.max_records_per_group, 500);
     }
