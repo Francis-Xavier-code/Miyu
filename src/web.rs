@@ -1979,13 +1979,11 @@ async fn handle_ipc_connection(
     {
         ipc::send(
             &mut stream,
-            &IpcFrame::Error {
-                message: format!(
-                    "unsupported IPC protocol version {}; expected {}",
-                    request.version,
-                    ipc::PROTOCOL_VERSION
-                ),
-            },
+            &IpcFrame::error(format!(
+                "unsupported IPC protocol version {}; expected {}",
+                request.version,
+                ipc::PROTOCOL_VERSION
+            )),
         )
         .await?;
         return Ok(());
@@ -2036,7 +2034,7 @@ async fn handle_ipc_connection(
             let record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     return Ok(());
                 }
             };
@@ -2056,12 +2054,10 @@ async fn handle_ipc_connection(
                 Err(error) => {
                     ipc::send(
                         &mut stream,
-                        &IpcFrame::Error {
-                            message: format!(
-                                "invalid configuration: {}",
-                                safe_error_message(error)
-                            ),
-                        },
+                        &IpcFrame::error(format!(
+                            "invalid configuration: {}",
+                            safe_error_message(error)
+                        )),
                     )
                     .await?;
                     return Ok(());
@@ -2070,13 +2066,7 @@ async fn handle_ipc_connection(
             let prompts = match read_prompt_documents(&next_config, &state.paths) {
                 Ok(prompts) => prompts,
                 Err(error) => {
-                    ipc::send(
-                        &mut stream,
-                        &IpcFrame::Error {
-                            message: safe_error_message(error),
-                        },
-                    )
-                    .await?;
+                    ipc::send(&mut stream, &IpcFrame::error(safe_error_message(error))).await?;
                     return Ok(());
                 }
             };
@@ -2092,15 +2082,12 @@ async fn handle_ipc_connection(
             {
                 Ok(listener) => listener,
                 Err(error) => {
-                    let _ = current_config.save(&state.paths);
                     ipc::send(
                         &mut stream,
-                        &IpcFrame::Error {
-                            message: format!(
-                                "Tencent QQ listener configuration failed: {}",
-                                safe_error_message(error)
-                            ),
-                        },
+                        &IpcFrame::error(format!(
+                            "Tencent QQ listener configuration failed: {}",
+                            safe_error_message(error)
+                        )),
                     )
                     .await?;
                     return Ok(());
@@ -2109,9 +2096,7 @@ async fn handle_ipc_connection(
             if let Err(error) = reserve_admin(&state.manager) {
                 ipc::send(
                     &mut stream,
-                    &IpcFrame::Error {
-                        message: error.message,
-                    },
+                    &IpcFrame::coded_error(ipc::ErrorCode::Busy, error.message),
                 )
                 .await?;
                 return Ok(());
@@ -2128,12 +2113,9 @@ async fn handle_ipc_connection(
                 .is_err()
             {
                 release_admin(&state.manager);
-                let _ = current_config.save(&state.paths);
                 ipc::send(
                     &mut stream,
-                    &IpcFrame::Error {
-                        message: "Miyu core worker is unavailable".to_string(),
-                    },
+                    &IpcFrame::error("Miyu core worker is unavailable"),
                 )
                 .await?;
                 return Ok(());
@@ -2153,28 +2135,19 @@ async fn handle_ipc_connection(
                             .await?
                         }
                         Err(error) => {
-                            ipc::send(
-                                &mut stream,
-                                &IpcFrame::Error {
-                                    message: safe_error_message(error),
-                                },
-                            )
-                            .await?
+                            ipc::send(&mut stream, &IpcFrame::error(safe_error_message(error)))
+                                .await?
                         }
                     }
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
-                    let _ = current_config.save(&state.paths);
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
-                    let _ = current_config.save(&state.paths);
                     ipc::send(
                         &mut stream,
-                        &IpcFrame::Error {
-                            message: "Miyu core stopped while reloading configuration".to_string(),
-                        },
+                        &IpcFrame::error("Miyu core stopped while reloading configuration"),
                     )
                     .await?
                 }
@@ -2185,7 +2158,7 @@ async fn handle_ipc_connection(
             let target_record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     return Ok(());
                 }
             };
@@ -2206,9 +2179,7 @@ async fn handle_ipc_connection(
                     Err(PlatformPersonaResetError::Busy) => {
                         ipc::send(
                             &mut stream,
-                            &IpcFrame::Error {
-                                message: "Miyu is busy with another operation".to_string(),
-                            },
+                            &IpcFrame::coded_error(ipc::ErrorCode::Busy, ipc::ADMIN_BUSY_MESSAGE),
                         )
                         .await?;
                     }
@@ -2216,7 +2187,7 @@ async fn handle_ipc_connection(
                         anyhow::bail!("Miyu core worker is unavailable");
                     }
                     Err(PlatformPersonaResetError::Internal(message)) => {
-                        ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                        ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     }
                 }
                 return Ok(());
@@ -2250,7 +2221,7 @@ async fn handle_ipc_connection(
                     .await?
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
@@ -2262,7 +2233,7 @@ async fn handle_ipc_connection(
             let record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     return Ok(());
                 }
             };
@@ -2293,7 +2264,7 @@ async fn handle_ipc_connection(
                     .await?
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
@@ -2305,7 +2276,7 @@ async fn handle_ipc_connection(
             let record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     return Ok(());
                 }
             };
@@ -2337,7 +2308,7 @@ async fn handle_ipc_connection(
                     .await?
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
@@ -2349,7 +2320,7 @@ async fn handle_ipc_connection(
             let record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                     return Ok(());
                 }
             };
@@ -2380,7 +2351,7 @@ async fn handle_ipc_connection(
                     .await?
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
-                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?
                 }
                 Err(_) => {
                     release_admin(&state.manager);
@@ -2452,13 +2423,7 @@ async fn handle_ipc_connection(
                     .await?;
                 }
                 Err(error) => {
-                    ipc::send(
-                        &mut stream,
-                        &IpcFrame::Error {
-                            message: error.to_string(),
-                        },
-                    )
-                    .await?;
+                    ipc::send(&mut stream, &IpcFrame::error(error.to_string())).await?;
                 }
             }
         }
@@ -2473,13 +2438,7 @@ async fn handle_ipc_connection(
             if cancelled.is_some() {
                 ipc::send(&mut stream, &IpcFrame::Ack).await?;
             } else {
-                ipc::send(
-                    &mut stream,
-                    &IpcFrame::Error {
-                        message: "active run not found".to_string(),
-                    },
-                )
-                .await?;
+                ipc::send(&mut stream, &IpcFrame::error("active run not found")).await?;
             }
         }
         IpcCommand::AnswerQuestion {
@@ -2499,19 +2458,12 @@ async fn handle_ipc_connection(
             }) {
             Ok(()) => ipc::send(&mut stream, &IpcFrame::Ack).await?,
             Err(error) => {
-                ipc::send(
-                    &mut stream,
-                    &IpcFrame::Error {
-                        message: match error {
-                            AnswerFailure::NotFound => "pending question not found".to_string(),
-                            AnswerFailure::Invalid(message) => message,
-                            AnswerFailure::Gone => {
-                                "pending question is no longer active".to_string()
-                            }
-                        },
-                    },
-                )
-                .await?;
+                let message = match error {
+                    AnswerFailure::NotFound => "pending question not found".to_string(),
+                    AnswerFailure::Invalid(message) => message,
+                    AnswerFailure::Gone => "pending question is no longer active".to_string(),
+                };
+                ipc::send(&mut stream, &IpcFrame::error(message)).await?;
             }
         },
         session_command => match handle_session_command(&state, session_command).await {
@@ -2525,7 +2477,7 @@ async fn handle_ipc_connection(
                 )
                 .await?
             }
-            Err(message) => ipc::send(&mut stream, &IpcFrame::Error { message }).await?,
+            Err(message) => ipc::send(&mut stream, &IpcFrame::error(message)).await?,
         },
     }
     Ok(())
@@ -3116,26 +3068,14 @@ async fn handle_ipc_turn(
     let content = match validate_content(content) {
         Ok(content) => content,
         Err(error) => {
-            ipc::send(
-                stream,
-                &IpcFrame::Error {
-                    message: error.message,
-                },
-            )
-            .await?;
+            ipc::send(stream, &IpcFrame::error(error.message)).await?;
             return Ok(());
         }
     };
     let mode = match parse_mode(&mode) {
         Ok(mode) => mode,
         Err(error) => {
-            ipc::send(
-                stream,
-                &IpcFrame::Error {
-                    message: error.message,
-                },
-            )
-            .await?;
+            ipc::send(stream, &IpcFrame::error(error.message)).await?;
             return Ok(());
         }
     };
@@ -3146,7 +3086,7 @@ async fn handle_ipc_turn(
     let session_id = match resolve_turn_session(state, session_id) {
         Ok(session_id) => session_id,
         Err(message) => {
-            ipc::send(stream, &IpcFrame::Error { message }).await?;
+            ipc::send(stream, &IpcFrame::error(message)).await?;
             return Ok(());
         }
     };
@@ -3176,9 +3116,7 @@ async fn handle_ipc_turn(
     if busy {
         ipc::send(
             stream,
-            &IpcFrame::Error {
-                message: "Miyu is busy with another operation".to_string(),
-            },
+            &IpcFrame::coded_error(ipc::ErrorCode::Busy, ipc::ADMIN_BUSY_MESSAGE),
         )
         .await?;
         return Ok(());
@@ -3204,13 +3142,7 @@ async fn handle_ipc_turn(
         .is_err()
     {
         finish_run(&state.manager, &run_id, None);
-        ipc::send(
-            stream,
-            &IpcFrame::Error {
-                message: "Miyu core worker is unavailable".to_string(),
-            },
-        )
-        .await?;
+        ipc::send(stream, &IpcFrame::error("Miyu core worker is unavailable")).await?;
         return Ok(());
     }
     let mut run_guard = IpcRunGuard {
@@ -3243,10 +3175,7 @@ async fn handle_ipc_turn(
         if record.kind == "resync_required" {
             ipc::send(
                 stream,
-                &IpcFrame::Error {
-                    message: "Miyu core event history was exhausted; the turn was cancelled"
-                        .to_string(),
-                },
+                &IpcFrame::error("Miyu core event history was exhausted; the turn was cancelled"),
             )
             .await?;
             break;
@@ -4461,7 +4390,7 @@ pub(crate) fn enqueue_turn_update(
 ) -> Result<TurnUpdateReceipt> {
     let manager = state.manager.lock().unwrap();
     if manager.admin_busy {
-        bail!("Miyu is busy with another operation");
+        bail!("{}", ipc::ADMIN_BUSY_MESSAGE);
     }
     let run = manager
         .active_runs
@@ -7114,10 +7043,7 @@ fn session_state_for(state: &DaemonState, session_id: &str) -> Result<ipc::Sessi
 fn reserve_admin(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
     if !manager.active_runs.is_empty() || manager.admin_busy {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Miyu is busy with another operation",
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, ipc::ADMIN_BUSY_MESSAGE));
     }
     manager.admin_busy = true;
     Ok(())
@@ -7132,10 +7058,7 @@ fn reserve_admin_for_session(
 ) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
     if manager.admin_busy || manager.session_has_runs(session_id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Miyu is busy with another operation",
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, ipc::ADMIN_BUSY_MESSAGE));
     }
     manager.admin_busy = true;
     Ok(())
@@ -7327,10 +7250,7 @@ pub(crate) async fn reset_platform_persona_state(
 fn reserve_admin_light(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
     if manager.admin_busy {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Miyu is busy with another operation",
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, ipc::ADMIN_BUSY_MESSAGE));
     }
     manager.admin_busy = true;
     Ok(())
@@ -9385,6 +9305,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_reload_applies_disk_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) = test_daemon_with_actor(temp.path());
+        let mut next_config = state.manager.lock().unwrap().config.clone();
+        next_config.display.show_token_usage = !next_config.display.show_token_usage;
+        let expected = next_config.display.show_token_usage;
+        next_config.save(&state.paths).unwrap();
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let task = tokio::spawn(async move { handle_ipc_connection(server_state, server).await });
+        ipc::send(&mut client, &IpcRequest::new(IpcCommand::ReloadConfig))
+            .await
+            .unwrap();
+        let response = ipc::receive::<IpcFrame>(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(response, IpcFrame::AdminResult { .. }));
+        task.await.unwrap().unwrap();
+        let manager = state.manager.lock().unwrap();
+        assert_eq!(manager.config.display.show_token_usage, expected);
+        assert!(!manager.admin_busy);
+        drop(manager);
+
+        state.actor_tx.send(ActorCommand::Shutdown).unwrap();
+        actor_join.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_config_reload_preserves_the_candidate_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let runtime_value = state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .display
+            .show_token_usage;
+        let mut candidate = state.manager.lock().unwrap().config.clone();
+        candidate.display.show_token_usage = !runtime_value;
+        candidate.save(&state.paths).unwrap();
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let task = tokio::spawn(async move { handle_ipc_connection(server_state, server).await });
+        ipc::send(&mut client, &IpcRequest::new(IpcCommand::ReloadConfig))
+            .await
+            .unwrap();
+        let response = ipc::receive::<IpcFrame>(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            IpcFrame::Error {
+                code: None,
+                message,
+            } if message.contains("worker is unavailable")
+        ));
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            AppConfig::load(&state.paths)
+                .unwrap()
+                .display
+                .show_token_usage,
+            !runtime_value
+        );
+        let manager = state.manager.lock().unwrap();
+        assert_eq!(manager.config.display.show_token_usage, runtime_value);
+        assert!(!manager.admin_busy);
+    }
+
+    #[tokio::test]
     async fn busy_config_reload_returns_an_error_frame() {
         let temp = tempfile::tempdir().unwrap();
         let (state, actor_join) = test_daemon_with_actor(temp.path());
@@ -9423,7 +9420,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             response,
-            IpcFrame::Error { message } if message.contains("busy with another operation")
+            IpcFrame::Error {
+                code: Some(ipc::ErrorCode::Busy),
+                message,
+            } if message.contains("busy with another operation")
         ));
         task.await.unwrap().unwrap();
 

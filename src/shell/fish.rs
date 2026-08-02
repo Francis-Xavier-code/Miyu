@@ -2,7 +2,7 @@ use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::Result;
 
-fn completion_entries() -> [(&'static str, &'static str); 15] {
+fn completion_entries() -> [(&'static str, &'static str); 16] {
     [
         (
             "ask",
@@ -22,6 +22,13 @@ fn completion_entries() -> [(&'static str, &'static str); 15] {
         (
             "config",
             t("Open or manage configuration", "打开或管理配置"),
+        ),
+        (
+            "reload",
+            t(
+                "Reload configuration in the running Miyu daemon",
+                "在运行中的 Miyu daemon 内重新加载配置",
+            ),
         ),
         ("models", t("List or switch models", "列出或切换模型")),
         (

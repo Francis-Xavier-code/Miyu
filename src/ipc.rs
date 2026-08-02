@@ -19,6 +19,7 @@ use tokio::net::UnixStream;
 pub const PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_WEB_PORT: u16 = 8300;
 pub const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+pub const ADMIN_BUSY_MESSAGE: &str = "Miyu is busy with another operation";
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 
 /// Unique id of this build, stamped by build.rs. A daemon whose build id
@@ -329,8 +330,34 @@ pub enum Frame {
         data: Value,
     },
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ErrorCode>,
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Busy,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Frame {
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error {
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn coded_error(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::Error {
+            code: Some(code),
+            message: message.into(),
+        }
+    }
 }
 
 pub async fn connect(path: &Path) -> Result<UnixStream> {
@@ -355,7 +382,7 @@ pub async fn daemon_info(paths: &MiyuPaths) -> Option<DaemonInfo> {
             build_id,
             protocol_version: PROTOCOL_VERSION,
         }),
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             let protocol_version = expected_protocol_version(&message)?;
             let Frame::Ready {
                 pid,
@@ -1040,6 +1067,42 @@ mod tests {
         assert_eq!(value["pid"], 42);
         assert_eq!(value["web_port"], 4096);
         assert_eq!(value["web_public"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn error_frames_keep_backward_compatibility_and_expose_codes() {
+        let legacy: Frame = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "message": ADMIN_BUSY_MESSAGE,
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Frame::Error {
+                code: None,
+                message,
+            } if message == ADMIN_BUSY_MESSAGE
+        ));
+
+        let coded =
+            serde_json::to_value(Frame::coded_error(ErrorCode::Busy, ADMIN_BUSY_MESSAGE)).unwrap();
+        assert_eq!(coded["type"], "error");
+        assert_eq!(coded["code"], "busy");
+        assert_eq!(coded["message"], ADMIN_BUSY_MESSAGE);
+
+        let future: Frame = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "code": "future_error",
+            "message": "future failure",
+        }))
+        .unwrap();
+        assert!(matches!(
+            future,
+            Frame::Error {
+                code: Some(ErrorCode::Unknown),
+                ..
+            }
+        ));
     }
 
     #[test]

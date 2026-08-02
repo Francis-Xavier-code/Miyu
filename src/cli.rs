@@ -39,6 +39,9 @@ use vte::{Params as VteParams, Parser as VteParser, Perform as VtePerform};
 const REPL_MAX_VISIBLE_INPUT_ROWS: u16 = 12;
 const REPL_PASTE_PLACEHOLDER_MIN_LINES: usize = 3;
 const REPL_PASTE_PLACEHOLDER_MIN_CHARS: usize = 150;
+const RELOAD_MAX_ATTEMPTS: usize = 12;
+const RELOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const RELOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug)]
 struct PastedText {
     text: String,
@@ -479,6 +482,11 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "显示应用配置、数据和缓存路径",
         ),
         ("config", "Open or manage configuration", "打开或管理配置"),
+        (
+            "reload",
+            "Reload configuration in the running Miyu daemon",
+            "在运行中的 Miyu daemon 内重新加载配置",
+        ),
         ("models", "List or switch models", "列出或切换模型"),
         (
             "variant",
@@ -822,6 +830,7 @@ pub enum Command {
     Init,
     Paths,
     Config(ConfigArgs),
+    Reload,
     Models(ModelsArgs),
     Variant(VariantArgs),
     FishInit,
@@ -1234,6 +1243,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
                 Ok(())
             }
         }
+        Some(Command::Reload) => run_reload(&paths).await,
         Some(Command::Models(args)) => {
             initialize_models_cache(&paths);
             run_models(&paths, args)?;
@@ -2154,6 +2164,103 @@ async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
             })?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigReloadResponse {
+    Reloaded,
+    Busy,
+}
+
+fn validate_config_reload_response(frame: Option<IpcFrame>) -> Result<ConfigReloadResponse> {
+    if let Some(IpcFrame::Error { code, message }) = &frame {
+        if *code == Some(ipc::ErrorCode::Busy)
+            || (code.is_none() && message == ipc::ADMIN_BUSY_MESSAGE)
+        {
+            return Ok(ConfigReloadResponse::Busy);
+        }
+    }
+    validate_ipc_command_response(frame)?;
+    Ok(ConfigReloadResponse::Reloaded)
+}
+
+async fn request_config_reload(paths: &MiyuPaths) -> Result<ConfigReloadResponse> {
+    request_config_reload_at(&paths.ipc_socket(), RELOAD_RESPONSE_TIMEOUT).await
+}
+
+async fn request_config_reload_at(
+    socket: &Path,
+    response_timeout: Duration,
+) -> Result<ConfigReloadResponse> {
+    tokio::time::timeout(response_timeout, async {
+        let mut stream = ipc::connect(socket).await?;
+        ipc::send(&mut stream, &IpcRequest::new(IpcCommand::ReloadConfig)).await?;
+        validate_config_reload_response(ipc::receive::<IpcFrame>(&mut stream).await?)
+    })
+    .await
+    .with_context(|| {
+        t(
+            "timed out waiting for Miyu daemon to reload configuration",
+            "等待 Miyu daemon 重新加载配置超时",
+        )
+    })?
+}
+
+async fn run_reload(paths: &MiyuPaths) -> Result<()> {
+    if ipc::daemon_info(paths).await.is_none() {
+        bail!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
+    }
+    retry_config_reload(RELOAD_MAX_ATTEMPTS, RELOAD_RETRY_INTERVAL, || {
+        request_config_reload(paths)
+    })
+    .await?;
+    println!("{}", t("configuration reloaded", "配置已重新加载"));
+    Ok(())
+}
+
+async fn retry_config_reload<F, Fut>(
+    max_attempts: usize,
+    retry_interval: Duration,
+    mut request_reload: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ConfigReloadResponse>>,
+{
+    if max_attempts == 0 {
+        bail!("reload must allow at least one attempt");
+    }
+
+    for attempt in 1..=max_attempts {
+        match request_reload().await? {
+            ConfigReloadResponse::Reloaded => return Ok(()),
+            ConfigReloadResponse::Busy if attempt < max_attempts => {
+                let seconds = retry_interval.as_secs();
+                let message = if is_zh() {
+                    format!(
+                        "Miyu daemon 正忙；将在 {seconds} 秒后重试配置重载（{attempt}/{max_attempts}）"
+                    )
+                } else {
+                    format!(
+                        "Miyu daemon is busy; retrying configuration reload in {seconds} seconds ({attempt}/{max_attempts})"
+                    )
+                };
+                eprintln!("{message}");
+                tokio::time::sleep(retry_interval).await;
+            }
+            ConfigReloadResponse::Busy => {
+                let message = if is_zh() {
+                    format!("Miyu daemon 在 {max_attempts} 次配置重载尝试后仍然忙碌")
+                } else {
+                    format!(
+                        "Miyu daemon remained busy after {max_attempts} configuration reload attempts"
+                    )
+                };
+                bail!("{message}");
+            }
+        }
+    }
+    unreachable!("reload loop always returns on its final attempt")
 }
 
 async fn run_tool(paths: &MiyuPaths, mode: AgentMode, args: ToolArgs) -> Result<()> {
@@ -3977,7 +4084,7 @@ async fn try_run_remote_chat(
     };
     let run_id = match first {
         IpcFrame::Accepted { run_id } => run_id,
-        IpcFrame::Error { message } => bail!("{message}"),
+        IpcFrame::Error { message, .. } => bail!("{message}"),
         _ => bail!("Miyu core returned an invalid response"),
     };
     let mut turn_id: Option<String> = None;
@@ -4163,7 +4270,7 @@ async fn try_run_remote_chat(
             bail!("Miyu core disconnected during the turn");
         };
         let IpcFrame::Event { kind, data, .. } = frame else {
-            if let IpcFrame::Error { message } = frame {
+            if let IpcFrame::Error { message, .. } = frame {
                 renderer.finish()?;
                 if let Some(live) = live.as_deref_mut() {
                     live.apply_renderer_frame(&mut renderer)?;
@@ -4484,7 +4591,7 @@ fn validate_ipc_command_response(frame: Option<IpcFrame>) -> Result<()> {
         Some(IpcFrame::Ack) | Some(IpcFrame::Ready { .. }) | Some(IpcFrame::AdminResult { .. }) => {
             Ok(())
         }
-        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        Some(IpcFrame::Error { message, .. }) => bail!("{message}"),
         Some(other) => bail!("Miyu core returned an unexpected response: {other:?}"),
         None => bail!("Miyu core closed the connection without a response"),
     }
@@ -5149,7 +5256,7 @@ async fn send_ipc_admin(
     ipc::send(&mut stream, &IpcRequest::new(command)).await?;
     match ipc::receive::<IpcFrame>(&mut stream).await? {
         Some(IpcFrame::AdminResult { state, data }) => Ok((state, data)),
-        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        Some(IpcFrame::Error { message, .. }) => bail!("{message}"),
         _ => bail!("Miyu core returned an invalid admin response"),
     }
 }
@@ -8467,7 +8574,7 @@ async fn persist_remote_queued_submission(
             uploaded_attachments: Vec::new(),
             submitted_at,
         }),
-        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        Some(IpcFrame::Error { message, .. }) => bail!("{message}"),
         Some(_) => bail!("Miyu core returned an invalid queue response"),
         None => bail!("Miyu core closed the queue connection"),
     }
@@ -10415,6 +10522,8 @@ mod repl_input_tests {
     use super::*;
     use crate::llm::ChatStreamKind;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn sample_pop_turn(status: TurnStatus) -> Turn {
         Turn {
@@ -10736,6 +10845,130 @@ mod repl_input_tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn reload_is_a_top_level_command() {
+        let cli = parse_args(["miyu", "reload"].map(OsString::from).to_vec()).unwrap();
+        assert!(matches!(cli.command, Some(Command::Reload)));
+        assert!(parse_args(["miyu", "reload", "extra"].map(OsString::from).to_vec()).is_err());
+    }
+
+    #[test]
+    fn config_reload_response_uses_codes_and_supports_legacy_busy_errors() {
+        assert_eq!(
+            validate_config_reload_response(Some(IpcFrame::coded_error(
+                ipc::ErrorCode::Busy,
+                "localized busy message",
+            )))
+            .unwrap(),
+            ConfigReloadResponse::Busy
+        );
+        assert_eq!(
+            validate_config_reload_response(Some(IpcFrame::error(ipc::ADMIN_BUSY_MESSAGE)))
+                .unwrap(),
+            ConfigReloadResponse::Busy
+        );
+        assert!(
+            validate_config_reload_response(Some(IpcFrame::error("invalid configuration")))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_reload_retries_busy_responses_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+
+        retry_config_reload(4, Duration::ZERO, move || {
+            let attempts = attempts.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(if attempt < 3 {
+                    ConfigReloadResponse::Busy
+                } else {
+                    ConfigReloadResponse::Reloaded
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn config_reload_stops_after_the_attempt_limit() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+
+        let error = retry_config_reload(3, Duration::ZERO, move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(ConfigReloadResponse::Busy)
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(observed.load(Ordering::SeqCst), 3);
+        assert!(error.to_string().contains('3'));
+    }
+
+    #[tokio::test]
+    async fn config_reload_retries_coded_busy_frames_over_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("reload.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 1..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = ipc::receive::<IpcRequest>(&mut stream)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(request.command, IpcCommand::ReloadConfig));
+                let response = if attempt < 3 {
+                    IpcFrame::coded_error(ipc::ErrorCode::Busy, ipc::ADMIN_BUSY_MESSAGE)
+                } else {
+                    IpcFrame::Ack
+                };
+                ipc::send(&mut stream, &response).await.unwrap();
+            }
+        });
+
+        retry_config_reload(4, Duration::ZERO, || {
+            request_config_reload_at(&socket, Duration::from_secs(1))
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_reload_request_times_out_when_daemon_does_not_respond() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("reload-timeout.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = ipc::receive::<IpcRequest>(&mut stream)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(request.command, IpcCommand::ReloadConfig));
+            std::future::pending::<()>().await;
+        });
+
+        let error = request_config_reload_at(&socket, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some());
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -12563,6 +12796,7 @@ mod remote_tool_image_tests {
     fn ipc_command_response_distinguishes_errors_and_closed_connections() {
         assert!(validate_ipc_command_response(Some(IpcFrame::Ack)).is_ok());
         let rejected = validate_ipc_command_response(Some(IpcFrame::Error {
+            code: None,
             message: "Miyu is busy with another operation".to_string(),
         }))
         .unwrap_err();
