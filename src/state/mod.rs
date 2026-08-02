@@ -8,18 +8,117 @@ use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::io::Cursor;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Cursor, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 #[allow(unused_imports)]
 pub use conversation_db::{
-    interrupted_text, pending_placeholder, ConversationDb, ImageAsset, ImageAssetData,
-    PlatformPluginScopeKey, PlatformSessionBindingKey, QueuedPrompt, QueuedPromptAttachment,
-    SessionOverview, SessionRecord, Turn, TurnFollowup, TurnStatus,
+    interrupted_text, pending_placeholder, ArtifactAsset, ArtifactAssetData, ConversationDb,
+    ImageAsset, ImageAssetData, PlatformAccessActor, PlatformAccessGrant, PlatformAccessGrantKey,
+    PlatformMemeRefRecord, PlatformPluginScopeKey, PlatformSessionBinding,
+    PlatformSessionBindingKey, QueuedPrompt, QueuedPromptAttachment, RedoCandidate, RedoInputKind,
+    RedoStart, SessionOverview, SessionRecord, Turn, TurnFollowup, TurnJournalEvent,
+    TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
+    GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
 pub use usage::UsageSnapshot;
+
+type PlatformAccessSubjects = HashSet<String>;
+type PlatformAccessKinds = HashMap<String, PlatformAccessSubjects>;
+type PlatformAccessPermissions = HashMap<String, PlatformAccessKinds>;
+type PlatformAccessScopes = HashMap<String, PlatformAccessPermissions>;
+
+#[derive(Debug)]
+struct SharedPlatformAccess {
+    index: RwLock<PlatformAccessIndex>,
+    mutations: Mutex<()>,
+}
+
+static PLATFORM_ACCESS_INDEXES: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedPlatformAccess>>>> =
+    OnceLock::new();
+
+#[derive(Debug, Default)]
+struct PlatformAccessIndex {
+    platforms: HashMap<String, PlatformAccessScopes>,
+}
+
+impl PlatformAccessIndex {
+    fn from_grants(grants: impl IntoIterator<Item = PlatformAccessGrant>) -> Self {
+        let mut index = Self::default();
+        for grant in grants {
+            index.insert(&grant.key);
+        }
+        index
+    }
+
+    fn contains(
+        &self,
+        platform: &str,
+        account_scope: &str,
+        permission: &str,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> bool {
+        self.platforms
+            .get(platform)
+            .and_then(|scopes| scopes.get(account_scope))
+            .and_then(|permissions| permissions.get(permission))
+            .and_then(|kinds| kinds.get(subject_kind))
+            .is_some_and(|subjects| subjects.contains(subject_id))
+    }
+
+    fn insert(&mut self, key: &PlatformAccessGrantKey) {
+        self.platforms
+            .entry(key.platform.clone())
+            .or_default()
+            .entry(key.account_scope.clone())
+            .or_default()
+            .entry(key.permission.clone())
+            .or_default()
+            .entry(key.subject_kind.clone())
+            .or_default()
+            .insert(key.subject_id.clone());
+    }
+
+    fn remove(&mut self, key: &PlatformAccessGrantKey) -> bool {
+        if let Some(subjects) = self
+            .platforms
+            .get_mut(&key.platform)
+            .and_then(|scopes| scopes.get_mut(&key.account_scope))
+            .and_then(|permissions| permissions.get_mut(&key.permission))
+            .and_then(|kinds| kinds.get_mut(&key.subject_kind))
+        {
+            return subjects.remove(&key.subject_id);
+        }
+        false
+    }
+}
+
+fn shared_platform_access_index(
+    state_dir: &Path,
+    conv_db: &ConversationDb,
+) -> Result<Arc<SharedPlatformAccess>> {
+    let key = state_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state_dir.to_path_buf());
+    let indexes = PLATFORM_ACCESS_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut indexes = indexes.lock().unwrap();
+    if let Some(index) = indexes.get(&key).and_then(Weak::upgrade) {
+        return Ok(index);
+    }
+    indexes.retain(|_, index| index.strong_count() > 0);
+    let index = Arc::new(SharedPlatformAccess {
+        index: RwLock::new(PlatformAccessIndex::from_grants(
+            conv_db.platform_access_grants(None)?,
+        )),
+        mutations: Mutex::new(()),
+    });
+    indexes.insert(key, Arc::downgrade(&index));
+    Ok(index)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningTurnQueueTarget {
@@ -28,10 +127,31 @@ pub struct RunningTurnQueueTarget {
     pub owner_pid: Option<u32>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PlatformAccessAuthorization {
+    pub(crate) statically_authorized: bool,
+    pub(crate) dynamic_key: PlatformAccessGrantKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlatformAccessMutation {
+    Grant,
+    Revoke,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlatformAccessMutationResult {
+    Unauthorized,
+    Unchanged,
+    Changed,
+}
+
 #[derive(Debug, Clone)]
 pub struct StateStore {
     state_dir: PathBuf,
+    artifacts_dir: PathBuf,
     conv_db: Arc<ConversationDb>,
+    platform_access: Arc<SharedPlatformAccess>,
     /// Active session. Shared across clones and swappable at runtime so a
     /// long-lived daemon switches every holder atomically.
     session_id: Arc<std::sync::RwLock<Arc<str>>>,
@@ -43,6 +163,7 @@ impl StateStore {
     pub fn new(paths: &MiyuPaths) -> Result<Self> {
         let state_dir = paths.state_dir.clone();
         let conv_db = Arc::new(ConversationDb::open(&state_dir)?);
+        let platform_access = shared_platform_access_index(&state_dir, &conv_db)?;
         let session_id = Arc::new(std::sync::RwLock::new(Arc::<str>::from(
             conv_db.resolve_current_session()?,
         )));
@@ -60,7 +181,9 @@ impl StateStore {
         conv_db.discard_stale_queued_prompts(&queue_session_id, queue_owner_pid)?;
         Ok(Self {
             state_dir,
+            artifacts_dir: paths.data_dir.join("artifacts"),
             conv_db,
+            platform_access,
             session_id,
             queue_session_id,
             queue_owner_pid,
@@ -88,7 +211,9 @@ impl StateStore {
     pub fn pinned(&self, session_id: &str) -> Self {
         Self {
             state_dir: self.state_dir.clone(),
+            artifacts_dir: self.artifacts_dir.clone(),
             conv_db: self.conv_db.clone(),
+            platform_access: self.platform_access.clone(),
             session_id: Arc::new(std::sync::RwLock::new(session_id.into())),
             queue_session_id: self.queue_session_id.clone(),
             queue_owner_pid: self.queue_owner_pid,
@@ -114,6 +239,14 @@ impl StateStore {
         store
     }
 
+    pub(crate) fn queue_target(&self, turn_id: impl Into<String>) -> RunningTurnQueueTarget {
+        RunningTurnQueueTarget {
+            turn_id: turn_id.into(),
+            queue_session_id: Some(self.queue_session_id.to_string()),
+            owner_pid: Some(self.queue_owner_pid),
+        }
+    }
+
     /// Whether any session has a running turn (global admin guard).
     pub fn has_any_running_turns(&self) -> Result<bool> {
         self.conv_db.has_any_running_turns()
@@ -124,6 +257,134 @@ impl StateStore {
         self.conv_db.set_current_session(session_id)?;
         self.adopt_session(session_id);
         Ok(())
+    }
+
+    pub fn has_platform_access_grant(
+        &self,
+        platform: &str,
+        account_id: &str,
+        permission: &str,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> bool {
+        let access = self.platform_access.index.read().unwrap();
+        access.contains(
+            platform,
+            GLOBAL_PLATFORM_ACCOUNT_SCOPE,
+            permission,
+            subject_kind,
+            subject_id,
+        ) || (account_id != GLOBAL_PLATFORM_ACCOUNT_SCOPE
+            && access.contains(platform, account_id, permission, subject_kind, subject_id))
+    }
+
+    pub fn platform_access_grants(&self, platform: &str) -> Result<Vec<PlatformAccessGrant>> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        self.conv_db.platform_access_grants(Some(platform))
+    }
+
+    pub(crate) fn platform_access_grants_if_authorized(
+        &self,
+        platform: &str,
+        authorization: &PlatformAccessAuthorization,
+    ) -> Result<Option<Vec<PlatformAccessGrant>>> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        if !self.platform_access_authorized(authorization) {
+            return Ok(None);
+        }
+        self.conv_db
+            .platform_access_grants(Some(platform))
+            .map(Some)
+    }
+
+    pub(crate) fn mutate_platform_access_grant_if_authorized(
+        &self,
+        key: &PlatformAccessGrantKey,
+        actor: &PlatformAccessActor,
+        operation: PlatformAccessMutation,
+        authorization: &PlatformAccessAuthorization,
+    ) -> Result<PlatformAccessMutationResult> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        if !self.platform_access_authorized(authorization) {
+            return Ok(PlatformAccessMutationResult::Unauthorized);
+        }
+        match operation {
+            PlatformAccessMutation::Grant => {
+                let inserted = self.conv_db.add_platform_access_grant(key, actor)?;
+                if inserted {
+                    self.platform_access.index.write().unwrap().insert(key);
+                    Ok(PlatformAccessMutationResult::Changed)
+                } else {
+                    Ok(PlatformAccessMutationResult::Unchanged)
+                }
+            }
+            PlatformAccessMutation::Revoke => {
+                let was_cached = self.platform_access.index.write().unwrap().remove(key);
+                match self.conv_db.remove_platform_access_grant(key, actor) {
+                    Ok(true) => Ok(PlatformAccessMutationResult::Changed),
+                    Ok(false) => Ok(PlatformAccessMutationResult::Unchanged),
+                    Err(error) => {
+                        if was_cached {
+                            self.platform_access.index.write().unwrap().insert(key);
+                        }
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn add_platform_access_grant(
+        &self,
+        key: &PlatformAccessGrantKey,
+        actor: &PlatformAccessActor,
+    ) -> Result<bool> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        let inserted = self.conv_db.add_platform_access_grant(key, actor)?;
+        if inserted {
+            self.platform_access.index.write().unwrap().insert(key);
+        }
+        Ok(inserted)
+    }
+
+    pub fn remove_platform_access_grant(
+        &self,
+        key: &PlatformAccessGrantKey,
+        actor: &PlatformAccessActor,
+    ) -> Result<bool> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        let was_cached = self.platform_access.index.write().unwrap().remove(key);
+        match self.conv_db.remove_platform_access_grant(key, actor) {
+            Ok(deleted) => Ok(deleted),
+            Err(error) => {
+                if was_cached {
+                    self.platform_access.index.write().unwrap().insert(key);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn platform_access_authorized(&self, authorization: &PlatformAccessAuthorization) -> bool {
+        if authorization.statically_authorized {
+            return true;
+        }
+        let key = &authorization.dynamic_key;
+        let access = self.platform_access.index.read().unwrap();
+        access.contains(
+            &key.platform,
+            GLOBAL_PLATFORM_ACCOUNT_SCOPE,
+            &key.permission,
+            &key.subject_kind,
+            &key.subject_id,
+        ) || (key.account_scope != GLOBAL_PLATFORM_ACCOUNT_SCOPE
+            && access.contains(
+                &key.platform,
+                &key.account_scope,
+                &key.permission,
+                &key.subject_kind,
+                &key.subject_id,
+            ))
     }
 
     pub fn persona_current_session(&self, persona: &str) -> Result<Option<String>> {
@@ -139,6 +400,21 @@ impl StateStore {
     /// persona scope.
     pub fn adopt_sessions_for_persona(&self, persona: &str) -> Result<()> {
         self.conv_db.adopt_sessions_for_persona(persona)
+    }
+
+    pub fn rename_persona_scope(&self, old_scope: &str, new_scope: &str) -> Result<()> {
+        self.conv_db.rename_persona_scope(old_scope, new_scope)
+    }
+
+    pub fn delete_persona_scope(&self, scope: &str) -> Result<()> {
+        let session_ids = self
+            .conv_db
+            .list_sessions(scope, true)?
+            .into_iter()
+            .map(|session| session.record.session_id)
+            .collect::<Vec<_>>();
+        self.conv_db.delete_persona_scope(scope)?;
+        self.remove_artifact_session_dirs(&session_ids)
     }
 
     pub fn session_record(&self, session_id: &str) -> Result<Option<SessionRecord>> {
@@ -165,6 +441,18 @@ impl StateStore {
         self.conv_db.is_platform_session(session_id)
     }
 
+    pub fn persona_reset_session_ids(&self, persona: &str, platform: &str) -> Result<Vec<String>> {
+        self.conv_db.persona_reset_session_ids(persona, platform)
+    }
+
+    pub fn platform_session_bindings(
+        &self,
+        persona: &str,
+        platform: &str,
+    ) -> Result<Vec<PlatformSessionBinding>> {
+        self.conv_db.platform_session_bindings(persona, platform)
+    }
+
     pub fn create_session(
         &self,
         persona: &str,
@@ -174,6 +462,14 @@ impl StateStore {
     ) -> Result<SessionRecord> {
         self.conv_db
             .create_session(persona, name, kind, parent_session_id)
+    }
+
+    pub fn create_or_get_platform_session(
+        &self,
+        key: &PlatformSessionBindingKey,
+        name: &str,
+    ) -> Result<(SessionRecord, bool)> {
+        self.conv_db.create_or_get_platform_session(key, name)
     }
 
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<()> {
@@ -189,7 +485,8 @@ impl StateStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.conv_db.delete_session(session_id)
+        self.conv_db.delete_session(session_id)?;
+        self.remove_artifact_session_dir(session_id)
     }
 
     pub fn touch_session(&self, session_id: &str) -> Result<()> {
@@ -198,6 +495,14 @@ impl StateStore {
 
     pub fn find_session_by_name(&self, persona: &str, name: &str) -> Result<Option<SessionRecord>> {
         self.conv_db.find_session_by_name(persona, name)
+    }
+
+    pub fn find_local_session_by_name(
+        &self,
+        persona: &str,
+        name: &str,
+    ) -> Result<Option<SessionRecord>> {
+        self.conv_db.find_local_session_by_name(persona, name)
     }
 
     pub fn find_platform_session_binding(
@@ -267,6 +572,31 @@ impl StateStore {
         self.conv_db.plugin_delete_scope(scope)
     }
 
+    pub fn put_platform_meme_ref(&self, record: &PlatformMemeRefRecord) -> Result<()> {
+        self.conv_db.put_platform_meme_ref(record)
+    }
+
+    pub fn platform_meme_refs_for_message(
+        &self,
+        platform: &str,
+        account_id: &str,
+        conversation_kind: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<PlatformMemeRefRecord>> {
+        self.conv_db.platform_meme_refs_for_message(
+            platform,
+            account_id,
+            conversation_kind,
+            conversation_id,
+            message_id,
+        )
+    }
+
+    pub fn delete_platform_meme_ref(&self, library: &str, meme_id: &str) -> Result<usize> {
+        self.conv_db.delete_platform_meme_ref(library, meme_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_subagent_usage(
         &self,
@@ -305,12 +635,35 @@ impl StateStore {
     }
 
     pub fn reset_if_prompt_changed(&self, system_prompt: &str) -> Result<()> {
+        self.reset_if_prompt_changed_with_compatible(system_prompt, None)
+    }
+
+    pub(crate) fn reset_if_prompt_changed_with_compatible(
+        &self,
+        system_prompt: &str,
+        compatible_previous_prompt: Option<&str>,
+    ) -> Result<()> {
         self.init_files()?;
         let fingerprint = prompt_fingerprint(system_prompt);
         let file = self.prompt_fingerprint_file();
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !file.exists() && self.state_dir.join("prompt.sha256").exists() {
+            std::fs::write(file, format!("{fingerprint}\n"))?;
+            return Ok(());
+        }
         let previous = std::fs::read_to_string(&file).unwrap_or_default();
         if previous.trim() != fingerprint {
+            if compatible_previous_prompt
+                .map(prompt_fingerprint)
+                .is_some_and(|compatible| previous.trim() == compatible)
+            {
+                std::fs::write(file, format!("{fingerprint}\n"))?;
+                return Ok(());
+            }
             self.conv_db.reset_history(&self.session())?;
+            self.remove_artifact_session_dir(&self.session())?;
             self.clear_last_usage()?;
             std::fs::write(file, format!("{fingerprint}\n"))?;
         }
@@ -323,6 +676,17 @@ impl StateStore {
     }
 
     pub fn start_turn(&self, turn_id: &str, user_content: &str, owner_pid: u32) -> Result<()> {
+        self.start_turn_with_display(turn_id, user_content, user_content, owner_pid, None)
+    }
+
+    pub fn start_turn_with_display(
+        &self,
+        turn_id: &str,
+        user_content: &str,
+        display_content: &str,
+        owner_pid: u32,
+        attachment_run_id: Option<&str>,
+    ) -> Result<()> {
         // Record the ambient turn workspace (if any) so the turn row captures
         // where its tools operated; NULL outside a turn workspace scope.
         let workspace =
@@ -331,9 +695,11 @@ impl StateStore {
             &self.session(),
             turn_id,
             user_content,
+            display_content,
             owner_pid,
             &self.queue_session_id,
             workspace.as_deref(),
+            attachment_run_id,
         )
     }
 
@@ -348,7 +714,27 @@ impl StateStore {
     }
 
     pub fn interrupt_turn(&self, turn_id: &str) -> Result<()> {
-        self.conv_db.interrupt_turn(turn_id)
+        self.conv_db.interrupt_turn(turn_id)?;
+        let session_id = self.session_id();
+        self.recover_journal_assets(&session_id, turn_id)
+    }
+
+    pub fn interrupt_turn_revision(&self, turn_id: &str, revision: i64) -> Result<()> {
+        let restored = self.conv_db.interrupt_turn_revision(turn_id, revision)?;
+        if restored {
+            let session_id = self
+                .conv_db
+                .turn_session_id(turn_id)?
+                .context("restored redo turn no longer exists")?;
+            self.reconcile_managed_artifacts_for_turn(&session_id, turn_id)?;
+        } else {
+            let session_id = self
+                .conv_db
+                .turn_session_id(turn_id)?
+                .context("interrupted turn no longer exists")?;
+            self.recover_journal_assets(&session_id, turn_id)?;
+        }
+        Ok(())
     }
 
     pub fn complete_turn_with_usage_and_model(
@@ -372,8 +758,72 @@ impl StateStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_turn_revision_with_usage_and_model(
+        &self,
+        turn_id: &str,
+        revision: i64,
+        content: &str,
+        reasoning: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        token_total: Option<u64>,
+        token_usage_estimated: bool,
+    ) -> Result<()> {
+        self.conv_db.complete_turn_revision_with_usage(
+            turn_id,
+            revision,
+            content,
+            reasoning,
+            provider_id,
+            model,
+            token_total,
+            token_usage_estimated,
+        )
+    }
+
     pub fn append_persisted_context(&self, turn_id: &str, report: &str) -> Result<()> {
         self.conv_db.append_tool_report(turn_id, report.trim())
+    }
+
+    pub fn append_persisted_contexts(&self, turn_id: &str, reports: &[String]) -> Result<()> {
+        self.conv_db.append_tool_reports(turn_id, reports)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_turn_journal_event(
+        &self,
+        turn_id: &str,
+        revision: i64,
+        segment_index: i64,
+        kind: &str,
+        call_id: Option<&str>,
+        name: Option<&str>,
+        text_payload: Option<&str>,
+        blob_payload: Option<&[u8]>,
+        ok: Option<bool>,
+    ) -> Result<()> {
+        self.conv_db.append_turn_journal_event(
+            turn_id,
+            revision,
+            segment_index,
+            kind,
+            call_id,
+            name,
+            text_payload,
+            blob_payload,
+            ok,
+        )
+    }
+
+    pub fn supersede_turn_journal_segment(
+        &self,
+        turn_id: &str,
+        revision: i64,
+        segment_index: i64,
+    ) -> Result<()> {
+        self.conv_db
+            .supersede_turn_journal_segment(turn_id, revision, segment_index)
     }
 
     pub fn save_image_asset(
@@ -444,11 +894,145 @@ impl StateStore {
     }
 
     pub fn load_image_assets(&self) -> Result<Vec<ImageAsset>> {
-        self.conv_db.load_image_assets()
+        self.conv_db.load_image_assets(&self.session())
     }
 
     pub fn load_image_asset(&self, asset_id: &str) -> Result<Option<ImageAssetData>> {
         self.conv_db.load_image_asset(asset_id)
+    }
+
+    pub fn save_artifact_asset(
+        &self,
+        turn_id: &str,
+        tool_id: Option<&str>,
+        path: &Path,
+        title: &str,
+    ) -> Result<ArtifactAsset> {
+        const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("resolving artifact path: {}", path.display()))?;
+        let metadata = std::fs::metadata(&canonical)
+            .with_context(|| format!("reading artifact metadata: {}", canonical.display()))?;
+        if !metadata.is_file() {
+            bail!("artifact path is not a file: {}", canonical.display());
+        }
+        if metadata.len() == 0 || metadata.len() > MAX_ARTIFACT_BYTES {
+            bail!("artifact must be between 1 byte and 20 MiB");
+        }
+        let bytes = std::fs::read(&canonical)
+            .with_context(|| format!("reading artifact: {}", canonical.display()))?;
+        let fallback_name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact");
+        let requested_name = if title.trim().is_empty() {
+            fallback_name
+        } else {
+            title.trim()
+        };
+        let file_name = requested_name
+            .chars()
+            .filter(|character| !character.is_control() && !matches!(character, '/' | '\\'))
+            .take(180)
+            .collect::<String>();
+        let file_name = if file_name.trim().is_empty() {
+            "artifact".to_string()
+        } else {
+            file_name
+        };
+        let (mime, kind) = artifact_media_type(&canonical);
+        let source_key = canonical.to_string_lossy().to_string();
+        let session_id = self.session();
+        let managed_session_dir = self.artifacts_dir.join(session_id.as_ref());
+        let identity_scope = if canonical.starts_with(&managed_session_dir) {
+            session_id.as_ref()
+        } else {
+            turn_id
+        };
+        let hash = blake3::hash(format!("{identity_scope}\0{source_key}").as_bytes());
+        let now = chrono::Utc::now().to_rfc3339();
+        let asset = ArtifactAsset {
+            asset_id: format!("art_{}", &hash.to_hex()[..32]),
+            turn_id: turn_id.to_string(),
+            tool_id: tool_id.map(str::to_string),
+            source_key,
+            file_name,
+            mime: mime.to_string(),
+            kind: kind.to_string(),
+            size_bytes: bytes.len() as u64,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.conv_db.upsert_artifact_asset(&asset, &bytes)?;
+        Ok(asset)
+    }
+
+    pub fn load_artifact_assets(&self) -> Result<Vec<ArtifactAsset>> {
+        self.conv_db.load_artifact_assets(&self.session())
+    }
+
+    pub fn load_artifact_asset(&self, asset_id: &str) -> Result<Option<ArtifactAssetData>> {
+        self.conv_db.load_artifact_asset(asset_id)
+    }
+
+    pub fn save_user_attachment(&self, attachment: &UserAttachment, data: &[u8]) -> Result<()> {
+        self.conv_db
+            .insert_user_attachment(&self.session(), attachment, data)
+    }
+
+    pub fn load_user_attachment(&self, attachment_id: &str) -> Result<Option<UserAttachmentData>> {
+        self.conv_db
+            .load_user_attachment(&self.session(), attachment_id)
+    }
+
+    pub fn load_user_attachment_by_id(
+        &self,
+        attachment_id: &str,
+    ) -> Result<Option<UserAttachmentData>> {
+        self.conv_db.load_user_attachment_by_id(attachment_id)
+    }
+
+    pub fn load_user_attachment_data_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Vec<UserAttachmentData>> {
+        self.conv_db
+            .load_user_attachment_data_for_turn(&self.session(), turn_id)
+    }
+
+    pub fn load_user_attachment_data_for_prompt(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Vec<UserAttachmentData>> {
+        self.conv_db
+            .load_user_attachment_data_for_prompt(&self.session(), prompt_id)
+    }
+
+    pub fn load_staged_user_attachments(
+        &self,
+        attachment_ids: &[String],
+    ) -> Result<Vec<UserAttachmentData>> {
+        self.conv_db
+            .load_user_attachments(&self.session(), attachment_ids)
+    }
+
+    pub fn reserve_user_attachments(&self, attachment_ids: &[String], run_id: &str) -> Result<()> {
+        self.conv_db
+            .reserve_user_attachments(&self.session(), attachment_ids, run_id)
+    }
+
+    pub fn release_user_attachments_for_run(&self, run_id: &str) -> Result<usize> {
+        self.conv_db.release_user_attachments_for_run(run_id)
+    }
+
+    pub fn delete_staged_user_attachment(&self, attachment_id: &str) -> Result<bool> {
+        self.conv_db
+            .delete_staged_user_attachment(&self.session(), attachment_id)
+    }
+
+    pub fn purge_stale_user_attachments(&self) -> Result<usize> {
+        self.conv_db.purge_stale_user_attachments()
     }
 
     pub fn append_question_exchange(
@@ -466,12 +1050,25 @@ impl StateStore {
         display_content: &str,
         attachments: &[QueuedPromptAttachment],
     ) -> Result<QueuedPrompt> {
+        self.enqueue_prompt_with_uploads(prompt_id, content, display_content, attachments, &[])
+    }
+
+    pub fn enqueue_prompt_with_uploads(
+        &self,
+        prompt_id: &str,
+        content: &str,
+        display_content: &str,
+        attachments: &[QueuedPromptAttachment],
+        uploaded_attachment_ids: &[String],
+    ) -> Result<QueuedPrompt> {
         self.conv_db.enqueue_prompt(
             &self.session(),
+            None,
             prompt_id,
             content,
             display_content,
             attachments,
+            uploaded_attachment_ids,
             &self.queue_session_id,
             self.queue_owner_pid,
         )
@@ -498,6 +1095,25 @@ impl StateStore {
         display_content: &str,
         attachments: &[QueuedPromptAttachment],
     ) -> Result<QueuedPrompt> {
+        self.enqueue_prompt_for_target_with_uploads(
+            target,
+            prompt_id,
+            content,
+            display_content,
+            attachments,
+            &[],
+        )
+    }
+
+    pub fn enqueue_prompt_for_target_with_uploads(
+        &self,
+        target: &RunningTurnQueueTarget,
+        prompt_id: &str,
+        content: &str,
+        display_content: &str,
+        attachments: &[QueuedPromptAttachment],
+        uploaded_attachment_ids: &[String],
+    ) -> Result<QueuedPrompt> {
         let queue_session_id = target
             .queue_session_id
             .as_deref()
@@ -507,10 +1123,12 @@ impl StateStore {
             .context("running turn does not expose an owner process")?;
         self.conv_db.enqueue_prompt(
             &self.session(),
+            Some(&target.turn_id),
             prompt_id,
             content,
             display_content,
             attachments,
+            uploaded_attachment_ids,
             queue_session_id,
             owner_pid,
         )
@@ -585,6 +1203,30 @@ impl StateStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_queued_prompts_with_checkpoint(
+        &self,
+        turn_id: &str,
+        prompts: &[(String, String)],
+        preceding_assistant_content: Option<&str>,
+        preceding_assistant_reasoning: Option<&str>,
+        preceding_assistant_provider_id: Option<&str>,
+        preceding_assistant_model: Option<&str>,
+        checkpoint: TurnRedoCheckpointPayload,
+    ) -> Result<()> {
+        self.conv_db.consume_queued_prompts_with_checkpoint(
+            &self.session(),
+            turn_id,
+            prompts,
+            preceding_assistant_content,
+            preceding_assistant_reasoning,
+            preceding_assistant_provider_id,
+            preceding_assistant_model,
+            &self.queue_session_id,
+            Some(checkpoint),
+        )
+    }
+
     pub fn discard_queued_prompts(&self) -> Result<usize> {
         self.conv_db
             .discard_queued_prompts(&self.session(), &self.queue_session_id)
@@ -626,7 +1268,18 @@ impl StateStore {
     }
 
     pub fn recover_stale_turns(&self) -> Result<usize> {
-        self.conv_db.recover_stale_running_turns()
+        let recoveries = self.conv_db.recover_stale_running_turns()?;
+        for recovery in &recoveries {
+            if recovery.restored_redo {
+                self.reconcile_managed_artifacts_for_turn(
+                    &recovery.session_id,
+                    &recovery.turn_id,
+                )?;
+            } else {
+                self.recover_journal_assets(&recovery.session_id, &recovery.turn_id)?;
+            }
+        }
+        Ok(recoveries.len())
     }
 
     pub fn history(&self, limit: usize) -> Result<Vec<StoredConversationEntry>> {
@@ -752,15 +1405,249 @@ impl StateStore {
         usage::reset_conversation(&self.usage_file())
     }
 
+    pub fn reset_conversation_usage(&self) -> Result<()> {
+        usage::reset_conversation(&self.usage_file())
+    }
+
+    pub fn reset_persona_contexts(&self, persona: &str, platform: &str) -> Result<Vec<String>> {
+        let session_ids = self.conv_db.reset_persona_contexts(persona, platform)?;
+        self.remove_artifact_session_dirs(&session_ids)?;
+        Ok(session_ids)
+    }
+
     /// Clears only the pinned session's conversation state. Platform commands
     /// use this instead of `reset_conversation` so they cannot reset the
     /// daemon-wide usage counters or another client's current session.
     pub fn clear_session_content(&self) -> Result<()> {
-        self.conv_db.reset(&self.session())
+        let session_id = self.session();
+        self.conv_db.reset(&session_id)?;
+        self.remove_artifact_session_dir(&session_id)
+    }
+
+    fn remove_artifact_session_dirs(&self, session_ids: &[String]) -> Result<()> {
+        for session_id in session_ids {
+            self.remove_artifact_session_dir(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn remove_artifact_session_dir(&self, session_id: &str) -> Result<()> {
+        use std::path::Component;
+
+        let mut components = Path::new(session_id).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            anyhow::bail!("invalid session id for Artifact workspace cleanup");
+        }
+        let path = self.artifacts_dir.join(session_id);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            std::fs::remove_file(path)?;
+        } else {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    fn recover_journal_assets(&self, session_id: &str, turn_id: &str) -> Result<()> {
+        let Some(turn) = self
+            .conv_db
+            .load_turns(session_id)?
+            .into_iter()
+            .find(|turn| turn.turn_id == turn_id)
+        else {
+            return Ok(());
+        };
+        if turn.journal_events.is_empty() {
+            return Ok(());
+        }
+        let mut images = self
+            .conv_db
+            .load_image_assets(session_id)?
+            .into_iter()
+            .filter(|asset| asset.turn_id == turn_id)
+            .collect::<Vec<_>>();
+        let mut artifacts = self
+            .conv_db
+            .load_artifact_assets(session_id)?
+            .into_iter()
+            .filter(|asset| asset.turn_id == turn_id)
+            .collect::<Vec<_>>();
+        for event in &turn.journal_events {
+            let kind = event.kind.as_str();
+            if kind != "image" && kind != "artifact" {
+                continue;
+            }
+            let Some(payload) = event
+                .text_payload
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            else {
+                continue;
+            };
+            let Some(raw_path) = payload.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let path = PathBuf::from(raw_path);
+            if !path.is_file() {
+                continue;
+            }
+            if kind == "image" {
+                let alt = payload
+                    .get("alt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if images.iter().any(|asset| {
+                    asset.tool_id.as_deref() == event.call_id.as_deref() && asset.alt == alt
+                }) {
+                    continue;
+                }
+                match self.save_image_asset(turn_id, event.call_id.as_deref(), &path, alt) {
+                    Ok(asset) => images.push(asset),
+                    Err(error) => tracing::warn!(
+                        turn_id,
+                        path = %path.display(),
+                        error = %error,
+                        "failed to recover an interrupted image asset"
+                    ),
+                }
+            } else {
+                let Ok(source_key) = path.canonicalize().map(|path| path.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+                if artifacts.iter().any(|asset| asset.source_key == source_key) {
+                    continue;
+                }
+                let title = payload
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match self.save_artifact_asset(turn_id, event.call_id.as_deref(), &path, title) {
+                    Ok(asset) => artifacts.push(asset),
+                    Err(error) => tracing::warn!(
+                        turn_id,
+                        path = %path.display(),
+                        error = %error,
+                        "failed to recover an interrupted Artifact asset"
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_managed_artifacts_for_turn(&self, session_id: &str, turn_id: &str) -> Result<()> {
+        use std::path::Component;
+
+        let mut components = Path::new(session_id).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!("invalid session id for Artifact workspace recovery");
+        }
+        let restored = self
+            .conv_db
+            .load_artifact_asset_data_for_turn(turn_id)?;
+        let session_dir = self.artifacts_dir.join(session_id);
+        match std::fs::symlink_metadata(&session_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!(
+                    "Artifact recovery path is not a directory: {}",
+                    session_dir.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && restored.is_empty() => {
+                return Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&session_dir)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))?;
+        let canonical_dir = session_dir.canonicalize()?;
+        let managed_target = |source_key: &str| -> Option<PathBuf> {
+            let source = Path::new(source_key);
+            let file_name = source.file_name()?;
+            let parent = source.parent()?.canonicalize().ok()?;
+            (parent == canonical_dir).then(|| canonical_dir.join(file_name))
+        };
+
+        let keep = self
+            .conv_db
+            .load_artifact_assets(session_id)?
+            .into_iter()
+            .filter_map(|asset| managed_target(&asset.source_key))
+            .collect::<HashSet<_>>();
+        for artifact in restored {
+            let Some(target) = managed_target(&artifact.asset.source_key) else {
+                continue;
+            };
+            let mut temp = tempfile::NamedTempFile::new_in(&canonical_dir)?;
+            temp.as_file_mut()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            temp.write_all(&artifact.bytes)?;
+            temp.as_file_mut().sync_all()?;
+            temp.persist(&target)
+                .map_err(|error| error.error)
+                .with_context(|| format!("restoring Artifact file: {}", target.display()))?;
+        }
+        for entry in std::fs::read_dir(&canonical_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if keep.contains(&path) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn undo_last_turn(&self) -> Result<(usize, Option<String>)> {
         self.conv_db.undo_last_turn(&self.session())
+    }
+
+    pub fn redo_candidate(&self) -> Result<Option<RedoCandidate>> {
+        self.conv_db.redo_candidate(&self.session())
+    }
+
+    pub fn load_redo_batch_prompts(
+        &self,
+        turn_id: &str,
+        prompt_ids: &[String],
+    ) -> Result<Vec<QueuedPrompt>> {
+        self.conv_db
+            .load_redo_batch_prompts(&self.session(), turn_id, prompt_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_redo(
+        &self,
+        turn_id: &str,
+        input_id: &str,
+        input_kind: RedoInputKind,
+        expected_revision: i64,
+        content: &str,
+        display_content: &str,
+        owner_pid: u32,
+    ) -> Result<RedoStart> {
+        self.conv_db.begin_redo(
+            &self.session(),
+            turn_id,
+            input_id,
+            input_kind,
+            expected_revision,
+            content,
+            display_content,
+            owner_pid,
+            &self.queue_session_id,
+        )
     }
 
     pub fn add_usage(&self, usage: &Usage) -> Result<()> {
@@ -818,7 +1705,33 @@ impl StateStore {
     }
 
     fn prompt_fingerprint_file(&self) -> PathBuf {
-        self.state_dir.join("prompt.sha256")
+        let key = blake3::hash(self.session().as_bytes()).to_hex();
+        self.state_dir
+            .join("prompt-fingerprints")
+            .join(format!("{key}.sha256"))
+    }
+}
+
+fn artifact_media_type(path: &Path) -> (&'static str, &'static str) {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => ("text/markdown; charset=utf-8", "markdown"),
+        "html" | "htm" => ("text/html; charset=utf-8", "html"),
+        "pdf" => ("application/pdf", "pdf"),
+        "json" | "jsonl" => ("application/json; charset=utf-8", "json"),
+        "txt" | "log" | "csv" | "tsv" => ("text/plain; charset=utf-8", "text"),
+        "css" => ("text/css; charset=utf-8", "code"),
+        "js" | "mjs" | "cjs" => ("text/javascript; charset=utf-8", "code"),
+        "xml" => ("application/xml; charset=utf-8", "code"),
+        "rs" | "jsx" | "ts" | "tsx" | "py" | "go" | "java" | "c" | "cc" | "cpp" | "h" | "hpp"
+        | "cs" | "rb" | "php" | "swift" | "kt" | "kts" | "sh" | "bash" | "zsh" | "fish"
+        | "toml" | "yaml" | "yml" | "scss" | "sql" => ("text/plain; charset=utf-8", "code"),
+        _ => ("application/octet-stream", "file"),
     }
 }
 
@@ -1055,6 +1968,128 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_turn_materializes_persisted_journal_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&MiyuPaths {
+            config_dir: temp.path().join("config"),
+            config_file: temp.path().join("config/config.jsonc"),
+            skills_dir: temp.path().join("config/skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish/miyu.fish"),
+            bash_hook_file: temp.path().join("shell/bash-hook.sh"),
+            zsh_hook_file: temp.path().join("shell/zsh-hook.zsh"),
+            scripts_dir: temp.path().join("config/scripts"),
+            system_scripts_dir: PathBuf::new(),
+        })
+        .unwrap();
+        store
+            .start_turn("turn_journal", "long task", 999999)
+            .unwrap();
+        store
+            .append_turn_journal_event(
+                "turn_journal",
+                0,
+                0,
+                "assistant_content",
+                None,
+                None,
+                Some("first persisted part"),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .append_turn_journal_event(
+                "turn_journal",
+                0,
+                0,
+                "assistant_reasoning",
+                None,
+                None,
+                Some("private reasoning"),
+                None,
+                None,
+            )
+            .unwrap();
+        store.interrupt_turn("turn_journal").unwrap();
+
+        let turn = store.load_turns().unwrap().remove(0);
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert!(turn.assistant_content.contains("first persisted part"));
+        assert!(turn.assistant_content.contains(interrupted_text()));
+        assert_eq!(
+            turn.assistant_reasoning.as_deref(),
+            Some("private reasoning")
+        );
+        assert_eq!(turn.journal_events.len(), 2);
+    }
+
+    #[test]
+    fn superseded_journal_keeps_completed_tool_events_without_partial_text() {
+        let (_temp, store) = test_store();
+        store.start_turn("superseded", "long task", 999999).unwrap();
+        store
+            .append_turn_journal_event(
+                "superseded",
+                0,
+                0,
+                "assistant_content",
+                None,
+                None,
+                Some("discarded partial answer"),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .append_turn_journal_event(
+                "superseded",
+                0,
+                0,
+                "tool_call",
+                Some("call-1"),
+                Some("read_file"),
+                Some("{\"path\":\"README.md\"}"),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .append_turn_journal_event(
+                "superseded",
+                0,
+                0,
+                "tool_result",
+                Some("call-1"),
+                Some("read_file"),
+                Some("completed tool output"),
+                None,
+                Some(true),
+            )
+            .unwrap();
+        store
+            .supersede_turn_journal_segment("superseded", 0, 0)
+            .unwrap();
+
+        let turn = store.load_turns().unwrap().remove(0);
+        assert!(!turn
+            .journal_events
+            .iter()
+            .any(|event| event.kind == "assistant_content"));
+        assert!(turn
+            .journal_events
+            .iter()
+            .any(|event| event.kind == "tool_call"));
+        assert!(turn
+            .journal_events
+            .iter()
+            .any(|event| event.kind == "tool_result"));
+    }
+
+    #[test]
     fn recover_stale_running() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
@@ -1156,6 +2191,58 @@ mod tests {
     }
 
     #[test]
+    fn stale_turn_recovery_consumes_accepted_queued_prompts() {
+        let (_temp, store) = test_store();
+        store.start_turn("turn_1", "initial", 999999).unwrap();
+        store
+            .append_turn_journal_event(
+                "turn_1",
+                0,
+                0,
+                "assistant_content",
+                None,
+                None,
+                Some("partial answer"),
+                None,
+                None,
+            )
+            .unwrap();
+        let target = store.running_turn_queue_target().unwrap().unwrap();
+        store
+            .enqueue_prompt_for_target(&target, "q1", "followup", "followup", &[])
+            .unwrap();
+
+        assert_eq!(store.recover_stale_turns().unwrap(), 1);
+        assert!(store.load_queued_prompts_for_target(&target).unwrap().is_empty());
+        let turn = store.load_turns().unwrap().remove(0);
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert_eq!(turn.followups.len(), 1);
+        assert_eq!(turn.followups[0].prompt_id, "q1");
+        assert_eq!(
+            turn.followups[0].preceding_assistant_content.as_deref(),
+            Some("partial answer")
+        );
+        assert!(turn
+            .journal_events
+            .iter()
+            .any(|event| event.kind == "queued_prompts_consumed"));
+    }
+
+    #[test]
+    fn finished_turn_cleanup_preserves_a_late_queued_prompt() {
+        let (_temp, store) = test_store();
+        store.start_turn("turn_1", "initial", std::process::id()).unwrap();
+        store.complete_turn("turn_1", "answer", None).unwrap();
+        store.enqueue_prompt("late", "followup", "followup", &[]).unwrap();
+
+        assert_eq!(store.discard_queued_prompts().unwrap(), 1);
+        let turn = store.load_turns().unwrap().remove(0);
+        assert_eq!(turn.followups.len(), 1);
+        assert_eq!(turn.followups[0].prompt_id, "late");
+        assert_eq!(turn.followups[0].preceding_assistant_content.as_deref(), Some("answer"));
+    }
+
+    #[test]
     fn undo_removes_last_turn() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
@@ -1209,6 +2296,172 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&test_paths(temp.path())).unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn platform_access_grants_are_cached_persisted_and_audited() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let store = StateStore::new(&paths).unwrap();
+        let peer = StateStore::new(&paths).unwrap();
+        let key = PlatformAccessGrantKey {
+            platform: "onebot".to_string(),
+            account_scope: GLOBAL_PLATFORM_ACCOUNT_SCOPE.to_string(),
+            permission: "private_whitelist".to_string(),
+            subject_kind: "user".to_string(),
+            subject_id: "2477342916".to_string(),
+        };
+        let actor = PlatformAccessActor {
+            platform: "onebot".to_string(),
+            account_id: "10000".to_string(),
+            user_id: "42".to_string(),
+            conversation_kind: "private".to_string(),
+            conversation_id: "42".to_string(),
+            message_id: "message-1".to_string(),
+        };
+
+        assert!(store.add_platform_access_grant(&key, &actor).unwrap());
+        assert!(!store.add_platform_access_grant(&key, &actor).unwrap());
+        assert!(store.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert!(peer.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert!(store.has_platform_access_grant(
+            "onebot",
+            "another-bot",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert_eq!(store.platform_access_grants("onebot").unwrap().len(), 1);
+
+        let reopened = StateStore::new(&paths).unwrap();
+        assert!(reopened.has_platform_access_grant(
+            "onebot",
+            "20000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert!(reopened.remove_platform_access_grant(&key, &actor).unwrap());
+        assert!(!reopened.remove_platform_access_grant(&key, &actor).unwrap());
+        assert!(!reopened.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert!(!store.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+        assert!(!peer.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "2477342916"
+        ));
+
+        let denied_key = PlatformAccessGrantKey {
+            subject_id: "99".to_string(),
+            ..key.clone()
+        };
+        let denied = store
+            .mutate_platform_access_grant_if_authorized(
+                &denied_key,
+                &actor,
+                PlatformAccessMutation::Grant,
+                &PlatformAccessAuthorization {
+                    statically_authorized: false,
+                    dynamic_key: PlatformAccessGrantKey {
+                        platform: "onebot".to_string(),
+                        account_scope: "10000".to_string(),
+                        permission: "administrator".to_string(),
+                        subject_kind: "user".to_string(),
+                        subject_id: "42".to_string(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(denied, PlatformAccessMutationResult::Unauthorized);
+        assert!(!store.has_platform_access_grant(
+            "onebot",
+            "10000",
+            "private_whitelist",
+            "user",
+            "99"
+        ));
+
+        let conn = rusqlite::Connection::open(paths.state_dir.join("conversation.db")).unwrap();
+        let audit_count: i64 = conn
+            .query_row("SELECT count(*) FROM platform_access_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(audit_count, 2);
+    }
+
+    #[test]
+    fn user_attachment_moves_from_staged_to_turn_and_cascades() {
+        let (_temp, store) = test_store();
+        let attachment = UserAttachment {
+            attachment_id: "att_test".to_string(),
+            file_name: "notes.md".to_string(),
+            mime: "text/markdown".to_string(),
+            kind: "text".to_string(),
+            size_bytes: 7,
+            width: 0,
+            height: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_user_attachment(&attachment, b"content").unwrap();
+        assert_eq!(
+            store
+                .load_staged_user_attachments(&[attachment.attachment_id.clone()])
+                .unwrap()[0]
+                .bytes,
+            b"content"
+        );
+
+        store
+            .reserve_user_attachments(&[attachment.attachment_id.clone()], "run_test")
+            .unwrap();
+        store
+            .start_turn_with_display(
+                "turn_test",
+                "visible\n\n<user-attachment>content</user-attachment>",
+                "visible",
+                std::process::id(),
+                Some("run_test"),
+            )
+            .unwrap();
+        let turns = store.load_turns().unwrap();
+        assert_eq!(turns[0].display_content, "visible");
+        assert_eq!(turns[0].attachments, vec![attachment.clone()]);
+        assert!(store
+            .load_staged_user_attachments(&[attachment.attachment_id.clone()])
+            .is_err());
+
+        store.reset_conversation().unwrap();
+        assert!(store
+            .load_user_attachment_by_id(&attachment.attachment_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1273,6 +2526,98 @@ mod tests {
             .session_record(&healed.session_id())
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn persona_reset_clears_active_local_and_onebot_contexts_only() {
+        let (_temp, store) = test_store();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let current = store.session_id().to_string();
+        let local = store.create_session("miyu", "local", "user", None).unwrap();
+        let archived = store
+            .create_session("miyu", "archived", "user", None)
+            .unwrap();
+        store
+            .set_session_archived(&archived.session_id, true)
+            .unwrap();
+        let other_persona = store
+            .create_session("other", "other", "user", None)
+            .unwrap();
+        let qq = store.create_session("miyu", "qq", "user", None).unwrap();
+        store.set_session_archived(&qq.session_id, true).unwrap();
+        store
+            .bind_platform_session(
+                &PlatformSessionBindingKey {
+                    platform: "onebot".to_string(),
+                    account_id: "10000".to_string(),
+                    conversation_kind: "group".to_string(),
+                    conversation_id: "42".to_string(),
+                    participant_id: None,
+                    persona: "miyu".to_string(),
+                },
+                &qq.session_id,
+            )
+            .unwrap();
+        let subagent = store
+            .create_session("miyu", "child", "subagent", Some(&local.session_id))
+            .unwrap();
+        let archived_child = store
+            .create_session(
+                "miyu",
+                "archived-child",
+                "subagent",
+                Some(&archived.session_id),
+            )
+            .unwrap();
+
+        let sessions = [
+            current.clone(),
+            local.session_id.clone(),
+            archived.session_id.clone(),
+            other_persona.session_id.clone(),
+            qq.session_id.clone(),
+            subagent.session_id.clone(),
+            archived_child.session_id.clone(),
+        ];
+        for (index, session_id) in sessions.iter().enumerate() {
+            let pinned = store.pinned(session_id);
+            let turn_id = format!("reset-scope-{index}");
+            pinned
+                .start_turn(&turn_id, "before", std::process::id())
+                .unwrap();
+            pinned.complete_turn(&turn_id, "after", None).unwrap();
+        }
+
+        let targets = store.persona_reset_session_ids("miyu", "onebot").unwrap();
+        assert!(targets.contains(&current));
+        assert!(targets.contains(&local.session_id));
+        assert!(targets.contains(&qq.session_id));
+        assert!(targets.contains(&subagent.session_id));
+        assert!(!targets.contains(&archived.session_id));
+        assert!(!targets.contains(&archived_child.session_id));
+        assert!(!targets.contains(&other_persona.session_id));
+
+        let cleared = store.reset_persona_contexts("miyu", "onebot").unwrap();
+        assert_eq!(cleared, targets);
+        for session_id in [
+            &current,
+            &local.session_id,
+            &qq.session_id,
+            &subagent.session_id,
+        ] {
+            assert!(store.pinned(session_id).load_turns().unwrap().is_empty());
+        }
+        for session_id in [
+            &archived.session_id,
+            &archived_child.session_id,
+            &other_persona.session_id,
+        ] {
+            assert_eq!(store.pinned(session_id).load_turns().unwrap().len(), 1);
+        }
+        assert_eq!(
+            store.platform_session_bindings("miyu", "onebot").unwrap()[0].session_id,
+            qq.session_id
+        );
     }
 
     fn platform_binding_key(
@@ -1347,13 +2692,74 @@ mod tests {
     }
 
     #[test]
+    fn persona_scope_rename_migrates_sessions_bindings_and_affection() {
+        let (_temp, store) = test_store();
+        let session = store
+            .create_session("old", "QQ group", "user", None)
+            .unwrap();
+        let old_binding = platform_binding_key("20000", None, "old");
+        store
+            .bind_platform_session(&old_binding, &session.session_id)
+            .unwrap();
+        store
+            .set_persona_current_session("old", &session.session_id)
+            .unwrap();
+        let scope = PlatformPluginScopeKey {
+            plugin_id: "real_context".to_string(),
+            ..plugin_scope("20000")
+        };
+        store
+            .plugin_put_json(
+                &scope,
+                "affection_profile:old",
+                &serde_json::json!({"score": 42}),
+            )
+            .unwrap();
+
+        store.rename_persona_scope("old", "new").unwrap();
+
+        assert_eq!(
+            store
+                .session_record(&session.session_id)
+                .unwrap()
+                .unwrap()
+                .persona,
+            "new"
+        );
+        assert!(store
+            .find_platform_session_binding(&old_binding)
+            .unwrap()
+            .is_none());
+        let new_binding = platform_binding_key("20000", None, "new");
+        assert_eq!(
+            store.find_platform_session_binding(&new_binding).unwrap(),
+            Some(session.session_id.clone())
+        );
+        assert_eq!(
+            store.persona_current_session("new").unwrap(),
+            Some(session.session_id)
+        );
+        assert!(store
+            .plugin_get_json::<serde_json::Value>(&scope, "affection_profile:old")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .plugin_get_json::<serde_json::Value>(&scope, "affection_profile:new")
+                .unwrap()
+                .unwrap()["score"],
+            42
+        );
+    }
+
+    #[test]
     fn local_session_listing_excludes_platform_owned_history() {
         let (_temp, store) = test_store();
         let local = store
-            .create_session("miyu", "local conversation", "user", None)
+            .create_session("miyu", "shared name", "user", None)
             .unwrap();
         let platform = store
-            .create_session("miyu", "QQ group 20000", "user", None)
+            .create_session("miyu", "shared name", "user", None)
             .unwrap();
         let key = platform_binding_key("20000", None, "miyu");
         store
@@ -1379,6 +2785,14 @@ mod tests {
         assert!(!local_ids.contains(&platform.session_id));
         assert!(!store.is_platform_session(&local.session_id).unwrap());
         assert!(store.is_platform_session(&platform.session_id).unwrap());
+        assert_eq!(
+            store
+                .find_local_session_by_name("miyu", "SHARED NAME")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            local.session_id
+        );
     }
 
     #[test]
@@ -1503,6 +2917,31 @@ mod tests {
     }
 
     #[test]
+    fn platform_session_creation_is_bound_atomically() {
+        let (_temp, store) = test_store();
+        let key = platform_binding_key("atomic-group", None, "miyu");
+        let (platform, created) = store
+            .create_or_get_platform_session(&key, "platform")
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            store.find_platform_session_binding(&key).unwrap(),
+            Some(platform.session_id.clone())
+        );
+        assert!(!store
+            .list_local_sessions("miyu", false)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.record.session_id == platform.session_id));
+
+        let (same, created) = store
+            .create_or_get_platform_session(&key, "ignored")
+            .unwrap();
+        assert!(!created);
+        assert_eq!(same.session_id, platform.session_id);
+    }
+
+    #[test]
     fn platform_plugin_json_is_shared_across_personas_and_supports_deletion() {
         let (_temp, store) = test_store();
         let scope = plugin_scope("20000");
@@ -1574,6 +3013,110 @@ mod tests {
         let mut values: Vec<usize> = first.plugin_get_json(&scope, "values").unwrap().unwrap();
         values.sort_unstable();
         assert_eq!(values, (0..8).collect::<Vec<_>>());
+    }
+
+    fn platform_meme_ref(
+        conversation_id: &str,
+        message_id: &str,
+        library: &str,
+        meme_id: &str,
+        direction: &str,
+        created_at: &str,
+    ) -> PlatformMemeRefRecord {
+        PlatformMemeRefRecord {
+            platform: "onebot".to_string(),
+            account_id: "10000".to_string(),
+            conversation_kind: "group".to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            library: library.to_string(),
+            meme_id: meme_id.to_string(),
+            direction: direction.to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn platform_meme_refs_are_ordered_isolated_upserted_and_cleaned_by_ref() {
+        let (_temp, store) = test_store();
+        let later = platform_meme_ref(
+            "group-a",
+            "message-1",
+            "secondary",
+            "meme-b",
+            "outbound",
+            "2026-01-02T00:00:00Z",
+        );
+        let earlier = platform_meme_ref(
+            "group-a",
+            "message-1",
+            "default",
+            "meme-a",
+            "inbound",
+            "2026-01-01T00:00:00Z",
+        );
+        let other_conversation = platform_meme_ref(
+            "group-b",
+            "message-1",
+            "default",
+            "meme-a",
+            "inbound",
+            "2026-01-03T00:00:00Z",
+        );
+        store.put_platform_meme_ref(&later).unwrap();
+        store.put_platform_meme_ref(&earlier).unwrap();
+        store.put_platform_meme_ref(&other_conversation).unwrap();
+
+        assert_eq!(
+            store
+                .platform_meme_refs_for_message("onebot", "10000", "group", "group-a", "message-1")
+                .unwrap(),
+            vec![earlier.clone(), later]
+        );
+
+        let mut updated = earlier;
+        updated.direction = "outbound".to_string();
+        updated.created_at = "2026-01-04T00:00:00Z".to_string();
+        store.put_platform_meme_ref(&updated).unwrap();
+        let records = store
+            .platform_meme_refs_for_message("onebot", "10000", "group", "group-a", "message-1")
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1], updated);
+
+        assert_eq!(
+            store.delete_platform_meme_ref("default", "meme-a").unwrap(),
+            2
+        );
+        assert!(store
+            .platform_meme_refs_for_message("onebot", "10000", "group", "group-b", "message-1")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .platform_meme_refs_for_message("onebot", "10000", "group", "group-a", "message-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn platform_meme_ref_rejects_invalid_direction() {
+        let (_temp, store) = test_store();
+        let record = platform_meme_ref(
+            "group-a",
+            "message-1",
+            "default",
+            "meme-a",
+            "sideways",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(store.put_platform_meme_ref(&record).is_err());
+        assert!(store
+            .platform_meme_refs_for_message("onebot", "10000", "group", "group-a", "message-1")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1665,6 +3208,86 @@ mod tests {
             .load_image_asset(&loaded.asset.asset_id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn artifact_assets_update_in_place_and_are_removed_with_history() {
+        let (temp, store) = test_store();
+        store.init_files().unwrap();
+        store
+            .start_turn("turn_artifact", "build it", 999999)
+            .unwrap();
+        let path = temp.path().join("report.md");
+        std::fs::write(&path, "# First\n").unwrap();
+        let managed_dir = temp
+            .path()
+            .join("data/artifacts")
+            .join(store.session_id().as_ref());
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::write(managed_dir.join("managed.md"), "# Managed\n").unwrap();
+
+        let first = store
+            .save_artifact_asset("turn_artifact", Some("tool_1"), &path, "Report")
+            .unwrap();
+        assert_eq!(first.kind, "markdown");
+        assert_eq!(first.file_name, "Report");
+
+        std::fs::write(&path, "# Updated\n").unwrap();
+        let updated = store
+            .save_artifact_asset("turn_artifact", Some("tool_2"), &path, "Updated report")
+            .unwrap();
+        assert_eq!(updated.asset_id, first.asset_id);
+        assert_eq!(store.load_artifact_assets().unwrap(), vec![updated.clone()]);
+        let loaded = store
+            .load_artifact_asset(&updated.asset_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.bytes, b"# Updated\n");
+
+        store.reset_conversation().unwrap();
+        assert!(!managed_dir.exists());
+        assert!(store.load_artifact_assets().unwrap().is_empty());
+        assert!(store
+            .load_artifact_asset(&updated.asset_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn managed_artifact_keeps_its_identity_across_turns() {
+        let (temp, store) = test_store();
+        store.init_files().unwrap();
+        let managed_dir = temp
+            .path()
+            .join("data/artifacts")
+            .join(store.session_id().as_ref());
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        let path = managed_dir.join("report.md");
+
+        store.start_turn("turn_one", "first", 999999).unwrap();
+        std::fs::write(&path, "# First\n").unwrap();
+        let first = store
+            .save_artifact_asset("turn_one", Some("tool_one"), &path, "Report")
+            .unwrap();
+        store.complete_turn("turn_one", "done", None).unwrap();
+
+        store.start_turn("turn_two", "update", 999999).unwrap();
+        std::fs::write(&path, "# Updated\n").unwrap();
+        let updated = store
+            .save_artifact_asset("turn_two", Some("tool_two"), &path, "Report")
+            .unwrap();
+
+        assert_eq!(updated.asset_id, first.asset_id);
+        assert_eq!(updated.turn_id, "turn_two");
+        assert_eq!(store.load_artifact_assets().unwrap(), vec![updated.clone()]);
+        assert_eq!(
+            store
+                .load_artifact_asset(&updated.asset_id)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"# Updated\n"
+        );
     }
 
     #[test]
@@ -1873,6 +3496,62 @@ mod tests {
     }
 
     #[test]
+    fn compatible_prompt_fingerprint_migration_preserves_history() {
+        let (_temp, store) = test_store();
+        store
+            .reset_if_prompt_changed("persona plus owner identity")
+            .unwrap();
+        store
+            .start_turn("turn", "hello", std::process::id())
+            .unwrap();
+        store.complete_turn("turn", "reply", None).unwrap();
+
+        store
+            .reset_if_prompt_changed_with_compatible(
+                "persona only",
+                Some("persona plus owner identity"),
+            )
+            .unwrap();
+        assert_eq!(store.load_visible_turns().unwrap().len(), 1);
+
+        store.reset_if_prompt_changed("different persona").unwrap();
+        assert!(store.load_visible_turns().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prompt_fingerprints_are_isolated_per_session() {
+        let (_temp, store) = test_store();
+        let first = store
+            .create_session("first", "first", "user", None)
+            .unwrap();
+        let second = store
+            .create_session("second", "second", "user", None)
+            .unwrap();
+        let first_store = store.pinned(&first.session_id);
+        let second_store = store.pinned(&second.session_id);
+        first_store.reset_if_prompt_changed("prompt A").unwrap();
+        second_store.reset_if_prompt_changed("prompt B").unwrap();
+        first_store
+            .start_turn("first-turn", "hello", std::process::id())
+            .unwrap();
+        first_store
+            .complete_turn("first-turn", "first reply", None)
+            .unwrap();
+        second_store
+            .start_turn("second-turn", "hello", std::process::id())
+            .unwrap();
+        second_store
+            .complete_turn("second-turn", "second reply", None)
+            .unwrap();
+
+        first_store.reset_if_prompt_changed("prompt A").unwrap();
+        second_store.reset_if_prompt_changed("prompt B").unwrap();
+
+        assert_eq!(first_store.load_visible_turns().unwrap().len(), 1);
+        assert_eq!(second_store.load_visible_turns().unwrap().len(), 1);
+    }
+
+    #[test]
     fn stale_queue_cleanup_preserves_another_live_process_session() {
         let (_temp, store) = test_store();
         let live_owner = std::process::id();
@@ -1880,9 +3559,11 @@ mod tests {
             .conv_db
             .enqueue_prompt(
                 &store.session_id(),
+                None,
                 "other-q",
                 "content",
                 "display",
+                &[],
                 &[],
                 "other-session",
                 live_owner,
@@ -2362,5 +4043,225 @@ mod tests {
             .replace_visible_with_summary(last_seq, &turn_ids, "stale", None, false)
             .is_err());
         assert_eq!(store.load_visible_turns().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn initial_prompt_redo_reuses_the_turn_with_a_new_revision() {
+        let (_temp, store) = test_store();
+        store
+            .start_turn_with_display("t1", "original", "original", 999999, None)
+            .unwrap();
+        store.complete_turn("t1", "old answer", None).unwrap();
+
+        let candidate = store.redo_candidate().unwrap().unwrap();
+        assert_eq!(candidate.input_kind, RedoInputKind::Initial);
+        let redo = store
+            .begin_redo(
+                "t1",
+                "t1",
+                RedoInputKind::Initial,
+                candidate.revision,
+                "edited internal",
+                "edited",
+                std::process::id(),
+            )
+            .unwrap();
+        assert_eq!(redo.revision, 1);
+        assert!(redo.checkpoint.is_none());
+
+        let turn = store.load_turns().unwrap().remove(0);
+        assert_eq!(turn.revision, 1);
+        assert_eq!(turn.status, TurnStatus::Running);
+        assert_eq!(turn.user_content, "edited internal");
+        assert_eq!(turn.display_content, "edited");
+        assert!(store
+            .begin_redo(
+                "t1",
+                "t1",
+                RedoInputKind::Initial,
+                candidate.revision,
+                "stale",
+                "stale",
+                std::process::id(),
+            )
+            .is_err());
+
+        store
+            .complete_turn_revision_with_usage_and_model(
+                "t1",
+                1,
+                "new answer",
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_turns().unwrap()[0].assistant_content,
+            "new answer"
+        );
+    }
+
+    #[test]
+    fn followup_redo_restores_the_last_batch_checkpoint() {
+        let (_temp, store) = test_store();
+        store
+            .start_turn("t1", "initial", std::process::id())
+            .unwrap();
+        store
+            .enqueue_prompt("q1", "followup", "followup", &[])
+            .unwrap();
+        let checkpoint = TurnRedoCheckpointPayload {
+            replay_messages: vec![crate::llm::ChatMessage::plain("assistant", "prefix answer")],
+            prefix_tool_reports: vec!["prefix report".to_string()],
+            tool_rounds: 1,
+            question_rounds: 0,
+            loaded_items: Vec::new(),
+            prefix_question_count: 0,
+            prefix_image_asset_ids: Vec::new(),
+            prefix_artifact_asset_ids: Vec::new(),
+        };
+        store
+            .consume_queued_prompts_with_checkpoint(
+                "t1",
+                &[("q1".to_string(), "followup".to_string())],
+                Some("prefix answer"),
+                None,
+                None,
+                None,
+                checkpoint,
+            )
+            .unwrap();
+        store.complete_turn("t1", "old final", None).unwrap();
+
+        let candidate = store.redo_candidate().unwrap().unwrap();
+        assert_eq!(candidate.input_kind, RedoInputKind::Followup);
+        assert_eq!(candidate.input_id, "q1");
+        let redo = store
+            .begin_redo(
+                "t1",
+                "q1",
+                RedoInputKind::Followup,
+                candidate.revision,
+                "edited followup",
+                "edited followup",
+                std::process::id(),
+            )
+            .unwrap();
+        let redo_revision = redo.revision;
+        let checkpoint = redo.checkpoint.unwrap();
+        assert_eq!(checkpoint.replay_messages.len(), 1);
+        assert_eq!(checkpoint.prefix_tool_reports, vec!["prefix report"]);
+        let turn = store.load_turns().unwrap().remove(0);
+        assert_eq!(turn.followups[0].content, "edited followup");
+        assert_eq!(turn.tool_reports, vec!["prefix report"]);
+        store
+            .enqueue_prompt("q2", "new during redo", "new during redo", &[])
+            .unwrap();
+        store
+            .consume_queued_prompts_with_checkpoint(
+                "t1",
+                &[("q2".to_string(), "new during redo".to_string())],
+                None,
+                None,
+                None,
+                None,
+                TurnRedoCheckpointPayload {
+                    replay_messages: Vec::new(),
+                    prefix_tool_reports: Vec::new(),
+                    tool_rounds: 0,
+                    question_rounds: 0,
+                    loaded_items: Vec::new(),
+                    prefix_question_count: 0,
+                    prefix_image_asset_ids: Vec::new(),
+                    prefix_artifact_asset_ids: Vec::new(),
+                },
+            )
+            .unwrap();
+        store.interrupt_turn_revision("t1", redo_revision).unwrap();
+        let restored = store.load_turns().unwrap().remove(0);
+        assert_eq!(restored.revision, 0);
+        assert_eq!(restored.status, TurnStatus::Completed);
+        assert_eq!(restored.assistant_content, "old final");
+        assert_eq!(restored.followups[0].content, "followup");
+        assert_eq!(restored.followups.len(), 1);
+        assert_eq!(store.redo_candidate().unwrap().unwrap().input_id, "q1");
+    }
+
+    #[test]
+    fn cancelled_initial_redo_restores_the_previous_turn() {
+        let (_temp, store) = test_store();
+        store
+            .start_turn_with_display("t1", "internal", "visible", 999999, None)
+            .unwrap();
+        store
+            .complete_turn("t1", "old answer", Some("old reasoning"))
+            .unwrap();
+        let candidate = store.redo_candidate().unwrap().unwrap();
+        let redo = store
+            .begin_redo(
+                "t1",
+                "t1",
+                RedoInputKind::Initial,
+                candidate.revision,
+                "edited internal",
+                "edited visible",
+                std::process::id(),
+            )
+            .unwrap();
+
+        store.interrupt_turn_revision("t1", redo.revision).unwrap();
+        let restored = store.load_turns().unwrap().remove(0);
+        assert_eq!(restored.revision, 0);
+        assert_eq!(restored.status, TurnStatus::Completed);
+        assert_eq!(restored.user_content, "internal");
+        assert_eq!(restored.display_content, "visible");
+        assert_eq!(restored.assistant_content, "old answer");
+        assert_eq!(
+            restored.assistant_reasoning.as_deref(),
+            Some("old reasoning")
+        );
+    }
+
+    #[test]
+    fn cancelled_redo_restores_artifact_versions() {
+        let (temp, store) = test_store();
+        let artifact_dir = temp.path().join("data/artifacts/default");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let path = artifact_dir.join("report.md");
+        std::fs::write(&path, "old artifact").unwrap();
+        store
+            .start_turn("t1", "create report", std::process::id())
+            .unwrap();
+        let old = store
+            .save_artifact_asset("t1", Some("tool-old"), &path, "Report")
+            .unwrap();
+        store.complete_turn("t1", "old answer", None).unwrap();
+
+        let candidate = store.redo_candidate().unwrap().unwrap();
+        let redo = store
+            .begin_redo(
+                "t1",
+                "t1",
+                RedoInputKind::Initial,
+                candidate.revision,
+                "redo report",
+                "redo report",
+                std::process::id(),
+            )
+            .unwrap();
+        assert!(store.load_artifact_assets().unwrap().is_empty());
+        std::fs::write(&path, "new artifact").unwrap();
+        store
+            .save_artifact_asset("t1", Some("tool-new"), &path, "Report")
+            .unwrap();
+        store.interrupt_turn_revision("t1", redo.revision).unwrap();
+
+        let restored = store.load_artifact_asset(&old.asset_id).unwrap().unwrap();
+        assert_eq!(restored.asset.tool_id.as_deref(), Some("tool-old"));
+        assert_eq!(restored.bytes, b"old artifact");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old artifact");
     }
 }

@@ -3,13 +3,20 @@ use cosmic_text::{
     Align as TextAlign, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping,
     Style as FontStyle, SwashCache, Weight, Wrap,
 };
+use fontdb::Database as FontDatabase;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder, Pixel as _, Rgba, RgbaImage};
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_INPUT_CHARS: usize = 20_000;
@@ -20,12 +27,27 @@ const MAX_TOTAL_PNG_BYTES: usize = 48 * 1024 * 1024;
 const MIN_CONFIGURED_HEIGHT: u32 = 1000;
 const MIN_RENDERED_HEIGHT: u32 = 360;
 const MAX_PAGE_HEIGHT: u32 = 5000;
-const MAX_CACHED_GLYPHS: usize = 8192;
+const MAX_CACHED_GLYPHS: usize = 2048;
+const MAX_CUSTOM_FONT_FILES: usize = 8;
 const COLUMN_WIDTH: u32 = 960;
 const COLUMN_GAP: u32 = 32;
 const TABLE_CELL_PADDING: u32 = 14;
+const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const RENDER_TIMEOUT: Duration = Duration::from_secs(60);
+const WORKER_ADDRESS_SPACE_LIMIT: u64 = 512 * 1024 * 1024;
+const MAX_REQUEST_FRAME_BYTES: usize = 512 * 1024;
+const MAX_ERROR_FRAME_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_IMAGES: usize = 1;
+const WORKER_ENV: &str = "MIYU_INTERNAL_RENDERER_WORKER";
+const WORKER_ARG: &str = "__renderer-worker";
+const DEFAULT_BODY_FONT: &str = "Noto Sans CJK SC";
+const DEFAULT_CODE_FONT: &str = "Noto Sans Mono CJK SC";
+const DEFAULT_EMOJI_FONT: &str = "Noto Color Emoji";
+const CJK_FONT_FILE: &str = "NotoSansCJK-Regular.ttc";
+const EMOJI_FONT_FILE: &str = "NotoColorEmoji.ttf";
+const RENDERER_FONTS_ENV: &str = "MIYU_RENDERER_FONTS_DIR";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RenderConfig {
     pub(crate) theme: String,
     pub(crate) max_height: u32,
@@ -64,41 +86,547 @@ pub(crate) struct RenderedImage {
 
 #[derive(Clone)]
 pub(crate) struct MarkdownImageRenderer {
-    inner: Arc<Mutex<RendererState>>,
+    worker: Arc<Mutex<WorkerSlot>>,
 }
 
 struct RendererState {
     font_system: FontSystem,
     swash_cache: SwashCache,
     resolved_fonts: HashMap<String, Option<String>>,
+    emoji_font_path: PathBuf,
+    emoji_loaded: bool,
 }
 
 impl MarkdownImageRenderer {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(Mutex::new(RendererState {
-                font_system: FontSystem::new(),
-                swash_cache: SwashCache::new(),
-                resolved_fonts: HashMap::new(),
-            })),
+            worker: Arc::new(Mutex::new(WorkerSlot::default())),
         })
     }
 
-    pub(crate) fn render(
+    pub(crate) async fn render(
         &self,
         markdown: &str,
         config: &RenderConfig,
     ) -> Result<Vec<RenderedImage>> {
         validate_markdown(markdown)?;
-        let config = NormalizedConfig::new(config);
-        let blocks = collect_blocks(markdown);
-        let palette = Palette::for_theme(&config.theme);
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow!("Markdown image renderer lock is poisoned"))?;
-        state.render(blocks, &config, palette)
+        #[cfg(test)]
+        {
+            render_in_process_for_test(markdown, config)
+        }
+        #[cfg(not(test))]
+        {
+            self.render_with_worker(markdown, config).await
+        }
     }
+
+    #[cfg(not(test))]
+    async fn render_with_worker(
+        &self,
+        markdown: &str,
+        config: &RenderConfig,
+    ) -> Result<Vec<RenderedImage>> {
+        let request = RenderRequest {
+            markdown: markdown.to_string(),
+            config: config.clone(),
+        };
+        let mut slot = self.worker.lock().await;
+        slot.cancel_idle_timer();
+
+        for attempt in 0..2 {
+            let mut worker = match slot.process.take() {
+                Some(worker) => worker,
+                None => WorkerProcess::spawn().await?,
+            };
+            let result =
+                tokio::time::timeout(RENDER_TIMEOUT, exchange_with_worker(&mut worker, &request))
+                    .await;
+            match result {
+                Ok(Ok(images)) => {
+                    self.recycle_worker(&mut slot, worker);
+                    return Ok(images);
+                }
+                Ok(Err(WorkerExchangeError::Render(message))) => {
+                    self.recycle_worker(&mut slot, worker);
+                    return Err(anyhow!(
+                        "long-image renderer rejected the request: {message}"
+                    ));
+                }
+                Ok(Err(WorkerExchangeError::Transport(error))) => {
+                    stop_worker(worker).await;
+                    if attempt == 1 {
+                        return Err(error)
+                            .context("long-image renderer worker communication failed");
+                    }
+                }
+                Err(_) => {
+                    stop_worker(worker).await;
+                    bail!(
+                        "long-image renderer exceeded its {}-second timeout",
+                        RENDER_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+        unreachable!("renderer worker retry loop always returns")
+    }
+
+    #[cfg(not(test))]
+    fn recycle_worker(&self, slot: &mut WorkerSlot, worker: WorkerProcess) {
+        slot.process = Some(worker);
+        slot.generation = slot.generation.wrapping_add(1);
+        let generation = slot.generation;
+        let weak_slot = Arc::downgrade(&self.worker);
+        slot.idle_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(WORKER_IDLE_TIMEOUT).await;
+            let Some(shared_slot) = weak_slot.upgrade() else {
+                return;
+            };
+            let mut slot = shared_slot.lock().await;
+            if slot.generation != generation {
+                return;
+            }
+            if let Some(worker) = slot.process.take() {
+                stop_worker(worker).await;
+            }
+            slot.idle_task.take();
+        }));
+    }
+}
+
+#[cfg(test)]
+fn render_in_process_for_test(
+    markdown: &str,
+    raw_config: &RenderConfig,
+) -> Result<Vec<RenderedImage>> {
+    static RENDERER: std::sync::OnceLock<std::sync::Mutex<RendererState>> =
+        std::sync::OnceLock::new();
+    let renderer = RENDERER.get_or_init(|| std::sync::Mutex::new(RendererState::new().unwrap()));
+    let mut renderer = renderer.lock().unwrap();
+    validate_markdown(markdown)?;
+    let config = NormalizedConfig::new(raw_config);
+    let blocks = collect_blocks(markdown);
+    let palette = Palette::for_theme(&config.theme);
+    renderer.render(blocks, &config, palette, markdown_contains_emoji(markdown))
+}
+
+struct WorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+#[derive(Default)]
+struct WorkerSlot {
+    process: Option<WorkerProcess>,
+    idle_task: Option<tokio::task::JoinHandle<()>>,
+    generation: u64,
+}
+
+impl WorkerSlot {
+    fn cancel_idle_timer(&mut self) {
+        if let Some(task) = self.idle_task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.cancel_idle_timer();
+    }
+}
+
+impl WorkerProcess {
+    async fn spawn() -> Result<Self> {
+        let executable = std::env::current_exe().context("locating the Miyu executable")?;
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .arg(WORKER_ARG)
+            .env(WORKER_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .context("starting the long-image renderer worker")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("renderer worker stdin was not piped")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("renderer worker stdout was not piped")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RenderRequest {
+    markdown: String,
+    config: RenderConfig,
+}
+
+#[derive(Debug)]
+enum WorkerExchangeError {
+    Transport(anyhow::Error),
+    Render(String),
+}
+
+async fn exchange_with_worker(
+    worker: &mut WorkerProcess,
+    request: &RenderRequest,
+) -> std::result::Result<Vec<RenderedImage>, WorkerExchangeError> {
+    let payload = serde_json::to_vec(request)
+        .map_err(|error| WorkerExchangeError::Transport(error.into()))?;
+    write_frame(&mut worker.stdin, &payload)
+        .await
+        .map_err(WorkerExchangeError::Transport)?;
+    tokio::io::AsyncWriteExt::flush(&mut worker.stdin)
+        .await
+        .map_err(|error| WorkerExchangeError::Transport(error.into()))?;
+    read_worker_response(&mut worker.stdout).await
+}
+
+async fn stop_worker(mut worker: WorkerProcess) {
+    let _ = worker.child.kill().await;
+    let _ = worker.child.wait().await;
+}
+
+pub(crate) fn renderer_worker_requested() -> bool {
+    std::env::var_os(WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(WORKER_ARG))
+}
+
+pub(crate) async fn run_renderer_worker() -> Result<()> {
+    apply_worker_address_space_limit()?;
+    let mut renderer = RendererState::new()?;
+    let mut input = tokio::io::stdin();
+    let mut output = tokio::io::stdout();
+
+    loop {
+        let payload = match tokio::time::timeout(
+            WORKER_IDLE_TIMEOUT,
+            read_frame(&mut input, MAX_REQUEST_FRAME_BYTES),
+        )
+        .await
+        {
+            Err(_) => return Ok(()),
+            Ok(Ok(Some(payload))) => payload,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+        };
+        let result = serde_json::from_slice::<RenderRequest>(&payload)
+            .context("decoding the renderer request")
+            .and_then(|request| {
+                validate_markdown(&request.markdown)?;
+                let config = NormalizedConfig::new(&request.config);
+                let blocks = collect_blocks(&request.markdown);
+                let palette = Palette::for_theme(&config.theme);
+                renderer.render(
+                    blocks,
+                    &config,
+                    palette,
+                    markdown_contains_emoji(&request.markdown),
+                )
+            });
+        write_worker_response(&mut output, result).await?;
+        tokio::io::AsyncWriteExt::flush(&mut output).await?;
+    }
+}
+
+#[cfg(unix)]
+fn apply_worker_address_space_limit() -> Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: WORKER_ADDRESS_SPACE_LIMIT as libc::rlim_t,
+        rlim_max: WORKER_ADDRESS_SPACE_LIMIT as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
+        return Err(io::Error::last_os_error()).context("limiting renderer worker address space");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_worker_address_space_limit() -> Result<()> {
+    Ok(())
+}
+
+impl RendererState {
+    fn new() -> Result<Self> {
+        Self::from_font_dir(&renderer_fonts_dir()?)
+    }
+
+    fn from_font_dir(font_dir: &std::path::Path) -> Result<Self> {
+        let mut database = FontDatabase::new();
+        let cjk_font = font_dir.join(CJK_FONT_FILE);
+        database
+            .load_font_file(&cjk_font)
+            .with_context(|| format!("loading renderer font {}", cjk_font.display()))?;
+        if database.faces().next().is_none() {
+            bail!("renderer font {} contains no faces", cjk_font.display());
+        }
+        database.set_sans_serif_family(DEFAULT_BODY_FONT);
+        database.set_monospace_family(DEFAULT_CODE_FONT);
+        Ok(Self {
+            font_system: FontSystem::new_with_locale_and_db("zh-CN".to_string(), database),
+            swash_cache: SwashCache::new(),
+            resolved_fonts: HashMap::new(),
+            emoji_font_path: font_dir.join(EMOJI_FONT_FILE),
+            emoji_loaded: false,
+        })
+    }
+}
+
+fn renderer_fonts_dir() -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os(RENDERER_FONTS_ENV) {
+        candidates.push(PathBuf::from(path));
+    }
+    #[cfg(debug_assertions)]
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts"));
+    candidates.push(PathBuf::from("/usr/share/miyu/fonts"));
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(prefix) = executable.parent().and_then(std::path::Path::parent) {
+            candidates.push(prefix.join("share/miyu/fonts"));
+        }
+        if let Some(workspace) = executable
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+        {
+            candidates.push(workspace.join("assets/fonts"));
+        }
+    }
+    for candidate in &candidates {
+        if candidate.join(CJK_FONT_FILE).is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "renderer font is missing; install {CJK_FONT_FILE} in /usr/share/miyu/fonts or set {RENDERER_FONTS_ENV} (searched: {searched})"
+    )
+}
+
+async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if payload.len() > MAX_REQUEST_FRAME_BYTES {
+        bail!("renderer request frame exceeds the {MAX_REQUEST_FRAME_BYTES}-byte limit");
+    }
+    let length = u32::try_from(payload.len()).context("renderer request frame is too large")?;
+    tokio::io::AsyncWriteExt::write_all(writer, &length.to_be_bytes()).await?;
+    tokio::io::AsyncWriteExt::write_all(writer, payload).await?;
+    Ok(())
+}
+
+async fn read_frame<R>(reader: &mut R, limit: usize) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length = [0_u8; 4];
+    match tokio::io::AsyncReadExt::read_exact(reader, &mut length).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_be_bytes(length) as usize;
+    if length > limit {
+        bail!("renderer frame exceeds the {limit}-byte limit");
+    }
+    let mut payload = vec![0_u8; length];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut payload).await?;
+    Ok(Some(payload))
+}
+
+async fn write_worker_response<W>(writer: &mut W, result: Result<Vec<RenderedImage>>) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match result {
+        Ok(images) => {
+            if images.len() > MAX_RESPONSE_IMAGES {
+                bail!("renderer returned more than {MAX_RESPONSE_IMAGES} image");
+            }
+            tokio::io::AsyncWriteExt::write_all(writer, &[0]).await?;
+            write_u32(writer, images.len(), "renderer image count").await?;
+            for image in images {
+                validate_page_dimensions(image.width, image.height)?;
+                if image.png.len() > MAX_PAGE_PNG_BYTES {
+                    bail!("renderer returned a PNG larger than its configured limit");
+                }
+                write_u32_value(writer, image.width).await?;
+                write_u32_value(writer, image.height).await?;
+                write_sized_bytes(writer, image.mime.as_bytes(), 64, "renderer MIME type").await?;
+                write_sized_bytes(
+                    writer,
+                    &image.png,
+                    MAX_PAGE_PNG_BYTES,
+                    "renderer PNG payload",
+                )
+                .await?;
+            }
+        }
+        Err(error) => {
+            tokio::io::AsyncWriteExt::write_all(writer, &[1]).await?;
+            let mut message = format!("{error:#}");
+            if message.len() > MAX_ERROR_FRAME_BYTES {
+                let mut end = MAX_ERROR_FRAME_BYTES;
+                while !message.is_char_boundary(end) {
+                    end = end.saturating_sub(1);
+                }
+                message.truncate(end);
+            }
+            write_sized_bytes(
+                writer,
+                message.as_bytes(),
+                MAX_ERROR_FRAME_BYTES,
+                "renderer error",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_worker_response<R>(
+    reader: &mut R,
+) -> std::result::Result<Vec<RenderedImage>, WorkerExchangeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let status = read_byte(reader)
+        .await
+        .map_err(WorkerExchangeError::Transport)?;
+    match status {
+        0 => {
+            let count = read_u32(reader)
+                .await
+                .map_err(WorkerExchangeError::Transport)? as usize;
+            if count > MAX_RESPONSE_IMAGES {
+                return Err(WorkerExchangeError::Transport(anyhow!(
+                    "renderer response contains too many images"
+                )));
+            }
+            let mut images = Vec::with_capacity(count);
+            let mut total_png_bytes = 0_usize;
+            for _ in 0..count {
+                let width = read_u32(reader)
+                    .await
+                    .map_err(WorkerExchangeError::Transport)?;
+                let height = read_u32(reader)
+                    .await
+                    .map_err(WorkerExchangeError::Transport)?;
+                validate_page_dimensions(width, height).map_err(WorkerExchangeError::Transport)?;
+                let mime = read_sized_bytes(reader, 64)
+                    .await
+                    .map_err(WorkerExchangeError::Transport)?;
+                let mime = String::from_utf8(mime)
+                    .context("renderer returned a non-UTF-8 MIME type")
+                    .map_err(WorkerExchangeError::Transport)?;
+                let png = read_sized_bytes(reader, MAX_PAGE_PNG_BYTES)
+                    .await
+                    .map_err(WorkerExchangeError::Transport)?;
+                total_png_bytes = total_png_bytes
+                    .checked_add(png.len())
+                    .context("renderer PNG byte count overflowed")
+                    .map_err(WorkerExchangeError::Transport)?;
+                if total_png_bytes > MAX_TOTAL_PNG_BYTES {
+                    return Err(WorkerExchangeError::Transport(anyhow!(
+                        "renderer response exceeds the total PNG byte limit"
+                    )));
+                }
+                images.push(RenderedImage {
+                    mime,
+                    png,
+                    width,
+                    height,
+                });
+            }
+            Ok(images)
+        }
+        1 => {
+            let message = read_sized_bytes(reader, MAX_ERROR_FRAME_BYTES)
+                .await
+                .map_err(WorkerExchangeError::Transport)?;
+            let message = String::from_utf8_lossy(&message).into_owned();
+            Err(WorkerExchangeError::Render(message))
+        }
+        value => Err(WorkerExchangeError::Transport(anyhow!(
+            "renderer response has unknown status byte {value}"
+        ))),
+    }
+}
+
+async fn write_u32<W>(writer: &mut W, value: usize, label: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let value = u32::try_from(value).with_context(|| format!("{label} does not fit in u32"))?;
+    write_u32_value(writer, value).await
+}
+
+async fn write_u32_value<W>(writer: &mut W, value: u32) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::io::AsyncWriteExt::write_all(writer, &value.to_be_bytes()).await?;
+    Ok(())
+}
+
+async fn read_u32<R>(reader: &mut R) -> Result<u32>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = [0_u8; 4];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut bytes).await?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+async fn read_byte<R>(reader: &mut R) -> Result<u8>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut byte = [0_u8; 1];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut byte).await?;
+    Ok(byte[0])
+}
+
+async fn write_sized_bytes<W>(writer: &mut W, bytes: &[u8], limit: usize, label: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if bytes.len() > limit {
+        bail!("{label} exceeds the {limit}-byte limit");
+    }
+    write_u32(writer, bytes.len(), label).await?;
+    tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
+    Ok(())
+}
+
+async fn read_sized_bytes<R>(reader: &mut R, limit: usize) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = read_u32(reader).await? as usize;
+    if length > limit {
+        bail!("renderer response field exceeds the {limit}-byte limit");
+    }
+    let mut bytes = vec![0_u8; length];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut bytes).await?;
+    Ok(bytes)
 }
 
 impl RendererState {
@@ -107,11 +635,12 @@ impl RendererState {
         blocks: Vec<Block>,
         config: &NormalizedConfig,
         palette: Palette,
+        needs_emoji: bool,
     ) -> Result<Vec<RenderedImage>> {
         if self.swash_cache.image_cache.len() > MAX_CACHED_GLYPHS {
             self.swash_cache.image_cache.clear();
         }
-        let fonts = self.resolve_config_fonts(config);
+        let fonts = self.resolve_config_fonts(config, needs_emoji)?;
         let layouts = layout_blocks(&mut self.font_system, blocks, config, palette, &fonts)?;
         let columns = plan_columns(&layouts, config)?;
         let rendered = render_pages(
@@ -128,19 +657,76 @@ impl RendererState {
         rendered
     }
 
-    fn resolve_config_fonts(&mut self, config: &NormalizedConfig) -> ResolvedFonts {
-        let body = self.resolve_font(&config.font);
+    fn resolve_config_fonts(
+        &mut self,
+        config: &NormalizedConfig,
+        needs_emoji: bool,
+    ) -> Result<ResolvedFonts> {
+        let body = self
+            .resolve_font(&config.font)
+            .or_else(|| Some(DEFAULT_BODY_FONT.to_string()));
         let title = if config.title_font.trim().is_empty() {
             body.clone()
         } else {
             self.resolve_font(&config.title_font)
         };
-        ResolvedFonts {
+        let emoji = if needs_emoji {
+            let configured = config.emoji_font.trim();
+            if configured.is_empty() || configured.eq_ignore_ascii_case(DEFAULT_EMOJI_FONT) {
+                self.ensure_bundled_emoji_font()?;
+                Some(DEFAULT_EMOJI_FONT.to_string())
+            } else if let Some(font) = self.resolve_font(configured) {
+                Some(font)
+            } else {
+                self.ensure_bundled_emoji_font()?;
+                Some(DEFAULT_EMOJI_FONT.to_string())
+            }
+        } else {
+            None
+        };
+        Ok(ResolvedFonts {
             body,
             title,
-            code: self.resolve_font(&config.code_font),
-            emoji: self.resolve_font(&config.emoji_font),
+            code: self
+                .resolve_font(&config.code_font)
+                .or_else(|| Some(DEFAULT_CODE_FONT.to_string())),
+            emoji,
+        })
+    }
+
+    fn ensure_bundled_emoji_font(&mut self) -> Result<()> {
+        if self.emoji_loaded {
+            return Ok(());
         }
+
+        let previous_faces = self.font_system.db().faces().count();
+        self.font_system
+            .db_mut()
+            .load_font_file(&self.emoji_font_path)
+            .with_context(|| {
+                format!(
+                    "loading renderer Emoji font {}",
+                    self.emoji_font_path.display()
+                )
+            })?;
+        let has_emoji_family = self
+            .font_system
+            .db()
+            .faces()
+            .skip(previous_faces)
+            .any(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(DEFAULT_EMOJI_FONT))
+            });
+        if !has_emoji_family {
+            bail!(
+                "renderer Emoji font {} does not contain the {DEFAULT_EMOJI_FONT} family",
+                self.emoji_font_path.display()
+            );
+        }
+        self.emoji_loaded = true;
+        Ok(())
     }
 
     fn resolve_font(&mut self, configured: &str) -> Option<String> {
@@ -150,12 +736,40 @@ impl RendererState {
         }
         let path = PathBuf::from(configured);
         if !path.is_file() {
+            let bundled_family = self.font_system.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(configured))
+            });
+            if !bundled_family {
+                tracing::warn!(
+                    font = configured,
+                    "{}",
+                    crate::i18n::text(
+                        "long-image renderer font is not a bundled family or readable file; using the default font",
+                        "长图渲染器字体不是内置字体族或可读文件；使用默认字体"
+                    )
+                );
+                return None;
+            }
             return Some(configured.to_string());
         }
         let path = path.canonicalize().unwrap_or(path);
         let cache_key = path.to_string_lossy().into_owned();
         if let Some(cached) = self.resolved_fonts.get(&cache_key) {
             return cached.clone();
+        }
+        if self.resolved_fonts.len() >= MAX_CUSTOM_FONT_FILES {
+            tracing::warn!(
+                font = %path.display(),
+                limit = MAX_CUSTOM_FONT_FILES,
+                "{}",
+                crate::i18n::text(
+                    "long-image renderer custom font limit reached; using the default font",
+                    "长图渲染器已达到自定义字体上限；使用默认字体"
+                )
+            );
+            return None;
         }
 
         let previous_faces = self.font_system.db().faces().count();
@@ -1152,6 +1766,10 @@ fn expand_spans(spans: &[RichSpan], split_emoji: bool) -> Vec<ExpandedSpan> {
     expanded
 }
 
+fn markdown_contains_emoji(markdown: &str) -> bool {
+    markdown.graphemes(true).any(grapheme_is_emoji)
+}
+
 fn grapheme_is_emoji(grapheme: &str) -> bool {
     grapheme.chars().any(|ch| {
         matches!(
@@ -1942,22 +2560,127 @@ fn color(rgba: [u8; 4]) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
 
-    fn renderer() -> MarkdownImageRenderer {
-        static RENDERER: OnceLock<MarkdownImageRenderer> = OnceLock::new();
-        RENDERER
-            .get_or_init(|| MarkdownImageRenderer::new().unwrap())
-            .clone()
+    fn render(markdown: &str, raw_config: &RenderConfig) -> Result<Vec<RenderedImage>> {
+        render_in_process_for_test(markdown, raw_config)
     }
 
     #[test]
-    fn renderer_and_config_satisfy_spawn_blocking_bounds() {
+    fn renderer_client_and_payloads_satisfy_async_bounds() {
         fn assert_send_static<T: Send + 'static>() {}
         fn assert_renderer<T: Clone + Send + Sync + 'static>() {}
         assert_send_static::<RenderConfig>();
         assert_send_static::<RenderedImage>();
         assert_renderer::<MarkdownImageRenderer>();
+    }
+
+    #[test]
+    fn renderer_client_is_lazy_and_limits_are_bounded() {
+        let renderer = MarkdownImageRenderer::new().unwrap();
+        assert!(renderer.worker.try_lock().unwrap().process.is_none());
+        assert_eq!(MAX_CACHED_GLYPHS, 2048);
+        assert_eq!(WORKER_IDLE_TIMEOUT, Duration::from_secs(60 * 60));
+        assert_eq!(RENDER_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(WORKER_ADDRESS_SPACE_LIMIT, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn renderer_loads_only_the_fonts_needed_by_the_request() {
+        let font_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+        let mut renderer = RendererState::from_font_dir(&font_dir).unwrap();
+        let config = NormalizedConfig::new(&RenderConfig::default());
+
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
+        assert!(fonts.emoji.is_none());
+        assert!(!renderer.emoji_loaded);
+        let cjk_face_count = {
+            let faces = renderer.font_system.db().faces().collect::<Vec<_>>();
+            assert!(!faces.is_empty());
+            assert!(faces.iter().all(|face| matches!(
+                &face.source,
+                fontdb::Source::File(path) if path == &font_dir.join(CJK_FONT_FILE)
+            )));
+            let families = faces
+                .iter()
+                .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+                .collect::<Vec<_>>();
+            assert!(families.contains(&DEFAULT_BODY_FONT));
+            assert!(families.contains(&DEFAULT_CODE_FONT));
+            assert!(!families.contains(&DEFAULT_EMOJI_FONT));
+            faces.len()
+        };
+
+        let fonts = renderer.resolve_config_fonts(&config, true).unwrap();
+        assert_eq!(fonts.emoji.as_deref(), Some(DEFAULT_EMOJI_FONT));
+        assert!(renderer.emoji_loaded);
+        let with_emoji = renderer.font_system.db().faces().count();
+        assert!(with_emoji > cjk_face_count);
+        renderer.ensure_bundled_emoji_font().unwrap();
+        assert_eq!(renderer.font_system.db().faces().count(), with_emoji);
+    }
+
+    #[test]
+    fn missing_emoji_font_does_not_block_text_only_requests() {
+        let font_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+        let mut renderer = RendererState::from_font_dir(&font_dir).unwrap();
+        renderer.emoji_font_path = font_dir.join("missing-emoji.ttf");
+        let config = NormalizedConfig::new(&RenderConfig::default());
+
+        assert!(renderer.resolve_config_fonts(&config, false).is_ok());
+        let error = renderer
+            .resolve_config_fonts(&config, true)
+            .err()
+            .expect("missing Emoji font should fail only Emoji requests");
+        assert!(error.to_string().contains("missing-emoji.ttf"));
+    }
+
+    #[test]
+    fn emoji_detection_only_marks_emoji_graphemes() {
+        assert!(!markdown_contains_emoji("纯中文 and `code`"));
+        assert!(markdown_contains_emoji("完成 ✅"));
+        assert!(markdown_contains_emoji("family 👨‍👩‍👧‍👦"));
+    }
+
+    #[tokio::test]
+    async fn worker_binary_response_round_trips_without_base64() {
+        let expected_png = b"\x89PNG\r\n\x1a\nworker".to_vec();
+        let (mut worker_side, mut client_side) = tokio::io::duplex(1024);
+        let write = write_worker_response(
+            &mut worker_side,
+            Ok(vec![RenderedImage {
+                mime: "image/png".to_string(),
+                png: expected_png.clone(),
+                width: 960,
+                height: MIN_RENDERED_HEIGHT,
+            }]),
+        );
+        let read = read_worker_response(&mut client_side);
+        let (write_result, read_result) = tokio::join!(write, read);
+        write_result.unwrap();
+        let images = read_result.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].png, expected_png);
+        assert_eq!(images[0].width, 960);
+        assert_eq!(images[0].height, MIN_RENDERED_HEIGHT);
+    }
+
+    #[tokio::test]
+    async fn request_frames_enforce_the_input_budget() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let payload = b"request";
+        let (write_result, read_result) = tokio::join!(
+            write_frame(&mut writer, payload),
+            read_frame(&mut reader, MAX_REQUEST_FRAME_BYTES)
+        );
+        write_result.unwrap();
+        assert_eq!(read_result.unwrap().unwrap(), payload);
+        assert!(write_frame(
+            &mut tokio::io::sink(),
+            &vec![0; MAX_REQUEST_FRAME_BYTES + 1]
+        )
+        .await
+        .is_err());
     }
 
     #[test]
@@ -1987,9 +2710,7 @@ fn main() {
 ---
 
 结束。"#;
-        let pages = renderer()
-            .render(markdown, &RenderConfig::default())
-            .unwrap();
+        let pages = render(markdown, &RenderConfig::default()).unwrap();
         assert_eq!(pages.len(), 1);
         for page in pages {
             assert_eq!(page.mime, "image/png");
@@ -2047,7 +2768,7 @@ fn main() {
             code_font: "/definitely/missing/code.ttf".to_string(),
             emoji_font: "/definitely/missing/emoji.ttf".to_string(),
         };
-        let pages = renderer().render("fallback 中文 😀", &config).unwrap();
+        let pages = render("fallback 中文 😀", &config).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(
             NormalizedConfig::new(&config).max_height,
@@ -2059,7 +2780,7 @@ fn main() {
 
     #[test]
     fn empty_markdown_produces_a_valid_blank_page() {
-        let pages = renderer().render("", &RenderConfig::default()).unwrap();
+        let pages = render("", &RenderConfig::default()).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].mime, "image/png");
         assert_eq!(pages[0].height, MIN_RENDERED_HEIGHT);
@@ -2138,15 +2859,10 @@ fn main() {
             max_height: MIN_CONFIGURED_HEIGHT,
             ..RenderConfig::default()
         });
-        let mut font_system = FontSystem::new();
-        let fonts = ResolvedFonts {
-            body: None,
-            title: None,
-            code: None,
-            emoji: None,
-        };
+        let mut renderer = RendererState::new().unwrap();
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
         let layouts = layout_blocks(
-            &mut font_system,
+            &mut renderer.font_system,
             collect_blocks(&markdown),
             &config,
             Palette::for_theme("paper"),
@@ -2175,15 +2891,10 @@ fn main() {
             max_height: MIN_CONFIGURED_HEIGHT,
             ..RenderConfig::default()
         });
-        let mut font_system = FontSystem::new();
-        let fonts = ResolvedFonts {
-            body: None,
-            title: None,
-            code: None,
-            emoji: None,
-        };
+        let mut renderer = RendererState::new().unwrap();
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
         let layouts = layout_blocks(
-            &mut font_system,
+            &mut renderer.font_system,
             collect_blocks(&markdown),
             &config,
             Palette::for_theme("paper"),
@@ -2213,15 +2924,10 @@ fn main() {
         let raw_config = RenderConfig::default();
         let config = NormalizedConfig::new(&raw_config);
         let palette = Palette::for_theme("paper");
-        let mut font_system = FontSystem::new();
-        let fonts = ResolvedFonts {
-            body: None,
-            title: None,
-            code: None,
-            emoji: None,
-        };
+        let mut renderer = RendererState::new().unwrap();
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
         let layouts = layout_blocks(
-            &mut font_system,
+            &mut renderer.font_system,
             collect_blocks(markdown),
             &config,
             palette,
@@ -2232,7 +2938,7 @@ fn main() {
         let header = &table.rows[0];
         let first = &table.rows[1];
         let second = &table.rows[2];
-        let page = renderer().render(markdown, &raw_config).unwrap().remove(0);
+        let page = render(markdown, &raw_config).unwrap().remove(0);
         let image = image::load_from_memory(&page.png).unwrap().to_rgba8();
         let x = config.padding + COLUMN_WIDTH - 5;
         assert_eq!(
@@ -2265,7 +2971,7 @@ fn main() {
             max_height: MIN_CONFIGURED_HEIGHT,
             ..RenderConfig::default()
         };
-        let pages = renderer().render(&markdown, &config).unwrap();
+        let pages = render(&markdown, &config).unwrap();
         assert_eq!(pages.len(), 1);
         let page = &pages[0];
         let old_three_column_width = config.padding * 2 + COLUMN_WIDTH * 3 + COLUMN_GAP * 2;
@@ -2288,7 +2994,7 @@ fn main() {
             padding: 160,
             ..RenderConfig::default()
         };
-        let error = renderer().render(&markdown, &config).unwrap_err();
+        let error = render(&markdown, &config).unwrap_err();
         assert!(error.to_string().contains("pixel limit"));
     }
 }

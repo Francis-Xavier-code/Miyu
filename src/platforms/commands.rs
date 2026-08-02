@@ -2,6 +2,7 @@ use crate::config::{PlatformCommandPermission, PlatformsConfig};
 use crate::i18n::text as t;
 
 pub(crate) const RESET_COMMAND_ID: &str = "reset";
+pub(crate) const STOP_COMMAND_ID: &str = "stop";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlatformCommandDescriptor {
@@ -9,15 +10,27 @@ pub(crate) struct PlatformCommandDescriptor {
     pub(crate) default_permission: PlatformCommandPermission,
 }
 
-pub(crate) const BUILTIN_COMMANDS: &[PlatformCommandDescriptor] = &[PlatformCommandDescriptor {
-    id: RESET_COMMAND_ID,
-    default_permission: PlatformCommandPermission::AdminOnly,
-}];
+pub(crate) const BUILTIN_COMMANDS: &[PlatformCommandDescriptor] = &[
+    PlatformCommandDescriptor {
+        id: RESET_COMMAND_ID,
+        default_permission: PlatformCommandPermission::AdminOnly,
+    },
+    PlatformCommandDescriptor {
+        id: STOP_COMMAND_ID,
+        default_permission: PlatformCommandPermission::AdminOnly,
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResetScope {
+    Current,
+    All,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParsedPlatformCommand {
-    Reset { has_arguments: bool },
-    Unknown,
+    Reset { scope: Option<ResetScope> },
+    Stop { has_arguments: bool },
 }
 
 pub(crate) fn descriptor(id: &str) -> Option<&'static PlatformCommandDescriptor> {
@@ -28,16 +41,23 @@ pub(crate) fn parse(config: &PlatformsConfig, text: &str) -> Option<ParsedPlatfo
     let text = text.trim();
     let rest = text.strip_prefix(&config.command_prefix)?;
     if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-        return Some(ParsedPlatformCommand::Unknown);
+        return None;
     }
 
     let mut parts = rest.split_whitespace();
     let command = parts.next().unwrap_or_default();
-    let has_arguments = parts.next().is_some();
     if command.eq_ignore_ascii_case(RESET_COMMAND_ID) {
-        Some(ParsedPlatformCommand::Reset { has_arguments })
+        let scope = match (parts.next(), parts.next()) {
+            (None, None) => Some(ResetScope::Current),
+            (Some(scope), None) if scope.eq_ignore_ascii_case("all") => Some(ResetScope::All),
+            _ => None,
+        };
+        Some(ParsedPlatformCommand::Reset { scope })
+    } else if command.eq_ignore_ascii_case(STOP_COMMAND_ID) {
+        let has_arguments = parts.next().is_some();
+        Some(ParsedPlatformCommand::Stop { has_arguments })
     } else {
-        Some(ParsedPlatformCommand::Unknown)
+        None
     }
 }
 
@@ -73,26 +93,23 @@ pub(crate) fn permission_denied_message(
 
 pub(crate) fn reset_usage_message(config: &PlatformsConfig) -> String {
     format!(
-        "{}{}{}",
+        "{}{}{} [all]",
         t("Usage", "用法"),
         t(": ", "："),
         command_text(config, RESET_COMMAND_ID)
     )
 }
 
-pub(crate) fn unknown_command_message(config: &PlatformsConfig) -> String {
-    let available = BUILTIN_COMMANDS
-        .iter()
-        .map(|command| command_text(config, command.id))
-        .collect::<Vec<_>>()
-        .join(t(", ", "、"));
+pub(crate) fn stop_usage_message(config: &PlatformsConfig) -> String {
+    usage_message(config, STOP_COMMAND_ID)
+}
+
+fn usage_message(config: &PlatformsConfig, command: &str) -> String {
     format!(
-        "{}{}",
-        t(
-            "Unknown command. Available commands: ",
-            "未知命令。可用命令："
-        ),
-        available
+        "{}{}{}",
+        t("Usage", "用法"),
+        t(": ", "："),
+        command_text(config, command)
     )
 }
 
@@ -107,47 +124,67 @@ mod tests {
         assert_eq!(
             parse(&config, "/reset"),
             Some(ParsedPlatformCommand::Reset {
-                has_arguments: false
+                scope: Some(ResetScope::Current)
             })
         );
         assert_eq!(
             parse(&config, "  /RESET  "),
             Some(ParsedPlatformCommand::Reset {
-                has_arguments: false
+                scope: Some(ResetScope::Current)
+            })
+        );
+        assert_eq!(
+            parse(&config, "/reset all"),
+            Some(ParsedPlatformCommand::Reset {
+                scope: Some(ResetScope::All)
             })
         );
         assert_eq!(
             parse(&config, "/reset now"),
-            Some(ParsedPlatformCommand::Reset {
-                has_arguments: true
+            Some(ParsedPlatformCommand::Reset { scope: None })
+        );
+        assert_eq!(
+            parse(&config, "/reset all extra"),
+            Some(ParsedPlatformCommand::Reset { scope: None })
+        );
+        assert_eq!(parse(&config, "/resetting"), None);
+        assert_eq!(
+            parse(&config, "/STOP"),
+            Some(ParsedPlatformCommand::Stop {
+                has_arguments: false
             })
         );
         assert_eq!(
-            parse(&config, "/resetting"),
-            Some(ParsedPlatformCommand::Unknown)
+            parse(&config, "/stop now"),
+            Some(ParsedPlatformCommand::Stop {
+                has_arguments: true
+            })
         );
-        assert_eq!(
-            parse(&config, "/ reset"),
-            Some(ParsedPlatformCommand::Unknown)
-        );
+        assert_eq!(parse(&config, "/stopping"), None);
+        assert_eq!(parse(&config, "/missing"), None);
+        assert_eq!(parse(&config, "/ reset"), None);
+        assert_eq!(parse(&config, "/"), None);
         assert_eq!(parse(&config, "please /reset"), None);
 
         config.command_prefix = "喵".to_string();
         assert_eq!(
             parse(&config, "喵reset"),
             Some(ParsedPlatformCommand::Reset {
-                has_arguments: false
+                scope: Some(ResetScope::Current)
             })
         );
         assert_eq!(parse(&config, "/reset"), None);
     }
 
     #[test]
-    fn reset_defaults_to_admin_and_supports_an_everyone_override() {
+    fn control_commands_default_to_admin_and_support_an_everyone_override() {
         let mut config = PlatformsConfig::default();
         let reset = descriptor(RESET_COMMAND_ID).unwrap();
+        let stop = descriptor(STOP_COMMAND_ID).unwrap();
         assert!(is_allowed(&config, reset, true));
         assert!(!is_allowed(&config, reset, false));
+        assert!(is_allowed(&config, stop, true));
+        assert!(!is_allowed(&config, stop, false));
 
         config.commands.insert(
             RESET_COMMAND_ID.to_string(),
@@ -156,5 +193,12 @@ mod tests {
             },
         );
         assert!(is_allowed(&config, reset, false));
+        config.commands.insert(
+            STOP_COMMAND_ID.to_string(),
+            PlatformCommandConfig {
+                permission: PlatformCommandPermission::Everyone,
+            },
+        );
+        assert!(is_allowed(&config, stop, false));
     }
 }

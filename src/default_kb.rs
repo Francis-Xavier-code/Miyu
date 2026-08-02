@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use crate::tools::knowledge_base::KnowledgeBase;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 
 const SHORIN_WIKI_REMOTE: &str = "https://github.com/SHORiN-KiWATA/Shorin-ArchLinux-Guide.git";
 const UPDATE_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const SPARSE_CHECKOUT_PATTERN: &str = "*.md";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DefaultKbState {
@@ -26,6 +27,52 @@ pub struct DefaultKbState {
 #[derive(Debug, Clone)]
 pub struct DefaultKbStatus {
     pub has_update_notice: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UpdateStage {
+    CheckingPrerequisites,
+    PreparingRepository,
+    FetchingRepository,
+    CloningRepository,
+    CheckingOutRepository,
+    ValidatingRepository,
+    BuildingSnapshot,
+    HashingSnapshot,
+    ImportingFiles,
+    SavingState,
+}
+
+impl UpdateStage {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::CheckingPrerequisites => {
+                t("Checking update prerequisites...", "正在检查更新环境...")
+            }
+            Self::PreparingRepository => t("Preparing repository cache...", "正在准备仓库缓存..."),
+            Self::FetchingRepository => t("Fetching remote updates...", "正在获取远程更新..."),
+            Self::CloningRepository => t(
+                "Downloading the update repository...",
+                "正在下载更新仓库...",
+            ),
+            Self::CheckingOutRepository => {
+                t("Checking out the latest revision...", "正在检出最新版本...")
+            }
+            Self::ValidatingRepository => {
+                t("Validating downloaded content...", "正在校验下载内容...")
+            }
+            Self::BuildingSnapshot => t(
+                "Building the knowledge-base snapshot...",
+                "正在整理知识库快照...",
+            ),
+            Self::HashingSnapshot => t(
+                "Calculating the content fingerprint...",
+                "正在计算内容校验...",
+            ),
+            Self::ImportingFiles => t("Importing knowledge-base files...", "正在导入知识库文件..."),
+            Self::SavingState => t("Saving update state...", "正在保存更新状态..."),
+        }
+    }
 }
 
 pub fn ensure_initialized(paths: &MiyuPaths, config: &AppConfig) -> Result<()> {
@@ -86,16 +133,34 @@ pub fn check_update_if_due(paths: &MiyuPaths) -> Result<()> {
     save_state(paths, &state)
 }
 
-pub fn update(paths: &MiyuPaths, config: &AppConfig) -> Result<DefaultKbState> {
+pub fn update<F>(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    mut on_progress: F,
+) -> Result<DefaultKbState>
+where
+    F: FnMut(UpdateStage),
+{
+    on_progress(UpdateStage::CheckingPrerequisites);
     let git = git_command()?;
     let repo = update_repo_dir(paths);
+    on_progress(UpdateStage::PreparingRepository);
     cleanup_legacy_update_repo(paths, &repo)?;
-    if repo.join(".git").is_dir() {
+    if optimized_update_repo(&git, &repo) {
+        on_progress(UpdateStage::FetchingRepository);
         run_git(
             &git,
             &repo,
-            &["fetch", "--quiet", "--depth=1", "origin", "HEAD"],
+            &[
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--filter=blob:none",
+                "origin",
+                "HEAD",
+            ],
         )?;
+        on_progress(UpdateStage::CheckingOutRepository);
         run_git(
             &git,
             &repo,
@@ -109,27 +174,20 @@ pub fn update(paths: &MiyuPaths, config: &AppConfig) -> Result<DefaultKbState> {
             ],
         )?;
     } else {
-        if let Some(parent) = repo.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let repo_arg = repo.display().to_string();
-        run_git(
-            &git,
-            paths.data_dir.as_path(),
-            &[
-                "clone",
-                "--quiet",
-                "--depth=1",
-                SHORIN_WIKI_REMOTE,
-                &repo_arg,
-            ],
-        )?;
+        on_progress(UpdateStage::CloningRepository);
+        rebuild_update_repo(&git, &repo, &mut on_progress)?;
     }
+    on_progress(UpdateStage::ValidatingRepository);
+    validate_update_repo(&repo)?;
     let commit = git_output(&git, &repo, &["rev-parse", "HEAD"])?;
+    on_progress(UpdateStage::BuildingSnapshot);
     let source = build_update_source(paths, &repo)?;
+    on_progress(UpdateStage::HashingSnapshot);
     let release_hash = hash_dir(&source)?;
+    on_progress(UpdateStage::ImportingFiles);
     let kb = KnowledgeBase::new(config.clone(), paths.clone())?;
     kb.replace_default_files(&source)?;
+    on_progress(UpdateStage::SavingState);
     let mut state = load_state(paths)?;
     state.release_hash = release_hash;
     state.shorin_wiki_commit = commit.clone();
@@ -188,6 +246,109 @@ fn cleanup_legacy_update_repo(paths: &MiyuPaths, repo: &Path) -> Result<()> {
     }
     if legacy.join(".git").is_dir() || legacy.is_dir() {
         std::fs::remove_dir_all(legacy)?;
+    }
+    Ok(())
+}
+
+fn optimized_update_repo(git: &str, repo: &Path) -> bool {
+    repo.join(".git").is_dir()
+        && git_output(git, repo, &["config", "--get", "remote.origin.promisor"])
+            .is_ok_and(|value| value == "true")
+        && git_output(
+            git,
+            repo,
+            &["config", "--get", "remote.origin.partialclonefilter"],
+        )
+        .is_ok_and(|value| value == "blob:none")
+        && git_output(git, repo, &["config", "--get", "core.sparseCheckout"])
+            .is_ok_and(|value| value == "true")
+        && git_output(git, repo, &["config", "--get", "core.sparseCheckoutCone"])
+            .is_ok_and(|value| value == "false")
+        && read_to_string(repo.join(".git/info/sparse-checkout")) == SPARSE_CHECKOUT_PATTERN
+}
+
+fn rebuild_update_repo(
+    git: &str,
+    repo: &Path,
+    on_progress: &mut impl FnMut(UpdateStage),
+) -> Result<()> {
+    let parent = repo.parent().context("update repository has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix("shorin-archlinux-guide-")
+        .tempdir_in(parent)?;
+    let staging_arg = staging.path().display().to_string();
+    run_git(
+        git,
+        parent,
+        &[
+            "clone",
+            "--quiet",
+            "--depth=1",
+            "--filter=blob:none",
+            "--no-checkout",
+            SHORIN_WIKI_REMOTE,
+            &staging_arg,
+        ],
+    )?;
+    on_progress(UpdateStage::CheckingOutRepository);
+    run_git(
+        git,
+        staging.path(),
+        &[
+            "sparse-checkout",
+            "set",
+            "--no-cone",
+            SPARSE_CHECKOUT_PATTERN,
+        ],
+    )?;
+    run_git(
+        git,
+        staging.path(),
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            "--force",
+            "HEAD",
+        ],
+    )?;
+    validate_update_repo(staging.path())?;
+    replace_update_repo(staging.path(), repo)?;
+    let _ = staging.keep();
+    Ok(())
+}
+
+fn replace_update_repo(staging: &Path, repo: &Path) -> Result<()> {
+    let backup = repo.with_extension("backup");
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup)?;
+    }
+    if repo.exists() {
+        std::fs::rename(repo, &backup)?;
+    }
+    if let Err(err) = std::fs::rename(staging, repo) {
+        if backup.exists() {
+            std::fs::rename(&backup, repo)
+                .context("failed to restore the previous update repository")?;
+        }
+        return Err(err.into());
+    }
+    if backup.exists() {
+        std::fs::remove_dir_all(backup)?;
+    }
+    Ok(())
+}
+
+fn validate_update_repo(repo: &Path) -> Result<()> {
+    let wiki = repo.join("wiki");
+    let source = if wiki.is_dir() { wiki.as_path() } else { repo };
+    if collect_markdown(source)?
+        .iter()
+        .all(|file| excluded(file.strip_prefix(source).unwrap_or(file)))
+    {
+        bail!("default knowledge base update contains no importable Markdown files");
     }
     Ok(())
 }
@@ -394,4 +555,64 @@ fn read_to_string(path: PathBuf) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_progress_has_a_distinct_message_for_every_stage() {
+        let stages = [
+            UpdateStage::CheckingPrerequisites,
+            UpdateStage::PreparingRepository,
+            UpdateStage::FetchingRepository,
+            UpdateStage::CloningRepository,
+            UpdateStage::CheckingOutRepository,
+            UpdateStage::ValidatingRepository,
+            UpdateStage::BuildingSnapshot,
+            UpdateStage::HashingSnapshot,
+            UpdateStage::ImportingFiles,
+            UpdateStage::SavingState,
+        ];
+        let messages = stages.map(UpdateStage::message);
+
+        assert!(messages.iter().all(|message| !message.trim().is_empty()));
+        let unique = messages
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), stages.len());
+    }
+
+    #[test]
+    fn update_repo_requires_importable_markdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let wiki = temp.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("legacy")).unwrap();
+        std::fs::write(wiki.join("legacy/old.md"), "old").unwrap();
+
+        assert!(validate_update_repo(temp.path()).is_err());
+
+        std::fs::create_dir_all(wiki.join("archlinux")).unwrap();
+        std::fs::write(wiki.join("archlinux/current.md"), "current").unwrap();
+
+        assert!(validate_update_repo(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn replacing_update_repo_removes_previous_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo.git");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(repo.join("old"), "old").unwrap();
+        std::fs::write(staging.join("new"), "new").unwrap();
+
+        replace_update_repo(&staging, &repo).unwrap();
+
+        assert_eq!(std::fs::read_to_string(repo.join("new")).unwrap(), "new");
+        assert!(!repo.join("old").exists());
+        assert!(!repo.with_extension("backup").exists());
+    }
 }

@@ -11,7 +11,7 @@ use std::time::Duration;
 pub fn register(registry: &mut ToolRegistry, config: AppConfig) {
     registry.register(ToolSpec::new_with_progress(
         "generate_image",
-        "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Returns a local image path. In the final assistant response, always include the returned path so the user can reuse it. Do not call print_image after this tool unless the user explicitly asks to display/print/preview the image; if this tool returns printed=true, never call print_image for the same image.",
+        "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Emits an image event and returns a local path. Messaging platforms deliver emitted images automatically, so do not pass the same image to send_message_to_user. Do not call print_image unless the user explicitly asks to display it. In the final assistant response, include the returned path so the user can reuse it.",
         json!({
             "type": "object",
             "properties": {
@@ -83,9 +83,9 @@ async fn generate_image(
         "printed": printed,
         "print_error": print_error,
         "assistant_instruction": if printed {
-            "The generated image has already been printed in the terminal. In your final response, include the exact local image path from final_response_must_include_path. Do not call print_image again unless the user asks to print it again."
+            "The generated image has already been emitted to the host and printed in the terminal. In your final response, include the exact local image path from final_response_must_include_path. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it."
         } else {
-            "The generated image was saved to disk. In your final response, include the exact local image path from final_response_must_include_path. Do not call print_image unless the user explicitly asked to display, print, render, preview, or show it."
+            "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. In your final response, include the exact local image path from final_response_must_include_path."
         }
     })
     .to_string())

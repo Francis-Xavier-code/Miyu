@@ -1,16 +1,41 @@
 use super::{ToolRegistry, ToolSpec};
 use crate::config::AppConfig;
 use crate::i18n::agent_text as t;
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryAccess, MemoryStore};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
+    register_with_context(
+        registry,
+        config,
+        paths,
+        MemoryAccess::Privileged,
+        None,
+        String::new(),
+    );
+}
+
+pub(crate) fn register_with_context(
+    registry: &mut ToolRegistry,
+    config: AppConfig,
+    paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
+) {
     if !config.memory_config().enabled {
         return;
     }
-    register_readonly(registry, config.clone(), paths.clone());
+    register_readonly_with_context(
+        registry,
+        config.clone(),
+        paths.clone(),
+        access.clone(),
+        writer_principal.clone(),
+        writer_display_name.clone(),
+    );
     registry.register(ToolSpec::new(
         "remember_fact",
         t("Save a durable memory fact or useful knowledge point for future association. Use only for reusable facts, preferences, methods, or stable discoveries.", "保存长期记忆事实或有用知识点，供之后联想使用。仅用于可复用事实、偏好、方法或稳定发现。"),
@@ -26,20 +51,56 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
         {
             let config = config.clone();
             let paths = paths.clone();
+            let access = access.clone();
+            let writer_principal = writer_principal.clone();
+            let writer_display_name = writer_display_name.clone();
             move |args| {
                 let config = config.clone();
                 let paths = paths.clone();
-                async move { remember_fact(args, config, paths).await }
+                let access = access.clone();
+                let writer_principal = writer_principal.clone();
+                let writer_display_name = writer_display_name.clone();
+                async move {
+                    remember_fact(
+                        args,
+                        config,
+                        paths,
+                        access,
+                        writer_principal,
+                        writer_display_name,
+                    )
+                    .await
+                }
             }
         },
     ).writes());
 }
 
 pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
+    register_readonly_with_context(
+        registry,
+        config,
+        paths,
+        MemoryAccess::Privileged,
+        None,
+        String::new(),
+    );
+}
+
+pub(crate) fn register_readonly_with_context(
+    registry: &mut ToolRegistry,
+    config: AppConfig,
+    paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
+) {
     if !config.memory_config().enabled {
         return;
     }
-    if config.memory_config().evicted_context_enabled {
+    if config.memory_config().evicted_context_enabled
+        && config.context.on_overflow != "compact"
+    {
         registry.register(ToolSpec::new(
             "search_evicted_context",
             t("Search conversation turns that were moved out of the active context window. Use this when the current context appears to be missing earlier discussion.", "搜索已经移出当前上下文窗口的对话轮次。当当前上下文明显缺少早前讨论时使用。"),
@@ -55,10 +116,26 @@ pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: 
             {
                 let config = config.clone();
                 let paths = paths.clone();
+                let access = access.clone();
+                let writer_principal = writer_principal.clone();
+                let writer_display_name = writer_display_name.clone();
                 move |args| {
                     let config = config.clone();
                     let paths = paths.clone();
-                    async move { search_evicted_context(args, config, paths).await }
+                    let access = access.clone();
+                    let writer_principal = writer_principal.clone();
+                    let writer_display_name = writer_display_name.clone();
+                    async move {
+                        search_evicted_context(
+                            args,
+                            config,
+                            paths,
+                            access,
+                            writer_principal,
+                            writer_display_name,
+                        )
+                        .await
+                    }
                 }
             },
         ));
@@ -78,10 +155,26 @@ pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: 
         {
             let config = config.clone();
             let paths = paths.clone();
+            let access = access.clone();
+            let writer_principal = writer_principal.clone();
+            let writer_display_name = writer_display_name.clone();
             move |args| {
                 let config = config.clone();
                 let paths = paths.clone();
-                async move { recall_past_events(args, config, paths).await }
+                let access = access.clone();
+                let writer_principal = writer_principal.clone();
+                let writer_display_name = writer_display_name.clone();
+                async move {
+                    recall_past_events(
+                        args,
+                        config,
+                        paths,
+                        access,
+                        writer_principal,
+                        writer_display_name,
+                    )
+                    .await
+                }
             }
         },
     ));
@@ -101,10 +194,26 @@ pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: 
         {
             let config = config.clone();
             let paths = paths.clone();
+            let access = access.clone();
+            let writer_principal = writer_principal.clone();
+            let writer_display_name = writer_display_name.clone();
             move |args| {
                 let config = config.clone();
                 let paths = paths.clone();
-                async move { recall_memories(args, config, paths).await }
+                let access = access.clone();
+                let writer_principal = writer_principal.clone();
+                let writer_display_name = writer_display_name.clone();
+                async move {
+                    recall_memories(
+                        args,
+                        config,
+                        paths,
+                        access,
+                        writer_principal,
+                        writer_display_name,
+                    )
+                    .await
+                }
             }
         },
     ));
@@ -114,29 +223,58 @@ async fn search_evicted_context(
     args: Value,
     config: AppConfig,
     paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
 ) -> Result<String> {
     let query = required_str(&args, "query")?;
     let limit = optional_limit(&args);
-    let store = MemoryStore::new(&config, &paths);
+    let store = MemoryStore::new(&config, &paths).with_request_context(
+        access,
+        writer_principal,
+        writer_display_name,
+    );
     Ok(store
         .search_evicted_context_readonly(query, limit)?
         .to_string())
 }
 
-async fn recall_past_events(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
+async fn recall_past_events(
+    args: Value,
+    config: AppConfig,
+    paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
+) -> Result<String> {
     let query = required_str(&args, "query")?;
     let limit = optional_limit(&args);
-    let store = MemoryStore::new(&config, &paths);
+    let store = MemoryStore::new(&config, &paths).with_request_context(
+        access,
+        writer_principal,
+        writer_display_name,
+    );
     Ok(store.recall_past_events_readonly(query, limit)?.to_string())
 }
 
-async fn remember_fact(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
+async fn remember_fact(
+    args: Value,
+    config: AppConfig,
+    paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
+) -> Result<String> {
     let content = required_str(&args, "content")?;
     let source = args
         .get("source")
         .and_then(Value::as_str)
         .unwrap_or("conversation");
-    let store = MemoryStore::new(&config, &paths);
+    let store = MemoryStore::new(&config, &paths).with_request_context(
+        access,
+        writer_principal,
+        writer_display_name,
+    );
     let id = store.remember_fact(content, source)?;
     Ok(json!({
         "ok": true,
@@ -148,14 +286,25 @@ async fn remember_fact(args: Value, config: AppConfig, paths: MiyuPaths) -> Resu
     .to_string())
 }
 
-async fn recall_memories(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
+async fn recall_memories(
+    args: Value,
+    config: AppConfig,
+    paths: MiyuPaths,
+    access: MemoryAccess,
+    writer_principal: Option<String>,
+    writer_display_name: String,
+) -> Result<String> {
     let query = required_str(&args, "query")?;
     let limit = optional_limit(&args);
     let include_forgotten = args
         .get("include_forgotten")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let store = MemoryStore::new(&config, &paths);
+    let store = MemoryStore::new(&config, &paths).with_request_context(
+        access,
+        writer_principal,
+        writer_display_name,
+    );
     Ok(store
         .recall_memories_readonly(query, limit, include_forgotten)?
         .to_string())
@@ -213,12 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn search_evicted_context_is_available_for_manual_pop_with_compact_overflow() {
+    fn search_evicted_context_is_hidden_for_compact_overflow() {
         let paths = test_paths();
         let compact_config = AppConfig::default();
         let mut compact_registry = ToolRegistry::new();
         register_readonly(&mut compact_registry, compact_config, paths.clone());
-        assert!(tool_names(&compact_registry).contains("search_evicted_context"));
+        assert!(!tool_names(&compact_registry).contains("search_evicted_context"));
 
         let mut pop_config = AppConfig::default();
         pop_config.context.on_overflow = "pop".to_string();

@@ -28,6 +28,10 @@ pub enum ToolProgressEvent {
         path: PathBuf,
         alt: String,
     },
+    Artifact {
+        path: PathBuf,
+        title: String,
+    },
     CommandOutput {
         stream: CommandOutputStream,
         chunk: Vec<u8>,
@@ -63,6 +67,15 @@ impl ToolProgress {
             let _ = sender.send(ToolProgressEvent::Image {
                 path: path.into(),
                 alt: alt.into(),
+            });
+        }
+    }
+
+    pub fn report_artifact(&self, path: impl Into<PathBuf>, title: impl Into<String>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(ToolProgressEvent::Artifact {
+                path: path.into(),
+                title: title.into(),
             });
         }
     }
@@ -125,6 +138,7 @@ pub struct ToolSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolPermission {
     ReadOnly,
+    Presentation,
     Writes,
 }
 
@@ -182,6 +196,11 @@ impl ToolSpec {
         self
     }
 
+    pub fn presentation(mut self) -> Self {
+        self.permission = ToolPermission::Presentation;
+        self
+    }
+
     pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
         self
@@ -212,11 +231,13 @@ impl ToolSpec {
     }
 
     pub fn apply_built_in_description(mut self) -> Self {
-        if self.name == "load_skill" {
-            return self;
-        }
         if let Some(desc) = crate::tools::tool_descriptions::get(&self.name) {
-            self.description = desc.description.clone();
+            // load_skill owns a dynamic catalog description, but still uses
+            // the same loading policy, groups, schema, and display metadata
+            // as every other built-in tool.
+            if self.name != "load_skill" {
+                self.description = desc.description.clone();
+            }
             self.parameters = desc.parameters.clone();
             self.display_name = Some(desc.display_name.clone());
             self.always_loaded = desc.always_loaded;
@@ -257,6 +278,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<ToolSpec>>,
     script_tool_names: BTreeSet<String>,
     unregistered_scripts: Vec<UnregisteredScript>,
+    skill_catalog_fingerprint: Option<[u8; 32]>,
 }
 
 impl ToolRegistry {
@@ -267,6 +289,19 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: ToolSpec) {
         let tool = tool.apply_built_in_description();
         self.tools.insert(tool.name.clone(), Arc::new(tool));
+    }
+
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.script_tool_names.remove(name);
+        self.tools.remove(name).is_some()
+    }
+
+    pub(crate) fn skill_catalog_fingerprint(&self) -> Option<[u8; 32]> {
+        self.skill_catalog_fingerprint
+    }
+
+    pub(crate) fn set_skill_catalog_fingerprint(&mut self, fingerprint: [u8; 32]) {
+        self.skill_catalog_fingerprint = Some(fingerprint);
     }
 
     /// Appends runtime info to a registered tool's description. Applied
@@ -429,6 +464,10 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub(crate) fn loadable_tools(&self, loaded: &BTreeSet<String>) -> Vec<&ToolSpec> {
         let mut tools = self
             .tools
@@ -562,6 +601,28 @@ impl ToolRegistry {
 
     pub(crate) fn unregistered_scripts(&self) -> &[UnregisteredScript] {
         &self.unregistered_scripts
+    }
+
+    pub(crate) fn script_summary_xml(&self) -> String {
+        let mut scripts = self
+            .tools
+            .values()
+            .filter(|tool| tool.is_script)
+            .collect::<Vec<_>>();
+        scripts.sort_by(|left, right| left.name.cmp(&right.name));
+        let always_loaded = scripts.iter().filter(|tool| tool.always_loaded).count();
+        let names = scripts
+            .iter()
+            .map(|tool| super::load_tools::xml_escape(&tool.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "<script_summary>\n  <total>{}</total>\n  <always_loaded>{}</always_loaded>\n  <lazy>{}</lazy>\n  <unregistered>{}</unregistered>\n  <registered_names>{names}</registered_names>\n</script_summary>",
+            scripts.len(),
+            always_loaded,
+            scripts.len() - always_loaded,
+            self.unregistered_scripts.len(),
+        )
     }
 
     pub fn clone_filtered(&self, allowed: &[&str]) -> ToolRegistry {
@@ -699,5 +760,22 @@ mod tests {
             registry.get("replaceable_tool").unwrap().description,
             "new description"
         );
+    }
+
+    #[test]
+    fn unregister_only_changes_the_current_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolSpec::new(
+            "remember_fact",
+            "remember",
+            json!({"type":"object","properties":{}}),
+            |_| async { Ok(String::new()) },
+        ));
+        let cached = registry.clone();
+
+        assert!(registry.unregister("remember_fact"));
+        assert!(registry.get("remember_fact").is_none());
+        assert!(cached.get("remember_fact").is_some());
+        assert!(!registry.unregister("remember_fact"));
     }
 }

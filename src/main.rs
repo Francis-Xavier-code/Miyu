@@ -22,6 +22,7 @@ mod question;
 mod question_tui;
 mod render;
 mod shell;
+mod skills;
 mod state;
 mod token_counter;
 mod token_estimate;
@@ -39,6 +40,9 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    if platforms::plugins::renderer_worker_requested() {
+        return platforms::plugins::run_renderer_worker().await;
+    }
     let paths = paths::MiyuPaths::new()?;
     let language = config::AppConfig::display_language_hint(&paths);
     i18n::init(language.as_deref().unwrap_or("auto"));

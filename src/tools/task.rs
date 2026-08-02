@@ -29,6 +29,11 @@ const GENERAL_EXCLUDED: &[&str] = &[
     "deep_diagnose",
     "deep_research_linux_game_compatibility",
     "load_skill",
+    "create_skill",
+    "update_skill",
+    "delete_skill",
+    "publish_skill",
+    "list_skill_drafts",
     "set_alarm",
     "list_alarms",
     "cancel_alarm",
@@ -458,6 +463,6 @@ fn record_subagent_audit(
         )
     })();
     if let Err(error) = outcome {
-        tracing::warn!(error = %error, "failed to record subagent audit session");
+        tracing::warn!(error = %error, "{}", crate::i18n::text("failed to record subagent audit session", "记录子代理审计会话失败"));
     }
 }

@@ -8,12 +8,14 @@ use crate::i18n::text as t;
 use crate::models_cache::{self, ModelReasoningInfo, ReasoningSetting, ReasoningVariant};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -25,6 +27,7 @@ static LLM_SCHEDULER: LazyLock<Mutex<LlmScheduler>> =
     LazyLock::new(|| Mutex::new(LlmScheduler::default()));
 
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_SEND_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -173,6 +176,22 @@ enum HttpFailureKind {
     Status,
     Authentication,
     RateLimit,
+    EndpointUnavailable,
+    EndpointIncompatible,
+    InvalidRequest,
+}
+
+impl std::fmt::Display for HttpFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Status => "status",
+            Self::Authentication => "authentication",
+            Self::RateLimit => "rate_limit",
+            Self::EndpointUnavailable => "endpoint_unavailable",
+            Self::EndpointIncompatible => "endpoint_incompatible",
+            Self::InvalidRequest => "invalid_request",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -183,22 +202,145 @@ struct HttpStatusFailure {
 
 impl HttpStatusFailure {
     fn classify(status: u16, body: &str) -> Self {
-        let body = body.to_ascii_lowercase();
-        let kind = if body.contains("rate limit")
-            || body.contains("ratelimit")
-            || body.contains("quota")
-        {
-            HttpFailureKind::RateLimit
-        } else if body.contains("unauthorized")
-            || body.contains("forbidden")
-            || body.contains("invalid api key")
-        {
-            HttpFailureKind::Authentication
-        } else {
-            HttpFailureKind::Status
+        let kind = match status {
+            401 | 403 => HttpFailureKind::Authentication,
+            429 => HttpFailureKind::RateLimit,
+            408 | 500..=599 => HttpFailureKind::Status,
+            _ => classify_provider_error_body(body).unwrap_or(HttpFailureKind::Status),
         };
         Self { status, kind }
     }
+}
+
+fn classify_provider_error_body(body: &str) -> Option<HttpFailureKind> {
+    let structured = serde_json::from_str::<Value>(body).ok();
+    let error = structured
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .or(structured.as_ref());
+    let mut signals = Vec::with_capacity(3);
+    if let Some(error) = error {
+        for field in ["code", "type", "status", "message"] {
+            if let Some(value) = error.get(field).and_then(Value::as_str) {
+                signals.push(normalize_error_signal(value));
+            }
+        }
+    }
+    if signals.is_empty() {
+        signals.push(normalize_error_signal(body));
+    }
+
+    for signal in &signals {
+        if contains_any(
+            signal,
+            &[
+                "invalid_api_key",
+                "incorrect_api_key",
+                "authentication",
+                "unauthorized",
+                "forbidden",
+                "permission_denied",
+            ],
+        ) {
+            return Some(HttpFailureKind::Authentication);
+        }
+    }
+    for signal in &signals {
+        if contains_any(
+            signal,
+            &["rate_limit", "ratelimit", "quota", "too_many_requests"],
+        ) {
+            return Some(HttpFailureKind::RateLimit);
+        }
+    }
+    for signal in &signals {
+        if contains_any(
+            signal,
+            &[
+                "model_not_found",
+                "model_not_available",
+                "model_unavailable",
+                "unsupported_model",
+                "deployment_not_found",
+                "model_access_denied",
+                "no_available_provider",
+                "provider_unavailable",
+                "upstream_request_failed",
+                "service_unavailable",
+                "overloaded",
+            ],
+        ) {
+            return Some(HttpFailureKind::EndpointUnavailable);
+        }
+    }
+    for signal in &signals {
+        if contains_any(
+            signal,
+            &[
+                "context_length",
+                "context_window",
+                "max_tokens",
+                "unsupported_parameter",
+                "unknown_parameter",
+                "unsupported_feature",
+                "not_supported",
+            ],
+        ) {
+            return Some(HttpFailureKind::EndpointIncompatible);
+        }
+    }
+    for signal in &signals {
+        if contains_any(
+            signal,
+            &[
+                "invalid_request",
+                "invalid_argument",
+                "malformed",
+                "validation_error",
+            ],
+        ) {
+            return Some(HttpFailureKind::InvalidRequest);
+        }
+    }
+    None
+}
+
+fn normalize_error_signal(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte.is_ascii_alphanumeric() {
+            let previous = index
+                .checked_sub(1)
+                .and_then(|index| bytes.get(index))
+                .copied();
+            let next = bytes.get(index + 1).copied();
+            let camel_case_boundary = byte.is_ascii_uppercase()
+                && previous.is_some_and(|previous| {
+                    previous.is_ascii_lowercase()
+                        || previous.is_ascii_digit()
+                        || (previous.is_ascii_uppercase()
+                            && next.is_some_and(|next_byte| next_byte.is_ascii_lowercase()))
+                });
+            if camel_case_boundary && !separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push((byte as char).to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !normalized.is_empty() {
+            normalized.push('_');
+            separator = true;
+        }
+    }
+    if normalized.ends_with('_') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
 }
 
 impl std::fmt::Display for HttpStatusFailure {
@@ -242,12 +384,12 @@ impl ProviderProtocol {
     }
 }
 
-fn effective_protocol(provider: &ProviderConfig) -> Result<ProviderProtocol> {
+fn effective_protocol(provider: &ProviderConfig, model: &str) -> Result<ProviderProtocol> {
     match ProviderProtocol::from_provider(provider)? {
         ProviderProtocol::Auto if provider_looks_anthropic(provider) => {
             Ok(ProviderProtocol::Anthropic)
         }
-        ProviderProtocol::Auto if uses_openai_responses(provider) => {
+        ProviderProtocol::Auto if uses_openai_responses(model) => {
             Ok(ProviderProtocol::OpenAiResponses)
         }
         ProviderProtocol::Auto => Ok(ProviderProtocol::OpenAiChat),
@@ -255,8 +397,8 @@ fn effective_protocol(provider: &ProviderConfig) -> Result<ProviderProtocol> {
     }
 }
 
-fn uses_openai_responses(provider: &ProviderConfig) -> bool {
-    let model = provider.default_model.to_ascii_lowercase();
+fn uses_openai_responses(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
     model.starts_with("gpt-5")
         || model.starts_with("o1")
         || model.starts_with("o3")
@@ -284,25 +426,35 @@ fn anthropic_reasoning_budget(max_tokens: u32, requested: u64) -> Option<u64> {
     (max_tokens > 1024 && requested < u64::from(max_tokens)).then_some(requested)
 }
 
-fn supported_reasoning_variants(provider: &ProviderConfig) -> Vec<ReasoningVariant> {
-    let Some(info) = models_cache::reasoning_info(&provider.id, &provider.default_model) else {
+fn supported_reasoning_variants(provider: &ProviderConfig, model: &str) -> Vec<ReasoningVariant> {
+    let Some(info) = models_cache::reasoning_info(&provider.id, model) else {
         return Vec::new();
     };
     info.variants
         .iter()
-        .filter(|variant| reasoning_variant_supported(provider, &info, variant))
+        .filter(|variant| reasoning_variant_supported(provider, model, &info, variant))
         .cloned()
         .collect()
 }
 
 fn reasoning_variant_supported(
     provider: &ProviderConfig,
+    model: &str,
     info: &ModelReasoningInfo,
     variant: &ReasoningVariant,
 ) -> bool {
-    let Ok(protocol) = effective_protocol(provider) else {
+    let Ok(protocol) = effective_protocol(provider, model) else {
         return false;
     };
+    reasoning_variant_supported_for_protocol(provider, info, variant, protocol)
+}
+
+fn reasoning_variant_supported_for_protocol(
+    provider: &ProviderConfig,
+    info: &ModelReasoningInfo,
+    variant: &ReasoningVariant,
+    protocol: ProviderProtocol,
+) -> bool {
     match protocol {
         ProviderProtocol::OpenAiResponses => matches!(
             variant.setting,
@@ -336,22 +488,144 @@ fn thinking_variant_key(provider_id: &str, model: &str) -> String {
     format!("{provider_id}\t{model}")
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ThinkingVariantPreferences {
+fn rename_thinking_variant_entries<T>(
+    entries: &mut HashMap<String, T>,
+    old_id: &str,
+    new_id: &str,
+) {
+    let prefix = format!("{old_id}\t");
+    let renamed = entries
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(&prefix)
+                .map(|model| (key.clone(), thinking_variant_key(new_id, model)))
+        })
+        .collect::<Vec<_>>();
+    for (old_key, new_key) in renamed {
+        if let Some(value) = entries.remove(&old_key) {
+            entries.insert(new_key, value);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ThinkingVariantPreferences {
     #[serde(default)]
     selected: HashMap<String, String>,
+    #[serde(skip)]
+    changes: HashMap<String, Option<String>>,
+    #[serde(skip)]
+    provider_renames: Vec<(String, String)>,
 }
 
 fn thinking_variant_preferences_file(paths: &MiyuPaths) -> PathBuf {
     paths.state_dir.join("thinking-variants.json")
 }
 
+fn lock_thinking_variant_preferences(paths: &MiyuPaths) -> Result<File> {
+    let lock_path = paths.state_dir.join("thinking-variants.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "failed to open thinking variant lock: {}",
+                lock_path.display()
+            )
+        })?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to lock thinking variant state: {}",
+                lock_path.display()
+            )
+        });
+    }
+    Ok(lock)
+}
+
 fn load_thinking_variant_preferences(paths: &MiyuPaths) -> ThinkingVariantPreferences {
-    let path = thinking_variant_preferences_file(paths);
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    ThinkingVariantPreferences::load(paths)
+}
+
+impl ThinkingVariantPreferences {
+    pub(crate) fn load(paths: &MiyuPaths) -> Self {
+        Self::load_for_update(paths).unwrap_or_default()
+    }
+
+    fn load_for_update(paths: &MiyuPaths) -> Result<Self> {
+        let path = thinking_variant_preferences_file(paths);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).with_context(|| {
+                format!("failed to parse thinking variant state: {}", path.display())
+            }),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to read thinking variant state: {}", path.display())
+            }),
+        }
+    }
+
+    pub(crate) fn selected(&self, provider_id: &str, model: &str) -> Option<&str> {
+        self.selected
+            .get(&thinking_variant_key(provider_id, model))
+            .map(String::as_str)
+    }
+
+    pub(crate) fn set(&mut self, provider_id: &str, model: &str, selected: Option<String>) {
+        let key = thinking_variant_key(provider_id, model);
+        let selected = selected.filter(|value| !value.trim().is_empty());
+        if self.selected.get(&key).map(String::as_str) == selected.as_deref() {
+            return;
+        }
+        if let Some(selected) = &selected {
+            self.selected.insert(key.clone(), selected.clone());
+        } else {
+            self.selected.remove(&key);
+        }
+        self.changes.insert(key, selected);
+    }
+
+    pub(crate) fn rename_provider(&mut self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        rename_thinking_variant_entries(&mut self.selected, old_id, new_id);
+        rename_thinking_variant_entries(&mut self.changes, old_id, new_id);
+        self.provider_renames
+            .push((old_id.to_string(), new_id.to_string()));
+    }
+
+    pub(crate) fn save(&self, paths: &MiyuPaths) -> Result<()> {
+        if self.changes.is_empty() && self.provider_renames.is_empty() {
+            return Ok(());
+        }
+
+        let path = thinking_variant_preferences_file(paths);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("thinking variant state path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let _lock = lock_thinking_variant_preferences(paths)?;
+        let mut persisted = Self::load_for_update(paths)?;
+        for (old_id, new_id) in &self.provider_renames {
+            rename_thinking_variant_entries(&mut persisted.selected, old_id, new_id);
+        }
+        for (key, selected) in &self.changes {
+            if let Some(selected) = selected {
+                persisted.selected.insert(key.clone(), selected.clone());
+            } else {
+                persisted.selected.remove(key);
+            }
+        }
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(serde_json::to_string_pretty(&persisted)?.as_bytes())?;
+        temp.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
 }
 
 fn chat_variant_body(
@@ -389,12 +663,32 @@ fn chat_variant_body(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ThinkingVariantOptions {
     pub provider_id: String,
     pub model: String,
     pub variants: Vec<String>,
     pub selected: Option<String>,
+}
+
+pub(crate) fn thinking_variant_options_for_model(
+    provider: &ProviderConfig,
+    model: &str,
+    selected: Option<&str>,
+) -> ThinkingVariantOptions {
+    let variants = supported_reasoning_variants(provider, model)
+        .into_iter()
+        .map(|variant| variant.id)
+        .collect::<Vec<_>>();
+    let selected = selected
+        .filter(|selected| variants.iter().any(|variant| variant == *selected))
+        .map(str::to_string);
+    ThinkingVariantOptions {
+        provider_id: provider.id.clone(),
+        model: model.to_string(),
+        variants,
+        selected,
+    }
 }
 
 #[derive(Clone)]
@@ -406,6 +700,13 @@ pub struct OpenAiCompatibleClient {
     thinking_variants: HashMap<String, String>,
     reasoning_visibility: ReasoningVisibility,
     detailed_reasoning_summary: bool,
+    request_timeouts: Option<RequestTimeouts>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTimeouts {
+    response_header: Duration,
+    stream_idle: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,13 +797,11 @@ fn mark_endpoint_success(endpoint: &LlmEndpoint) {
     }
 }
 
-fn mark_endpoint_failure(endpoint: &LlmEndpoint, error: &anyhow::Error) {
-    let Some(duration) = cooldown_for_error(error) else {
-        return;
-    };
-    if let Ok(mut scheduler) = LLM_SCHEDULER.lock() {
-        scheduler.mark_failure(endpoint.id(), duration);
-    }
+fn mark_endpoint_failure(endpoint: &LlmEndpoint, error: &anyhow::Error) -> Option<Duration> {
+    let duration = cooldown_for_error(error)?;
+    let mut scheduler = LLM_SCHEDULER.lock().ok()?;
+    scheduler.mark_failure(endpoint.id(), duration);
+    Some(duration)
 }
 
 fn cooldown_for_status(status: u16) -> Option<Duration> {
@@ -519,6 +818,8 @@ fn cooldown_for_error(error: &anyhow::Error) -> Option<Duration> {
             HttpFailureKind::Authentication | HttpFailureKind::RateLimit => {
                 Some(Duration::from_secs(600))
             }
+            HttpFailureKind::EndpointUnavailable => Some(Duration::from_secs(120)),
+            HttpFailureKind::EndpointIncompatible | HttpFailureKind::InvalidRequest => None,
             HttpFailureKind::Status => cooldown_for_status(failure.status),
         };
     }
@@ -529,6 +830,12 @@ fn cooldown_for_error(error: &anyhow::Error) -> Option<Duration> {
         .downcast_ref::<reqwest::Error>()
         .filter(|error| error.is_connect() || error.is_timeout())
         .map(|_| Duration::from_secs(120))
+}
+
+fn endpoint_failover_allowed(error: &anyhow::Error) -> bool {
+    !error
+        .downcast_ref::<HttpStatusFailure>()
+        .is_some_and(|failure| failure.kind == HttpFailureKind::InvalidRequest)
 }
 
 fn endpoint_client(provider: &ProviderConfig) -> Result<Client> {
@@ -585,6 +892,7 @@ impl OpenAiCompatibleClient {
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
+            request_timeouts: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -642,6 +950,7 @@ impl OpenAiCompatibleClient {
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
+            request_timeouts: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -678,6 +987,7 @@ impl OpenAiCompatibleClient {
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
+            request_timeouts: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -703,6 +1013,18 @@ impl OpenAiCompatibleClient {
             ReasoningVisibility::Hidden
         };
         self.detailed_reasoning_summary = full;
+        self
+    }
+
+    pub fn with_request_timeouts(
+        mut self,
+        response_header: Duration,
+        stream_idle: Duration,
+    ) -> Self {
+        self.request_timeouts = Some(RequestTimeouts {
+            response_header: response_header.max(Duration::from_millis(1)),
+            stream_idle: stream_idle.max(Duration::from_millis(1)),
+        });
         self
     }
 
@@ -741,6 +1063,7 @@ impl OpenAiCompatibleClient {
             thinking_variants: self.thinking_variants.clone(),
             reasoning_visibility: self.reasoning_visibility,
             detailed_reasoning_summary: self.detailed_reasoning_summary,
+            request_timeouts: self.request_timeouts,
         }
     }
 
@@ -808,63 +1131,46 @@ impl OpenAiCompatibleClient {
             .into_iter()
             .filter_map(|(provider_id, model)| {
                 let selected = preferences
-                    .selected
-                    .get(&thinking_variant_key(&provider_id, &model))?;
-                Some((provider_id, model, selected.clone()))
+                    .selected(&provider_id, &model)
+                    .map(str::to_string)?;
+                Some((provider_id, model, selected))
             })
             .collect::<Vec<_>>();
         self.restore_thinking_variants(&selections);
     }
 
     pub fn save_thinking_variants(&self, paths: &MiyuPaths) -> Result<()> {
-        let path = thinking_variant_preferences_file(paths);
         let mut preferences = load_thinking_variant_preferences(paths);
         for (provider_id, model) in self.endpoint_model_preferences() {
             let key = thinking_variant_key(&provider_id, &model);
-            if let Some(variant) = self.thinking_variants.get(&key) {
-                preferences.selected.insert(key, variant.clone());
-            } else {
-                preferences.selected.remove(&key);
-            }
+            preferences.set(
+                &provider_id,
+                &model,
+                self.thinking_variants.get(&key).cloned(),
+            );
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("thinking variant state path has no parent"))?;
-        std::fs::create_dir_all(parent)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        temp.write_all(serde_json::to_string_pretty(&preferences)?.as_bytes())?;
-        temp.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        preferences.save(paths)
     }
 
     pub fn thinking_variant_options(&self) -> Vec<ThinkingVariantOptions> {
         self.endpoint_model_preferences()
             .into_iter()
             .filter_map(|(provider_id, model)| {
-                let provider = self
+                let provider = &self
                     .endpoints
                     .iter()
                     .find(|endpoint| {
                         endpoint.provider.id == provider_id
                             && endpoint.provider.default_model == model
                     })?
-                    .provider
-                    .clone();
-                let variants: Vec<String> = supported_reasoning_variants(&provider)
-                    .into_iter()
-                    .map(|variant| variant.id)
-                    .collect();
+                    .provider;
                 let selected = self
                     .thinking_variants
                     .get(&thinking_variant_key(&provider_id, &model))
-                    .filter(|selected| variants.iter().any(|variant| variant == *selected))
-                    .cloned();
-                Some(ThinkingVariantOptions {
-                    provider_id,
-                    model,
-                    variants,
-                    selected,
-                })
+                    .map(String::as_str);
+                Some(thinking_variant_options_for_model(
+                    provider, &model, selected,
+                ))
             })
             .collect()
     }
@@ -909,7 +1215,13 @@ impl OpenAiCompatibleClient {
             .iter()
             .find(|candidate| candidate.id.as_str() == id)
             .cloned()?;
-        reasoning_variant_supported(&self.provider, &info, &variant).then_some((info, variant))
+        reasoning_variant_supported(
+            &self.provider,
+            &self.provider.default_model,
+            &info,
+            &variant,
+        )
+        .then_some((info, variant))
     }
 
     fn selected_thinking_variant_id(&self) -> Option<&str> {
@@ -992,11 +1304,47 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
+        self.chat_stream_inner(messages, tools, false, &mut on_chunk)
+            .await
+    }
+
+    /// Runs an internal completion without exposing partial output. Since no
+    /// chunk is committed to a user, a failed endpoint can be safely replaced
+    /// even after it emitted an incomplete response.
+    pub async fn chat_buffered(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<ChatResult> {
+        self.chat_stream_inner(messages, tools, true, &mut |_| Ok(()))
+            .await
+    }
+
+    async fn chat_stream_inner<F>(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        buffered: bool,
+        on_chunk: &mut F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
         let request_id = gen_llm_request_id();
         let endpoints = self.endpoints.as_ref();
         let mut errors = Vec::new();
         let mut order = ordered_endpoint_indices(endpoints);
         if order.is_empty() {
+            tracing::warn!(
+                request_id,
+                endpoint_count = endpoints.len(),
+                all_endpoints_cooling_down = true,
+                "{}",
+                t(
+                    "All LLM endpoints are cooling down; attempting the full pool",
+                    "所有 LLM 端点均在冷却；将尝试完整端点池"
+                )
+            );
             order = (0..endpoints.len()).collect();
         }
         tracing::debug!(
@@ -1004,7 +1352,8 @@ impl OpenAiCompatibleClient {
             endpoint_count = order.len(),
             message_count = messages.len(),
             tool_count = tools.len(),
-            "LLM request started"
+            "{}",
+            t("LLM request started", "LLM 请求已开始")
         );
         for (attempt, index) in order.into_iter().enumerate() {
             let endpoint = &endpoints[index];
@@ -1022,13 +1371,16 @@ impl OpenAiCompatibleClient {
                 provider = %endpoint.provider.id,
                 model = %endpoint.provider.default_model,
                 key_index = endpoint.key_index + 1,
-                "LLM endpoint attempt started"
+                "{}",
+                t("LLM endpoint attempt started", "LLM 端点尝试已开始")
             );
             let mut attempt_committed = false;
             let result = {
                 let mut attempt_on_chunk = |chunk: ChatStreamChunk| {
-                    attempt_committed |=
-                        stream_chunk_commits_attempt(&chunk, client.reasoning_visibility);
+                    if !buffered {
+                        attempt_committed |=
+                            stream_chunk_commits_attempt(&chunk, client.reasoning_visibility);
+                    }
                     on_chunk(chunk)
                 };
                 client
@@ -1051,12 +1403,15 @@ impl OpenAiCompatibleClient {
                         provider = %endpoint.provider.id,
                         model = %endpoint.provider.default_model,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "LLM endpoint succeeded"
+                        "{}",
+                        t("LLM endpoint succeeded", "LLM 端点请求成功")
                     );
                     return Ok(result);
                 }
                 Err(err) => {
-                    mark_endpoint_failure(endpoint, &err);
+                    let cooldown = mark_endpoint_failure(endpoint, &err);
+                    let endpoint_cooling_down = cooldown.is_some();
+                    let cooldown_seconds = cooldown.map(|duration| duration.as_secs()).unwrap_or(0);
                     if let Some(failure) = err.downcast_ref::<TransportFailure>() {
                         tracing::error!(
                             request_id,
@@ -1065,9 +1420,12 @@ impl OpenAiCompatibleClient {
                             model = %endpoint.provider.default_model,
                             stage = failure.stage,
                             transport_kind = %failure.kind,
+                            endpoint_cooling_down,
+                            cooldown_seconds,
                             elapsed_ms = started.elapsed().as_millis(),
                             error = %format!("{err:#}"),
-                            "LLM endpoint transport failure"
+                            "{}",
+                            t("LLM endpoint transport failure", "LLM 端点传输失败")
                         );
                     } else if let Some(failure) = err.downcast_ref::<HttpStatusFailure>() {
                         tracing::error!(
@@ -1076,8 +1434,12 @@ impl OpenAiCompatibleClient {
                             provider = %endpoint.provider.id,
                             model = %endpoint.provider.default_model,
                             status = failure.status,
+                            failure_kind = %failure.kind,
+                            endpoint_cooling_down,
+                            cooldown_seconds,
                             elapsed_ms = started.elapsed().as_millis(),
-                            "LLM endpoint HTTP failure"
+                            "{}",
+                            t("LLM endpoint HTTP failure", "LLM 端点 HTTP 请求失败")
                         );
                     } else {
                         tracing::error!(
@@ -1085,9 +1447,15 @@ impl OpenAiCompatibleClient {
                             attempt = attempt + 1,
                             provider = %endpoint.provider.id,
                             model = %endpoint.provider.default_model,
+                            endpoint_cooling_down,
+                            cooldown_seconds,
                             elapsed_ms = started.elapsed().as_millis(),
                             error = %format!("{err:#}"),
-                            "LLM endpoint failed outside the HTTP send stage"
+                            "{}",
+                            t(
+                                "LLM endpoint failed outside the HTTP send stage",
+                                "LLM 端点在 HTTP 发送阶段之外失败"
+                            )
                         );
                     }
                     let message = format!("{err:#}");
@@ -1100,6 +1468,11 @@ impl OpenAiCompatibleClient {
                     if attempt_committed {
                         return Err(err.context(
                             "LLM stream failed after emitting output; endpoint failover was suppressed",
+                        ));
+                    }
+                    if !endpoint_failover_allowed(&err) {
+                        return Err(err.context(
+                            "LLM request was rejected; endpoint failover was suppressed",
                         ));
                     }
                 }
@@ -1141,6 +1514,19 @@ impl OpenAiCompatibleClient {
             if protocol == ProviderProtocol::OpenAiResponses {
                 bail!("OpenAI Responses protocol is not supported by this provider");
             }
+            if let Some((info, variant)) = self.selected_reasoning_variant() {
+                if !reasoning_variant_supported_for_protocol(
+                    &self.provider,
+                    &info,
+                    &variant,
+                    ProviderProtocol::OpenAiChat,
+                ) {
+                    bail!(
+                        "thinking variant '{}' cannot be applied after falling back from OpenAI Responses to Chat Completions",
+                        variant.id
+                    );
+                }
+            }
         }
         let extra_body = merge_extra_body(
             sanitize_extra_body(self.provider.extra_body.clone(), CHAT_RESERVED_BODY_KEYS),
@@ -1168,6 +1554,46 @@ impl OpenAiCompatibleClient {
         let mut status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            if non_stream_quota_fallback_candidate(status.as_u16(), &body) {
+                let mut retry = request.clone();
+                retry.stream = false;
+                retry.stream_options = None;
+                let response = self
+                    .send_chat_completion_request(
+                        &url,
+                        &retry,
+                        request_id,
+                        "chat.retry_without_streaming",
+                    )
+                    .await?;
+                let retry_status = response.status();
+                if retry_status.is_success() {
+                    tracing::info!(
+                        request_id,
+                        provider = %self.provider.id,
+                        model = %self.provider.default_model,
+                        "{}",
+                        t(
+                            "streaming quota was unavailable; non-streaming compatibility retry succeeded",
+                            "流式配额不可用；非流式兼容重试成功"
+                        )
+                    );
+                    return self
+                        .consume_chat_completion_response(response, on_chunk)
+                        .await;
+                }
+                let retry_body = response.text().await.unwrap_or_default();
+                tracing::debug!(
+                    request_id,
+                    status = retry_status.as_u16(),
+                    "{}",
+                    t(
+                        "non-streaming quota compatibility retry returned an HTTP error",
+                        "非流式配额兼容重试返回 HTTP 错误"
+                    )
+                );
+                return self.bail_chat_completion_failure(retry_status.as_u16(), &retry_body);
+            }
             if stream_options_unsupported(status.as_u16(), &body) {
                 request.stream_options = None;
                 response = self
@@ -1250,10 +1676,37 @@ impl OpenAiCompatibleClient {
         loop {
             attempt = attempt.saturating_add(1);
             let started = Instant::now();
-            match build_request().send().await {
+            let send = build_request().send();
+            let response = if let Some(timeouts) = self.request_timeouts {
+                match tokio::time::timeout(timeouts.response_header, send).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id,
+                            stage,
+                            attempt,
+                            timeout_seconds = timeouts.response_header.as_secs(),
+                            "{}",
+                            t("LLM response header timed out", "LLM 响应头等待超时")
+                        );
+                        return Err(anyhow::anyhow!(
+                            "LLM response header timed out after {} seconds",
+                            timeouts.response_header.as_secs()
+                        )
+                        .context(TransportFailure {
+                            stage,
+                            kind: TransportFailureKind::Timeout,
+                        }));
+                    }
+                }
+            } else {
+                send.await
+            };
+            match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    let will_retry = retryable_http_status(status);
+                    let retryable_status = retryable_http_status(status);
+                    let will_retry = retryable_status && attempt < MAX_SEND_ATTEMPTS;
                     tracing::debug!(
                         request_id,
                         stage,
@@ -1261,7 +1714,11 @@ impl OpenAiCompatibleClient {
                         status,
                         will_retry,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "LLM HTTP response headers received"
+                        "{}",
+                        t(
+                            "LLM HTTP response headers received",
+                            "已收到 LLM HTTP 响应头"
+                        )
                     );
                     if will_retry {
                         let delay = http_status_retry_delay(attempt);
@@ -1271,11 +1728,22 @@ impl OpenAiCompatibleClient {
                             attempt,
                             status,
                             retry_delay_ms = delay.as_millis(),
-                            "LLM HTTP request returned a transient server error"
+                            "{}",
+                            t(
+                                "LLM HTTP request returned a transient server error",
+                                "LLM HTTP 请求返回临时服务器错误"
+                            )
                         );
                         let _ = response.bytes().await;
                         tokio::time::sleep(delay).await;
                         continue;
+                    }
+                    if retryable_status {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(anyhow::anyhow!(
+                            "LLM HTTP request failed after {attempt} attempts: {body}"
+                        )
+                        .context(HttpStatusFailure::classify(status, &body)));
                     }
                     return Ok(response);
                 }
@@ -1287,7 +1755,9 @@ impl OpenAiCompatibleClient {
                     } else {
                         TransportFailureKind::Other
                     };
-                    let will_retry = !connect_retry_used && retryable_transport_failure(kind);
+                    let will_retry = attempt < MAX_SEND_ATTEMPTS
+                        && !connect_retry_used
+                        && retryable_transport_failure(kind);
                     connect_retry_used |= will_retry;
                     let error = error.without_url();
                     tracing::warn!(
@@ -1298,7 +1768,8 @@ impl OpenAiCompatibleClient {
                         will_retry,
                         elapsed_ms = started.elapsed().as_millis(),
                         error = %format_error_chain(&error),
-                        "LLM HTTP transport attempt failed"
+                        "{}",
+                        t("LLM HTTP transport attempt failed", "LLM HTTP 传输尝试失败")
                     );
                     if will_retry {
                         tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
@@ -1308,6 +1779,39 @@ impl OpenAiCompatibleClient {
                 }
             }
         }
+    }
+
+    async fn next_response_chunk<S, T>(
+        &self,
+        stream: &mut S,
+        stage: &'static str,
+    ) -> Result<Option<T>>
+    where
+        S: Stream<Item = std::result::Result<T, reqwest::Error>> + Unpin,
+    {
+        let next = if let Some(timeouts) = self.request_timeouts {
+            match tokio::time::timeout(timeouts.stream_idle, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "LLM response stream was idle for {} seconds",
+                        timeouts.stream_idle.as_secs()
+                    )
+                    .context(TransportFailure {
+                        stage,
+                        kind: TransportFailureKind::Timeout,
+                    }));
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        next.transpose().map_err(|error| {
+            anyhow::Error::new(error).context(TransportFailure {
+                stage,
+                kind: TransportFailureKind::Other,
+            })
+        })
     }
 
     async fn try_zen_chat_completion_compat_retry<F>(
@@ -1359,7 +1863,11 @@ impl OpenAiCompatibleClient {
                 request_id,
                 attempt = attempt + 1,
                 status = status.as_u16(),
-                "Zen compatibility retry returned an HTTP error"
+                "{}",
+                t(
+                    "Zen compatibility retry returned an HTTP error",
+                    "Zen 兼容重试返回 HTTP 错误"
+                )
             );
             let _ = response.text().await;
         }
@@ -1386,8 +1894,7 @@ impl OpenAiCompatibleClient {
         let mut usage = None;
         let mut tool_calls = ToolCallAccumulator::default();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while let Some(chunk) = self.next_response_chunk(&mut stream, "chat.stream").await? {
             for line in buffer.push(&chunk)? {
                 if let Some(done) = handle_sse_line(
                     &line,
@@ -1448,7 +1955,8 @@ impl OpenAiCompatibleClient {
             content_chars = content.chars().count(),
             reasoning_chars = reasoning.chars().count(),
             tool_call_count = tool_calls.calls.len(),
-            "Chat completions stream reached EOF"
+            "{}",
+            t("Chat completions stream reached EOF", "聊天补全流已到达 EOF")
         );
         let result = finalize_stream_result(content, reasoning, usage, tool_calls.finish(), dsml)?;
         if reasoning_part_active {
@@ -1458,6 +1966,112 @@ impl OpenAiCompatibleClient {
             })?;
         }
         Ok(result)
+    }
+
+    async fn consume_chat_completion_response<F>(
+        &self,
+        response: reqwest::Response,
+        on_chunk: &mut F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
+        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            bail!("non-streaming chat response exceeds the 16 MiB limit");
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = self
+            .next_response_chunk(&mut stream, "chat.response")
+            .await?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                bail!("non-streaming chat response exceeds the 16 MiB limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let response: ChatCompletionResponse =
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "{}: {}",
+                    t(
+                        "invalid non-streaming chat completions response",
+                        "无效的非流式聊天响应",
+                    ),
+                    clean_plain_text(String::from_utf8_lossy(&bytes).to_string())
+                )
+            })?;
+        if let Some(error) = response.error {
+            bail!(
+                "{}: {}",
+                t(
+                    "non-streaming chat completions returned an error",
+                    "非流式聊天响应返回错误"
+                ),
+                provider_error_text(&error)
+            );
+        }
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .context("non-streaming chat response contained no choices")?;
+        let mut tool_calls = ToolCallAccumulator::default();
+        let reasoning = delta_reasoning_text(&choice.message).unwrap_or_default();
+        if !reasoning.is_empty() {
+            on_chunk(ChatStreamChunk {
+                kind: ChatStreamKind::ReasoningPartStart,
+                text: String::new(),
+            })?;
+            on_chunk(ChatStreamChunk {
+                kind: ChatStreamKind::Reasoning,
+                text: reasoning.clone(),
+            })?;
+            on_chunk(ChatStreamChunk {
+                kind: ChatStreamKind::ReasoningPartEnd,
+                text: String::new(),
+            })?;
+        }
+        let content = choice.message.content.unwrap_or_default();
+        if !content.is_empty() {
+            on_chunk(ChatStreamChunk {
+                kind: ChatStreamKind::Content,
+                text: content.clone(),
+            })?;
+        }
+        for tool_call in choice.message.tool_calls {
+            if let Some(name) = tool_calls.push(tool_call) {
+                on_chunk(ChatStreamChunk {
+                    kind: ChatStreamKind::ToolCall,
+                    text: name,
+                })?;
+            }
+        }
+        tracing::debug!(
+            provider = %self.provider.id,
+            model = %self.provider.default_model,
+            finish_reason = choice.finish_reason.as_deref(),
+            content_chars = content.chars().count(),
+            reasoning_chars = reasoning.chars().count(),
+            tool_call_count = tool_calls.calls.len(),
+            "{}",
+            t(
+                "Non-streaming chat completions response consumed",
+                "非流式聊天补全响应已处理"
+            )
+        );
+        finalize_stream_result(
+            content,
+            reasoning,
+            response.usage,
+            tool_calls.finish(),
+            dsml_enabled_for(&self.provider),
+        )
     }
 
     fn bail_chat_completion_failure<T>(&self, status: u16, body: &str) -> Result<T> {
@@ -1582,8 +2196,10 @@ impl OpenAiCompatibleClient {
         let mut state = AnthropicStreamState::default();
         let mut buffer = SseDataBuffer::default();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while let Some(chunk) = self
+            .next_response_chunk(&mut stream, "anthropic.stream")
+            .await?
+        {
             for data in buffer.push(&chunk)? {
                 if handle_anthropic_sse_data(&data, &mut state, &mut *on_chunk)? {
                     return finalize_stream_result(
@@ -1670,7 +2286,8 @@ impl OpenAiCompatibleClient {
             model = %self.provider.default_model,
             reasoning_effort,
             reasoning_summary,
-            "Responses request configured"
+            "{}",
+            t("Responses request configured", "Responses 请求配置完成")
         );
         let url = format!("{}/responses", self.provider.base_url.trim_end_matches('/'));
         let response = self
@@ -1705,8 +2322,10 @@ impl OpenAiCompatibleClient {
         let mut content_started = false;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while let Some(chunk) = self
+            .next_response_chunk(&mut stream, "responses.stream")
+            .await?
+        {
             for line in buffer.push(&chunk)? {
                 if handle_responses_sse_line(
                     &line,
@@ -1894,6 +2513,10 @@ fn stream_options_unsupported(status: u16, body: &str) -> bool {
             || body.contains("unrecognized")
             || body.contains("invalid")
             || body.contains("extra"))
+}
+
+fn non_stream_quota_fallback_candidate(status: u16, body: &str) -> bool {
+    status == 429 && body.to_ascii_lowercase().contains("insufficient_quota")
 }
 
 fn zen_upstream_failed(provider: &ProviderConfig, status: u16, body: &str) -> bool {
@@ -2360,6 +2983,24 @@ struct ChatStreamResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    #[serde(default, deserialize_with = "null_as_default")]
+    choices: Vec<ChatCompletionChoice>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    usage: Option<Usage>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChoice {
+    #[serde(default, deserialize_with = "null_as_default")]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    message: ChatChoiceMessage,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatStreamChoice {
     #[serde(default, deserialize_with = "null_as_default")]
     finish_reason: Option<String>,
@@ -2397,6 +3038,7 @@ where
 
 #[derive(Debug, Default, Deserialize)]
 struct ToolCallDelta {
+    #[serde(default)]
     index: usize,
     #[serde(default, deserialize_with = "null_as_default")]
     id: Option<String>,
@@ -2551,6 +3193,33 @@ struct AnthropicStreamState {
 /// index 2^30) makes the accumulator allocate gigabytes. Chunks addressing
 /// an index beyond the cap are dropped.
 const MAX_STREAM_TOOL_CALLS: usize = 128;
+const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+fn append_bounded(target: &mut String, text: &str, limit: usize) {
+    let remaining = limit.saturating_sub(target.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut end = text.len().min(remaining);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&text[..end]);
+}
+
+fn bounded_stream_string(mut value: String, limit: usize) -> String {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
 
 #[derive(Debug, Default)]
 struct AnthropicToolAccumulator {
@@ -2579,7 +3248,11 @@ impl AnthropicToolAccumulator {
         while self.calls.len() <= index {
             self.calls.push(PartialToolCall::default());
         }
-        self.calls[index].arguments.push_str(&text);
+        append_bounded(
+            &mut self.calls[index].arguments,
+            &text,
+            MAX_STREAM_TOOL_ARGUMENT_BYTES,
+        );
     }
 
     fn finish(self) -> Vec<ToolCall> {
@@ -2624,7 +3297,10 @@ impl ResponsesToolAccumulator {
             id: item.call_id.or(item.id).unwrap_or_default(),
             kind: "function".to_string(),
             name: name.clone(),
-            arguments: item.arguments.unwrap_or_default(),
+            arguments: bounded_stream_string(
+                item.arguments.unwrap_or_default(),
+                MAX_STREAM_TOOL_ARGUMENT_BYTES,
+            ),
         });
         (!name.is_empty()).then_some(name)
     }
@@ -2636,12 +3312,12 @@ impl ResponsesToolAccumulator {
                 .iter_mut()
                 .find(|call| call.id == item_id || call.id.is_empty())
             {
-                call.arguments.push_str(&delta);
+                append_bounded(&mut call.arguments, &delta, MAX_STREAM_TOOL_ARGUMENT_BYTES);
                 return;
             }
         }
         if let Some(call) = self.calls.last_mut() {
-            call.arguments.push_str(&delta);
+            append_bounded(&mut call.arguments, &delta, MAX_STREAM_TOOL_ARGUMENT_BYTES);
         }
     }
 
@@ -2655,7 +3331,7 @@ impl ResponsesToolAccumulator {
                 call.name = name;
             }
             if let Some(arguments) = item.arguments {
-                call.arguments = arguments;
+                call.arguments = bounded_stream_string(arguments, MAX_STREAM_TOOL_ARGUMENT_BYTES);
             }
         } else {
             let _ = self.start(ResponsesStreamItem {
@@ -2721,10 +3397,14 @@ impl ToolCallAccumulator {
             call.kind = kind;
         }
         if let Some(name) = delta.function.name {
-            call.name.push_str(&name);
+            append_bounded(&mut call.name, &name, 16 * 1024);
         }
         if let Some(arguments) = delta.function.arguments {
-            call.arguments.push_str(&arguments);
+            append_bounded(
+                &mut call.arguments,
+                &arguments,
+                MAX_STREAM_TOOL_ARGUMENT_BYTES,
+            );
         }
         (name_updated && !call.name.is_empty()).then(|| call.name.clone())
     }
@@ -2759,10 +3439,18 @@ impl ToolCallAccumulator {
 #[derive(Default)]
 struct Utf8LineBuffer {
     buffer: Vec<u8>,
+    received_bytes: usize,
 }
 
 impl Utf8LineBuffer {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
+        if self.received_bytes.saturating_add(bytes.len()) > MAX_STREAM_RESPONSE_BYTES {
+            bail!("streaming response exceeded {MAX_STREAM_RESPONSE_BYTES} bytes");
+        }
+        if self.buffer.len().saturating_add(bytes.len()) > MAX_STREAM_LINE_BYTES {
+            bail!("streaming response line exceeded {MAX_STREAM_LINE_BYTES} bytes");
+        }
+        self.received_bytes += bytes.len();
         self.buffer.extend_from_slice(bytes);
         let mut lines = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -2933,7 +3621,11 @@ where
             content_chars = content.chars().count(),
             reasoning_chars = reasoning.chars().count(),
             tool_call_count = tool_calls.calls.len(),
-            "Chat completions stream received DONE"
+            "{}",
+            t(
+                "Chat completions stream received DONE",
+                "聊天补全流已收到 DONE"
+            )
         );
         return Ok(Some(true));
     }
@@ -2964,7 +3656,11 @@ where
         if let Some(next_finish_reason) = choice.finish_reason {
             tracing::debug!(
                 finish_reason = %next_finish_reason,
-                "Chat completions stream finish reason received"
+                "{}",
+                t(
+                    "Chat completions stream finish reason received",
+                    "已收到聊天补全流结束原因"
+                )
             );
             *finish_reason = Some(next_finish_reason);
         }
@@ -3110,7 +3806,8 @@ where
             item_kind = ?item_kind,
             delta_chars = ?delta_chars,
             reasoning_tokens = ?reasoning_tokens,
-            "Responses stream milestone"
+            "{}",
+            t("Responses stream milestone", "Responses 流关键节点")
         );
     }
     match event.kind.as_str() {
@@ -4189,6 +4886,22 @@ mod tests {
     }
 
     #[test]
+    fn quota_compatibility_retry_is_narrowly_scoped() {
+        assert!(non_stream_quota_fallback_candidate(
+            429,
+            r#"{"error":{"code":"insufficient_quota"}}"#
+        ));
+        assert!(!non_stream_quota_fallback_candidate(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+        assert!(!non_stream_quota_fallback_candidate(
+            400,
+            r#"{"error":{"code":"insufficient_quota"}}"#
+        ));
+    }
+
+    #[test]
     fn zen_upstream_failed_detects_opencode_zen_compat_error() {
         let provider = test_provider("myopencode", OPENCODE_ZEN_BASE_URL);
 
@@ -4890,11 +5603,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_http_server_errors_continue_until_cancelled() {
+    async fn persistent_http_server_errors_stop_after_three_attempts() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/retry", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+            for _ in 0..MAX_SEND_ATTEMPTS {
+                let (mut stream, _) = listener.accept().await.unwrap();
                 read_http_headers(&mut stream).await;
                 stream
                     .write_all(
@@ -4907,22 +5621,143 @@ mod tests {
 
         let client = test_client(test_provider("test", "http://example.invalid/v1"));
         let mut builds = 0;
-        let result = tokio::time::timeout(
-            Duration::from_millis(120),
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
             client.send_with_transport_retry("request-test", "chat.send", || {
                 builds += 1;
                 client.client.get(&url)
             }),
         )
-        .await;
+        .await
+        .expect("persistent 5xx retries did not stop")
+        .unwrap_err();
 
-        assert!(
-            result.is_err(),
-            "persistent 5xx unexpectedly stopped retrying"
-        );
-        assert!(builds >= 4, "expected repeated 5xx attempts, got {builds}");
-        server.abort();
-        let _ = server.await;
+        assert_eq!(builds, MAX_SEND_ATTEMPTS);
+        let failure = error.downcast_ref::<HttpStatusFailure>().unwrap();
+        assert_eq!(failure.status, 500);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_stops_a_stalled_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut provider = test_provider("header-timeout-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        let client = test_client(provider)
+            .with_request_timeouts(Duration::from_millis(20), Duration::from_secs(1));
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("response header timed out"), "{message}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_fails_over_to_the_next_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stalled, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stalled).await;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(stalled);
+            });
+            let (mut healthy, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut healthy).await;
+            write_http_sse_response(
+                &mut healthy,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut first = test_provider("header-timeout-first", &url);
+        first.protocol = "openai-chat".to_string();
+        let mut second = test_provider("header-timeout-second", &url);
+        second.protocol = "openai-chat".to_string();
+        let http_client = reqwest::Client::new();
+        let endpoints = vec![
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: first.clone(),
+                api_key: "first".to_string(),
+                key_index: 0,
+            },
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: second,
+                api_key: "second".to_string(),
+                key_index: 0,
+            },
+        ];
+        let client = OpenAiCompatibleClient {
+            client: http_client,
+            provider: first,
+            api_key: "first".to_string(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Hidden,
+            detailed_reasoning_summary: false,
+            request_timeouts: Some(RequestTimeouts {
+                response_header: Duration::from_millis(20),
+                stream_idle: Duration::from_secs(1),
+            }),
+        };
+
+        let result = client
+            .chat_buffered(vec![ChatMessage::plain("user", "hi")], Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(result.content, "fallback");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_stops_a_stalled_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut provider = test_provider("stream-idle-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        let client = test_client(provider)
+            .with_request_timeouts(Duration::from_secs(1), Duration::from_millis(20));
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("response stream was idle"), "{message}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4966,6 +5801,64 @@ mod tests {
                 ChatStreamKind::ReasoningPartStart,
                 ChatStreamKind::Reasoning,
                 ChatStreamKind::ReasoningPartEnd,
+            ]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insufficient_streaming_quota_falls_back_to_non_streaming_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut first).await;
+            let quota = r#"{"error":{"message":"quota","code":"insufficient_quota"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                quota.len(),
+                quota
+            );
+            first.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut second).await;
+            let body = r#"{"choices":[{"finish_reason":"stop","message":{"reasoning_content":"think","content":"answer"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            second.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut provider = test_provider("quota-fallback-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+        let mut chunks = Vec::new();
+        let result = client
+            .chat_stream(
+                vec![ChatMessage::plain("user", "hi")],
+                Vec::new(),
+                |chunk| {
+                    chunks.push(chunk);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "answer");
+        assert_eq!(result.reasoning.as_deref(), Some("think"));
+        assert_eq!(result.usage.unwrap().total_tokens, 5);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.kind).collect::<Vec<_>>(),
+            vec![
+                ChatStreamKind::ReasoningPartStart,
+                ChatStreamKind::Reasoning,
+                ChatStreamKind::ReasoningPartEnd,
+                ChatStreamKind::Content,
             ]
         );
         server.await.unwrap();
@@ -5024,6 +5917,7 @@ mod tests {
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
+            request_timeouts: None,
         };
         let mut chunks = Vec::new();
 
@@ -5053,6 +5947,66 @@ mod tests {
                 ChatStreamKind::Content,
             ]
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_completion_fails_over_after_partial_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let bodies = [
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"incomplete\"}}]}\n\n",
+                    "data: {\"error\":{\"message\":\"upstream stream failed\"}}\n\n"
+                ),
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            ];
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                write_http_sse_response(&mut stream, body).await;
+            }
+        });
+
+        let mut first = test_provider("buffered-first-test", &url);
+        first.protocol = "openai-chat".to_string();
+        let mut second = test_provider("buffered-second-test", &url);
+        second.protocol = "openai-chat".to_string();
+        let http_client = reqwest::Client::new();
+        let endpoints = vec![
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: first.clone(),
+                api_key: "first".to_string(),
+                key_index: 0,
+            },
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: second,
+                api_key: "second".to_string(),
+                key_index: 0,
+            },
+        ];
+        let client = OpenAiCompatibleClient {
+            client: http_client,
+            provider: first,
+            api_key: "first".to_string(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Summary,
+            detailed_reasoning_summary: false,
+            request_timeouts: None,
+        };
+
+        let result = client
+            .chat_buffered(vec![ChatMessage::plain("user", "hi")], Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(result.content, "answer");
         server.await.unwrap();
     }
 
@@ -5141,6 +6095,149 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(cooldown_for_error(&protocol), None);
+    }
+
+    #[test]
+    fn structured_provider_errors_drive_failure_semantics() {
+        let rate_limit = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
+        );
+        let invalid_key = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#,
+        );
+        let unavailable_model = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"type":"invalid_request_error","code":"model_not_available"}}"#,
+        );
+        let incompatible_endpoint = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"Unknown parameter: tools"}}"#,
+        );
+        let invalid_request = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"Malformed request body"}}"#,
+        );
+        let google_invalid_request = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"status":"InvalidArgument","message":"request rejected"}}"#,
+        );
+        let azure_missing_deployment = HttpStatusFailure::classify(
+            400,
+            r#"{"error":{"code":"DeploymentNotFound","message":"missing"}}"#,
+        );
+        let unknown = HttpStatusFailure::classify(400, r#"{"error":{"message":"failed"}}"#);
+
+        assert_eq!(rate_limit.kind, HttpFailureKind::RateLimit);
+        assert_eq!(invalid_key.kind, HttpFailureKind::Authentication);
+        assert_eq!(unavailable_model.kind, HttpFailureKind::EndpointUnavailable);
+        assert_eq!(
+            incompatible_endpoint.kind,
+            HttpFailureKind::EndpointIncompatible
+        );
+        assert_eq!(invalid_request.kind, HttpFailureKind::InvalidRequest);
+        assert_eq!(google_invalid_request.kind, HttpFailureKind::InvalidRequest);
+        assert_eq!(
+            azure_missing_deployment.kind,
+            HttpFailureKind::EndpointUnavailable
+        );
+        assert_eq!(unknown.kind, HttpFailureKind::Status);
+
+        assert!(endpoint_failover_allowed(&anyhow::Error::new(
+            incompatible_endpoint
+        )));
+        let invalid_request = anyhow::Error::new(invalid_request);
+        assert_eq!(cooldown_for_error(&invalid_request), None);
+        assert!(!endpoint_failover_allowed(&invalid_request));
+        assert!(endpoint_failover_allowed(&anyhow::Error::new(unknown)));
+    }
+
+    #[test]
+    fn scheduler_skips_cooling_endpoints_and_reports_an_exhausted_pool() {
+        let first = test_client(test_provider(
+            "scheduler-first",
+            "http://example.invalid/v1",
+        ));
+        let second = test_client(test_provider(
+            "scheduler-second",
+            "http://example.invalid/v1",
+        ));
+        let endpoints = vec![first.endpoints[0].clone(), second.endpoints[0].clone()];
+        let mut scheduler = LlmScheduler::default();
+
+        scheduler.mark_failure(endpoints[0].id(), Duration::from_secs(60));
+        assert_eq!(scheduler.ordered_indices(&endpoints), vec![1]);
+
+        scheduler.mark_failure(endpoints[1].id(), Duration::from_secs(60));
+        assert!(scheduler.ordered_indices(&endpoints).is_empty());
+
+        scheduler.mark_success(&endpoints[0].id());
+        assert_eq!(scheduler.ordered_indices(&endpoints), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn invalid_request_does_not_fail_over_to_another_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            let body =
+                r#"{"error":{"type":"invalid_request_error","message":"Malformed request body"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        });
+
+        let mut first = test_provider("invalid-request-first", &url);
+        first.protocol = "openai-chat".to_string();
+        let mut second = test_provider("invalid-request-second", &url);
+        second.protocol = "openai-chat".to_string();
+        let http_client = reqwest::Client::new();
+        let endpoints = vec![
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: first.clone(),
+                api_key: "first".to_string(),
+                key_index: 0,
+            },
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: second,
+                api_key: "second".to_string(),
+                key_index: 0,
+            },
+        ];
+        let client = OpenAiCompatibleClient {
+            client: http_client,
+            provider: first,
+            api_key: "first".to_string(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Summary,
+            detailed_reasoning_summary: false,
+            request_timeouts: None,
+        };
+
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("endpoint failover was suppressed"));
+        assert!(
+            server.await.unwrap(),
+            "a second endpoint received the request"
+        );
     }
 
     #[test]
@@ -5299,6 +6396,7 @@ mod tests {
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
+            request_timeouts: None,
         }
     }
 
@@ -5331,7 +6429,7 @@ mod tests {
             model_modalities: std::collections::HashMap::new(),
             default_model: String::new(),
             timeout_seconds: 60,
-            temperature: 0.7,
+            temperature: 1.0,
             anthropic_max_tokens: 4096,
             extra_body: None,
         }
@@ -5352,6 +6450,7 @@ mod tests {
                 thinking_variant_key(&provider.id, &provider.default_model),
                 "high".to_string(),
             )]),
+            ..ThinkingVariantPreferences::default()
         };
         std::fs::write(
             thinking_variant_preferences_file(&paths),
@@ -5382,6 +6481,7 @@ mod tests {
         let active_key = thinking_variant_key("custom", "reasoning-model");
         let preferences = ThinkingVariantPreferences {
             selected: HashMap::from([(inactive_key.clone(), "max".to_string())]),
+            ..ThinkingVariantPreferences::default()
         };
         std::fs::write(
             thinking_variant_preferences_file(&paths),
@@ -5418,6 +6518,134 @@ mod tests {
     }
 
     #[test]
+    fn staged_thinking_variant_update_merges_only_the_edited_inactive_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let mut staged = ThinkingVariantPreferences::load(&paths);
+        staged.set("future-provider", "future-model", Some("high".to_string()));
+
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let concurrent_key = thinking_variant_key("other-provider", "other-model");
+        let concurrent = ThinkingVariantPreferences {
+            selected: HashMap::from([(concurrent_key.clone(), "max".to_string())]),
+            ..ThinkingVariantPreferences::default()
+        };
+        std::fs::write(
+            thinking_variant_preferences_file(&paths),
+            serde_json::to_string(&concurrent).unwrap(),
+        )
+        .unwrap();
+
+        staged.save(&paths).unwrap();
+
+        let saved = ThinkingVariantPreferences::load(&paths);
+        assert_eq!(
+            saved.selected("future-provider", "future-model"),
+            Some("high")
+        );
+        assert_eq!(
+            saved.selected.get(&concurrent_key).map(String::as_str),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn malformed_thinking_variant_state_is_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let path = thinking_variant_preferences_file(&paths);
+        std::fs::write(&path, "{not-json").unwrap();
+        let mut preferences = ThinkingVariantPreferences::load(&paths);
+        preferences.set("provider", "model", Some("high".to_string()));
+
+        let error = preferences.save(&paths).unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to parse thinking variant state"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{not-json");
+    }
+
+    #[test]
+    fn thinking_variant_preferences_follow_provider_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let preferences = ThinkingVariantPreferences {
+            selected: HashMap::from([
+                (thinking_variant_key("old", "first"), "high".to_string()),
+                (thinking_variant_key("old", "second"), "max".to_string()),
+                (thinking_variant_key("other", "first"), "low".to_string()),
+            ]),
+            ..ThinkingVariantPreferences::default()
+        };
+        std::fs::write(
+            thinking_variant_preferences_file(&paths),
+            serde_json::to_string(&preferences).unwrap(),
+        )
+        .unwrap();
+        let mut preferences = ThinkingVariantPreferences::load(&paths);
+
+        preferences.set("old", "second", Some("low".to_string()));
+        preferences.rename_provider("old", "new");
+        let mut concurrent = ThinkingVariantPreferences::load(&paths);
+        concurrent.set("old", "first", Some("medium".to_string()));
+        concurrent.set("old", "second", Some("high".to_string()));
+        concurrent.set("old", "late", Some("medium".to_string()));
+        concurrent.save(&paths).unwrap();
+        preferences.save(&paths).unwrap();
+
+        let saved = ThinkingVariantPreferences::load(&paths);
+        assert_eq!(saved.selected("new", "first"), Some("medium"));
+        assert_eq!(saved.selected("new", "second"), Some("low"));
+        assert_eq!(saved.selected("new", "late"), Some("medium"));
+        assert_eq!(saved.selected("other", "first"), Some("low"));
+        assert_eq!(saved.selected("old", "first"), None);
+        assert_eq!(saved.selected("old", "second"), None);
+        assert_eq!(saved.selected("old", "late"), None);
+    }
+
+    #[test]
+    fn provider_rename_replays_when_the_initial_variant_snapshot_was_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let mut renaming = ThinkingVariantPreferences::load(&paths);
+        renaming.rename_provider("old", "new");
+
+        let mut concurrent = ThinkingVariantPreferences::load(&paths);
+        concurrent.set("old", "late", Some("high".to_string()));
+        concurrent.save(&paths).unwrap();
+        renaming.save(&paths).unwrap();
+
+        let saved = ThinkingVariantPreferences::load(&paths);
+        assert_eq!(saved.selected("new", "late"), Some("high"));
+        assert_eq!(saved.selected("old", "late"), None);
+    }
+
+    #[test]
+    fn concurrent_thinking_variant_updates_keep_distinct_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles = ["first", "second"].map(|model| {
+            let paths = paths.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut preferences = ThinkingVariantPreferences::load(&paths);
+                preferences.set("provider", model, Some("high".to_string()));
+                barrier.wait();
+                preferences.save(&paths).unwrap();
+            })
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let saved = ThinkingVariantPreferences::load(&paths);
+        assert_eq!(saved.selected("provider", "first"), Some("high"));
+        assert_eq!(saved.selected("provider", "second"), Some("high"));
+    }
+
+    #[test]
     fn reasoning_variants_use_current_wire_protocol_mapping() {
         let info = ModelReasoningInfo {
             provider_npm: Some("@openrouter/ai-sdk-provider".to_string()),
@@ -5432,8 +6660,18 @@ mod tests {
             setting: ReasoningSetting::BudgetTokens(8000),
         };
         let provider = test_provider("openrouter", "https://openrouter.ai/api/v1");
-        assert!(reasoning_variant_supported(&provider, &info, &effort));
-        assert!(reasoning_variant_supported(&provider, &info, &budget));
+        assert!(reasoning_variant_supported(
+            &provider,
+            "test-model",
+            &info,
+            &effort
+        ));
+        assert!(reasoning_variant_supported(
+            &provider,
+            "test-model",
+            &info,
+            &budget
+        ));
 
         let unknown_info = ModelReasoningInfo {
             provider_npm: Some("@unknown/provider".to_string()),
@@ -5442,11 +6680,13 @@ mod tests {
         let unknown = test_provider("proxy", "https://proxy.example/v1");
         assert!(reasoning_variant_supported(
             &unknown,
+            "test-model",
             &unknown_info,
             &effort
         ));
         assert!(!reasoning_variant_supported(
             &unknown,
+            "test-model",
             &unknown_info,
             &budget
         ));
@@ -5458,8 +6698,28 @@ mod tests {
         };
         assert!(reasoning_variant_supported(
             &alibaba,
+            "test-model",
             &unknown_info,
             &toggle
+        ));
+
+        assert!(reasoning_variant_supported(
+            &unknown,
+            "gpt-5-mini",
+            &unknown_info,
+            &toggle
+        ));
+        assert!(!reasoning_variant_supported(
+            &unknown,
+            "gpt-4.1",
+            &unknown_info,
+            &toggle
+        ));
+        assert!(!reasoning_variant_supported_for_protocol(
+            &unknown,
+            &unknown_info,
+            &toggle,
+            ProviderProtocol::OpenAiChat
         ));
     }
 
@@ -5522,6 +6782,7 @@ mod tests {
             )]),
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
+            request_timeouts: None,
         };
 
         let first_endpoint = client.with_endpoint(&client.endpoints[0]);

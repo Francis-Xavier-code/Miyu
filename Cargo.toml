@@ -2,6 +2,7 @@
 name = "miyu"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/SHORiN-KiWATA/Miyu"
 description = "Command-line AI assistant"
@@ -19,19 +20,22 @@ blake3 = "1.5"
 blake2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-cosmic-text = "0.15.0"
+cosmic-text = { version = "0.15.0", default-features = false, features = ["std", "swash"] }
 crc32fast = "1.4"
 crossterm = "0.28"
 directories = "5.0"
 hex = "0.4"
-html2md = "0.2"
-html2text = "0.12"
+html2text = "0.16.7"
+htmd = "0.5.5"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 json_comments = "0.2"
+markup5ever_rcdom = "0.38"
 futures-util = "0.3"
 flate2 = "1.0"
 fuzzy-matcher = "0.3"
 fancy-regex = "0.17"
+fst = "0.4"
+fontdb = { version = "0.23", default-features = false, features = ["std", "fs", "memmap"] }
 if-addrs = "0.13"
 libc = "0.2"
 md5 = "0.7"
@@ -51,7 +55,7 @@ syntect = { version = "5.2", default-features = false, features = ["default-synt
 termimad = "0.34"
 tempfile = "3.15"
 tar = "0.4"
-tokio = { version = "1.38", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.38", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 trash = "5.2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
@@ -62,11 +66,14 @@ unicode-width = "0.2"
 urlencoding = "2.1"
 vte = "0.15"
 rustc-hash = "2"
+yaml-rust2 = { version = "0.11", default-features = false }
 
 [build-dependencies]
 base64 = "0.22"
+fst = "0.4"
 
 [dev-dependencies]
+jieba-rs = "0.7"
 tiktoken-rs = "0.12"
 
 [profile.release]

@@ -3,10 +3,169 @@ pub mod fish;
 pub mod zsh;
 
 use crate::i18n::text as t;
+use anyhow::{bail, Context, Result};
 use std::env;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+
+const BASH_BEGIN_MARKER: &str = "# >>> miyu bash hook >>>";
+const BASH_END_MARKER: &str = "# <<< miyu bash hook <<<";
+const ZSH_BEGIN_MARKER: &str = "# >>> miyu zsh hook >>>";
+const ZSH_END_MARKER: &str = "# <<< miyu zsh hook <<<";
+
+pub(super) fn upsert_source_block(
+    rc_path: &Path,
+    begin: &str,
+    end: &str,
+    hook_file: &Path,
+) -> Result<()> {
+    let existing = read_optional_text(rc_path)?;
+    let block = source_block(begin, end, hook_file);
+    if let Some(updated) = replace_marked_block(&existing, begin, end, &block)? {
+        if updated != existing {
+            fs::write(rc_path, updated)
+                .with_context(|| format!("updating shell startup file {}", rc_path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = rc_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rc_path)?;
+    if !existing.ends_with('\n') && !existing.is_empty() {
+        writeln!(file)?;
+    }
+    file.write_all(block.as_bytes())?;
+    Ok(())
+}
+
+/// Refreshes only hook blocks installed by an older Miyu layout. It never
+/// enables shell integration for a user who did not already have it enabled.
+pub(crate) fn refresh_migrated_hook_sources(
+    home: &Path,
+    bash_hook: Option<&Path>,
+    zsh_hook: Option<&Path>,
+) -> Result<()> {
+    if let Some(hook) = bash_hook {
+        refresh_source_block_if_present(
+            &home.join(".bashrc"),
+            BASH_BEGIN_MARKER,
+            BASH_END_MARKER,
+            hook,
+        )?;
+    }
+    if let Some(hook) = zsh_hook {
+        refresh_source_block_if_present(
+            &home.join(".zshrc"),
+            ZSH_BEGIN_MARKER,
+            ZSH_END_MARKER,
+            hook,
+        )?;
+    }
+    Ok(())
+}
+
+fn refresh_source_block_if_present(
+    rc_path: &Path,
+    begin: &str,
+    end: &str,
+    hook_file: &Path,
+) -> Result<()> {
+    let existing = read_optional_text(rc_path)?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let block = source_block(begin, end, hook_file);
+    let Some(updated) = replace_marked_block(&existing, begin, end, &block)? else {
+        return Ok(());
+    };
+    if updated != existing {
+        write_text_atomically(rc_path, &updated)
+            .with_context(|| format!("refreshing migrated shell hook in {}", rc_path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_text_atomically(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("shell startup file has no parent directory")?;
+    let mode = fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
+    let temporary = parent.join(format!(
+        ".miyu-hook-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "creating temporary shell startup file {}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("installing updated shell startup file {}", path.display()))?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn read_optional_text(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn source_block(begin: &str, end: &str, hook_file: &Path) -> String {
+    let hook = shell_quote(hook_file);
+    format!("{begin}\n[ -r {hook} ] && source {hook}\n{end}\n")
+}
+
+fn replace_marked_block(
+    existing: &str,
+    begin: &str,
+    end: &str,
+    replacement: &str,
+) -> Result<Option<String>> {
+    let Some(begin_index) = existing.find(begin) else {
+        if existing.contains(end) {
+            bail!("shell startup file contains a Miyu end marker without its begin marker");
+        }
+        return Ok(None);
+    };
+    let Some(end_relative) = existing[begin_index..].find(end) else {
+        bail!("shell startup file contains an incomplete Miyu hook block");
+    };
+    let mut end_index = begin_index + end_relative + end.len();
+    if existing.as_bytes().get(end_index) == Some(&b'\r') {
+        end_index += 1;
+    }
+    if existing.as_bytes().get(end_index) == Some(&b'\n') {
+        end_index += 1;
+    }
+    let mut updated = String::with_capacity(
+        existing.len().saturating_sub(end_index - begin_index) + replacement.len(),
+    );
+    updated.push_str(&existing[..begin_index]);
+    updated.push_str(replacement);
+    updated.push_str(&existing[end_index..]);
+    Ok(Some(updated))
+}
 
 pub fn print_reload_hint(shell: &str, hook_file: &Path) {
     let source = match shell {

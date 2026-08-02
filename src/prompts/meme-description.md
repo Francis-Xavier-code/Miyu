@@ -16,7 +16,9 @@
 - 只收录能在聊天中表达反应、情绪、关系感或玩梗的图片。
 - 图片的主要价值如果是传递信息、记录数据、展示内容，而不是表达聊天反应，应拒收或降低优先级。
 - 跑分图、benchmark、性能对比图、控制台/日志/代码/报错截图、文档/论文/网页/聊天记录截图、表格/图表/报告/教程、普通照片、隐私截图、广告不应作为默认表情包收录。
-- GIF 默认按静态预览处理，除非用户显式允许动画。
+- 普通照片一律拒收，即使主体、构图或情绪看起来有趣。
+- GIF 按静态和动态内容整体判断，不因动画形式放宽标准。
+- 只有图片明确是可复用的聊天反应、主要价值是表达而不是传递信息、没有任何风险门，且判断置信度为 100 时才允许收录。
 
 ## 输出格式
 
@@ -25,6 +27,23 @@
 ```json
 {
   "save": true,
+  "confidence": 100,
+  "positive_gates": {
+    "chat_reaction": true,
+    "emotion_or_meme": true,
+    "reusable": true,
+    "context_independent": true,
+    "persona_fit": true,
+    "meaning_clear": true,
+    "visual_quality": true
+  },
+  "risk_gates": {
+    "ordinary_photo": false,
+    "informational_content": false,
+    "privacy": false,
+    "advertisement": false,
+    "unsafe_or_abusive": false
+  },
   "name": { "zh": "", "en": "" },
   "description": "",
   "usage": "",
@@ -32,3 +51,5 @@
   "tags": [""]
 }
 ```
+
+字段必须与上述 schema 完全一致，不得省略或增加字段。无法确认时必须令 `save` 为 false，并如实填写门控值和置信度。

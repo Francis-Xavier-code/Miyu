@@ -3,7 +3,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-const BASE_DESCRIPTION: &str = "按需加载工具、脚本或工具组的完整说明和参数 schema。请从 <available_load_targets> 中选择 <name>，并使用 {\"names\":[\"名称\"]} 加载。type=tool/script 表示加载单个工具；type=group 表示加载该组所有未加载工具。<unregistered_scripts> 中的文件尚未注册为工具，不能直接加载或调用；需要先读取对应路径并使用 register_script 注册。";
+const BASE_DESCRIPTION: &str = "按需加载工具、脚本或工具组的完整说明和参数 schema。请从 <available_load_targets> 中选择 <name>，并使用 {\"names\":[\"名称\"]} 加载。type=tool/script 表示加载单个工具；type=group 表示加载该组所有未加载工具。<script_summary> 是全部脚本状态摘要：always_loaded 已经可以直接调用，不需要加载；lazy 脚本需要从 available_load_targets 中选择并加载；unregistered_scripts 只表示缺少描述、尚未注册的用户脚本，不表示已注册脚本数量。<unregistered_scripts> 中的文件不能直接加载或调用，需要先读取对应路径并使用 register_script 注册。";
 
 pub fn register(registry: &mut ToolRegistry) {
     registry.register(
@@ -32,7 +32,8 @@ pub fn register(registry: &mut ToolRegistry) {
 
 pub(super) fn dynamic_description(registry: &ToolRegistry, loaded: &BTreeSet<String>) -> String {
     format!(
-        "{BASE_DESCRIPTION}\n\n{}\n{}",
+        "{BASE_DESCRIPTION}\n\n{}\n{}\n{}",
+        registry.script_summary_xml(),
         registry.load_targets_xml(loaded),
         unregistered_scripts_xml(registry),
     )
@@ -96,7 +97,7 @@ fn unregistered_scripts_xml(registry: &ToolRegistry) -> String {
     format!("<unregistered_scripts>\n{items}\n</unregistered_scripts>")
 }
 
-fn xml_escape(text: &str) -> String {
+pub(super) fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -140,6 +141,10 @@ mod tests {
             .unwrap();
 
         let description = dynamic_description(&registry, &BTreeSet::new());
+        assert!(description.contains("<total>1</total>"));
+        assert!(description.contains("<lazy>1</lazy>"));
+        assert!(description.contains("<unregistered>1</unregistered>"));
+        assert!(description.contains("<registered_names>lazy_script</registered_names>"));
         assert!(description.contains("<available_load_targets>"));
         assert!(description.contains("custom_builtin"));
         assert!(description.contains("lazy_script"));

@@ -4,16 +4,49 @@
   const MAX_CONTENT_CHARS = 20_000;
   const MAX_CUSTOM_ANSWER_CHARS = 4_000;
   const MAX_TOOL_OUTPUT_CHARS = 200_000;
+  const MAX_ATTACHMENTS = 12;
+  const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+  const MAX_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024;
+  const COMMAND_OUTPUT_PREVIEW_ROWS = 8;
   const NEAR_BOTTOM_PX = 120;
+  const UI_SCALE = 1.1;
+  const ARTIFACT_TEXT_SCALE = 1.2 / UI_SCALE;
   const DEFAULT_BOARD_TITLE = "今天想聊些什么？";
   const DEFAULT_BOARD_SUBTITLE = "从一个问题、计划或此刻的想法开始。";
   const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
+  const CONVERSATION_MODES = [
+    { id: "normal", label: "普通" },
+    { id: "plan", label: "计划" },
+    { id: "chat", label: "闲聊" }
+  ];
+  const THINKING_VARIANT_LABELS = Object.freeze({
+    default: "默认",
+    none: "关闭",
+    minimal: "最小",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高",
+    max: "最大",
+    on: "开启",
+    off: "关闭",
+    auto: "自动"
+  });
+
+  function layoutViewportWidth() {
+    return (window.innerWidth || document.documentElement.clientWidth || 0) / UI_SCALE;
+  }
+
+  function visualPixelsToLayout(value) {
+    return Number(value || 0) / UI_SCALE;
+  }
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const ICONS = {
     "arrow-down": [["path", { d: "M12 5v14" }], ["path", { d: "m19 12-7 7-7-7" }]],
     "arrow-up": [["path", { d: "m5 12 7-7 7 7" }], ["path", { d: "M12 19V5" }]],
     atom: [["circle", { cx: "12", cy: "12", r: "1" }], ["path", { d: "M20.2 20.2c2.04-2.03.02-7.37-4.5-11.9-4.52-4.52-9.87-6.54-11.9-4.5-2.04 2.03-.02 7.37 4.5 11.9 4.52 4.52 9.87 6.54 11.9 4.5Z" }], ["path", { d: "M15.7 15.7c4.52-4.52 6.54-9.87 4.5-11.9-2.03-2.04-7.37-.02-11.9 4.5-4.52 4.52-6.54 9.87-4.5 11.9 2.03 2.04 7.37.02 11.9-4.5Z" }]],
+    brain: [["path", { d: "M9.5 4A2.5 2.5 0 0 1 12 6.5v11a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 5.5 13a3 3 0 0 1 .34-5.98A2.5 2.5 0 0 1 9.5 4Z" }], ["path", { d: "M14.5 4A2.5 2.5 0 0 0 12 6.5v11a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 18.5 13a3 3 0 0 0-.34-5.98A2.5 2.5 0 0 0 14.5 4Z" }]],
     check: [["path", { d: "M20 6 9 17l-5-5" }]],
     "chevron-down": [["path", { d: "m6 9 6 6 6-6" }]],
     "chevron-right": [["path", { d: "m9 18 6-6-6-6" }]],
@@ -22,12 +55,16 @@
     "circle-stop": [["circle", { cx: "12", cy: "12", r: "10" }], ["rect", { width: "6", height: "6", x: "9", y: "9", rx: "1" }]],
     "cloud-sun": [["path", { d: "M12 2v2" }], ["path", { d: "m4.93 4.93 1.41 1.41" }], ["path", { d: "M20 12h2" }], ["path", { d: "m19.07 4.93-1.41 1.41" }], ["path", { d: "M16 6a4 4 0 0 0-3.46 6" }], ["path", { d: "M17.5 19H9a4 4 0 1 1 3.68-5.57A3 3 0 1 1 17.5 19Z" }]],
     copy: [["rect", { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }], ["path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }]],
+    "code-2": [["path", { d: "m18 16 4-4-4-4" }], ["path", { d: "m6 8-4 4 4 4" }], ["path", { d: "m14.5 4-5 16" }]],
     download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["polyline", { points: "7 10 12 15 17 10" }], ["line", { x1: "12", x2: "12", y1: "15", y2: "3" }]],
+    "dollar-sign": [["line", { x1: "12", x2: "12", y1: "2", y2: "22" }], ["path", { d: "M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" }]],
     ellipsis: [["circle", { cx: "12", cy: "12", r: "1" }], ["circle", { cx: "19", cy: "12", r: "1" }], ["circle", { cx: "5", cy: "12", r: "1" }]],
+    eye: [["path", { d: "M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" }], ["circle", { cx: "12", cy: "12", r: "3" }]],
     "external-link": [["path", { d: "M15 3h6v6" }], ["path", { d: "M10 14 21 3" }], ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }]],
     folder: [["path", { d: "M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" }]],
+    globe: [["circle", { cx: "12", cy: "12", r: "10" }], ["path", { d: "M2 12h20" }], ["path", { d: "M12 2a15.3 15.3 0 0 1 0 20" }], ["path", { d: "M12 2a15.3 15.3 0 0 0 0 20" }]],
+    "file-text": [["path", { d: "M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" }], ["polyline", { points: "14 2 14 8 20 8" }], ["line", { x1: "8", x2: "16", y1: "13", y2: "13" }], ["line", { x1: "8", x2: "16", y1: "17", y2: "17" }]],
     "trash-2": [["path", { d: "M3 6h18" }], ["path", { d: "M8 6V4h8v2" }], ["path", { d: "M19 6 18 20H6L5 6" }], ["path", { d: "M10 11v5" }], ["path", { d: "M14 11v5" }]],
-    fileTerminal: [["path", { d: "M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" }], ["polyline", { points: "14 2 14 8 20 8" }], ["path", { d: "m8 13 2 2-2 2" }], ["path", { d: "M12 17h4" }]],
     lightbulb: [["path", { d: "M9 18h6" }], ["path", { d: "M10 22h4" }], ["path", { d: "M15.09 14c.18-.59.59-1.05 1.05-1.52A6 6 0 1 0 7.86 12.5c.45.44.85.9 1.03 1.5" }], ["path", { d: "M9 14h6v1a3 3 0 0 1-6 0v-1Z" }]],
     "list-todo": [["rect", { x: "3", y: "5", width: "6", height: "6", rx: "1" }], ["path", { d: "m3 17 2 2 4-4" }], ["path", { d: "M13 6h8" }], ["path", { d: "M13 12h8" }], ["path", { d: "M13 18h8" }]],
     "loader-circle": [["path", { d: "M21 12a9 9 0 1 1-6.219-8.56" }]],
@@ -37,7 +74,18 @@
     "messages-square": [["path", { d: "M14 9a2 2 0 0 1-2 2H6l-4 4V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z" }], ["path", { d: "M18 9h2a2 2 0 0 1 2 2v10l-4-4h-6a2 2 0 0 1-2-2v-1" }]],
     moon: [["path", { d: "M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" }]],
     "image-search": [["rect", { x: "3", y: "3", width: "14", height: "14", rx: "2" }], ["circle", { cx: "11", cy: "9", r: "2" }], ["path", { d: "m3 15 4-4 5 5" }], ["circle", { cx: "18", cy: "18", r: "3" }], ["path", { d: "m20.2 20.2 1.8 1.8" }]],
+    image: [["rect", { x: "3", y: "3", width: "18", height: "18", rx: "2" }], ["circle", { cx: "8.5", cy: "8.5", r: "1.5" }], ["path", { d: "m21 15-5-5L5 21" }]],
+    "file-code": [["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }], ["path", { d: "M14 2v6h6" }], ["path", { d: "m10 13-2 2 2 2" }], ["path", { d: "m14 13 2 2-2 2" }]],
+    "file-markdown": [["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }], ["path", { d: "M14 2v6h6" }], ["path", { d: "M8 16v-4l2 2 2-2v4" }], ["path", { d: "M15 12v4" }]],
+    "file-json": [["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }], ["path", { d: "M14 2v6h6" }], ["path", { d: "M8 12h1a1 1 0 0 1 0 2H8v2h1a1 1 0 0 1 0 2H8" }], ["path", { d: "M16 12h-1a1 1 0 0 0 0 2h1v2h-1" }]],
+    "maximize-2": [["path", { d: "M15 3h6v6" }], ["path", { d: "m21 3-7 7" }], ["path", { d: "m3 21 7-7" }], ["path", { d: "M9 21H3v-6" }]],
+    "minimize-2": [["path", { d: "m14 10 7-7" }], ["path", { d: "M20 10h-6V4" }], ["path", { d: "m3 21 7-7" }], ["path", { d: "M4 14h6v6" }]],
+    paintbrush: [["path", { d: "m14.622 17.897-10.68-2.913" }], ["path", { d: "M18.376 2.622a1 1 0 0 1 3.002 3.002L17.36 9.642a2 2 0 0 1-2.121.447l-2.741-1.02a1 1 0 0 1-.583-.583l-1.02-2.741a2 2 0 0 1 .447-2.121Z" }], ["path", { d: "M9 8c-1.804.716-3.5 2.5-3.5 4.5 0 .6.4 1 1 1 2 0 3.784-1.696 4.5-3.5" }]],
     "panel-left": [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }], ["path", { d: "M9 3v18" }]],
+    "panel-left-close": [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }], ["path", { d: "M9 3v18" }], ["path", { d: "m15 9-3 3 3 3" }]],
+    "panel-left-open": [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }], ["path", { d: "M9 3v18" }], ["path", { d: "m12 9 3 3-3 3" }]],
+    "panel-right": [["rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }], ["path", { d: "M15 3v18" }]],
+    paperclip: [["path", { d: "m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" }]],
     "refresh-cw": [["path", { d: "M21 12a9 9 0 0 0-15.35-6.35L3 8" }], ["path", { d: "M3 3v5h5" }], ["path", { d: "M3 12a9 9 0 0 0 15.35 6.35L21 16" }], ["path", { d: "M16 16h5v5" }]],
     route: [["circle", { cx: "6", cy: "19", r: "3" }], ["path", { d: "M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" }], ["circle", { cx: "18", cy: "5", r: "3" }]],
     "settings-2": [["path", { d: "M20 7h-9" }], ["path", { d: "M14 17H5" }], ["circle", { cx: "17", cy: "17", r: "3" }], ["circle", { cx: "7", cy: "7", r: "3" }]],
@@ -50,6 +98,8 @@
     "sun-moon": [["path", { d: "M12 8a2.83 2.83 0 0 0 4 4 4 4 0 1 1-4-4" }], ["path", { d: "M12 2v2" }], ["path", { d: "M12 20v2" }], ["path", { d: "m4.9 4.9 1.4 1.4" }], ["path", { d: "m17.7 17.7 1.4 1.4" }], ["path", { d: "M2 12h2" }], ["path", { d: "M20 12h2" }], ["path", { d: "m6.3 17.7-1.4 1.4" }], ["path", { d: "m19.1 4.9-1.4 1.4" }]],
     "triangle-alert": [["path", { d: "m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" }], ["path", { d: "M12 9v4" }], ["path", { d: "M12 17h.01" }]],
     wrench: [["path", { d: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z" }]],
+    "zoom-in": [["circle", { cx: "11", cy: "11", r: "8" }], ["path", { d: "m21 21-4.3-4.3" }], ["path", { d: "M11 8v6" }], ["path", { d: "M8 11h6" }]],
+    "zoom-out": [["circle", { cx: "11", cy: "11", r: "8" }], ["path", { d: "m21 21-4.3-4.3" }], ["path", { d: "M8 11h6" }]],
     x: [["path", { d: "M18 6 6 18" }], ["path", { d: "m6 6 12 12" }]]
   };
 
@@ -64,12 +114,15 @@
     "reasoning.title",
     "reasoning.delta",
     "tool.started",
+    "tool.preparing",
     "tool.progress",
     "tool.output",
     "tool.image",
+    "tool.artifact",
     "tool.finished",
     "question.requested",
     "question.answered",
+    "question.closed",
     "context.compact_start",
     "context.compact_delta",
     "context.compact_end",
@@ -79,6 +132,7 @@
     "queue.added",
     "queue.removed",
     "queue.consumed",
+    "generation.superseded",
     "run.completed",
     "run.cancelled",
     "run.failed",
@@ -97,9 +151,13 @@
 
   const elements = {
     body: document.body,
+    appShell: document.getElementById("appShell"),
+    mainStage: document.getElementById("mainStage"),
     sidebar: document.getElementById("sidebar"),
     sidebarScrim: document.getElementById("sidebarScrim"),
     sidebarClose: document.getElementById("sidebarClose"),
+    sidebarCollapseButton: document.getElementById("sidebarCollapseButton"),
+    sidebarExpandButton: document.getElementById("sidebarExpandButton"),
     mobileMenuButton: document.getElementById("mobileMenuButton"),
     sidebarStatusDot: document.getElementById("sidebarStatusDot"),
     sidebarConnectionStatus: document.getElementById("sidebarConnectionStatus"),
@@ -121,7 +179,13 @@
     brandName: document.getElementById("brandName"),
     conversationTitle: document.getElementById("conversationTitle"),
     conversationMeta: document.getElementById("conversationMeta"),
-    modeSwitch: document.getElementById("modeSwitch"),
+    modeCycle: document.getElementById("modeCycle"),
+    thinkingVariantButton: document.getElementById("thinkingVariantButton"),
+    thinkingVariantPopover: document.getElementById("thinkingVariantPopover"),
+    thinkingModelList: document.getElementById("thinkingModelList"),
+    thinkingLevelList: document.getElementById("thinkingLevelList"),
+    thinkingModelName: document.getElementById("thinkingModelName"),
+    thinkingModelProvider: document.getElementById("thinkingModelProvider"),
     modelMenuWrap: document.getElementById("modelMenuWrap"),
     modelButton: document.getElementById("modelButton"),
     modelMark: document.getElementById("modelMark"),
@@ -129,6 +193,24 @@
     modelMenu: document.getElementById("modelMenu"),
     themeButton: document.getElementById("themeButton"),
     topbarSettingsButton: document.getElementById("topbarSettingsButton"),
+    artifactToggleButton: document.getElementById("artifactToggleButton"),
+    artifactWorkspace: document.getElementById("artifactWorkspace"),
+    artifactResizeHandle: document.getElementById("artifactResizeHandle"),
+    artifactCloseButton: document.getElementById("artifactCloseButton"),
+    artifactTitle: document.getElementById("artifactTitle"),
+    artifactTypeLabel: document.getElementById("artifactTypeLabel"),
+    artifactTitleButton: document.getElementById("artifactTitleButton"),
+    artifactResourceMenu: document.getElementById("artifactResourceMenu"),
+    artifactPreviewButton: document.getElementById("artifactPreviewButton"),
+    artifactSourceButton: document.getElementById("artifactSourceButton"),
+    artifactImageActions: document.getElementById("artifactImageActions"),
+    artifactImageExternalButton: document.getElementById("artifactImageExternalButton"),
+    artifactImageZoomOutButton: document.getElementById("artifactImageZoomOutButton"),
+    artifactImageZoomInButton: document.getElementById("artifactImageZoomInButton"),
+    artifactCopyButton: document.getElementById("artifactCopyButton"),
+    artifactDownloadButton: document.getElementById("artifactDownloadButton"),
+    artifactMaximizeButton: document.getElementById("artifactMaximizeButton"),
+    artifactView: document.getElementById("artifactView"),
     errorRegion: document.getElementById("errorRegion"),
     chatScroll: document.getElementById("chatScroll"),
     loadingState: document.getElementById("loadingState"),
@@ -155,6 +237,9 @@
     questionDock: document.getElementById("questionDock"),
     composerForm: document.getElementById("composerForm"),
     composerInput: document.getElementById("composerInput"),
+    attachmentTray: document.getElementById("attachmentTray"),
+    attachmentInput: document.getElementById("attachmentInput"),
+    attachButton: document.getElementById("attachButton"),
     queueTray: document.getElementById("queueTray"),
     composerState: document.getElementById("composerState"),
     characterCount: document.getElementById("characterCount"),
@@ -176,6 +261,11 @@
     pluginEditor: document.getElementById("pluginEditor"),
     promptEditor: document.getElementById("promptEditor"),
     advancedConfigEditor: document.getElementById("advancedConfigEditor"),
+    qqHistoryForm: document.getElementById("qqHistoryForm"),
+    qqHistoryAccount: document.getElementById("qqHistoryAccount"),
+    qqHistoryGroup: document.getElementById("qqHistoryGroup"),
+    qqHistoryStatus: document.getElementById("qqHistoryStatus"),
+    qqHistoryOutput: document.getElementById("qqHistoryOutput"),
     applyAdvancedConfigButton: document.getElementById("applyAdvancedConfigButton"),
     reloadConfigButton: document.getElementById("reloadConfigButton"),
     saveConfigButton: document.getElementById("saveConfigButton"),
@@ -208,6 +298,7 @@
     viewSessionId: null,
     viewRunningTurnId: null,
     viewLoading: false,
+    viewLoadGeneration: 0,
     viewSyncTimer: null,
     runsBySession: new Map(),
     liveRuns: new Map(),
@@ -238,7 +329,22 @@
     stagedModelKeys: null,
     modelMenuError: "",
     submitting: false,
+    revisionSubmitting: false,
+    redoCandidate: null,
+    revisionEditor: null,
     pendingSubmission: null,
+    composerAttachments: [],
+    artifacts: [],
+    selectedArtifactId: null,
+    artifactOpen: false,
+    artifactRenderToken: 0,
+    artifactZoom: 1,
+    artifactPanX: 0,
+    artifactPanY: 0,
+    artifactMode: "preview",
+    artifactMaximized: false,
+    artifactWidthRatio: 0.5,
+    artifactSourceCache: new Map(),
     colorScheme: null,
     matugenAvailable: null,
     reasoningExpanded: false,
@@ -252,10 +358,21 @@
     programmaticScroll: false,
     settingsOpener: null,
     sidebarOpener: null,
+    sidebarCollapsed: false,
+    sidebarAutoCollapsed: false,
     toastTimer: null,
+    modeAnimationTimer: null,
     healthTimer: null,
     terminalRunIds: new Set(),
     mode: "normal",
+    thinkingVariantModels: [],
+    thinkingVariantActiveKey: null,
+    thinkingVariantLoading: false,
+    thinkingVariantLoadGeneration: 0,
+    thinkingVariantError: "",
+    thinkingVariantConfirmed: new Map(),
+    thinkingVariantRevisions: new Map(),
+    thinkingVariantWriteChain: Promise.resolve(),
     composing: false,
     settingsView: "interface",
     configLoaded: false,
@@ -364,6 +481,7 @@
     const requested = scheme === "madobe" ? "madobe" : "matugen";
     const selected = requested === "matugen" && state.matugenAvailable === false ? "madobe" : requested;
     state.colorScheme = selected;
+    elements.body.dataset.colorScheme = selected;
     if (elements.matugenThemeLink) elements.matugenThemeLink.disabled = selected !== "matugen";
     document.querySelectorAll("[data-scheme-choice]").forEach((button) => {
       const active = button.dataset.schemeChoice === selected;
@@ -392,6 +510,7 @@
   function setChatFontSize(size, persist = true) {
     const selected = CHAT_FONT_SIZES.includes(size) ? size : "15px";
     document.documentElement.style.setProperty("--fs-chat", selected);
+    document.documentElement.style.setProperty("--fs-artifact-chat", `${Number.parseFloat(selected) * ARTIFACT_TEXT_SCALE}px`);
     document.querySelectorAll("[data-chat-font]").forEach((button) => {
       const active = button.dataset.chatFont === selected;
       button.classList.toggle("active", active);
@@ -421,21 +540,360 @@
     if (persist) safeStorageSet("miyu.web.toolExpanded", String(state.toolExpanded));
   }
 
-  function setMode(mode, persist = true) {
-    const selected = ["normal", "plan", "chat"].includes(mode) ? mode : "normal";
+  function setMode(mode, persist = true, animate = false) {
+    const selected = CONVERSATION_MODES.some((item) => item.id === mode) ? mode : "normal";
+    const previous = state.mode;
+    const options = Array.from(elements.modeCycle.querySelectorAll("[data-mode-option]"));
+    const previousOption = options.find((option) => option.dataset.modeOption === previous);
+    const selectedOption = options.find((option) => option.dataset.modeOption === selected);
+    if (state.modeAnimationTimer) window.clearTimeout(state.modeAnimationTimer);
+    options.forEach((option) => option.classList.remove("is-entering", "is-leaving"));
+    options.forEach((option) => option.classList.toggle("is-active", option.dataset.modeOption === previous));
+    if (animate && previous !== selected) {
+      previousOption?.classList.remove("is-active");
+      previousOption?.classList.add("is-leaving");
+      selectedOption?.classList.add("is-active", "is-entering");
+      state.modeAnimationTimer = window.setTimeout(() => {
+        previousOption?.classList.remove("is-leaving");
+        selectedOption?.classList.remove("is-entering");
+        state.modeAnimationTimer = null;
+      }, 240);
+    } else {
+      options.forEach((option) => option.classList.toggle("is-active", option === selectedOption));
+    }
     state.mode = selected;
-    elements.modeSwitch.querySelectorAll("[data-mode]").forEach((button) => {
-      const active = button.dataset.mode === selected;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", String(active));
-    });
+    elements.modeCycle.dataset.mode = selected;
+    options.forEach((option) => option.setAttribute("aria-hidden", String(option !== selectedOption)));
+    const selectedIndex = CONVERSATION_MODES.findIndex((item) => item.id === selected);
+    const selectedMode = CONVERSATION_MODES[selectedIndex];
+    const nextMode = CONVERSATION_MODES[(selectedIndex + 1) % CONVERSATION_MODES.length];
+    const description = `当前模式：${selectedMode.label}；点击切换到${nextMode.label}`;
+    elements.modeCycle.title = description;
+    elements.modeCycle.setAttribute("aria-label", description);
     if (persist) safeStorageSet("miyu.web.mode", selected);
+  }
+
+  function cycleMode() {
+    const current = CONVERSATION_MODES.findIndex((item) => item.id === state.mode);
+    setMode(CONVERSATION_MODES[(current + 1) % CONVERSATION_MODES.length].id, true, true);
+  }
+
+  function thinkingVariantLabel(variant, short = false) {
+    if (variant == null) return short ? "默认" : "模型默认";
+    const value = String(variant);
+    return THINKING_VARIANT_LABELS[value.toLowerCase()] || value;
+  }
+
+  function normalizeThinkingVariantModels(value) {
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((item) => {
+      const providerId = String(item?.provider_id || "").trim();
+      const model = String(item?.model || "").trim();
+      if (!providerId || !model) return [];
+      const variants = Array.from(new Set(
+        (Array.isArray(item?.variants) ? item.variants : [])
+          .map((variant) => String(variant).trim())
+          .filter(Boolean)
+      ));
+      const selected = typeof item?.selected === "string" && variants.includes(item.selected)
+        ? item.selected
+        : null;
+      return [{ provider_id: providerId, model, variants, selected }];
+    });
+  }
+
+  function thinkingVariantModel(key = state.thinkingVariantActiveKey) {
+    return state.thinkingVariantModels.find((model) => modelKey(model) === key) || null;
+  }
+
+  function thinkingVariantDisplay(model) {
+    const configured = state.models.find((candidate) => modelKey(candidate) === modelKey(model));
+    return {
+      name: String(configured?.model || model?.model || ""),
+      provider: String(configured?.provider_name || configured?.provider_id || model?.provider_id || "")
+    };
+  }
+
+  function updateThinkingVariantTrigger() {
+    const models = state.thinkingVariantModels;
+    const hasOverride = models.some((model) => model.selected != null);
+    elements.thinkingVariantButton.classList.toggle("has-override", hasOverride);
+    if (state.thinkingVariantError && models.length === 0) {
+      elements.thinkingVariantButton.title = state.thinkingVariantError;
+      elements.thinkingVariantButton.setAttribute("aria-label", `思考程度暂不可用：${state.thinkingVariantError}`);
+      return;
+    }
+    const summary = models.length === 1
+      ? thinkingVariantLabel(models[0].selected)
+      : `${models.length} 个模型`;
+    elements.thinkingVariantButton.title = models.length ? `思考程度：${summary}` : "当前模型没有可配置的思考档位";
+    elements.thinkingVariantButton.setAttribute("aria-label", elements.thinkingVariantButton.title);
+  }
+
+  function renderThinkingVariantModels() {
+    const models = state.thinkingVariantModels;
+    if (!models.some((model) => modelKey(model) === state.thinkingVariantActiveKey)) {
+      state.thinkingVariantActiveKey = models.length ? modelKey(models[0]) : null;
+    }
+    const fragment = document.createDocumentFragment();
+    for (const model of models) {
+      const key = modelKey(model);
+      const selected = key === state.thinkingVariantActiveKey;
+      const display = thinkingVariantDisplay(model);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "thinking-model-option";
+      button.dataset.modelKey = key;
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      button.title = `${display.provider} / ${model.model}`;
+      const name = document.createElement("span");
+      name.className = "thinking-model-option-name";
+      name.textContent = display.name;
+      const level = document.createElement("span");
+      level.className = "thinking-model-option-level";
+      level.textContent = thinkingVariantLabel(model.selected, true);
+      button.append(name, level);
+      button.addEventListener("click", () => {
+        state.thinkingVariantActiveKey = key;
+        renderThinkingVariantMenu();
+        Array.from(elements.thinkingModelList.querySelectorAll(".thinking-model-option"))
+          .find((option) => option.dataset.modelKey === key)?.focus();
+      });
+      fragment.appendChild(button);
+    }
+    if (!models.length) {
+      const empty = document.createElement("div");
+      empty.className = "thinking-variant-empty";
+      empty.textContent = "当前模型没有可配置的思考档位";
+      fragment.appendChild(empty);
+    }
+    elements.thinkingModelList.replaceChildren(fragment);
+  }
+
+  function renderThinkingVariantLevels() {
+    const model = thinkingVariantModel();
+    elements.thinkingLevelList.replaceChildren();
+    if (!model) {
+      elements.thinkingModelName.textContent = "";
+      elements.thinkingModelProvider.textContent = "";
+      return;
+    }
+    const display = thinkingVariantDisplay(model);
+    elements.thinkingModelName.textContent = display.name;
+    elements.thinkingModelName.title = model.model;
+    elements.thinkingModelProvider.textContent = `${display.provider} / ${model.model}`;
+    elements.thinkingModelProvider.title = elements.thinkingModelProvider.textContent;
+    const fragment = document.createDocumentFragment();
+    for (const variant of [null, ...model.variants]) {
+      const selected = model.selected === variant;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "thinking-level-option";
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      button.title = variant == null ? "使用模型默认设置" : String(variant);
+      const check = document.createElement("span");
+      check.className = "thinking-level-check";
+      check.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "thinking-level-name";
+      label.textContent = thinkingVariantLabel(variant);
+      button.append(check, label);
+      button.addEventListener("click", () => selectThinkingVariant(modelKey(model), variant));
+      fragment.appendChild(button);
+    }
+    elements.thinkingLevelList.appendChild(fragment);
+  }
+
+  function renderThinkingVariantMenu() {
+    renderThinkingVariantModels();
+    renderThinkingVariantLevels();
+    updateThinkingVariantTrigger();
+    positionThinkingVariantPopover();
+  }
+
+  function positionThinkingVariantPopover() {
+    const popover = elements.thinkingVariantPopover;
+    if (popover.hidden) return;
+    const trigger = elements.thinkingVariantButton.getBoundingClientRect();
+    const margin = 9;
+    const gap = 8;
+    const availableWidth = Math.max(180, window.innerWidth - margin * 2);
+    popover.style.maxWidth = `${visualPixelsToLayout(availableWidth)}px`;
+    popover.style.minWidth = `${Math.min(286, visualPixelsToLayout(availableWidth))}px`;
+    popover.style.maxHeight = `${visualPixelsToLayout(Math.max(150, trigger.top - margin - gap))}px`;
+    const measuredWidth = popover.offsetWidth * UI_SCALE;
+    const measuredHeight = popover.offsetHeight * UI_SCALE;
+    const left = Math.min(
+      Math.max(margin, trigger.left),
+      window.innerWidth - measuredWidth - margin
+    );
+    const top = Math.max(margin, trigger.top - measuredHeight - gap);
+    popover.style.left = `${visualPixelsToLayout(left)}px`;
+    popover.style.top = `${visualPixelsToLayout(top)}px`;
+  }
+
+  function openThinkingVariantPopover() {
+    if (elements.thinkingVariantButton.disabled || !state.thinkingVariantModels.length) return;
+    closeModelMenu();
+    renderThinkingVariantMenu();
+    elements.thinkingVariantPopover.hidden = false;
+    elements.thinkingVariantButton.setAttribute("aria-expanded", "true");
+    window.requestAnimationFrame(() => {
+      positionThinkingVariantPopover();
+      elements.thinkingLevelList.querySelector('[aria-checked="true"]')?.focus();
+    });
+  }
+
+  function closeThinkingVariantPopover({ restoreFocus = false } = {}) {
+    if (elements.thinkingVariantPopover.hidden) return;
+    elements.thinkingVariantPopover.hidden = true;
+    elements.thinkingVariantButton.setAttribute("aria-expanded", "false");
+    if (restoreFocus) elements.thinkingVariantButton.focus();
+  }
+
+  async function loadThinkingVariants() {
+    const generation = ++state.thinkingVariantLoadGeneration;
+    state.thinkingVariantLoading = true;
+    state.thinkingVariantError = "";
+    updateControlState();
+    try {
+      const response = await apiRequest("/api/models/thinking-variants", { cache: "no-store" });
+      const payload = await response.json();
+      if (generation !== state.thinkingVariantLoadGeneration) return;
+      state.thinkingVariantModels = normalizeThinkingVariantModels(payload?.options);
+      state.thinkingVariantConfirmed = new Map(
+        state.thinkingVariantModels.map((model) => [modelKey(model), model.selected])
+      );
+      state.thinkingVariantRevisions.clear();
+      renderThinkingVariantMenu();
+    } catch (error) {
+      if (generation !== state.thinkingVariantLoadGeneration) return;
+      state.thinkingVariantError = error.message || "无法载入思考档位";
+      if (!state.thinkingVariantModels.length) closeThinkingVariantPopover();
+      updateThinkingVariantTrigger();
+    } finally {
+      if (generation === state.thinkingVariantLoadGeneration) {
+        state.thinkingVariantLoading = false;
+        updateControlState();
+      }
+    }
+  }
+
+  function selectThinkingVariant(key, variant) {
+    const model = thinkingVariantModel(key);
+    if (!model || model.selected === variant) return;
+    model.selected = variant;
+    state.thinkingVariantRevisions.set(key, (state.thinkingVariantRevisions.get(key) || 0) + 1);
+    renderThinkingVariantMenu();
+    elements.thinkingLevelList.querySelector('[aria-checked="true"]')?.focus();
+    state.thinkingVariantWriteChain = state.thinkingVariantWriteChain
+      .catch(() => {})
+      .then(() => persistLatestThinkingVariant(key));
+  }
+
+  async function persistLatestThinkingVariant(key) {
+    const model = thinkingVariantModel(key);
+    if (!model) return;
+    const desired = model.selected;
+    const confirmed = state.thinkingVariantConfirmed.has(key)
+      ? state.thinkingVariantConfirmed.get(key)
+      : null;
+    if (desired === confirmed) return;
+    const revision = state.thinkingVariantRevisions.get(key) || 0;
+    try {
+      const response = await apiRequest("/api/models/thinking-variants", {
+        method: "PUT",
+        body: JSON.stringify({
+          updates: [{
+            provider_id: model.provider_id,
+            model: model.model,
+            selected: desired
+          }]
+        })
+      });
+      const payload = await response.json();
+      const returned = normalizeThinkingVariantModels(payload?.options)
+        .find((candidate) => modelKey(candidate) === key);
+      const applied = returned ? returned.selected : desired;
+      state.thinkingVariantConfirmed.set(key, applied);
+      const current = thinkingVariantModel(key);
+      if (current && state.thinkingVariantRevisions.get(key) === revision && current.selected !== applied) {
+        current.selected = applied;
+        renderThinkingVariantMenu();
+      } else {
+        updateThinkingVariantTrigger();
+      }
+    } catch (error) {
+      const current = thinkingVariantModel(key);
+      if (current && state.thinkingVariantRevisions.get(key) === revision) {
+        current.selected = confirmed;
+        renderThinkingVariantMenu();
+        showToast(error.message || "思考程度未保存", "error");
+      }
+    }
+  }
+
+  function handleThinkingVariantKeydown(event) {
+    const inModels = event.target.closest("#thinkingModelList");
+    const inLevels = event.target.closest("#thinkingLevelList");
+    const container = inModels || inLevels;
+    if (!container) return;
+    const selector = inModels ? ".thinking-model-option" : ".thinking-level-option";
+    const items = Array.from(container.querySelectorAll(selector));
+    const index = items.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      items[(index + direction + items.length) % items.length]?.focus();
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      items[event.key === "Home" ? 0 : items.length - 1]?.focus();
+    } else if (event.key === "ArrowRight" && inModels) {
+      event.preventDefault();
+      (elements.thinkingLevelList.querySelector('[aria-checked="true"]')
+        || elements.thinkingLevelList.querySelector(".thinking-level-option"))?.focus();
+    } else if (event.key === "ArrowLeft" && inLevels) {
+      event.preventDefault();
+      (elements.thinkingModelList.querySelector('[aria-selected="true"]')
+        || elements.thinkingModelList.querySelector(".thinking-model-option"))?.focus();
+    }
   }
 
   function closeSidebar() {
     elements.sidebar.classList.remove("open");
     elements.sidebarScrim.classList.remove("visible");
     elements.sidebarScrim.tabIndex = -1;
+  }
+
+  function setSidebarCollapsed(collapsed, { automatic = false } = {}) {
+    state.sidebarCollapsed = Boolean(collapsed);
+    state.sidebarAutoCollapsed = Boolean(automatic && collapsed);
+    elements.appShell?.classList.toggle("is-sidebar-collapsed", state.sidebarCollapsed);
+    if (elements.sidebarExpandButton) elements.sidebarExpandButton.hidden = !state.sidebarCollapsed;
+    if (elements.sidebarCollapseButton) elements.sidebarCollapseButton.hidden = state.sidebarCollapsed;
+    if (state.sidebarCollapsed) closeSidebar();
+    if (!automatic) safeStorageSet("miyu.web.sidebarCollapsed", String(state.sidebarCollapsed));
+    syncArtifactLayout?.();
+  }
+
+  function syncSidebarSpace() {
+    if (layoutViewportWidth() <= 760) {
+      if (state.sidebarAutoCollapsed) setSidebarCollapsed(false, { automatic: true });
+      return;
+    }
+    const shellWidth = elements.appShell.clientWidth;
+    const sidebarWidth = Number.parseFloat(getComputedStyle(elements.appShell).getPropertyValue("--sidebar-width")) || 252;
+    const artifactWidth = state.artifactOpen && !state.artifactMaximized ? artifactWidthPixels() + 26 : 0;
+    const availableWhenExpanded = shellWidth - sidebarWidth - artifactWidth;
+    if (!state.sidebarCollapsed && availableWhenExpanded < 360) {
+      setSidebarCollapsed(true, { automatic: true });
+    } else if (state.sidebarAutoCollapsed && availableWhenExpanded >= 420) {
+      setSidebarCollapsed(false, { automatic: true });
+    }
   }
 
   function openSidebar(opener = document.activeElement) {
@@ -453,6 +911,7 @@
   function openSettings(opener = document.activeElement) {
     state.settingsOpener = opener;
     closeModelMenu();
+    closeThinkingVariantPopover();
     elements.settingsDrawer.classList.add("open");
     elements.settingsDrawer.setAttribute("aria-hidden", "false");
     elements.drawerScrim.classList.add("visible");
@@ -473,6 +932,7 @@
 
   function openModelMenu() {
     if (elements.modelButton.disabled || state.models.length === 0) return;
+    closeThinkingVariantPopover();
     state.stagedModelKeys = new Set(activeModels().map(modelKey));
     state.modelMenuError = "";
     renderModelMenu();
@@ -868,6 +1328,10 @@
         booleanConfigField("启用联想", "memory.association_enabled"),
         booleanConfigField("自动日记", "memory.auto_diary_enabled"),
         booleanConfigField("自动事实记忆", "memory.auto_fact_enabled"),
+        textConfigField("日记整理轮数", "memory.diary_batch_size", { type: "number", inputType: "number", integer: true, min: 2, max: 100 }),
+        textConfigField("短期日记保留天数", "memory.short_diary_retention_days", { type: "number", inputType: "number", integer: true, min: 1, max: 3650 }),
+        textConfigField("日记长期化召回次数", "memory.diary_promotion_recalls", { type: "number", inputType: "number", integer: true, min: 1, max: 100 }),
+        textConfigField("记忆整理超时秒数", "memory.organizer_timeout_seconds", { type: "number", inputType: "number", integer: true, min: 5, max: 600 }),
         textConfigField("联想知识条数", "memory.association_facts", { type: "number", inputType: "number", integer: true, min: 0 }),
         textConfigField("联想事件条数", "memory.association_episodes", { type: "number", inputType: "number", integer: true, min: 0 }),
         textConfigField("联想字符上限", "memory.association_max_chars", { type: "number", inputType: "number", integer: true, min: 0 }),
@@ -948,7 +1412,7 @@
       model_modalities: {},
       default_model: "",
       timeout_seconds: 60,
-      temperature: 0.7,
+      temperature: 1.0,
       anthropic_max_tokens: 4096,
       extra_body: null,
       ...provider
@@ -1419,7 +1883,7 @@
     vision: "识图", exchange_rate: "汇率", xuanxue: "玄学", image_generation: "生图", print_image: "打印图片",
     memes: "表情包", knowledge_base: "知识库", archlinux: "Arch Linux", man: "在线手册", moegirl: "萌娘百科",
     hash_codec: "哈希与编解码", calculator: "计算器", package_advisor: "AUR 审查",
-    deep_research_linux_game_compatibility: "Linux 游戏兼容", diagnostics: "系统诊断", memory: "记忆"
+    deep_research_linux_game_compatibility: "Linux 游戏兼容", diagnostics: "系统诊断", api_quota: "大模型额度查询", memory: "记忆"
   };
 
   const SECRET_PLUGIN_PATHS = new Map([
@@ -1455,6 +1919,136 @@
     return textConfigField(humanizeConfigKey(fieldKey), path, { type: "json", multiline: true, rows: 5 });
   }
 
+  function apiQuotaProviderEditor(providerKey, provider) {
+    const details = document.createElement("details");
+    details.className = "plugin-subsection";
+    const summary = document.createElement("summary");
+    summary.textContent = providerKey === "deepseek" ? "DeepSeek" : "OpenRouter";
+    const body = document.createElement("div");
+    body.className = "plugin-subsection-body";
+    const hint = document.createElement("p");
+    hint.className = "config-field-hint";
+    hint.textContent = providerKey === "deepseek"
+      ? "DeepSeek API 余额按 CNY 与 USD 分为两个独立余额池，以下分别显示各币种总余额。"
+      : "每个账号配置对应一个 OpenRouter API Key。";
+    body.appendChild(hint);
+    provider.accounts = Array.isArray(provider.accounts) && provider.accounts.length
+      ? provider.accounts
+      : [{ id: "account-1", name: "默认账号", api_key: "" }];
+    const nextAccountId = () => `account-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+    const nextAccountName = () => {
+      let number = 2;
+      while (provider.accounts.some((account) => account.name === `账号 ${number}`)) number += 1;
+      return `账号 ${number}`;
+    };
+    const reindexSecrets = (previousAccounts) => {
+      const prefix = `plugins.api_quota.${providerKey}.accounts.`;
+      const previous = new Map(previousAccounts.map((account, index) => {
+        const key = `${prefix}${index}.api_key`;
+        return [account.id || account.name, {
+          configured: Boolean(state.secretStates[key]),
+          change: state.secretChanges[key]
+        }];
+      }));
+      for (const key of Object.keys(state.secretChanges)) {
+        if (key.startsWith(prefix)) delete state.secretChanges[key];
+      }
+      for (const key of Object.keys(state.secretStates)) {
+        if (key.startsWith(prefix)) delete state.secretStates[key];
+      }
+      provider.accounts.forEach((account, index) => {
+        const prior = previous.get(account.id || account.name);
+        const key = `${prefix}${index}.api_key`;
+        state.secretStates[key] = Boolean(prior?.configured);
+        if (prior?.change) state.secretChanges[key] = prior.change;
+      });
+    };
+    const renderAccounts = () => {
+      for (const child of Array.from(accountsBody.children)) child.remove();
+      provider.accounts.forEach((account, index) => {
+        const accountDetails = document.createElement("details");
+        accountDetails.className = "quota-account";
+        accountDetails.open = true;
+        const accountSummary = document.createElement("summary");
+        const accountTitle = document.createElement("span");
+        accountTitle.textContent = account.name || `账号 ${index + 1}`;
+        const remove = actionButton("删除", "text-button danger-text");
+        remove.addEventListener("click", (event) => {
+          event.preventDefault();
+          if (!window.confirm(`删除账号配置“${account.name || `账号 ${index + 1}`}”？`)) return;
+          const previousAccounts = provider.accounts.map((item) => ({ ...item }));
+          const deletingOnlyAccount = provider.accounts.length === 1;
+          if (deletingOnlyAccount) {
+            provider.accounts[0] = { id: provider.accounts[0].id || "account-1", name: "默认账号", api_key: "" };
+          } else {
+            provider.accounts.splice(index, 1);
+          }
+          reindexSecrets(previousAccounts);
+          if (deletingOnlyAccount) {
+            const key = `plugins.api_quota.${providerKey}.accounts.0.api_key`;
+            state.secretStates[key] = false;
+            state.secretChanges[key] = { action: "clear" };
+          }
+          markConfigDirty();
+          renderAccounts();
+        });
+        accountSummary.append(accountTitle, remove);
+        const accountBody = document.createElement("div");
+        accountBody.className = "quota-account-body";
+        accountBody.appendChild(textConfigField("账号名称", `plugins.api_quota.${providerKey}.accounts.${index}.name`, { value: account.name || `账号 ${index + 1}` }));
+        accountBody.appendChild(secretEditor("API Key", `plugins.api_quota.${providerKey}.accounts.${index}.api_key`));
+        accountDetails.append(accountSummary, accountBody);
+        accountsBody.appendChild(accountDetails);
+      });
+    };
+    const accountsBody = document.createElement("div");
+    accountsBody.className = "quota-accounts";
+    body.appendChild(accountsBody);
+    const add = actionButton("新建账号", "text-button");
+    add.addEventListener("click", () => {
+      if (provider.accounts.length >= 32) {
+        showToast("每个平台最多配置 32 个账号", "error");
+        return;
+      }
+      const previousAccounts = provider.accounts.map((item) => ({ ...item }));
+      provider.accounts.push({ id: nextAccountId(), name: nextAccountName(), api_key: "" });
+      reindexSecrets(previousAccounts);
+      markConfigDirty();
+      renderAccounts();
+    });
+    body.appendChild(add);
+    renderAccounts();
+    details.append(summary, body);
+    return details;
+  }
+
+  function remapApiQuotaSecrets(previousConfig, nextConfig) {
+    for (const providerKey of ["deepseek", "openrouter"]) {
+      const prefix = `plugins.api_quota.${providerKey}.accounts.`;
+      const previousAccounts = previousConfig?.plugins?.api_quota?.[providerKey]?.accounts || [];
+      const saved = new Map(previousAccounts.map((account, index) => {
+        const key = `${prefix}${index}.api_key`;
+        return [account.id, {
+          configured: Boolean(state.secretStates[key]),
+          change: state.secretChanges[key]
+        }];
+      }).filter(([id]) => id));
+      for (const key of Object.keys(state.secretStates)) {
+        if (key.startsWith(prefix)) delete state.secretStates[key];
+      }
+      for (const key of Object.keys(state.secretChanges)) {
+        if (key.startsWith(prefix)) delete state.secretChanges[key];
+      }
+      const nextAccounts = nextConfig?.plugins?.api_quota?.[providerKey]?.accounts || [];
+      nextAccounts.forEach((account, index) => {
+        const prior = saved.get(account.id);
+        const key = `${prefix}${index}.api_key`;
+        state.secretStates[key] = Boolean(prior?.configured);
+        if (prior?.change) state.secretChanges[key] = prior.change;
+      });
+    }
+  }
+
   function renderPlugins() {
     elements.pluginEditor.replaceChildren();
     for (const [pluginKey, plugin] of Object.entries(state.configDraft?.plugins || {})) {
@@ -1476,6 +2070,10 @@
       body.className = "plugin-card-body";
       for (const [fieldKey, value] of Object.entries(plugin || {})) {
         if (WEB_HIDDEN_PLUGIN_FIELDS.has(`${pluginKey}.${fieldKey}`)) continue;
+        if (pluginKey === "api_quota" && (fieldKey === "deepseek" || fieldKey === "openrouter")) {
+          body.appendChild(apiQuotaProviderEditor(fieldKey, value));
+          continue;
+        }
         body.appendChild(pluginValueEditor(pluginKey, fieldKey, value));
       }
       details.append(summary, body);
@@ -1713,6 +2311,8 @@
       access_token: "",
       admin_users: [],
       allow_non_admin_host_tools: false,
+      user_identification: true,
+      show_group_name: true,
       conversations: [],
       plugins: {},
       asset_base_url: "",
@@ -1721,14 +2321,14 @@
     qq.private_chats = Object.assign({
       whitelist: [],
       allow_non_whitelist: true,
-      non_whitelist_rate_per_minute: 3
+      non_whitelist_rate_limit: { max_messages: 1, window_seconds: 180 }
     }, qq.private_chats);
     qq.group_chats = Object.assign({
       whitelist: [],
       trigger_keywords: [],
-      whitelist_rate_per_minute: 30,
+      whitelist_rate_limit: { max_messages: 30, window_seconds: 60 },
       allow_non_whitelist: true,
-      non_whitelist_rate_per_minute: 10
+      non_whitelist_rate_limit: { max_messages: 10, window_seconds: 60 }
     }, qq.group_chats);
     draft.platforms.qq = qq;
   }
@@ -1844,6 +2444,7 @@
       const parsed = JSON.parse(elements.advancedConfigEditor.value);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("配置必须是 JSON 对象");
       const oldSecretStates = new Map((state.configDraft?.providers || []).map((provider, index) => [String(provider?.id || ""), Boolean(state.providerSecretStates[index])]));
+      remapApiQuotaSecrets(state.configDraft, parsed);
       state.configDraft = parsed;
       ensurePlatformDefaults(state.configDraft);
       state.providerSecretStates = (Array.isArray(parsed.providers) ? parsed.providers : []).map((provider) => oldSecretStates.get(String(provider?.id || "")) || false);
@@ -1880,6 +2481,122 @@
     }
     if (!response.ok) throw new ApiError(await readErrorMessage(response), response.status);
     return response;
+  }
+
+  function qqHistoryQuery() {
+    return new URLSearchParams({
+      account_id: elements.qqHistoryAccount.value.trim(),
+      group_id: elements.qqHistoryGroup.value.trim()
+    });
+  }
+
+  function qqHistoryButton(label, className, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = label;
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  function renderQqHistory(data) {
+    const offenderValue = data?.offender_history ?? data?.offenders;
+    const offenders = offenderValue && typeof offenderValue === "object" && !Array.isArray(offenderValue) ? offenderValue : {};
+    const kickValue = data?.kick_history ?? data?.kicks;
+    const kicks = Array.isArray(kickValue) ? kickValue : [];
+    const output = elements.qqHistoryOutput;
+    output.replaceChildren();
+    const heading = document.createElement("div");
+    heading.className = "qq-history-summary";
+    heading.textContent = `违规者 ${formatInteger(Object.keys(offenders).length)} 人 · 踢人 ${formatInteger(kicks.length)} 条`;
+    output.appendChild(heading);
+
+    const offenderSection = document.createElement("section");
+    offenderSection.className = "qq-history-list";
+    const offenderTitle = document.createElement("h3");
+    offenderTitle.textContent = "违规者统计";
+    offenderSection.appendChild(offenderTitle);
+    for (const [userId, record] of Object.entries(offenders)) {
+      const row = document.createElement("div");
+      row.className = "qq-history-row";
+      const text = document.createElement("span");
+      text.textContent = `${record?.user_name || "未知用户"} (${userId}) · ${formatInteger(record?.ban_count)} 次 · ${record?.last_reason || "无原因"}`;
+      const remove = qqHistoryButton("删除", "text-button danger-text", async () => {
+        if (!window.confirm(`删除 ${userId} 的违规记录？`)) return;
+        try {
+          await apiRequest(`/api/qq-group-management/offenders/${encodeURIComponent(userId)}?${qqHistoryQuery()}`, { method: "DELETE" });
+          await loadQqHistory();
+        } catch (error) { showToast(error.message, "error"); }
+      });
+      row.append(text, remove);
+      offenderSection.appendChild(row);
+    }
+    if (!Object.keys(offenders).length) offenderSection.appendChild(qqHistoryEmpty("暂无违规者记录"));
+    output.appendChild(offenderSection);
+
+    const kickSection = document.createElement("section");
+    kickSection.className = "qq-history-list";
+    const kickHeader = document.createElement("div");
+    kickHeader.className = "qq-history-list-heading";
+    const kickTitle = document.createElement("h3");
+    kickTitle.textContent = "踢人历史";
+    kickHeader.appendChild(kickTitle);
+    if (kicks.length) kickHeader.appendChild(qqHistoryButton("清空", "text-button danger-text", () => clearQqHistory("kicks")));
+    kickSection.appendChild(kickHeader);
+    for (const record of kicks.slice().reverse()) {
+      const row = document.createElement("div");
+      row.className = "qq-history-row qq-history-kick";
+      const kickedAt = typeof record?.kicked_at === "number" ? record.kicked_at * 1000 : record?.kicked_at;
+      row.textContent = `${record?.user_name || "未知用户"} (${record?.user_id || "--"}) · ${record?.reason || "无原因"} · ${formatDateTime(kickedAt)}`;
+      kickSection.appendChild(row);
+    }
+    if (!kicks.length) kickSection.appendChild(qqHistoryEmpty("暂无踢人记录"));
+    output.appendChild(kickSection);
+    if (Object.keys(offenders).length) {
+      const clear = qqHistoryButton("清空违规者", "text-button danger-text", () => clearQqHistory("offenders"));
+      offenderTitle.appendChild(clear);
+      offenderTitle.className = "qq-history-list-heading";
+    }
+    output.hidden = false;
+  }
+
+  function qqHistoryEmpty(text) {
+    const empty = document.createElement("p");
+    empty.className = "settings-empty";
+    empty.textContent = text;
+    return empty;
+  }
+
+  async function loadQqHistory() {
+    const account = elements.qqHistoryAccount.value.trim();
+    const group = elements.qqHistoryGroup.value.trim();
+    if (!/^\d{5,12}$/.test(account) || !/^\d{5,12}$/.test(group)) {
+      showToast("请输入有效的 bot QQ 和群号", "error");
+      return;
+    }
+    elements.qqHistoryStatus.textContent = "正在加载记录...";
+    try {
+      const response = await apiRequest(`/api/qq-group-management/history?${qqHistoryQuery()}`);
+      const data = await response.json();
+      const accounts = Array.isArray(data.connected_accounts) ? data.connected_accounts : [];
+      elements.qqHistoryStatus.textContent = accounts.length ? `当前连接账户：${accounts.join("、")}` : "当前没有在线连接账户";
+      renderQqHistory(data);
+    } catch (error) {
+      elements.qqHistoryStatus.textContent = "";
+      showToast(error.message, "error");
+    }
+  }
+
+  async function clearQqHistory(kind) {
+    const title = kind === "offenders" ? "违规者记录" : "踢人记录";
+    if (!window.confirm(`清空全部${title}？此操作无法撤销。`)) return;
+    try {
+      await apiRequest("/api/qq-group-management/history/clear", {
+        method: "POST",
+        body: JSON.stringify({ account_id: elements.qqHistoryAccount.value.trim(), group_id: elements.qqHistoryGroup.value.trim(), kind })
+      });
+      await loadQqHistory();
+    } catch (error) { showToast(error.message, "error"); }
   }
 
   function asFiniteNumber(value, fallback = 0) {
@@ -2629,24 +3346,28 @@
     }
   }
 
-  async function openSessionView(sessionId) {
+  async function openSessionView(sessionId, { userInitiated = true } = {}) {
     if (!sessionId) return;
-    if (sessionId === state.viewSessionId) {
+    if (sessionId === state.viewSessionId && !state.viewLoading) {
       closeSidebar();
       scrollToBottom({ force: true, smooth: true });
       return;
     }
-    await loadSessionView(sessionId);
+    await loadSessionView(sessionId, { userInitiated });
   }
 
-  async function loadSessionView(sessionId, { quiet = false } = {}) {
-    if (!sessionId || state.viewLoading) return;
+  async function loadSessionView(sessionId, { quiet = false, userInitiated = false } = {}) {
+    if (!sessionId || (quiet && sessionId !== state.viewSessionId) || (state.viewLoading && !userInitiated)) return;
+    const generation = ++state.viewLoadGeneration;
     state.viewLoading = true;
     try {
       const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/turns`);
-      applySessionView(await response.json());
+      const payload = await response.json();
+      if (generation !== state.viewLoadGeneration) return;
+      applySessionView(payload);
       if (!quiet) closeSidebar();
     } catch (error) {
+      if (generation !== state.viewLoadGeneration) return;
       if (error.status === 401) showBlockedState(true);
       else if (error.status === 404) {
         showToast("会话不存在", "error");
@@ -2654,8 +3375,10 @@
         if (sessionId === state.viewSessionId) window.setTimeout(() => openFallbackSessionView(sessionId), 0);
       } else showToast(error.message || "载入会话失败", "error");
     } finally {
-      state.viewLoading = false;
-      updateControlState();
+      if (generation === state.viewLoadGeneration) {
+        state.viewLoading = false;
+        updateControlState();
+      }
     }
   }
 
@@ -2669,6 +3392,9 @@
   function applySessionView(payload) {
     const sessionId = String(payload?.session_id || "");
     if (!sessionId) return;
+    if (state.viewSessionId && state.viewSessionId !== sessionId && state.composerAttachments.length) {
+      clearComposerAttachments(true);
+    }
     disposeAllLiveRuns();
     clearViewSyncTimer();
     state.viewSessionId = sessionId;
@@ -2676,6 +3402,10 @@
       ? payload.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
       : [];
     state.queuedPrompts = Array.isArray(payload?.queued_prompts) ? payload.queued_prompts : [];
+    state.redoCandidate = payload?.redo_candidate && typeof payload.redo_candidate === "object"
+      ? payload.redo_candidate
+      : null;
+    closeRevisionEditor();
     state.pendingSubmission = null;
     const runs = (Array.isArray(payload?.runs) ? payload.runs : []).filter((run) => run?.run_id);
     if (runs.length) state.runsBySession.set(sessionId, new Set(runs.map((run) => String(run.run_id))));
@@ -2699,15 +3429,21 @@
     return state.turns.find((turn) => turn?.status === "running" && !claimed.has(String(turn?.id))) || null;
   }
 
-  function createLiveForRun(runId, userText = "", { claimTurn = true } = {}) {
+  function createLiveForRun(runId, userText = "", options = {}) {
+    const { claimTurn = true, operation = "create", turnId = null, inputId = null } = options;
     const existing = state.liveRuns.get(runId);
     if (existing) return existing;
-    const runningTurn = userText || !claimTurn ? null : findUnclaimedRunningTurn();
+    const redo = operation === "redo";
+    const runningTurn = redo || userText || !claimTurn ? null : findUnclaimedRunningTurn();
     const live = createLiveState(runId, {
-      turnId: runningTurn?.id || null,
+      turnId: turnId || runningTurn?.id || null,
       userText: userText || runningTurn?.user_content || "",
+      userAttachments: runningTurn?.attachments || [],
       startedAt: runningTurn?.user_timestamp || new Date(),
-      userRendered: Boolean(runningTurn)
+      userRendered: redo || Boolean(runningTurn),
+      operation,
+      inputId,
+      editedContent: options.editedContent
     });
     state.liveRuns.set(runId, live);
     return live;
@@ -2725,7 +3461,16 @@
     for (const run of runs) {
       const runId = String(run?.run_id || "");
       if (!runId || state.terminalRunIds.has(runId)) continue;
-      createLiveForRun(runId);
+      const live = createLiveForRun(runId, "", {
+        operation: String(run?.operation || "create"),
+        turnId: String(run?.turn_id || "") || null,
+        inputId: String(run?.input_id || "") || null
+      });
+      if (live.operation === "redo" && state.turns.some((turn) => {
+        return String(turn?.id) === String(live.turnId) && turn?.status === "running";
+      })) {
+        live.redoCommitted = true;
+      }
       restored = true;
     }
     if (restored) beginRunReplay();
@@ -2733,10 +3478,11 @@
 
   async function openFallbackSessionView(excludedSessionId) {
     const excluded = String(excludedSessionId || "");
+    if (state.viewSessionId !== excluded) return;
     const fallback = state.currentSessionId && state.currentSessionId !== excluded
       ? state.currentSessionId
       : String(state.sessions.find((session) => String(session?.session_id) !== excluded)?.session_id || "");
-    if (fallback) await loadSessionView(fallback, { quiet: true });
+    if (fallback) await loadSessionView(fallback);
     else await loadBootstrap();
   }
 
@@ -2879,6 +3625,16 @@
     return state.liveRuns.size > 0 || Boolean(state.viewRunningTurnId);
   }
 
+  function activeTurnUpdateTarget(sessionId) {
+    const runIds = state.runsBySession.get(String(sessionId || ""));
+    if (!runIds) return null;
+    const candidates = [...runIds]
+      .map((runId) => state.liveRuns.get(String(runId)))
+      .filter((live) => live && !live.ended && live.turnId);
+    if (candidates.length !== 1) return null;
+    return { runId: candidates[0].runId, turnId: candidates[0].turnId };
+  }
+
   function hasPendingQuestion() {
     for (const live of state.liveRuns.values()) {
       for (const question of live.questions.values()) {
@@ -2901,13 +3657,246 @@
   function resizeComposer() {
     const input = elements.composerInput;
     input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, window.innerWidth <= 760 ? 120 : 146)}px`;
+    input.style.height = `${Math.min(input.scrollHeight, layoutViewportWidth() <= 760 ? 120 : 146)}px`;
     const count = countCharacters(input.value);
     elements.characterCount.textContent = `${formatInteger(count)} / 20,000`;
     elements.characterCount.hidden = count < 18_000;
     elements.characterCount.classList.toggle("is-error", count > MAX_CONTENT_CHARS);
     updateControlState();
     window.requestAnimationFrame(updateJumpButtonOffset);
+  }
+
+  function formatFileSize(value) {
+    const bytes = Math.max(0, asFiniteNumber(value));
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function safeAttachmentUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw, window.location.origin);
+      if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/attachments/") || url.pathname === "/api/attachments/") return null;
+      return url.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function attachmentSessionId() {
+    return String(state.viewSessionId || state.currentSessionId || "");
+  }
+
+  function renderComposerAttachments() {
+    const tray = elements.attachmentTray;
+    tray.replaceChildren();
+    tray.hidden = state.composerAttachments.length === 0;
+    for (const item of state.composerAttachments) {
+      const isImage = item.kind === "image" && item.previewUrl;
+      const entry = document.createElement("div");
+      entry.className = `attachment-item ${isImage ? "is-image" : "is-file"} is-${item.status}`;
+      entry.title = item.status === "error" ? `${item.name}: ${item.error || "上传失败"}` : item.name;
+      if (isImage) {
+        const image = document.createElement("img");
+        image.src = item.previewUrl;
+        image.alt = "";
+        const fallback = document.createElement("span");
+        fallback.className = "attachment-image-fallback";
+        fallback.hidden = true;
+        fallback.appendChild(makeIconSlot("circle-alert"));
+        image.addEventListener("load", () => { fallback.hidden = true; }, { once: true });
+        image.addEventListener("error", () => {
+          image.hidden = true;
+          fallback.hidden = false;
+        }, { once: true });
+        entry.append(image, fallback);
+      } else {
+        const icon = document.createElement("span");
+        icon.className = "attachment-file-icon";
+        const nameParts = String(item.name || "").split(".");
+        const extension = nameParts.length > 1 ? nameParts.pop().toUpperCase() : "FILE";
+        icon.textContent = extension.slice(0, 4);
+        entry.appendChild(icon);
+        const copy = document.createElement("span");
+        copy.className = "attachment-item-copy";
+        const name = document.createElement("strong");
+        name.textContent = item.name;
+        name.title = item.name;
+        const meta = document.createElement("small");
+        if (item.status === "uploading") meta.textContent = `上传中 ${Math.round(item.progress || 0)}%`;
+        else if (item.status === "error") meta.textContent = item.error || "上传失败";
+        else meta.textContent = formatFileSize(item.size);
+        copy.append(name, meta);
+        entry.appendChild(copy);
+      }
+      if (item.status === "uploading") {
+        const spinner = makeIconSlot("loader-circle", "attachment-spinner is-spinning");
+        entry.appendChild(spinner);
+      } else if (item.status === "error") {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "attachment-action";
+        retry.title = "重试上传";
+        retry.setAttribute("aria-label", `重试上传 ${item.name}`);
+        retry.appendChild(makeIconSlot("refresh-cw"));
+        retry.addEventListener("click", () => uploadComposerAttachment(item));
+        entry.appendChild(retry);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "attachment-action attachment-remove";
+      remove.title = "移除附件";
+      remove.setAttribute("aria-label", `移除附件 ${item.name}`);
+      remove.appendChild(makeIconSlot("x"));
+      remove.addEventListener("click", () => removeComposerAttachment(item));
+      entry.appendChild(remove);
+      tray.appendChild(entry);
+    }
+    window.requestAnimationFrame(updateJumpButtonOffset);
+  }
+
+  function uploadComposerAttachment(item) {
+    if (!item?.file || !item.sessionId) return;
+    item.status = "uploading";
+    item.progress = 0;
+    item.error = "";
+    renderComposerAttachments();
+    updateControlState();
+    const request = new XMLHttpRequest();
+    item.request = request;
+    request.open("POST", `/api/attachments?session_id=${encodeURIComponent(item.sessionId)}`);
+    request.setRequestHeader("Accept", "application/json");
+    request.setRequestHeader("Content-Type", item.file.type || "application/octet-stream");
+    request.setRequestHeader("X-Miyu-Filename", encodeURIComponent(item.file.name));
+    request.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable || item.request !== request) return;
+      item.progress = Math.min(99, Math.round((event.loaded / event.total) * 100));
+      renderComposerAttachments();
+    });
+    request.addEventListener("load", () => {
+      if (item.request !== request) return;
+      item.request = null;
+      let payload = null;
+      try { payload = JSON.parse(request.responseText || "null"); } catch (_) {}
+      if (request.status >= 200 && request.status < 300 && payload?.id) {
+        const uploadedPreview = payload.kind === "image" ? safeAttachmentUrl(payload.url) : null;
+        if (uploadedPreview && item.previewUrl?.startsWith("blob:")) URL.revokeObjectURL(item.previewUrl);
+        Object.assign(item, payload, {
+          previewUrl: uploadedPreview || item.previewUrl,
+          status: "ready",
+          progress: 100,
+          error: ""
+        });
+      } else {
+        item.status = "error";
+        item.error = payload?.error?.message || `上传失败 (${request.status || "网络错误"})`;
+      }
+      renderComposerAttachments();
+      updateControlState();
+    });
+    request.addEventListener("error", () => {
+      if (item.request !== request) return;
+      item.request = null;
+      item.status = "error";
+      item.error = "无法连接上传服务";
+      renderComposerAttachments();
+      updateControlState();
+    });
+    request.send(item.file);
+  }
+
+  function collectTransferFiles(transfer) {
+    const files = [];
+    const seen = new Set();
+    const add = (file) => {
+      if (!(file instanceof File)) return;
+      const key = `${file.name}\0${file.size}\0${file.lastModified}\0${file.type}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      files.push(file);
+    };
+    for (const item of Array.from(transfer?.items || [])) {
+      if (item.kind === "file") add(item.getAsFile());
+    }
+    for (const file of Array.from(transfer?.files || [])) add(file);
+    return files;
+  }
+
+  function addComposerFiles(files) {
+    if (!state.capabilities?.attachments) return;
+    const incoming = Array.isArray(files) ? files : Array.from(files || []);
+    if (!incoming.length) return;
+    const available = Math.max(0, MAX_ATTACHMENTS - state.composerAttachments.length);
+    if (incoming.length > available) {
+      showToast(`每条消息最多添加 ${MAX_ATTACHMENTS} 个附件，已忽略 ${incoming.length - available} 个`, "error");
+    }
+    const accepted = incoming.slice(0, available);
+    const existingBytes = state.composerAttachments.reduce((sum, item) => sum + asFiniteNumber(item.size), 0);
+    let totalBytes = existingBytes;
+    for (const file of accepted) {
+      if (!(file instanceof File) || file.size <= 0 || file.size > MAX_ATTACHMENT_BYTES) {
+        showToast(`${file?.name || "附件"} 必须小于 10 MB`, "error");
+        continue;
+      }
+      if (totalBytes + file.size > MAX_ATTACHMENT_TOTAL_BYTES) {
+        showToast("单条消息的附件总计不能超过 32 MB", "error");
+        break;
+      }
+      totalBytes += file.size;
+      const image = file.type.startsWith("image/");
+      const item = {
+        localId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        file,
+        sessionId: attachmentSessionId(),
+        name: file.name,
+        mime: file.type,
+        kind: image ? "image" : "text",
+        size: file.size,
+        status: "uploading",
+        progress: 0,
+        previewUrl: image ? URL.createObjectURL(file) : "",
+        request: null,
+        error: ""
+      };
+      state.composerAttachments.push(item);
+      uploadComposerAttachment(item);
+    }
+    renderComposerAttachments();
+    updateControlState();
+  }
+
+  function removeComposerAttachment(item, deleteRemote = true) {
+    item.request?.abort();
+    item.request = null;
+    state.composerAttachments = state.composerAttachments.filter((candidate) => candidate !== item);
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    if (deleteRemote && item.id && item.sessionId) {
+      apiRequest(`/api/attachments/${encodeURIComponent(item.id)}?session_id=${encodeURIComponent(item.sessionId)}`, { method: "DELETE" }).catch(() => {});
+    }
+    renderComposerAttachments();
+    updateControlState();
+  }
+
+  function clearComposerAttachments(deleteRemote = true) {
+    for (const item of [...state.composerAttachments]) removeComposerAttachment(item, deleteRemote);
+    elements.attachmentInput.value = "";
+  }
+
+  function committedComposerAttachments() {
+    const attachments = state.composerAttachments.filter((item) => item.status === "ready").map((item) => ({
+      id: item.id,
+      url: item.url,
+      name: item.name,
+      mime: item.mime,
+      kind: item.kind,
+      size: item.size,
+      width: item.width || 0,
+      height: item.height || 0
+    }));
+    clearComposerAttachments(false);
+    return attachments;
   }
 
   function updateJumpButtonOffset() {
@@ -2919,14 +3908,20 @@
     const busy = state.adminBusy || state.submitting;
     const locked = state.blocked || state.adminBusy;
     const inputCount = countCharacters(elements.composerInput.value.trim());
+    const attachmentUploading = state.composerAttachments.some((item) => item.status === "uploading");
+    const attachmentError = state.composerAttachments.some((item) => item.status === "error");
+    const attachmentReady = state.composerAttachments.some((item) => item.status === "ready");
 
     elements.composerInput.disabled = locked;
     elements.composerForm.classList.toggle("is-disabled", locked);
+    elements.attachButton.disabled = locked || state.submitting || !state.capabilities?.attachments || state.composerAttachments.length >= MAX_ATTACHMENTS;
     elements.newChatButton.disabled = state.blocked || busy || state.sessionBusy || state.viewLoading;
     elements.modelButton.disabled = state.blocked || running || busy || state.models.length === 0;
-    elements.modeSwitch.querySelectorAll("button").forEach((button) => {
-      button.disabled = state.blocked || running || busy;
-    });
+    elements.modeCycle.disabled = state.blocked || running || busy;
+    elements.thinkingVariantButton.disabled = state.blocked || running || busy
+      || state.thinkingVariantLoading || state.thinkingVariantModels.length === 0;
+    if (elements.thinkingVariantButton.disabled) closeThinkingVariantPopover();
+    updateThinkingVariantTrigger();
     elements.promptGrid.querySelectorAll("button").forEach((button) => {
       button.disabled = state.blocked || running || busy;
     });
@@ -2939,14 +3934,20 @@
     elements.sendButton.querySelector(".icon-slot").replaceChildren(createIcon("arrow-up"));
     elements.sendButton.title = running ? "加入队列" : "发送消息";
     elements.sendButton.setAttribute("aria-label", elements.sendButton.title);
-    elements.sendButton.disabled = state.blocked || state.adminBusy || state.submitting || hasPendingQuestion() || inputCount === 0 || inputCount > MAX_CONTENT_CHARS;
+    elements.sendButton.disabled = state.blocked || state.adminBusy || state.submitting || hasPendingQuestion()
+      || (inputCount === 0 && !attachmentReady) || inputCount > MAX_CONTENT_CHARS || attachmentUploading || attachmentError;
+    document.querySelectorAll(".edit-action, .redo-action").forEach((button) => {
+      button.disabled = !revisionEligible();
+    });
 
     if (state.blocked) elements.composerState.textContent = "未授权";
     else if (hasPendingQuestion()) elements.composerState.textContent = "等待回答";
+    else if (attachmentUploading) elements.composerState.textContent = "正在上传";
+    else if (attachmentError) elements.composerState.textContent = "附件上传失败";
     else if (busy) elements.composerState.textContent = state.submitting ? (running ? "正在加入队列" : "正在发送") : "正在处理";
     else if (inputCount > MAX_CONTENT_CHARS) elements.composerState.textContent = "消息不能超过 20,000 个字符";
     else elements.composerState.textContent = "";
-    elements.composerState.classList.toggle("is-error", inputCount > MAX_CONTENT_CHARS);
+    elements.composerState.classList.toggle("is-error", inputCount > MAX_CONTENT_CHARS || attachmentError);
     updateSettingsControls();
   }
 
@@ -3030,6 +4031,149 @@
     button.appendChild(makeIconSlot("copy"));
     button.addEventListener("click", () => copyText(typeof textProvider === "function" ? textProvider() : textProvider));
     return button;
+  }
+
+  function makeMessageAction(icon, label, handler) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.appendChild(makeIconSlot(icon));
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  function revisionEligible(candidate = state.redoCandidate) {
+    if (!candidate || !state.capabilities?.redo) return false;
+    return !state.blocked && !state.viewLoading && !state.resyncing
+      && !conversationRunning() && !state.submitting && !state.revisionSubmitting
+      && !state.adminBusy && !state.sessionBusy && !hasPendingQuestion()
+      && state.queuedPrompts.length === 0;
+  }
+
+  function closeRevisionEditor({ restoreFocus = false } = {}) {
+    const editor = state.revisionEditor;
+    if (!editor) return;
+    editor.form.remove();
+    editor.bubble.hidden = editor.wasHidden;
+    state.revisionEditor = null;
+    if (restoreFocus) editor.opener?.focus();
+  }
+
+  function openRevisionEditor(article, bubble, content, candidate, opener) {
+    if (!revisionEligible(candidate)) return;
+    closeRevisionEditor();
+    const form = document.createElement("form");
+    form.className = "revision-editor";
+    form.setAttribute("aria-label", "编辑最后一条消息");
+    const textarea = document.createElement("textarea");
+    textarea.value = String(content || "");
+    textarea.maxLength = MAX_CONTENT_CHARS;
+    textarea.setAttribute("aria-label", "消息内容");
+    const error = document.createElement("div");
+    error.className = "revision-editor-error";
+    error.setAttribute("role", "alert");
+    error.hidden = true;
+    const footer = document.createElement("div");
+    footer.className = "revision-editor-footer";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "取消";
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.textContent = "发送";
+    footer.append(cancel, submit);
+    form.append(textarea, error, footer);
+    const wasHidden = bubble.hidden;
+    bubble.hidden = true;
+    article.insertBefore(form, article.querySelector(".message-actions"));
+    state.revisionEditor = { form, textarea, error, submit, bubble, wasHidden, opener, candidate };
+    cancel.addEventListener("click", () => closeRevisionEditor({ restoreFocus: true }));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const draft = textarea.value.trim();
+      if (!draft && !article.querySelector(".user-attachments")) {
+        error.textContent = "消息不能为空";
+        error.hidden = false;
+        return;
+      }
+      if (countCharacters(draft) > MAX_CONTENT_CHARS) {
+        error.textContent = "消息不能超过 20,000 个字符";
+        error.hidden = false;
+        return;
+      }
+      await submitRedo(candidate, draft);
+    });
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRevisionEditor({ restoreFocus: true });
+      } else if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    window.requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      form.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  async function submitRedo(candidate, editedContent = null) {
+    if (!revisionEligible(candidate)) return;
+    const sessionId = state.viewSessionId;
+    if (!sessionId) return;
+    state.revisionSubmitting = true;
+    const editor = state.revisionEditor;
+    if (editor) {
+      editor.form.setAttribute("aria-busy", "true");
+      editor.textarea.disabled = true;
+      editor.submit.disabled = true;
+      editor.error.hidden = true;
+    }
+    updateControlState();
+    try {
+      const body = {
+        expected_revision: candidate.revision,
+        input_id: candidate.input_id,
+        mode: state.mode
+      };
+      if (editedContent != null) body.content = editedContent;
+      const response = await apiRequest(
+        `/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(candidate.turn_id)}/redo`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      const payload = await response.json();
+      const runId = String(payload?.run_id || "");
+      if (!runId) throw new ApiError("服务未返回运行标识", response.status);
+      trackRun(sessionId, runId);
+      createLiveForRun(runId, "", {
+        claimTurn: false,
+        operation: "redo",
+        turnId: candidate.turn_id,
+        inputId: candidate.input_id,
+        editedContent
+      });
+      state.redoCandidate = null;
+      renderSessionList();
+      updateConversationChrome();
+    } catch (error) {
+      if (editor && state.revisionEditor === editor) {
+        editor.error.textContent = error.status === 409 ? "会话已变化，请重新操作" : error.message;
+        editor.error.hidden = false;
+      }
+      showToast(error.status === 409 ? "会话状态已更新" : error.message, "error");
+      if (error.status === 409) await loadSessionView(sessionId, { quiet: true });
+    } finally {
+      state.revisionSubmitting = false;
+      if (editor && state.revisionEditor === editor) {
+        editor.form.removeAttribute("aria-busy");
+        editor.textarea.disabled = false;
+        editor.submit.disabled = false;
+      }
+      updateControlState();
+    }
   }
 
   function validHttpUrl(value) {
@@ -3407,19 +4551,79 @@
     if (attributes.turnId) article.dataset.turnId = attributes.turnId;
     if (attributes.runId) article.dataset.runId = attributes.runId;
     if (attributes.followupId) article.dataset.followupId = attributes.followupId;
+    if (attributes.inputId) article.dataset.inputId = attributes.inputId;
     const bubble = document.createElement("div");
     bubble.className = "user-bubble";
     const paragraph = document.createElement("p");
-    paragraph.textContent = String(content || "");
+    const textContent = String(content || "");
+    paragraph.textContent = textContent;
     bubble.appendChild(paragraph);
+    bubble.hidden = !textContent.trim();
+    const attachments = createUserAttachments(attributes.attachments);
     const actions = document.createElement("div");
     actions.className = "message-actions";
     const time = document.createElement("span");
     time.textContent = formatTime(timestamp) || "刚刚";
     time.title = formatDateTime(timestamp);
-    actions.append(time, makeCopyButton(String(content || ""), "复制消息"));
+    actions.appendChild(time);
+    if (attributes.revisionTarget) {
+      const edit = makeMessageAction("square-pen", "编辑最后一条消息", () => {
+        openRevisionEditor(article, bubble, textContent, attributes.revisionTarget, edit);
+      });
+      edit.className = "edit-action";
+      actions.appendChild(edit);
+    }
+    if (textContent.trim()) actions.appendChild(makeCopyButton(textContent, "复制消息"));
+    if (attachments) article.appendChild(attachments);
     article.append(bubble, actions);
     return article;
+  }
+
+  function createUserAttachments(values) {
+    const attachments = Array.isArray(values) ? values : [];
+    if (!attachments.length) return null;
+    const list = document.createElement("div");
+    list.className = "user-attachments";
+    for (const attachment of attachments) {
+      const url = safeAttachmentUrl(attachment?.url);
+      if (!url) continue;
+      const name = String(attachment?.name || "附件");
+      if (attachment?.kind === "image" || String(attachment?.mime || "").startsWith("image/")) {
+        const link = document.createElement("a");
+        link.className = "user-attachment-image";
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.title = name;
+        const image = document.createElement("img");
+        image.src = url;
+        image.alt = name;
+        image.loading = "lazy";
+        image.decoding = "async";
+        const width = validAssetDimension(attachment?.width);
+        const height = validAssetDimension(attachment?.height);
+        if (width) image.width = width;
+        if (height) image.height = height;
+        link.appendChild(image);
+        list.appendChild(link);
+        continue;
+      }
+      const link = document.createElement("a");
+      link.className = "user-attachment-file";
+      link.href = url;
+      link.setAttribute("download", "");
+      link.title = `下载 ${name}`;
+      link.appendChild(makeIconSlot("file-text"));
+      const copy = document.createElement("span");
+      const strong = document.createElement("strong");
+      strong.textContent = name;
+      const small = document.createElement("small");
+      small.textContent = formatFileSize(attachment?.size);
+      copy.append(strong, small);
+      link.append(copy, makeIconSlot("download"));
+      list.appendChild(link);
+    }
+    return list.childElementCount ? list : null;
   }
 
   function safeAssetUrl(value) {
@@ -3432,6 +4636,418 @@
     } catch (_) {
       return null;
     }
+  }
+
+  function safeArtifactUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw, window.location.origin);
+      const allowed = ["/api/assets/", "/api/artifacts/"].some((prefix) => url.pathname.startsWith(prefix) && url.pathname !== prefix);
+      return url.origin === window.location.origin && allowed ? url.href : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function artifactName(source) {
+    return String(source?.name || source?.alt || "预览资源").trim() || "预览资源";
+  }
+
+  function normalizeArtifact(source, fallbackKind = "file") {
+    if (!source || typeof source !== "object") return null;
+    const url = safeArtifactUrl(source.url);
+    if (!url) return null;
+    const mime = String(source.mime || "application/octet-stream").toLowerCase();
+    return {
+      ...source,
+      id: String(source.id || url),
+      url,
+      name: artifactName(source),
+      type_label: String(source.type_label || "").trim().toUpperCase(),
+      mime,
+      kind: String(source.kind || (mime.startsWith("image/") ? "image" : fallbackKind))
+    };
+  }
+
+  function artifactSupportsPreview(artifact) {
+    return artifact?.kind === "image"
+      || artifact?.mime?.startsWith("image/")
+      || ["markdown", "html", "pdf"].includes(artifact?.kind);
+  }
+
+  function artifactSupportsSource(artifact) {
+    return ["markdown", "html", "text", "code", "json"].includes(artifact?.kind)
+      || artifact?.mime?.startsWith("text/")
+      || artifact?.mime?.startsWith("application/json");
+  }
+
+  function defaultArtifactMode(artifact) {
+    return artifactSupportsPreview(artifact) ? "preview" : "source";
+  }
+
+  function artifactWidthPixels() {
+    const viewportWidth = Math.max(320, layoutViewportWidth());
+    return Math.min(viewportWidth - 20, Math.max(320, viewportWidth * state.artifactWidthRatio));
+  }
+
+  function syncArtifactLayout() {
+    const width = artifactWidthPixels();
+    elements.mainStage.style.setProperty("--artifact-width", `${Math.round(width)}px`);
+    const roomForConversation = elements.mainStage.clientWidth - width - 10;
+    const split = state.artifactOpen && !state.artifactMaximized && layoutViewportWidth() > 760 && roomForConversation >= 320;
+    elements.mainStage.classList.toggle("artifact-split", split);
+    elements.mainStage.classList.toggle("artifact-maximized", state.artifactOpen && state.artifactMaximized);
+    syncSidebarSpace();
+  }
+
+  function closeArtifactResourceMenu() {
+    elements.artifactResourceMenu.hidden = true;
+    elements.artifactTitleButton.setAttribute("aria-expanded", "false");
+  }
+
+  function setArtifactWorkspaceOpen(open) {
+    const hasArtifacts = state.artifacts.length > 0;
+    state.artifactOpen = Boolean(open && hasArtifacts);
+    if (!state.artifactOpen) state.artifactMaximized = false;
+    elements.artifactWorkspace.hidden = !state.artifactOpen;
+    elements.artifactWorkspace.setAttribute("aria-hidden", String(!state.artifactOpen));
+    elements.mainStage.classList.toggle("artifact-open", state.artifactOpen);
+    closeArtifactResourceMenu();
+    syncArtifactLayout();
+    elements.artifactToggleButton.setAttribute("aria-pressed", String(state.artifactOpen));
+    if (state.artifactOpen) {
+      elements.artifactToggleButton.classList.remove("has-new-artifact");
+      renderArtifactWorkspace();
+    }
+  }
+
+  function registerArtifact(source, { autoOpen = false } = {}) {
+    const artifact = normalizeArtifact(source, source?.kind || "file");
+    if (!artifact) return;
+    const index = state.artifacts.findIndex((item) => item.id === artifact.id);
+    if (index >= 0) state.artifacts[index] = artifact;
+    else state.artifacts.push(artifact);
+    state.artifactSourceCache.delete(artifact.id);
+    state.selectedArtifactId = artifact.id;
+    state.artifactMode = defaultArtifactMode(artifact);
+    state.artifactZoom = 1;
+    state.artifactPanX = 0;
+    state.artifactPanY = 0;
+    elements.artifactToggleButton.hidden = false;
+    if (autoOpen && layoutViewportWidth() > 760) setArtifactWorkspaceOpen(true);
+    else if (!state.artifactOpen) elements.artifactToggleButton.classList.add("has-new-artifact");
+    if (state.artifactOpen) renderArtifactWorkspace();
+  }
+
+  function syncArtifactsFromTurns(turns) {
+    const artifacts = [];
+    for (const turn of turns) {
+      for (const source of [...(Array.isArray(turn?.assets) ? turn.assets : []), ...(Array.isArray(turn?.artifacts) ? turn.artifacts : [])]) {
+        const artifact = normalizeArtifact(source, "file");
+        if (artifact && !artifacts.some((item) => item.id === artifact.id)) artifacts.push(artifact);
+      }
+    }
+    state.artifacts = artifacts;
+    if (!artifacts.some((item) => item.id === state.selectedArtifactId)) {
+      state.selectedArtifactId = artifacts.at(-1)?.id || null;
+      state.artifactMode = defaultArtifactMode(artifacts.at(-1));
+    }
+    const knownIds = new Set(artifacts.map((artifact) => artifact.id));
+    for (const id of state.artifactSourceCache.keys()) {
+      if (!knownIds.has(id)) state.artifactSourceCache.delete(id);
+    }
+    elements.artifactToggleButton.hidden = artifacts.length === 0;
+    if (!artifacts.length) setArtifactWorkspaceOpen(false);
+    else if (state.artifactOpen) renderArtifactWorkspace();
+  }
+
+  function artifactIconName(artifact) {
+    if (artifact?.kind === "image" || artifact?.mime?.startsWith("image/")) return "image";
+    if (artifact?.kind === "markdown") return "file-markdown";
+    if (artifact?.kind === "json") return "file-json";
+    if (artifact?.kind === "code" || artifact?.kind === "html") return "file-code";
+    return "file-text";
+  }
+
+  function artifactTypeLabel(artifact) {
+    if (artifact?.type_label) return artifact.type_label;
+    if (artifact?.kind === "markdown") return "MD";
+    if (artifact?.kind === "json") return "JSON";
+    if (artifact?.kind === "html") return "HTML";
+    if (artifact?.kind === "code") return "CODE";
+    if (artifact?.kind === "pdf") return "PDF";
+    if (artifact?.kind === "image") return String(artifact.mime || "IMAGE").split("/").pop().toUpperCase();
+    return "FILE";
+  }
+
+  function artifactIconButton(icon, label, handler) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "icon-button";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.appendChild(makeIconSlot(icon));
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  function renderArtifactImage(artifact) {
+    const stage = document.createElement("div");
+    stage.className = "artifact-image-stage";
+    const image = document.createElement("img");
+    image.src = artifact.url;
+    image.alt = artifact.name;
+    const applyTransform = () => {
+      image.style.transform = `translate(${state.artifactPanX}px, ${state.artifactPanY}px) scale(${state.artifactZoom})`;
+      stage.classList.toggle("is-zoomed", state.artifactZoom > 1);
+    };
+    applyTransform();
+    stage.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const nextZoom = Math.min(4, Math.max(0.25, state.artifactZoom * (event.deltaY < 0 ? 1.12 : 0.89)));
+      state.artifactZoom = nextZoom;
+      if (nextZoom <= 1) {
+        state.artifactZoom = 1;
+        state.artifactPanX = 0;
+        state.artifactPanY = 0;
+      }
+      applyTransform();
+      updateArtifactImageControls();
+    }, { passive: false });
+    stage.addEventListener("pointerdown", (event) => {
+      if (state.artifactZoom <= 1 || event.button !== 0) return;
+      event.preventDefault();
+      stage.classList.add("is-dragging");
+      stage.setPointerCapture(event.pointerId);
+      stage.dataset.panStartX = String(event.clientX);
+      stage.dataset.panStartY = String(event.clientY);
+      stage.dataset.panOriginX = String(state.artifactPanX);
+      stage.dataset.panOriginY = String(state.artifactPanY);
+    });
+    stage.addEventListener("pointermove", (event) => {
+      if (!stage.classList.contains("is-dragging")) return;
+      state.artifactPanX = Number(stage.dataset.panOriginX)
+        + visualPixelsToLayout(event.clientX - Number(stage.dataset.panStartX));
+      state.artifactPanY = Number(stage.dataset.panOriginY)
+        + visualPixelsToLayout(event.clientY - Number(stage.dataset.panStartY));
+      applyTransform();
+    });
+    const finishPan = () => stage.classList.remove("is-dragging");
+    stage.addEventListener("pointerup", finishPan);
+    stage.addEventListener("pointercancel", finishPan);
+    stage.appendChild(image);
+    return stage;
+  }
+
+  function updateArtifactImageControls() {
+    const isImage = state.artifacts.find((item) => item.id === state.selectedArtifactId)?.kind === "image";
+    if (!isImage) return;
+    elements.artifactImageZoomOutButton.disabled = state.artifactZoom <= 0.25;
+    elements.artifactImageZoomInButton.disabled = state.artifactZoom >= 4;
+  }
+
+  async function loadArtifactSource(artifact) {
+    const version = `${artifact.url}|${artifact.updated_at || ""}`;
+    const cached = state.artifactSourceCache.get(artifact.id);
+    if (cached?.version === version) return cached.text;
+    const response = await fetch(artifact.url, { credentials: "same-origin", cache: "no-store" });
+    if (!response.ok) throw new Error("文件载入失败");
+    const text = await response.text();
+    state.artifactSourceCache.set(artifact.id, { version, text });
+    return text;
+  }
+
+  function artifactLoadingNode() {
+    const loading = document.createElement("div");
+    loading.className = "artifact-loading";
+    loading.append(makeIconSlot("loader-circle", "is-spinning"));
+    return loading;
+  }
+
+  function renderArtifactFailure(error, token) {
+    if (token !== state.artifactRenderToken) return;
+    const failure = document.createElement("div");
+    failure.className = "artifact-failure";
+    failure.append(makeIconSlot("circle-alert"), document.createTextNode(error?.message || "文件载入失败"));
+    elements.artifactView.replaceChildren(failure);
+  }
+
+  async function renderArtifactSource(artifact, token) {
+    let text = await loadArtifactSource(artifact);
+    if (token !== state.artifactRenderToken) return;
+    if (artifact.kind === "json" || artifact.mime.startsWith("application/json") || /\.json$/i.test(artifact.name)) {
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    }
+    const source = document.createElement("div");
+    source.className = "artifact-source";
+    const gutter = document.createElement("div");
+    gutter.className = "artifact-line-numbers";
+    const lines = text.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const number = document.createElement("span");
+      number.textContent = String(index + 1);
+      gutter.appendChild(number);
+    }
+    const pre = document.createElement("pre");
+    pre.className = "artifact-code";
+    const code = document.createElement("code");
+    code.textContent = text;
+    pre.appendChild(code);
+    source.append(gutter, pre);
+    elements.artifactView.replaceChildren(source);
+  }
+
+  async function renderArtifactPreview(artifact, token) {
+    if (artifact.kind === "image" || artifact.mime.startsWith("image/")) {
+      elements.artifactView.replaceChildren(renderArtifactImage(artifact));
+      return;
+    }
+    if (artifact.kind === "pdf") {
+      const frame = document.createElement("iframe");
+      frame.className = "artifact-frame";
+      frame.src = artifact.url;
+      frame.title = artifact.name;
+      elements.artifactView.replaceChildren(frame);
+      return;
+    }
+    if (artifact.kind === "html") {
+      const frame = document.createElement("iframe");
+      frame.className = "artifact-frame";
+      frame.src = artifact.url;
+      frame.title = artifact.name;
+      frame.setAttribute("sandbox", "");
+      elements.artifactView.replaceChildren(frame);
+      return;
+    }
+    if (artifact.kind === "markdown") {
+      const text = await loadArtifactSource(artifact);
+      if (token !== state.artifactRenderToken) return;
+      const article = document.createElement("article");
+      article.className = "markdown-body artifact-markdown";
+      renderMarkdown(article, text);
+      elements.artifactView.replaceChildren(article);
+      return;
+    }
+    throw new Error("此格式不支持预览");
+  }
+
+  function renderArtifactResourceMenu(artifact) {
+    elements.artifactResourceMenu.replaceChildren();
+    for (const item of state.artifacts) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.role = "menuitem";
+      button.className = item.id === artifact.id ? "active" : "";
+      const label = document.createElement("span");
+      label.textContent = item.name;
+      const type = document.createElement("small");
+      type.textContent = artifactTypeLabel(item);
+      button.append(makeIconSlot(artifactIconName(item)), label, type);
+      if (item.id === artifact.id) button.appendChild(makeIconSlot("check"));
+      button.addEventListener("click", () => {
+        state.selectedArtifactId = item.id;
+        state.artifactMode = defaultArtifactMode(item);
+        state.artifactZoom = 1;
+        state.artifactPanX = 0;
+        state.artifactPanY = 0;
+        closeArtifactResourceMenu();
+        renderArtifactWorkspace();
+      });
+      elements.artifactResourceMenu.appendChild(button);
+    }
+    elements.artifactTitleButton.disabled = state.artifacts.length <= 1;
+  }
+
+  function renderArtifactWorkspace() {
+    if (!state.artifactOpen) return;
+    const artifact = state.artifacts.find((item) => item.id === state.selectedArtifactId) || state.artifacts.at(-1);
+    if (!artifact) return;
+    state.selectedArtifactId = artifact.id;
+    const canPreview = artifactSupportsPreview(artifact);
+    const canSource = artifactSupportsSource(artifact);
+    const isImage = artifact.kind === "image" || artifact.mime.startsWith("image/");
+    if ((state.artifactMode === "preview" && !canPreview) || (state.artifactMode === "source" && !canSource)) {
+      state.artifactMode = defaultArtifactMode(artifact);
+    }
+    elements.artifactTitle.textContent = artifact.name;
+    elements.artifactTitle.title = artifact.name;
+    elements.artifactTypeLabel.textContent = artifactTypeLabel(artifact);
+    elements.artifactDownloadButton.href = artifact.url;
+    elements.artifactPreviewButton.parentElement.hidden = isImage;
+    elements.artifactImageActions.hidden = !isImage;
+    elements.artifactImageExternalButton.href = isImage ? artifact.url : "";
+    elements.artifactImageZoomOutButton.disabled = !isImage || state.artifactZoom <= 0.25;
+    elements.artifactImageZoomInButton.disabled = !isImage || state.artifactZoom >= 4;
+    elements.artifactPreviewButton.hidden = !canPreview;
+    elements.artifactSourceButton.hidden = !canSource;
+    elements.artifactPreviewButton.classList.toggle("active", state.artifactMode === "preview");
+    elements.artifactSourceButton.classList.toggle("active", state.artifactMode === "source");
+    elements.artifactPreviewButton.setAttribute("aria-pressed", String(state.artifactMode === "preview"));
+    elements.artifactSourceButton.setAttribute("aria-pressed", String(state.artifactMode === "source"));
+    elements.artifactCopyButton.disabled = !canSource && artifact.kind === "pdf";
+    elements.artifactCopyButton.hidden = isImage;
+    elements.artifactMaximizeButton.replaceChildren(makeIconSlot(state.artifactMaximized ? "minimize-2" : "maximize-2"));
+    elements.artifactMaximizeButton.title = state.artifactMaximized ? "退出全屏" : "全屏显示";
+    elements.artifactMaximizeButton.setAttribute("aria-label", elements.artifactMaximizeButton.title);
+    renderArtifactResourceMenu(artifact);
+    const token = ++state.artifactRenderToken;
+    elements.artifactView.replaceChildren(artifactLoadingNode());
+    const render = state.artifactMode === "source"
+      ? renderArtifactSource(artifact, token)
+      : renderArtifactPreview(artifact, token);
+    render.catch((error) => renderArtifactFailure(error, token));
+  }
+
+  async function copySelectedArtifact() {
+    const artifact = state.artifacts.find((item) => item.id === state.selectedArtifactId);
+    if (!artifact) return;
+    try {
+      if (artifactSupportsSource(artifact)) {
+        await navigator.clipboard.writeText(await loadArtifactSource(artifact));
+      } else if (artifact.kind === "image" && window.ClipboardItem) {
+        const response = await fetch(artifact.url, { credentials: "same-origin" });
+        if (!response.ok) throw new Error("图片载入失败");
+        const blob = await response.blob();
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+      } else {
+        await navigator.clipboard.writeText(artifact.url);
+      }
+      showToast("已复制", "success");
+    } catch (error) {
+      showToast(error.message || "复制失败", "error");
+    }
+  }
+
+  function setArtifactMode(mode) {
+    const artifact = state.artifacts.find((item) => item.id === state.selectedArtifactId);
+    if (!artifact || (mode === "preview" ? !artifactSupportsPreview(artifact) : !artifactSupportsSource(artifact))) return;
+    state.artifactMode = mode;
+    renderArtifactWorkspace();
+  }
+
+  function toggleArtifactMaximized() {
+    if (!state.artifactOpen) return;
+    state.artifactMaximized = !state.artifactMaximized;
+    syncArtifactLayout();
+    renderArtifactWorkspace();
+  }
+
+  function changeArtifactImageZoom(delta) {
+    const artifact = state.artifacts.find((item) => item.id === state.selectedArtifactId);
+    if (!artifact || !(artifact.kind === "image" || artifact.mime.startsWith("image/"))) return;
+    state.artifactZoom = Math.min(4, Math.max(0.25, (state.artifactZoom || 1) + delta));
+    if (state.artifactZoom <= 1) {
+      state.artifactZoom = 1;
+      state.artifactPanX = 0;
+      state.artifactPanY = 0;
+    }
+    const image = elements.artifactView.querySelector(".artifact-image-stage > img");
+    if (image) {
+      image.style.transform = `translate(${state.artifactPanX}px, ${state.artifactPanY}px) scale(${state.artifactZoom})`;
+      image.closest(".artifact-image-stage")?.classList.toggle("is-zoomed", state.artifactZoom > 1);
+    }
+    updateArtifactImageControls();
   }
 
   function validAssetDimension(value) {
@@ -3515,6 +5131,10 @@
       const actions = document.createElement("span");
       actions.className = "conversation-media-actions";
       actions.append(
+        artifactIconButton("panel-right", "在预览工作区打开", () => {
+          registerArtifact({ ...source, url, name: alt, kind: "image" });
+          setArtifactWorkspaceOpen(true);
+        }),
         createAssetAction("external-link", "在新窗口打开图片", url),
         createAssetAction("download", "下载图片", url, true)
       );
@@ -3623,12 +5243,15 @@
     model = "",
     activeContext = true,
     turnId = null,
-    muted = false
+    muted = false,
+    segmentKind = "final",
+    redoTarget = null
   } = {}) {
     const article = document.createElement("article");
     article.className = `message assistant-message${muted ? " is-muted" : ""}`;
     article.dataset.role = "assistant";
     if (turnId) article.dataset.turnId = turnId;
+    article.dataset.segmentKind = segmentKind;
     const header = document.createElement("header");
     header.className = "assistant-label";
     const avatar = document.createElement("img");
@@ -3642,7 +5265,7 @@
     time.textContent = formatTime(timestamp) || "";
     time.title = formatDateTime(timestamp);
     identity.append(name, time);
-    header.append(avatar, identity, stop);
+    header.append(avatar, identity);
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content";
     const blocks = document.createElement("div");
@@ -3682,13 +5305,31 @@
       meta.appendChild(contextBadge);
     }
     const copyValue = String(content || "").trim() || String(reasoning || "");
-    if (copyValue) {
+    if (copyValue || redoTarget) {
       const spacer = document.createElement("span");
       spacer.className = "meta-spacer";
-      meta.append(spacer, makeCopyButton(copyValue, "复制回复"));
+      meta.appendChild(spacer);
+      if (redoTarget) {
+        const redo = makeMessageAction("refresh-cw", "重新生成回复", () => submitRedo(redoTarget));
+        redo.className = "redo-action";
+        meta.appendChild(redo);
+      }
+      if (copyValue) meta.appendChild(makeCopyButton(copyValue, "复制回复"));
     }
     if (meta.childNodes.length) article.appendChild(meta);
     return article;
+  }
+
+  function setAssistantRedoAction(article, candidate) {
+    const meta = article?.querySelector(".assistant-meta");
+    if (!meta) return;
+    meta.querySelector(".redo-action")?.remove();
+    if (!candidate) return;
+    const redo = makeMessageAction("refresh-cw", "重新生成回复", () => submitRedo(candidate));
+    redo.className = "redo-action";
+    const copy = meta.querySelector("button:last-child");
+    if (copy) meta.insertBefore(redo, copy);
+    else meta.appendChild(redo);
   }
 
   function createAnsweredQuestionCard(exchange, compact = true) {
@@ -3758,7 +5399,15 @@
 
   function renderPersistedTurn(turn) {
     const turnId = String(turn?.id || "");
-    elements.timeline.appendChild(createUserMessage(turn?.user_content || "", turn?.user_timestamp, { turnId }));
+    const candidate = state.redoCandidate && String(state.redoCandidate.turn_id) === turnId
+      ? state.redoCandidate
+      : null;
+    elements.timeline.appendChild(createUserMessage(turn?.user_content || "", turn?.user_timestamp, {
+      turnId,
+      inputId: turnId,
+      revisionTarget: candidate && String(candidate.input_id) === turnId ? candidate : null,
+      attachments: turn?.attachments
+    }));
 
     /*
      * 本页会话内完成的 turn:优先复用 live 流式渲染出的 article(含按时序排列的
@@ -3793,12 +5442,16 @@
           model: followup?.model,
           timestamp: followup?.submitted_at,
           turnId,
+          segmentKind: "segment",
           activeContext: turn?.active_context !== false
         }));
       }
       elements.timeline.appendChild(createUserMessage(followup?.content || "", followup?.submitted_at, {
         turnId,
-        followupId: String(followup?.id || "")
+        followupId: String(followup?.id || ""),
+        inputId: String(followup?.id || ""),
+        revisionTarget: candidate && String(candidate.input_id) === String(followup?.id || "") ? candidate : null,
+        attachments: followup?.attachments
       }));
     }
     let leftoverSegment;
@@ -3810,6 +5463,8 @@
     const stashedFinal = takeStash("final");
     if (stashedFinal) {
       stashedFinal.classList.toggle("is-muted", turn?.active_context === false);
+      stashedFinal.dataset.segmentKind = "final";
+      setAssistantRedoAction(stashedFinal, candidate);
       elements.timeline.appendChild(stashedFinal);
     } else if (assistantContent.trim() || assistantReasoning.trim() || assets.length) {
       elements.timeline.appendChild(createAssistantMessage({
@@ -3823,6 +5478,8 @@
         tokenEstimated: Boolean(turn?.token_usage_estimated),
         activeContext: turn?.active_context !== false,
         turnId,
+        segmentKind: "final",
+        redoTarget: candidate,
         muted: turn?.active_context === false
       }));
     }
@@ -3842,6 +5499,7 @@
     elements.timeline.replaceChildren();
     const turns = [...state.turns].sort((left, right) => asFiniteNumber(left?.seq) - asFiniteNumber(right?.seq));
     state.turns = turns;
+    syncArtifactsFromTurns(turns);
     if (state.finishedTurnArticles.size) {
       const knownTurnIds = new Set(turns.map((turn) => String(turn?.id)));
       for (const key of [...state.finishedTurnArticles.keys()]) {
@@ -3878,6 +5536,7 @@
       runId,
       turnId: options.turnId || null,
       userText: options.userText || "",
+      userAttachments: Array.isArray(options.userAttachments) ? options.userAttachments : [],
       startedAt: options.startedAt || new Date(),
       userRendered: Boolean(options.userRendered),
       article: null,
@@ -3892,6 +5551,7 @@
       assistantText: "",
       assistantReasoning: "",
       assets: [],
+      artifacts: [],
       reasoning: null,
       reasoningParts: [],
       reasoningStarted: false,
@@ -3900,10 +5560,17 @@
       providerId: "",
       model: "",
       tools: new Map(),
+      preparingTool: null,
       questions: new Map(),
       contextOperation: null,
       typing: null,
-      ended: false
+      typingAnimation: null,
+      streamRail: null,
+      ended: false,
+      operation: options.operation || "create",
+      inputId: options.inputId || null,
+      editedContent: options.editedContent ?? null,
+      redoCommitted: false
     };
   }
 
@@ -3915,7 +5582,11 @@
       const row = document.createElement("div");
       row.className = "queue-item";
       const text = document.createElement("span");
-      text.textContent = String(prompt?.content || "");
+      const attachmentCount = Array.isArray(prompt?.attachments) ? prompt.attachments.length : 0;
+      const promptText = String(prompt?.content || "").trim();
+      text.textContent = attachmentCount
+        ? `${promptText || "附件消息"} · ${attachmentCount} 个附件`
+        : promptText;
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "queue-remove";
@@ -3931,8 +5602,13 @@
 
   async function removeQueuedPrompt(promptId) {
     if (!promptId) return;
+    const target = activeTurnUpdateTarget(state.viewSessionId);
+    if (!target) {
+      showToast("无法确定排队消息所属的回复", "error");
+      return;
+    }
     try {
-      await apiRequest(`/api/queue/${encodeURIComponent(promptId)}`, { method: "DELETE" });
+      await apiRequest(`/api/runs/${encodeURIComponent(target.runId)}/turns/${encodeURIComponent(target.turnId)}/queue/${encodeURIComponent(promptId)}`, { method: "DELETE" });
       state.queuedPrompts = state.queuedPrompts.filter((prompt) => String(prompt?.id) !== String(promptId));
       renderQueueTray();
     } catch (error) {
@@ -3943,7 +5619,14 @@
 
   function disposeLiveState(live) {
     if (!live) return;
+    for (const question of live.questions?.values?.() || []) {
+      if (question.autoAdvanceTimer) window.clearTimeout(question.autoAdvanceTimer);
+      question.autoAdvanceTimer = null;
+    }
+    clearPreparingTool(live);
     removeLiveStopButton(live);
+    live.typingAnimation?.cancel();
+    live.typingAnimation = null;
     if (live.reasoningTimer) {
       window.clearInterval(live.reasoningTimer);
       live.reasoningTimer = null;
@@ -3955,6 +5638,8 @@
     for (const tool of live.tools?.values?.() || []) {
       if (tool.collapseTimer) window.clearTimeout(tool.collapseTimer);
       tool.collapseTimer = null;
+      if (tool.outputRenderFrame) window.cancelAnimationFrame(tool.outputRenderFrame);
+      tool.outputRenderFrame = null;
     }
   }
 
@@ -3968,11 +5653,14 @@
   function ensureLiveUser(live, content) {
     if (!live || live.userRendered) return;
     const text = String(content || live.userText || "");
-    if (!text.trim()) return;
+    if (!text.trim() && !live.userAttachments.length) return;
     live.userText = text;
     ensureTimelineVisible();
     appendDayDividerIfNeeded(new Date());
-    const message = createUserMessage(text, new Date(), { runId: live.runId });
+    const message = createUserMessage(text, new Date(), {
+      runId: live.runId,
+      attachments: live.userAttachments
+    });
     if (live.article?.isConnected) elements.timeline.insertBefore(message, live.article);
     else elements.timeline.appendChild(message);
     live.userRendered = true;
@@ -3987,32 +5675,102 @@
     status?.remove();
   }
 
+  function commitRedoLive(live) {
+    if (!live || live.operation !== "redo" || live.redoCommitted) return;
+    live.redoCommitted = true;
+    closeRevisionEditor();
+    const stashKey = String(live.turnId || "");
+    const previousStash = state.finishedTurnArticles.get(stashKey) || [];
+    for (const entry of previousStash) {
+      if (entry.kind === "final") entry.article?.remove();
+    }
+    const prefixSegments = previousStash.filter((entry) => entry.kind === "segment");
+    if (prefixSegments.length) state.finishedTurnArticles.set(stashKey, prefixSegments);
+    else state.finishedTurnArticles.delete(stashKey);
+    for (const article of elements.timeline.querySelectorAll(".assistant-message")) {
+      if (article.dataset.turnId === String(live.turnId || "") && article.dataset.segmentKind === "final") {
+        article.remove();
+      }
+    }
+    removeRunningStatus(live.turnId);
+    if (live.inputId && live.editedContent != null) {
+      const user = Array.from(elements.timeline.querySelectorAll(".user-message"))
+        .find((article) => article.dataset.inputId === String(live.inputId));
+      const paragraph = user?.querySelector(".user-bubble p");
+      if (paragraph) paragraph.textContent = String(live.editedContent);
+    }
+    const turn = state.turns.find((item) => String(item?.id) === String(live.turnId));
+    if (turn) {
+      turn.status = "running";
+      turn.assistant_content = "";
+      turn.assistant_reasoning = null;
+    }
+    showTypingIndicator(live);
+  }
+
+  function createTypingIndicator() {
+    const indicator = document.createElement("div");
+    indicator.className = "typing-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 3; index += 1) indicator.appendChild(document.createElement("i"));
+    return indicator;
+  }
+
   /* 发送后、第一个内容 part 到达前:气泡内三点弹跳等待动画 */
   function showTypingIndicator(live) {
     if (!live || live.ended || live.typing) return;
     ensureLiveArticle(live);
     if (live.blocks.childElementCount > 0) return;
-    const indicator = document.createElement("div");
-    indicator.className = "typing-indicator";
-    indicator.setAttribute("aria-hidden", "true");
-    for (let index = 0; index < 3; index += 1) indicator.appendChild(document.createElement("i"));
+    const indicator = createTypingIndicator();
     live.blocks.appendChild(indicator);
     live.typing = indicator;
     contentAdded();
   }
 
-  function clearTypingIndicator(live) {
+  function promoteTypingIndicator(live) {
+    if (!live || live.ended) return;
+    ensureLiveArticle(live);
+    let indicator = live.typing;
+    if (indicator?.classList.contains("is-streaming")) return;
+    const start = indicator?.getBoundingClientRect() || null;
+    if (!indicator) {
+      indicator = createTypingIndicator();
+      live.typing = indicator;
+    }
+    live.streamRail.hidden = false;
+    live.streamRail.appendChild(indicator);
+    indicator.classList.add("is-streaming");
+    live.article.classList.add("is-streaming");
+    if (start && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const finish = indicator.getBoundingClientRect();
+      live.typingAnimation?.cancel();
+      live.typingAnimation = indicator.animate([
+        { transform: `translate(${visualPixelsToLayout(start.left - finish.left)}px, ${visualPixelsToLayout(start.top - finish.top)}px)` },
+        { transform: "translate(0, 0)" }
+      ], { duration: 260, easing: "cubic-bezier(0.2, 0, 0, 1)" });
+    }
+    contentAdded();
+  }
+
+  function clearTypingIndicator(live, { waitingOnly = false } = {}) {
     if (!live?.typing) return;
+    if (waitingOnly && live.typing.classList.contains("is-streaming")) return;
+    live.typingAnimation?.cancel();
+    live.typingAnimation = null;
     live.typing.remove();
     live.typing = null;
+    if (live.streamRail) live.streamRail.hidden = true;
+    live.article?.classList.remove("is-streaming");
   }
 
   /* 完成态保时序:live 渲染出的 article 按 turn 存档,重渲染时原样复用 */
   function stashLiveArticle(live, kind) {
-    if (!live?.article || !live.turnId) return;
+    if (!live?.article) return;
     clearTypingIndicator(live);
+    if (!live.turnId) return;
     if (!live.blocks || live.blocks.childElementCount === 0) return;
     live.article.classList.remove("live-assistant");
+    live.article.dataset.segmentKind = kind;
     const key = String(live.turnId);
     const list = state.finishedTurnArticles.get(key) || [];
     list.push({ kind, article: live.article });
@@ -4051,8 +5809,8 @@
     }
   }
 
-  // 气泡宽度:blocks 里出现正文/媒体/上下文操作等「宽内容」前保持贴合内容
-  const WIDE_BLOCK_SELECTOR = ".markdown-body, .conversation-media, .context-operation, img, .tool-live-progress:not([hidden])";
+  // 普通 Markdown 随内容收缩；只有需要稳定横向空间的结构撑满消息列。
+  const WIDE_BLOCK_SELECTOR = ".markdown-body pre, .markdown-table-scroll, .conversation-media, .context-operation, img, .tool-card:not(.collapsed), .tool-live-progress:not([hidden])";
   function syncBubbleWidth(article) {
     if (!article) return;
     const content = article.querySelector(".assistant-content");
@@ -4069,6 +5827,7 @@
     article.className = "message assistant-message live-assistant";
     article.dataset.role = "assistant";
     article.dataset.runId = live.runId;
+    if (live.turnId) article.dataset.turnId = String(live.turnId);
     const header = document.createElement("header");
     header.className = "assistant-label";
     const avatar = document.createElement("img");
@@ -4116,7 +5875,10 @@
     const copy = makeCopyButton(() => live.assistantText, "复制回复");
     copy.hidden = true;
     meta.append(endpoint, metaText, spacer, copy);
-    article.append(header, bubble, meta);
+    const streamRail = document.createElement("div");
+    streamRail.className = "assistant-stream-rail";
+    streamRail.hidden = true;
+    article.append(header, bubble, meta, streamRail);
     elements.timeline.appendChild(article);
     live.article = article;
     live.blocks = blocks;
@@ -4125,6 +5887,7 @@
     live.meta = metaText;
     live.endpoint = endpoint;
     live.copyButton = copy;
+    live.streamRail = streamRail;
     updateLiveStopButton(live);
     contentAdded();
     return article;
@@ -4147,7 +5910,7 @@
     const text = String(delta || "");
     if (!text) return;
     ensureLiveArticle(live);
-    clearTypingIndicator(live);
+    const startsText = !live.currentText;
     if (!live.currentText) {
       finalizeLiveReasoning(live);
       const element = document.createElement("div");
@@ -4162,13 +5925,37 @@
     live.currentText.raw += text;
     live.assistantText += text;
     live.copyButton.hidden = !live.assistantText.trim();
-    scheduleMarkdownRender(live.currentText);
+    if (startsText) {
+      renderMarkdown(live.currentText.element, live.currentText.raw);
+      promoteTypingIndicator(live);
+    } else {
+      scheduleMarkdownRender(live.currentText);
+    }
     contentAdded();
+  }
+
+  function resetSupersededGeneration(live) {
+    if (live.currentText?.renderFrame) window.cancelAnimationFrame(live.currentText.renderFrame);
+    live.currentText?.element?.remove();
+    live.currentText = null;
+    for (const reasoning of live.reasoningParts || []) reasoning.element?.remove();
+    if (live.reasoningTimer) window.clearInterval(live.reasoningTimer);
+    live.reasoningTimer = null;
+    live.reasoning = null;
+    live.reasoningParts = [];
+    live.reasoningStarted = false;
+    live.reasoningTitle = "";
+    live.reasoningClockStart = null;
+    live.assistantText = "";
+    live.assistantReasoning = "";
+    if (live.copyButton) live.copyButton.hidden = true;
+    clearTypingIndicator(live);
+    showTypingIndicator(live);
   }
 
   function ensureLiveReasoning(live) {
     ensureLiveArticle(live);
-    clearTypingIndicator(live);
+    clearTypingIndicator(live, { waitingOnly: true });
     if (live.reasoning) return live.reasoning;
     breakLiveText(live);
     live.contextOperation = null;
@@ -4357,6 +6144,13 @@
   function updateToolSummary(tool) {
     const details = [];
     const subject = dedupeToolSubject(tool.titleText, tool.subject);
+    if (tool.commandPreview) {
+      tool.commandPreview.textContent = tool.commandText || subject || "等待命令";
+      tool.summary.textContent = tool.finishedAt == null
+        ? ""
+        : formatToolDuration(tool.finishedAt - tool.startedAt);
+      return;
+    }
     if (subject) details.push(subject);
     if (tool.imageCount) details.push(`${tool.imageCount} 张图片`);
     if (tool.finishedAt != null) details.push(formatToolDuration(tool.finishedAt - tool.startedAt));
@@ -4395,9 +6189,44 @@
     if (statusClass) tool.card.classList.add(statusClass);
   }
 
+  function renderCommandOutputPreview(tool) {
+    const preview = tool.pendingOutputPreview;
+    const panel = tool.commandOutputPreview;
+    if (!panel || !preview || !Array.isArray(preview.lines)) return;
+    const wasFollowing = panel.hidden || panel.scrollHeight - panel.scrollTop - panel.clientHeight <= 2;
+    const previousScrollTop = panel.scrollTop;
+    const children = [];
+    if (preview.omitted) {
+      const omitted = document.createElement("span");
+      omitted.className = "tool-command-output-omitted";
+      omitted.textContent = "⋮ 已省略较早输出";
+      children.push(omitted);
+    }
+    for (const line of preview.lines) {
+      const row = document.createElement("span");
+      row.className = `tool-command-output-line${line?.stream === "stderr" ? " is-stderr" : ""}`;
+      row.textContent = String(line?.text || "");
+      children.push(row);
+    }
+    panel.replaceChildren(...children);
+    panel.hidden = children.length === 0;
+    if (!panel.hidden) panel.scrollTop = wasFollowing ? panel.scrollHeight : previousScrollTop;
+  }
+
+  function scheduleCommandOutputPreview(tool, preview) {
+    if (!tool?.commandOutputPreview || !preview || typeof preview !== "object") return;
+    tool.pendingOutputPreview = preview;
+    if (tool.outputRenderFrame) return;
+    tool.outputRenderFrame = window.requestAnimationFrame(() => {
+      tool.outputRenderFrame = null;
+      renderCommandOutputPreview(tool);
+      contentAdded();
+    });
+  }
+
   function createTool(live, data) {
     ensureLiveArticle(live);
-    clearTypingIndicator(live);
+    clearTypingIndicator(live, { waitingOnly: true });
     breakLiveText(live);
     finalizeLiveReasoning(live);
     live.contextOperation = null;
@@ -4411,13 +6240,17 @@
     const isTask = String(data?.name || "") === "task" || /^task[:：]/i.test(String(data?.display_name || ""));
     if (isTask) card.classList.add("is-task");
     const subjectText = toolSubject(data?.name, data?.arguments);
+    const commandArguments = isCommand ? parsedToolArguments(data?.arguments) : null;
+    const commandText = isCommand ? String(commandArguments?.command || commandArguments?.cmd || "").trim() : "";
     const head = document.createElement("button");
     head.className = "tool-head";
     head.type = "button";
     head.setAttribute("aria-expanded", String(Boolean(state.toolExpanded)));
     const icon = document.createElement("span");
     icon.className = "tool-icon";
-    icon.appendChild(makeIconSlot(isCommand ? "fileTerminal" : "wrench"));
+    const toolName = String(data?.name || "");
+    const isWebTool = ["web_search", "web_fetch", "search_web_images", "search_web", "webfetch"].includes(toolName);
+    icon.appendChild(makeIconSlot(isCommand ? "dollar-sign" : isWebTool ? "globe" : toolName === "generate_image" ? "paintbrush" : toolName === "present_artifact" ? "file-text" : "wrench"));
     const title = document.createElement("span");
     title.className = "tool-title";
     const displayName = document.createElement("strong");
@@ -4436,6 +6269,18 @@
     status.append(statusIcon, statusText);
     const chevron = makeIconSlot("chevron-down", "tool-chevron");
     head.append(icon, title, status, chevron);
+    let commandPreview = null;
+    let commandOutputPreview = null;
+    if (isCommand) {
+      commandPreview = document.createElement("pre");
+      commandPreview.className = "tool-command-preview";
+      commandPreview.textContent = commandText || subjectText || "等待命令";
+      commandOutputPreview = document.createElement("div");
+      commandOutputPreview.className = "tool-command-output-preview";
+      commandOutputPreview.setAttribute("aria-label", "最近命令输出");
+      commandOutputPreview.style.setProperty("--command-output-lines", String(COMMAND_OUTPUT_PREVIEW_ROWS));
+      commandOutputPreview.hidden = true;
+    }
     const body = document.createElement("div");
     body.className = "tool-body";
     const argumentsDetail = createToolDetail("参数", true);
@@ -4459,7 +6304,10 @@
       liveProgress.textContent = subjectText || "正在启动子代理…";
       card.append(head, liveProgress, body);
     } else {
-      card.append(head, body);
+      card.append(head);
+      if (commandPreview) card.appendChild(commandPreview);
+      if (commandOutputPreview) card.appendChild(commandOutputPreview);
+      card.appendChild(body);
     }
     const tool = {
       id: toolId,
@@ -4471,6 +6319,12 @@
       statusIcon,
       statusText,
       summary,
+      commandPreview,
+      commandOutputPreview,
+      commandText,
+      artifactPreview: null,
+      pendingOutputPreview: null,
+      outputRenderFrame: null,
       argumentsDetail,
       progressDetail,
       stdoutDetail,
@@ -4489,6 +6343,7 @@
     head.addEventListener("click", () => {
       const collapsed = card.classList.toggle("collapsed");
       head.setAttribute("aria-expanded", String(!collapsed));
+      syncBubbleWidth(live.article);
       if (!collapsed) {
         window.requestAnimationFrame(() => {
           scrollToolOutputToEnd(tool);
@@ -4499,6 +6354,7 @@
     updateToolSummary(tool);
     live.tools.set(toolId, tool);
     live.blocks.appendChild(card);
+    syncBubbleWidth(live.article);
     contentAdded();
     return tool;
   }
@@ -4508,8 +6364,46 @@
     return (toolId && live.tools.get(toolId)) || createTool(live, data);
   }
 
+  function preparingToolLabel(name) {
+    if (name === "apply_patch" || name === "apply_artifact_patch") return "准备修改";
+    if (name === "ask_question") return "准备问题";
+    return "准备工具";
+  }
+
+  function clearPreparingTool(live) {
+    if (!live?.preparingTool) return;
+    live.preparingTool.remove();
+    live.preparingTool = null;
+    contentAdded();
+  }
+
+  function handleToolPreparing(live, data) {
+    const name = String(data?.tool_name || "");
+    if (!name) return;
+    ensureLiveArticle(live);
+    clearTypingIndicator(live, { waitingOnly: true });
+    finalizeLiveReasoning(live);
+    if (live.preparingTool?.dataset.toolName === name) return;
+    clearPreparingTool(live);
+    const tag = document.createElement("div");
+    tag.className = "tool-preparing-tag";
+    tag.dataset.toolName = name;
+    const label = document.createElement("span");
+    label.textContent = preparingToolLabel(name);
+    tag.append(makeIconSlot("loader-circle", "is-spinning"), label);
+    live.blocks.appendChild(tag);
+    live.preparingTool = tag;
+    syncBubbleWidth(live.article);
+    contentAdded();
+  }
+
   function handleToolEvent(name, live, data) {
+    if (name === "tool.preparing") {
+      handleToolPreparing(live, data);
+      return;
+    }
     if (name === "tool.started") {
+      clearPreparingTool(live);
       createTool(live, data);
       return;
     }
@@ -4520,12 +6414,13 @@
         const assetId = String(asset.id || asset.url);
         if (!live.assets.some((item) => String(item?.id || item?.url) === assetId)) {
           ensureLiveArticle(live);
-          clearTypingIndicator(live);
+          clearTypingIndicator(live, { waitingOnly: true });
           breakLiveText(live);
           finalizeLiveReasoning(live);
           live.contextOperation = null;
           live.assets.push(asset);
           live.blocks.appendChild(createConversationMedia(asset, { eager: true }));
+          registerArtifact({ ...asset, name: String(asset.alt || "生成的图片"), kind: "image" }, { autoOpen: true });
           syncBubbleWidth(live.article);
           tool.imageCount += 1;
         }
@@ -4540,8 +6435,46 @@
         }
       }
       updateToolSummary(tool);
+    } else if (name === "tool.artifact") {
+      const artifact = normalizeArtifact(data?.artifact, "file");
+      if (artifact) {
+        registerArtifact(artifact, { autoOpen: true });
+        if (!live.artifacts) live.artifacts = [];
+        const index = live.artifacts.findIndex((item) => String(item?.id) === artifact.id);
+        if (index >= 0) live.artifacts[index] = artifact;
+        else live.artifacts.push(artifact);
+        if (!tool.artifactPreview) {
+          tool.artifactPreview = document.createElement("button");
+          tool.artifactPreview.type = "button";
+          tool.artifactPreview.className = "tool-artifact-preview";
+          tool.card.insertBefore(tool.artifactPreview, tool.body);
+          tool.artifactPreview.addEventListener("click", () => {
+            const current = state.artifacts.find((item) => item.id === tool.artifactPreview.dataset.artifactId);
+            if (!current) return;
+            state.selectedArtifactId = current.id;
+            setArtifactWorkspaceOpen(true);
+          });
+        }
+        tool.artifactPreview.dataset.artifactId = artifact.id;
+        const artifactLabel = document.createElement("span");
+        artifactLabel.textContent = artifact.name;
+        tool.artifactPreview.replaceChildren(
+          makeIconSlot(artifactIconName(artifact)),
+          artifactLabel,
+          makeIconSlot("panel-right")
+        );
+        tool.subject = artifact.name;
+      } else if (data?.error) {
+        tool.progressDetail.raw = String(data.error);
+        tool.progressDetail.content.textContent = tool.progressDetail.raw;
+        tool.progressDetail.wrapper.hidden = false;
+      }
+      updateToolSummary(tool);
     } else if (name === "tool.progress") {
-      const message = String(data?.message || "");
+      let message = String(data?.message || "");
+      if (message.startsWith("__tool_phase__")) {
+        message = message.slice("__tool_phase__".length).replace(/^~\s*/, "").trim();
+      }
       // 任何持续汇报进度的工具(插件子代理如深度研究/兼容性调查)都惰性获得实时进度面板,
       // 不再仅限内置 task 工具
       if (!tool.liveProgress && !tool.finished && message) {
@@ -4566,6 +6499,7 @@
       detail.content.textContent = detail.raw;
       detail.wrapper.hidden = !detail.raw;
       if (!tool.card.classList.contains("collapsed")) detail.content.scrollTop = detail.content.scrollHeight;
+      scheduleCommandOutputPreview(tool, data?.preview);
       updateToolSummary(tool);
     } else if (name === "tool.finished") {
       tool.finished = true;
@@ -4575,6 +6509,7 @@
       tool.resultDetail.content.textContent = tool.resultDetail.raw;
       tool.resultDetail.wrapper.hidden = !tool.resultDetail.raw;
       const ok = Boolean(data?.ok);
+      scheduleCommandOutputPreview(tool, data?.preview);
       updateToolStatus(tool, ok ? "完成" : "失败", ok ? "check" : "circle-alert", ok ? "is-success" : "is-failure");
       updateToolSummary(tool);
       if (tool.liveProgress) {
@@ -4591,21 +6526,54 @@
     contentAdded();
   }
 
+  function questionHasAnswer(questionState, index = questionState.pageIndex) {
+    const control = questionState.controls[index];
+    if (!control) return false;
+    return control.options.some((option) => option.input.checked)
+      || Boolean(control.custom?.toggle.checked && control.custom.textarea.value.trim());
+  }
+
+  function updateQuestionNavigation(questionState) {
+    if (!questionState?.questions?.length) return;
+    const lastIndex = questionState.questions.length - 1;
+    const atLastPage = questionState.pageIndex === lastIndex;
+    const answered = questionHasAnswer(questionState);
+    const canInteract = questionState.pending && !questionState.submitting && !questionState.closing;
+
+    questionState.previous.disabled = !canInteract || questionState.pageIndex === 0;
+    questionState.next.hidden = atLastPage;
+    questionState.next.disabled = !canInteract || !answered;
+    questionState.next.classList.toggle("is-ready", canInteract && answered && !atLastPage);
+    questionState.submit.hidden = !atLastPage;
+    questionState.submit.disabled = !canInteract || !answered;
+    questionState.submit.classList.toggle("is-ready", canInteract && answered && atLastPage);
+    questionState.close.disabled = !canInteract;
+
+    questionState.controls.forEach((control, index) => {
+      const custom = control.custom;
+      if (!custom?.next) return;
+      const customAnswered = Boolean(custom.toggle.checked && custom.textarea.value.trim());
+      const show = canInteract && customAnswered;
+      custom.next.hidden = !show;
+      custom.next.disabled = !show;
+      custom.next.classList.toggle("is-ready", show);
+      custom.next.replaceChildren(makeIconSlot(index === lastIndex ? "check" : "chevron-right"));
+      custom.next.title = index === lastIndex ? "提交回答" : "下一题";
+      custom.next.setAttribute("aria-label", custom.next.title);
+    });
+  }
+
   function updateQuestionOptionClasses(questionState) {
     for (const control of questionState.controls) {
       for (const option of control.options) option.label.classList.toggle("selected", option.input.checked);
       if (control.custom) control.custom.wrapper.classList.toggle("selected", control.custom.toggle.checked);
     }
-    questionState.pageTabs?.forEach((tab, index) => {
-      const control = questionState.controls[index];
-      const answered = control.options.some((option) => option.input.checked)
-        || Boolean(control.custom?.toggle.checked && control.custom.textarea.value.trim());
-      tab.classList.toggle("is-complete", answered);
-    });
+    updateQuestionNavigation(questionState);
   }
 
   function updateQuestionDock() {
     elements.questionDock.hidden = elements.questionDock.childElementCount === 0;
+    elements.composerDock.classList.toggle("has-pending-question", !elements.questionDock.hidden);
     window.requestAnimationFrame(updateJumpButtonOffset);
   }
 
@@ -4628,29 +6596,34 @@
 
   function setQuestionPage(questionState, index, { focus = false } = {}) {
     if (!questionState?.pages?.length) return;
+    if (questionState.autoAdvanceTimer) {
+      window.clearTimeout(questionState.autoAdvanceTimer);
+      questionState.autoAdvanceTimer = null;
+    }
     const lastIndex = questionState.pages.length - 1;
     const nextIndex = Math.max(0, Math.min(lastIndex, Number(index) || 0));
     questionState.pageIndex = nextIndex;
     questionState.pages.forEach((page, pageIndex) => {
       page.hidden = pageIndex !== nextIndex;
     });
-    questionState.pageTabs.forEach((tab, pageIndex) => {
-      const active = pageIndex === nextIndex;
-      tab.classList.toggle("active", active);
-      tab.setAttribute("aria-selected", String(active));
-      tab.tabIndex = active ? 0 : -1;
-    });
-    const multiple = Boolean(questionState.questions[nextIndex]?.multiple);
-    questionState.pageLabel.textContent = `第 ${nextIndex + 1} / ${questionState.pages.length} 项`;
-    questionState.hint.textContent = multiple ? "可多选" : "请选择一项";
-    questionState.previous.hidden = nextIndex === 0;
-    questionState.next.hidden = nextIndex === lastIndex;
-    questionState.submit.hidden = nextIndex !== lastIndex;
+    const question = questionState.questions[nextIndex] || {};
+    questionState.prompt.textContent = String(question.question || question.header || `问题 ${nextIndex + 1}`);
+    questionState.position.textContent = `${nextIndex + 1} of ${questionState.pages.length}`;
+    updateQuestionNavigation(questionState);
     elements.questionDock.scrollTop = 0;
     window.requestAnimationFrame(() => {
       updateJumpButtonOffset();
       if (focus) questionState.pages[nextIndex].querySelector("input:not(:disabled), textarea:not(:disabled)")?.focus();
     });
+  }
+
+  function advanceQuestion(questionState) {
+    if (!questionState?.pending || questionState.submitting || !questionHasAnswer(questionState)) return;
+    if (questionState.pageIndex >= questionState.pages.length - 1) {
+      submitQuestion(questionState);
+      return;
+    }
+    setQuestionPage(questionState, questionState.pageIndex + 1, { focus: true });
   }
 
   function selectedQuestionAnswers(questionState) {
@@ -4696,11 +6669,19 @@
 
   function markQuestionAnswered(questionState, answers) {
     if (!questionState || !questionState.pending) return;
+    if (questionState.autoAdvanceTimer) window.clearTimeout(questionState.autoAdvanceTimer);
+    questionState.autoAdvanceTimer = null;
     questionState.pending = false;
     questionState.submitting = false;
+    questionState.closing = false;
+    questionState.restoreFocusOnClose = false;
     questionState.answers = answers;
     questionState.card.classList.remove("is-error");
     questionState.card.classList.add("is-answered");
+    questionState.card.removeAttribute("aria-busy");
+    questionState.header.hidden = false;
+    questionState.card.removeAttribute("aria-label");
+    questionState.card.setAttribute("aria-labelledby", questionState.titleId);
     questionState.status.textContent = "已回答";
     questionState.icon.replaceChildren(makeIconSlot("check"));
     questionState.error.hidden = true;
@@ -4709,6 +6690,60 @@
     moveQuestionToTimeline(questionState);
     updateControlState();
     contentAdded();
+  }
+
+  function markQuestionClosed(questionState) {
+    if (!questionState?.pending) return;
+    const restoreFocus = questionState.restoreFocusOnClose || questionState.card.contains(document.activeElement);
+    questionState.restoreFocusOnClose = false;
+    if (questionState.autoAdvanceTimer) window.clearTimeout(questionState.autoAdvanceTimer);
+    questionState.autoAdvanceTimer = null;
+    questionState.pending = false;
+    questionState.submitting = false;
+    questionState.closing = false;
+    questionState.card.removeAttribute("aria-busy");
+    setQuestionControlsDisabled(questionState, true);
+    removeQuestionFromDock(questionState);
+    updateControlState();
+    showToast("回答界面已关闭");
+    if (restoreFocus) window.requestAnimationFrame(focusComposerIfDesktop);
+    contentAdded();
+  }
+
+  async function closeQuestion(questionState) {
+    if (!questionState?.pending || questionState.submitting || questionState.closing) return;
+    questionState.restoreFocusOnClose = questionState.card.contains(document.activeElement);
+    questionState.closing = true;
+    questionState.error.hidden = true;
+    questionState.card.classList.remove("is-error");
+    questionState.card.setAttribute("aria-busy", "true");
+    questionState.close.replaceChildren(makeIconSlot("loader-circle", "is-spinning"));
+    questionState.close.title = "正在关闭";
+    questionState.close.setAttribute("aria-label", "正在关闭");
+    setQuestionControlsDisabled(questionState, true);
+    try {
+      await apiRequest(`/api/questions/${encodeURIComponent(questionState.id)}`, { method: "DELETE" });
+      if (questionState.pending) markQuestionClosed(questionState);
+    } catch (error) {
+      if (!questionState.pending) return;
+      const restoreFocus = questionState.restoreFocusOnClose;
+      questionState.restoreFocusOnClose = false;
+      questionState.closing = false;
+      questionState.card.removeAttribute("aria-busy");
+      questionState.error.textContent = error.message || "回答界面关闭失败";
+      questionState.error.hidden = false;
+      questionState.card.classList.add("is-error");
+      questionState.close.replaceChildren(makeIconSlot("x"));
+      questionState.close.title = "关闭回答";
+      questionState.close.setAttribute("aria-label", "关闭回答");
+      setQuestionControlsDisabled(questionState, false);
+      updateQuestionNavigation(questionState);
+      showToast(error.message || "回答界面关闭失败", "error");
+      if (restoreFocus) window.requestAnimationFrame(() => questionState.close.focus());
+      if ((error.status === 404 || error.status === 409) && state.viewSessionId) {
+        window.setTimeout(() => loadSessionView(state.viewSessionId, { quiet: true }), 300);
+      }
+    }
   }
 
   async function submitQuestion(questionState) {
@@ -4727,7 +6762,10 @@
     questionState.submitting = true;
     questionState.error.hidden = true;
     questionState.card.classList.remove("is-error");
-    questionState.submit.textContent = "提交中";
+    questionState.card.setAttribute("aria-busy", "true");
+    questionState.submit.replaceChildren(makeIconSlot("loader-circle", "is-spinning"));
+    questionState.submit.title = "提交中";
+    questionState.submit.setAttribute("aria-label", "提交中");
     setQuestionControlsDisabled(questionState, true);
     try {
       await apiRequest(`/api/questions/${encodeURIComponent(questionState.id)}/answer`, {
@@ -4738,11 +6776,15 @@
     } catch (error) {
       if (!questionState.pending) return;
       questionState.submitting = false;
+      questionState.card.removeAttribute("aria-busy");
       questionState.error.textContent = error.message || "回答提交失败";
       questionState.error.hidden = false;
       questionState.card.classList.add("is-error");
-      questionState.submit.textContent = "提交回答";
+      questionState.submit.replaceChildren(makeIconSlot("check"));
+      questionState.submit.title = "提交回答";
+      questionState.submit.setAttribute("aria-label", "提交回答");
       setQuestionControlsDisabled(questionState, false);
+      updateQuestionNavigation(questionState);
       showToast(error.message || "回答提交失败", "error");
       if ((error.status === 404 || error.status === 409) && state.viewSessionId) {
         window.setTimeout(() => loadSessionView(state.viewSessionId, { quiet: true }), 300);
@@ -4751,7 +6793,7 @@
   }
 
   function createQuestion(live, data) {
-    clearTypingIndicator(live);
+    clearTypingIndicator(live, { waitingOnly: true });
     const questionId = String(data?.question_id || "");
     if (!questionId) return null;
     if (live.questions.has(questionId)) return live.questions.get(questionId);
@@ -4764,8 +6806,9 @@
     card.className = "question-card";
     card.dataset.questionId = questionId;
     const titleId = `live-question-title-${live.questions.size + 1}`;
-    card.setAttribute("aria-labelledby", titleId);
+    card.setAttribute("aria-label", "待回答问题");
     const header = document.createElement("header");
+    header.hidden = true;
     const icon = document.createElement("span");
     icon.className = "question-icon";
     icon.appendChild(makeIconSlot("circle-help"));
@@ -4779,42 +6822,62 @@
     header.append(icon, headerCopy);
     const form = document.createElement("form");
     form.className = "question-form";
-    const pagination = document.createElement("div");
-    pagination.className = "question-pagination";
-    const pageLabel = document.createElement("span");
-    pageLabel.className = "question-page-label";
-    const pageTabsWrap = document.createElement("div");
-    pageTabsWrap.className = "question-page-tabs";
-    pageTabsWrap.setAttribute("role", "tablist");
-    pageTabsWrap.setAttribute("aria-label", "问题页");
-    pagination.append(pageLabel, pageTabsWrap);
-    form.appendChild(pagination);
+    const heading = document.createElement("div");
+    heading.className = "question-heading";
+    const prompt = document.createElement("p");
+    prompt.className = "question-prompt";
+    prompt.id = `question-${questionId}-prompt`;
+    prompt.setAttribute("aria-live", "polite");
+    prompt.setAttribute("aria-atomic", "true");
+    prompt.textContent = String(questions[0]?.question || questions[0]?.header || "问题 1");
+    const navigation = document.createElement("div");
+    navigation.className = "question-navigation";
+    navigation.setAttribute("role", "group");
+    navigation.setAttribute("aria-label", "问题导航");
+    const previous = document.createElement("button");
+    previous.type = "button";
+    previous.className = "question-page-button is-previous";
+    previous.title = "上一题";
+    previous.setAttribute("aria-label", "上一题");
+    previous.appendChild(makeIconSlot("chevron-right"));
+    const position = document.createElement("span");
+    position.className = "question-position";
+    position.textContent = `1 of ${questions.length}`;
+    position.setAttribute("aria-live", "polite");
+    const next = document.createElement("button");
+    next.type = "button";
+    next.className = "question-page-button";
+    next.title = "下一题";
+    next.setAttribute("aria-label", "下一题");
+    next.appendChild(makeIconSlot("chevron-right"));
+    const submit = document.createElement("button");
+    submit.className = "question-page-button question-submit";
+    submit.type = "submit";
+    submit.title = "提交回答";
+    submit.setAttribute("aria-label", "提交回答");
+    submit.hidden = true;
+    submit.appendChild(makeIconSlot("check"));
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "question-page-button question-close-button";
+    close.title = "关闭回答";
+    close.setAttribute("aria-label", "关闭回答");
+    close.appendChild(makeIconSlot("x"));
+    navigation.append(previous, position, next, submit, close);
+    heading.append(prompt, navigation);
+    form.appendChild(heading);
     const controls = [];
     const pages = [];
-    const pageTabs = [];
     questions.forEach((question, questionIndex) => {
       const fieldset = document.createElement("fieldset");
       fieldset.className = "question-fieldset";
       fieldset.id = `question-${questionId}-page-${questionIndex + 1}`;
-      fieldset.setAttribute("role", "tabpanel");
+      fieldset.setAttribute("aria-labelledby", prompt.id);
       fieldset.hidden = questionIndex !== 0;
-      const pageTab = document.createElement("button");
-      pageTab.type = "button";
-      pageTab.className = "question-page-tab";
-      pageTab.id = `question-${questionId}-tab-${questionIndex + 1}`;
-      pageTab.textContent = String(questionIndex + 1);
-      pageTab.title = String(question?.header || `问题 ${questionIndex + 1}`);
-      pageTab.setAttribute("role", "tab");
-      pageTab.setAttribute("aria-controls", fieldset.id);
-      pageTab.setAttribute("aria-selected", String(questionIndex === 0));
-      fieldset.setAttribute("aria-labelledby", pageTab.id);
-      pageTabsWrap.appendChild(pageTab);
-      pageTabs.push(pageTab);
       const legend = document.createElement("legend");
-      const headerLabel = document.createElement("span");
-      headerLabel.className = "question-header-label";
-      headerLabel.textContent = String(question?.header || `问题 ${questionIndex + 1}`);
-      legend.append(headerLabel, document.createTextNode(String(question?.question || "")));
+      legend.className = "question-legend";
+      legend.setAttribute("aria-hidden", "true");
+      legend.textContent = String(question?.question || question?.header || `问题 ${questionIndex + 1}`);
       fieldset.appendChild(legend);
       const optionList = document.createElement("div");
       optionList.className = "question-options";
@@ -4829,6 +6892,7 @@
         input.type = inputType;
         input.name = inputName;
         input.value = String(option?.label || "");
+        input.dataset.questionIndex = String(questionIndex);
         const optionCopy = document.createElement("span");
         optionCopy.className = "question-option-copy";
         const optionLabel = document.createElement("strong");
@@ -4846,12 +6910,14 @@
       fieldset.appendChild(optionList);
       let custom = null;
       if (question?.custom !== false) {
-        const wrapper = document.createElement("label");
+        const wrapper = document.createElement("div");
         wrapper.className = "custom-answer";
         const toggle = document.createElement("input");
         toggle.type = inputType;
         toggle.name = inputName;
         toggle.value = "__custom__";
+        toggle.dataset.questionIndex = String(questionIndex);
+        toggle.setAttribute("aria-label", `${question?.header || `问题 ${questionIndex + 1}`}使用自定义回答`);
         const textarea = document.createElement("textarea");
         textarea.rows = 1;
         textarea.placeholder = "自定义回答";
@@ -4861,45 +6927,34 @@
           updateQuestionOptionClasses(questionState);
         });
         textarea.addEventListener("input", () => {
-          if (textarea.value) toggle.checked = true;
+          toggle.checked = Boolean(textarea.value.trim());
           updateQuestionOptionClasses(questionState);
         });
+        let customNext = null;
+        if (!multiple) {
+          customNext = document.createElement("button");
+          customNext.type = "button";
+          customNext.className = "custom-answer-next";
+          customNext.title = "下一题";
+          customNext.setAttribute("aria-label", "下一题");
+          customNext.hidden = true;
+          customNext.appendChild(makeIconSlot("chevron-right"));
+          customNext.addEventListener("click", () => advanceQuestion(questionState));
+        }
         wrapper.append(toggle, textarea);
+        if (customNext) wrapper.appendChild(customNext);
         fieldset.appendChild(wrapper);
-        custom = { wrapper, toggle, textarea };
+        custom = { wrapper, toggle, textarea, next: customNext };
       }
       form.appendChild(fieldset);
       pages.push(fieldset);
       controls.push({ multiple, options, custom });
     });
-    pagination.hidden = questions.length <= 1;
     const error = document.createElement("p");
     error.className = "question-error";
+    error.setAttribute("role", "alert");
     error.hidden = true;
-    const actions = document.createElement("footer");
-    actions.className = "question-actions";
-    const hint = document.createElement("span");
-    const pageActions = document.createElement("div");
-    pageActions.className = "question-page-actions";
-    const previous = document.createElement("button");
-    previous.type = "button";
-    previous.className = "question-page-button is-previous";
-    previous.title = "上一题";
-    previous.setAttribute("aria-label", "上一题");
-    previous.appendChild(makeIconSlot("chevron-right"));
-    const next = document.createElement("button");
-    next.type = "button";
-    next.className = "question-page-button";
-    next.title = "下一题";
-    next.setAttribute("aria-label", "下一题");
-    next.appendChild(makeIconSlot("chevron-right"));
-    const submit = document.createElement("button");
-    submit.className = "question-submit";
-    submit.type = "submit";
-    submit.textContent = "提交回答";
-    pageActions.append(previous, next, submit);
-    actions.append(hint, pageActions);
-    form.append(error, actions);
+    form.appendChild(error);
     const summary = document.createElement("dl");
     summary.className = "question-answer-summary";
     summary.hidden = true;
@@ -4909,39 +6964,45 @@
       runId: live.runId,
       questions,
       card,
+      header,
+      titleId,
       form,
       controls,
       pages,
-      pageTabs,
       pageIndex: 0,
-      pageLabel,
-      hint,
+      prompt,
+      position,
       previous,
       next,
       icon,
       status,
       submit,
+      close,
       error,
       summary,
       timelineParent: live.blocks,
       pending: true,
       submitting: false,
+      closing: false,
+      restoreFocusOnClose: false,
+      autoAdvanceTimer: null,
       answers: null
     };
-    form.querySelectorAll("input").forEach((input) => input.addEventListener("change", () => updateQuestionOptionClasses(questionState)));
-    pageTabs.forEach((tab, index) => tab.addEventListener("click", () => setQuestionPage(questionState, index, { focus: true })));
-    pageTabsWrap.addEventListener("keydown", (event) => {
-      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-      event.preventDefault();
-      let index = questionState.pageIndex;
-      if (event.key === "ArrowLeft") index -= 1;
-      else if (event.key === "ArrowRight") index += 1;
-      else index = event.key === "Home" ? 0 : pageTabs.length - 1;
-      setQuestionPage(questionState, index);
-      pageTabs[questionState.pageIndex]?.focus();
-    });
+    form.querySelectorAll("input").forEach((input) => input.addEventListener("change", () => {
+      updateQuestionOptionClasses(questionState);
+      const questionIndex = Number(input.dataset.questionIndex);
+      const control = questionState.controls[questionIndex];
+      if (!input.checked || input.value === "__custom__" || control?.multiple || questionIndex >= questionState.pages.length - 1) return;
+      window.clearTimeout(questionState.autoAdvanceTimer);
+      questionState.autoAdvanceTimer = window.setTimeout(() => {
+        questionState.autoAdvanceTimer = null;
+        if (questionState.pageIndex !== questionIndex || !input.checked) return;
+        advanceQuestion(questionState);
+      }, 120);
+    }));
     previous.addEventListener("click", () => setQuestionPage(questionState, questionState.pageIndex - 1, { focus: true }));
-    next.addEventListener("click", () => setQuestionPage(questionState, questionState.pageIndex + 1, { focus: true }));
+    next.addEventListener("click", () => advanceQuestion(questionState));
+    close.addEventListener("click", () => closeQuestion(questionState));
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       submitQuestion(questionState);
@@ -4959,8 +7020,13 @@
   function endPendingQuestions(live, message) {
     for (const question of live.questions.values()) {
       if (!question.pending) continue;
+      if (question.autoAdvanceTimer) window.clearTimeout(question.autoAdvanceTimer);
+      question.autoAdvanceTimer = null;
       question.pending = false;
       question.submitting = false;
+      question.closing = false;
+      question.restoreFocusOnClose = false;
+      question.card.removeAttribute("aria-busy");
       question.card.classList.add("is-error");
       question.status.textContent = "本轮已结束";
       question.error.textContent = message;
@@ -4972,7 +7038,7 @@
 
   function createContextOperation(live, kind) {
     ensureLiveArticle(live);
-    clearTypingIndicator(live);
+    clearTypingIndicator(live, { waitingOnly: true });
     breakLiveText(live);
     finalizeLiveReasoning(live);
     const block = document.createElement("section");
@@ -5072,7 +7138,8 @@
       elements.timeline.appendChild(createUserMessage(prompt?.content || "", prompt?.submitted_at || new Date(), {
         turnId: live.turnId,
         runId: live.runId,
-        followupId: prompt?.id
+        followupId: prompt?.id,
+        attachments: prompt?.attachments
       }));
     }
     renderQueueTray();
@@ -5085,6 +7152,8 @@
     live.meta = null;
     live.endpoint = null;
     live.copyButton = null;
+    live.streamRail = null;
+    live.typingAnimation = null;
     live.currentText = null;
     live.assistantText = "";
     live.assistantReasoning = "";
@@ -5103,7 +7172,7 @@
   function updateLocalTurnFromLive(live, terminalStatus, data) {
     const status = terminalStatus === "completed" ? "completed" : "interrupted";
     let turn = live.turnId ? state.turns.find((item) => String(item?.id) === String(live.turnId)) : null;
-    if (!turn && live.userText) {
+    if (!turn && (live.userText || live.userAttachments.length)) {
       turn = {
         id: live.turnId || `local-${live.runId}`,
         seq: state.turns.length ? Math.max(...state.turns.map((item) => asFiniteNumber(item?.seq))) + 1 : 1,
@@ -5120,7 +7189,9 @@
         token_usage_estimated: Boolean(data?.usage_estimated),
         question_exchanges: [],
         followups: [],
-        assets: [...live.assets]
+        assets: [...live.assets],
+        artifacts: [...live.artifacts],
+        attachments: [...live.userAttachments]
       };
       state.turns.push(turn);
     } else if (turn) {
@@ -5130,6 +7201,7 @@
       if (data?.provider_id || live.providerId) turn.provider_id = data?.provider_id || live.providerId;
       if (data?.model || live.model) turn.model = data?.model || live.model;
       if (live.assets.length) turn.assets = [...live.assets];
+      if (live.artifacts.length) turn.artifacts = [...live.artifacts];
       turn.assistant_timestamp = new Date().toISOString();
       if (terminalStatus === "completed") {
         turn.token_total = effectiveUsageTotal(data?.usage);
@@ -5141,7 +7213,20 @@
   function finishLiveRun(kind, data, live) {
     if (!live || live.ended) return;
     const runId = live.runId;
+    if (live.operation === "redo" && kind !== "completed") {
+      live.ended = true;
+      disposeLiveState(live);
+      state.liveRuns.delete(runId);
+      state.replayRunIds?.delete(runId);
+      state.terminalRunIds.add(runId);
+      showToast(kind === "failed" ? String(data?.message || "重新生成失败") : "重新生成已取消", "error");
+      if (state.viewSessionId) loadSessionView(state.viewSessionId, { quiet: true });
+      updateConversationChrome();
+      updateControlState();
+      return;
+    }
     live.ended = true;
+    clearPreparingTool(live);
     clearTypingIndicator(live);
     finalizeLiveReasoning(live);
     setLiveEndpoint(live, data?.provider_id, data?.model);
@@ -5242,9 +7327,14 @@
           ? payload.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
           : state.turns;
         const turnsChanged = JSON.stringify(nextTurns) !== JSON.stringify(state.turns);
+        const nextCandidate = payload?.redo_candidate && typeof payload.redo_candidate === "object"
+          ? payload.redo_candidate
+          : null;
+        const candidateChanged = JSON.stringify(nextCandidate) !== JSON.stringify(state.redoCandidate);
         state.turns = nextTurns;
         state.queuedPrompts = Array.isArray(payload?.queued_prompts) ? payload.queued_prompts : state.queuedPrompts;
-        if (turnsChanged) renderConversation();
+        state.redoCandidate = nextCandidate;
+        if (turnsChanged || candidateChanged) renderConversation();
         renderQueueTray();
         restoreLiveRuns(runs);
       }
@@ -5283,6 +7373,7 @@
       const turn = Array.isArray(payload?.turns) ? payload.turns.find((item) => String(item?.id) === String(turnId)) : null;
       if (!turn) return;
       live.userText = String(turn.user_content || "");
+      live.userAttachments = Array.isArray(turn.attachments) ? turn.attachments : [];
       ensureLiveUser(live, live.userText);
     } catch (_) {
       // The stream can continue; a later view refresh will recover the user turn.
@@ -5300,13 +7391,23 @@
     if (!live && !terminal && !state.terminalRunIds.has(runId) && sessionId && sessionId === state.viewSessionId) {
       // 视图会话里出现的新 run（本端发起、他端发起或重放）都会挂上 live 块。
       // run.started 意味着全新的 turn，不去认领时间线里已有的 running turn。
-      live = createLiveForRun(runId, "", { claimTurn: name !== "run.started" });
+      live = createLiveForRun(runId, "", {
+        claimTurn: name !== "run.started",
+        operation: String(data?.operation || "create"),
+        turnId: String(data?.turn_id || "") || null,
+        inputId: String(data?.input_id || "") || null
+      });
       if (live.turnId && state.viewRunningTurnId === String(live.turnId)) state.viewRunningTurnId = null;
     }
 
     if (name === "run.started") {
       if (live && ["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
-      if (live && !live.ended) showTypingIndicator(live);
+      if (live) {
+        live.operation = String(data?.operation || live.operation || "create");
+        live.turnId = String(data?.turn_id || live.turnId || "") || null;
+        live.inputId = String(data?.input_id || live.inputId || "") || null;
+      }
+      if (live && !live.ended && live.operation !== "redo") showTypingIndicator(live);
       renderSessionList();
       updateConversationChrome();
       updateControlState();
@@ -5332,17 +7433,31 @@
 
     if (name === "turn.started") {
       live.turnId = String(data?.turn_id || "");
+      if (live.article) live.article.dataset.turnId = live.turnId;
+      if (String(data?.operation || "") === "redo") {
+        live.operation = "redo";
+        live.inputId = String(data?.input_id || live.inputId || "") || null;
+        if (typeof data?.display_content === "string") live.editedContent = data.display_content;
+      }
       if (state.viewRunningTurnId === live.turnId) state.viewRunningTurnId = null;
       removeRunningStatus(live.turnId);
-      ensureActiveTurnUser(live, live.turnId);
+      if (live.operation === "redo") commitRedoLive(live);
+      else ensureActiveTurnUser(live, live.turnId);
     } else if (name === "assistant.delta") appendAssistantDelta(live, data?.delta);
+    else if (name === "generation.superseded") resetSupersededGeneration(live);
     else if (name.startsWith("reasoning.")) handleReasoningEvent(name, live, data);
     else if (name === "queue.consumed") consumeLiveQueue(live, data);
     else if (name.startsWith("tool.")) handleToolEvent(name, live, data);
-    else if (name === "question.requested") createQuestion(live, data);
+    else if (name === "question.requested") {
+      clearPreparingTool(live);
+      createQuestion(live, data);
+    }
     else if (name === "question.answered") {
       const question = live.questions.get(String(data?.question_id || ""));
       if (question) markQuestionAnswered(question, data?.answers);
+    } else if (name === "question.closed") {
+      const question = live.questions.get(String(data?.question_id || ""));
+      if (question) markQuestionClosed(question);
     } else if (name.startsWith("context.")) handleContextEvent(name, live, data);
   }
 
@@ -5402,9 +7517,15 @@
       return;
     }
     if (name === "conversation.reset" || name === "conversation.pop") {
-      // 这两个事件作用于全局默认会话；仅当视图正停在默认会话时才需要重载。
-      if (!state.viewSessionId || state.viewSessionId === state.currentSessionId) loadBootstrap();
-      else refreshSessions();
+      const sessionId = typeof data?.session_id === "string" ? data.session_id : "";
+      if (sessionId && sessionId !== state.viewSessionId) {
+        refreshSessions();
+      } else if (!state.viewSessionId || state.viewSessionId === state.currentSessionId) {
+        loadBootstrap();
+      } else {
+        loadSessionView(state.viewSessionId, { quiet: true });
+        refreshSessions();
+      }
       return;
     }
     handleRunEvent(name, data);
@@ -5506,7 +7627,7 @@
     state.display = snapshot?.display && typeof snapshot.display === "object" ? snapshot.display : state.display;
     state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : { tokens: 0, window: null };
     state.usage = snapshot?.usage && typeof snapshot.usage === "object" ? snapshot.usage : {};
-    state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {};
+      state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {};
     state.sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : [];
     state.currentSessionId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
     state.sessionMenuFor = null;
@@ -5542,7 +7663,8 @@
         turns: snapshot?.turns,
         queued_prompts: snapshot?.queued_prompts,
         running_turn_id: snapshot?.running_turn_id,
-        runs: allRuns.filter((run) => String(run.session_id) === String(state.currentSessionId))
+        runs: allRuns.filter((run) => String(run.session_id) === String(state.currentSessionId)),
+        redo_candidate: snapshot?.redo_candidate
       });
       if (state.liveRuns.size === 0) {
         state.lastEventId = state.latestEventId;
@@ -5554,6 +7676,9 @@
       state.viewRunningTurnId = typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id ? snapshot.running_turn_id : null;
       state.turns = Array.isArray(snapshot?.turns) ? snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq)) : [];
       state.queuedPrompts = Array.isArray(snapshot?.queued_prompts) ? snapshot.queued_prompts : [];
+      state.redoCandidate = snapshot?.redo_candidate && typeof snapshot.redo_candidate === "object"
+        ? snapshot.redo_candidate
+        : null;
       renderConversation();
       renderQueueTray();
       state.lastEventId = state.latestEventId;
@@ -5563,6 +7688,7 @@
     updateRuntimeUsage();
     updateConversationChrome();
     updateControlState();
+    loadThinkingVariants();
   }
 
   async function loadBootstrap() {
@@ -5676,6 +7802,7 @@
         closeModelMenu();
         renderModelMenu();
         updateContext();
+        loadThinkingVariants();
         showToast("模型设置已更新");
       }
       updateControlState();
@@ -5692,9 +7819,22 @@
     if (hasPendingQuestion()) return;
     const sessionId = state.viewSessionId;
     const queueing = conversationRunning();
+    const updateTarget = queueing ? activeTurnUpdateTarget(sessionId) : null;
     const content = elements.composerInput.value.trim();
+    const readyAttachments = state.composerAttachments.filter((item) => item.status === "ready");
+    const attachmentIds = readyAttachments.map((item) => item.id);
+    const sentAttachments = readyAttachments.map((item) => ({
+      id: item.id,
+      url: item.url,
+      name: item.name,
+      mime: item.mime,
+      kind: item.kind,
+      size: item.size,
+      width: item.width || 0,
+      height: item.height || 0
+    }));
     const count = countCharacters(content);
-    if (!content) {
+    if (!content && !attachmentIds.length) {
       elements.composerState.textContent = "消息不能为空";
       elements.composerState.classList.add("is-error");
       return;
@@ -5704,12 +7844,19 @@
       elements.composerState.classList.add("is-error");
       return;
     }
+    if (queueing && !updateTarget) {
+      elements.composerState.textContent = "当前存在多个回复或回复仍在启动，无法确定追加目标";
+      elements.composerState.classList.add("is-error");
+      return;
+    }
     state.submitting = true;
-    if (!queueing) state.pendingSubmission = { content, mode: state.mode };
+    if (!queueing) state.pendingSubmission = { content, mode: state.mode, attachments: sentAttachments };
     clearInlineError();
     updateControlState();
     try {
-      const body = queueing ? { content } : { content, mode: state.mode };
+      const body = queueing
+        ? { content, run_id: updateTarget.runId, turn_id: updateTarget.turnId, attachment_ids: attachmentIds }
+        : { content, mode: state.mode, attachment_ids: attachmentIds };
       if (sessionId) body.session_id = sessionId;
       const response = await apiRequest(queueing ? "/api/queue" : "/api/turns", {
         method: "POST",
@@ -5723,6 +7870,7 @@
         }
         state.pendingSubmission = null;
         elements.composerInput.value = "";
+        committedComposerAttachments();
         resizeComposer();
         renderQueueTray();
         if (!queueing) {
@@ -5752,9 +7900,11 @@
         if (sessionId) trackRun(sessionId, runId);
         const live = createLiveForRun(runId, content);
         live.userText = content;
+        live.userAttachments = sentAttachments;
         ensureLiveUser(live, content);
         showTypingIndicator(live);
         elements.composerInput.value = "";
+        committedComposerAttachments();
         resizeComposer();
         updateRuntimeUsage();
         updateConversationChrome();
@@ -5820,7 +7970,11 @@
     elements.resetConfirmButton.textContent = "正在清除";
     updateControlState();
     try {
-      await apiRequest("/api/conversation/reset", { method: "POST" });
+      if (!state.viewSessionId) throw new Error("无法确定要清除的会话");
+      await apiRequest("/api/conversation/reset", {
+        method: "POST",
+        body: JSON.stringify({ session_id: state.viewSessionId })
+      });
       if (elements.resetDialog.open) elements.resetDialog.close("confirmed");
       await loadBootstrap();
       focusComposerIfDesktop();
@@ -5857,9 +8011,20 @@
     }
     if (event.key === "Escape") {
       if (elements.resetDialog.open) return;
+      if (!elements.artifactResourceMenu.hidden) {
+        event.preventDefault();
+        closeArtifactResourceMenu();
+        elements.artifactTitleButton.focus();
+        return;
+      }
       if (state.sessionMenuFor) {
         event.preventDefault();
         closeSessionMenu();
+        return;
+      }
+      if (!elements.thinkingVariantPopover.hidden) {
+        event.preventDefault();
+        closeThinkingVariantPopover({ restoreFocus: true });
         return;
       }
       if (!elements.modelMenu.hidden) {
@@ -5870,6 +8035,16 @@
       if (elements.settingsDrawer.classList.contains("open")) {
         event.preventDefault();
         closeSettings();
+        return;
+      }
+      if (state.artifactOpen) {
+        event.preventDefault();
+        if (state.artifactMaximized) {
+          toggleArtifactMaximized();
+          return;
+        }
+        setArtifactWorkspaceOpen(false);
+        elements.artifactToggleButton.focus();
         return;
       }
       if (elements.sidebar.classList.contains("open")) {
@@ -5888,13 +8063,68 @@
     elements.mobileMenuButton.addEventListener("click", (event) => openSidebar(event.currentTarget));
     elements.sidebarClose.addEventListener("click", closeSidebar);
     elements.sidebarScrim.addEventListener("click", closeSidebar);
+    elements.sidebarCollapseButton?.addEventListener("click", () => setSidebarCollapsed(true));
+    elements.sidebarExpandButton?.addEventListener("click", () => setSidebarCollapsed(false));
     elements.archivedToggle.addEventListener("click", toggleArchivedSection);
     elements.settingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
+    elements.artifactToggleButton.addEventListener("click", () => setArtifactWorkspaceOpen(!state.artifactOpen));
+    elements.artifactCloseButton.addEventListener("click", () => setArtifactWorkspaceOpen(false));
+    elements.artifactPreviewButton.addEventListener("click", () => setArtifactMode("preview"));
+    elements.artifactSourceButton.addEventListener("click", () => setArtifactMode("source"));
+    elements.artifactImageZoomOutButton.addEventListener("click", () => changeArtifactImageZoom(-0.25));
+    elements.artifactImageZoomInButton.addEventListener("click", () => changeArtifactImageZoom(0.25));
+    elements.artifactCopyButton.addEventListener("click", copySelectedArtifact);
+    elements.artifactMaximizeButton.addEventListener("click", toggleArtifactMaximized);
+    elements.artifactTitleButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (elements.artifactTitleButton.disabled) return;
+      const opening = elements.artifactResourceMenu.hidden;
+      elements.artifactResourceMenu.hidden = !opening;
+      elements.artifactTitleButton.setAttribute("aria-expanded", String(opening));
+    });
+    elements.artifactResizeHandle.addEventListener("pointerdown", (event) => {
+      if (layoutViewportWidth() <= 760 || state.artifactMaximized) return;
+      event.preventDefault();
+      elements.artifactResizeHandle.setPointerCapture(event.pointerId);
+      const startX = event.clientX;
+      const startWidth = elements.artifactWorkspace.offsetWidth;
+      let resizeFrame = null;
+      let nextRatio = state.artifactWidthRatio;
+      const applyResize = () => {
+        resizeFrame = null;
+        state.artifactWidthRatio = nextRatio;
+        syncArtifactLayout();
+      };
+      const move = (moveEvent) => {
+        const viewportWidth = Math.max(320, layoutViewportWidth());
+        const pointerDelta = visualPixelsToLayout(startX - moveEvent.clientX);
+        const width = Math.min(viewportWidth - 20, Math.max(320, startWidth + pointerDelta));
+        nextRatio = width / viewportWidth;
+        if (!resizeFrame) resizeFrame = window.requestAnimationFrame(applyResize);
+      };
+      const finish = () => {
+        if (resizeFrame) {
+          window.cancelAnimationFrame(resizeFrame);
+          applyResize();
+        }
+        safeStorageSet("miyu.web.artifactWidthRatio.v2", String(state.artifactWidthRatio));
+        elements.artifactResizeHandle.removeEventListener("pointermove", move);
+        elements.artifactResizeHandle.removeEventListener("pointerup", finish);
+        elements.artifactResizeHandle.removeEventListener("pointercancel", finish);
+      };
+      elements.artifactResizeHandle.addEventListener("pointermove", move);
+      elements.artifactResizeHandle.addEventListener("pointerup", finish);
+      elements.artifactResizeHandle.addEventListener("pointercancel", finish);
+    });
     elements.settingsClose.addEventListener("click", () => closeSettings());
     elements.drawerScrim.addEventListener("click", () => closeSettings());
     elements.settingsNav.querySelectorAll("[data-settings-view]").forEach((button) => {
       button.addEventListener("click", () => setSettingsView(button.dataset.settingsView));
+    });
+    elements.qqHistoryForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      loadQqHistory();
     });
     elements.addProviderButton.addEventListener("click", () => {
       if (!state.configDraft) return;
@@ -5922,7 +8152,12 @@
     document.querySelectorAll("[data-chat-font]").forEach((button) => button.addEventListener("click", () => setChatFontSize(button.dataset.chatFont)));
     elements.reasoningExpandToggle?.addEventListener("click", () => setReasoningExpanded(!state.reasoningExpanded));
     elements.toolExpandToggle?.addEventListener("click", () => setToolExpanded(!state.toolExpanded));
-    elements.modeSwitch.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
+    elements.modeCycle.addEventListener("click", cycleMode);
+    elements.thinkingVariantButton.addEventListener("click", () => {
+      if (elements.thinkingVariantPopover.hidden) openThinkingVariantPopover();
+      else closeThinkingVariantPopover({ restoreFocus: true });
+    });
+    elements.thinkingVariantPopover.addEventListener("keydown", handleThinkingVariantKeydown);
     elements.modelButton.addEventListener("click", (event) => {
       event.stopPropagation();
       if (elements.modelMenu.hidden) openModelMenu();
@@ -5943,9 +8178,17 @@
         closeModelMenu({ restoreFocus: true });
       }
     });
+    document.addEventListener("pointerdown", (event) => {
+      if (!elements.thinkingVariantPopover.hidden
+        && !event.target.closest("#thinkingVariantPopover")
+        && !event.target.closest("#thinkingVariantButton")) {
+        closeThinkingVariantPopover();
+      }
+    });
     document.addEventListener("click", (event) => {
       if (!elements.modelMenu.hidden && !event.target.closest("#modelMenuWrap")) closeModelMenu();
       if (state.sessionMenuFor && !event.target.closest(".session-menu") && !event.target.closest(".session-menu-button")) closeSessionMenu();
+      if (!elements.artifactResourceMenu.hidden && !event.target.closest(".artifact-resource-wrap")) closeArtifactResourceMenu();
     });
     elements.promptGrid.querySelectorAll("[data-prompt]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -5956,6 +8199,42 @@
       });
     });
     elements.composerInput.addEventListener("input", resizeComposer);
+    elements.attachButton.addEventListener("click", () => elements.attachmentInput.click());
+    elements.attachmentInput.addEventListener("change", () => {
+      addComposerFiles(elements.attachmentInput.files);
+      elements.attachmentInput.value = "";
+    });
+    elements.composerForm.addEventListener("dragenter", (event) => {
+      if (!event.dataTransfer?.types?.includes("Files")) return;
+      event.preventDefault();
+      elements.composerForm.classList.add("is-dragging");
+    });
+    elements.composerForm.addEventListener("dragover", (event) => {
+      if (!event.dataTransfer?.types?.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      elements.composerForm.classList.add("is-dragging");
+    });
+    elements.composerForm.addEventListener("dragleave", (event) => {
+      if (!elements.composerForm.contains(event.relatedTarget)) elements.composerForm.classList.remove("is-dragging");
+    });
+    elements.composerForm.addEventListener("drop", (event) => {
+      elements.composerForm.classList.remove("is-dragging");
+      const files = collectTransferFiles(event.dataTransfer);
+      if (!files.length) return;
+      event.preventDefault();
+      addComposerFiles(files);
+    });
+    elements.composerInput.addEventListener("paste", (event) => {
+      const files = collectTransferFiles(event.clipboardData);
+      if (!files.length) {
+        const hasUriList = Array.from(event.clipboardData?.items || []).some((item) => item.type === "text/uri-list");
+        if (hasUriList) showToast("浏览器没有提供文件内容，请直接拖入输入框", "error");
+        return;
+      }
+      event.preventDefault();
+      addComposerFiles(files);
+    });
     elements.composerInput.addEventListener("compositionstart", () => {
       state.composing = true;
     });
@@ -5996,9 +8275,16 @@
       suspendOutputFollowing();
     }, { passive: true });
     elements.jumpBottomButton.addEventListener("click", () => scrollToBottom({ force: true, smooth: true }));
-    window.addEventListener("resize", updateJumpButtonOffset, { passive: true });
+    window.addEventListener("resize", () => {
+      updateJumpButtonOffset();
+      syncArtifactLayout();
+      positionThinkingVariantPopover();
+    }, { passive: true });
+    new ResizeObserver(syncArtifactLayout).observe(elements.mainStage);
     if (window.visualViewport) {
       window.visualViewport.addEventListener("resize", syncAppHeight, { passive: true });
+      window.visualViewport.addEventListener("resize", positionThinkingVariantPopover, { passive: true });
+      window.visualViewport.addEventListener("scroll", positionThinkingVariantPopover, { passive: true });
       syncAppHeight();
     }
     document.addEventListener("keydown", handleGlobalKeydown);
@@ -6007,7 +8293,7 @@
   function syncAppHeight() {
     const viewport = window.visualViewport;
     if (!viewport) return;
-    document.documentElement.style.setProperty("--app-height", `${Math.round(viewport.height * viewport.scale)}px`);
+    document.documentElement.style.setProperty("--app-height", `${Math.round(viewport.height * viewport.scale / UI_SCALE)}px`);
   }
 
   function initialize() {
@@ -6020,6 +8306,12 @@
     setReasoningExpanded(safeStorageGet("miyu.web.reasoningExpanded") === "true", false);
     setToolExpanded(safeStorageGet("miyu.web.toolExpanded") === "true", false);
     setMode(safeStorageGet("miyu.web.mode") || "normal", false);
+    const artifactRatio = Number(safeStorageGet("miyu.web.artifactWidthRatio.v2"));
+    if (Number.isFinite(artifactRatio) && artifactRatio >= 0.25 && artifactRatio <= 0.9) {
+      state.artifactWidthRatio = artifactRatio;
+    }
+    setSidebarCollapsed(safeStorageGet("miyu.web.sidebarCollapsed") === "true");
+    syncArtifactLayout();
     setSettingsView("interface");
     bindEvents();
     resizeComposer();

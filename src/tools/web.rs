@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use crate::config::WebPluginConfig;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -1359,7 +1359,7 @@ async fn search_fallback_html(
 }
 
 fn clean_html_text(value: &str) -> String {
-    html_unescape(&html2text::from_read(value.as_bytes(), 120))
+    html_unescape(&html_conversion::to_text_lossy(value, 120))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1510,16 +1510,12 @@ async fn web_fetch(args: Value) -> Result<String> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_RESPONSE_SIZE {
-        bail!("response too large (exceeds 5MB limit)");
-    }
-    let content = String::from_utf8_lossy(&bytes).to_string();
+    let content = http_response::read_text(response, MAX_RESPONSE_SIZE).await?;
     let output = if content_type.contains("text/html") {
         match format {
             "html" => content,
-            "text" => html2text::from_read(content.as_bytes(), 120),
-            _ => html2md::parse_html(&content),
+            "text" => html_conversion::to_text_async(content, 120).await?,
+            _ => html_conversion::to_markdown(content).await?,
         }
     } else {
         content

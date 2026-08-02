@@ -211,7 +211,7 @@ fn plist_value(raw: &str, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn read_file(args: Value) -> Result<String> {
+pub(crate) fn read_file(args: Value) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let offset = args
         .get("offset")

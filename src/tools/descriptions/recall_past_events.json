@@ -1,7 +1,7 @@
 {
   "name": "recall_past_events",
   "display_name": "回忆往事",
-  "description": "搜索过去发送过的对话。",
+  "description": "搜索近期日记和长期保留的经历。",
   "parameters": {
     "type": "object",
     "properties": {

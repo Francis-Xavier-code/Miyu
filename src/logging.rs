@@ -1,3 +1,4 @@
+use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::{Context, Result};
 use tracing::level_filters::LevelFilter;
@@ -45,7 +46,7 @@ pub fn init(paths: &MiyuPaths, cli_debug: bool) -> Result<LoggingGuard> {
         .with_target("miyu::qq", qq_level(level, cli_debug, env_value.is_some()));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_target(false)
+        .with_target(true)
         .with_writer(writer)
         .with_filter(targets);
     tracing_subscriber::registry()
@@ -56,13 +57,18 @@ pub fn init(paths: &MiyuPaths, cli_debug: bool) -> Result<LoggingGuard> {
     if invalid_env {
         tracing::error!(
             variable = LOG_ENV,
-            "invalid log level ignored; expected off, error, warn, info, debug, or trace"
+            "{}",
+            t(
+                "invalid log level ignored; expected off, error, warn, info, debug, or trace",
+                "已忽略无效日志级别；应为 off、error、warn、info、debug 或 trace"
+            )
         );
     }
     tracing::debug!(
         level = %level,
         log_dir = %logs_dir.display(),
-        "debug logging initialized"
+        "{}",
+        t("debug logging initialized", "调试日志已初始化")
     );
     Ok(LoggingGuard {
         _worker: Some(worker),

@@ -4,29 +4,44 @@
 
 # Miyu
 
-一个活在终端里的二次元少女。
+一个活在终端里的二次元少女。开箱即用的开源 AI 助手，支持接入通讯平台。
 
 >暂时
 
 ## 谁是 Miyu？
 
-Miyu 是从我曾经很喜欢的动画中的角色[久遠寺未有](http://www.minatosoft.com/kimiaru/chara-miyu.html)身上汲取灵感制作的人物。
-
-![](./pics/miyuwallpaper.png)
+Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚构角色。
 
 ## 有什么功能？
 
-`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。她并非专业的 Coding Agent，而是更偏向聊天日常、游戏娱乐、系统排障等日用场景。并且 `miyu` 还可以无缝与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
+`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。比起Coding，她更偏向聊天日常、游戏娱乐、系统排障等日用场景。
+
+`miyu` 可以与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
 
 ![](./pics/shell-init.png)
 
-`miyu` 还自带了 TUI 方便修改配置。
+有终端交互模式
+
+![](./pics/REPL.png)
+
+自带了 TUI 方便修改配置。
 
 ```
 miyu config
 ```
 
 ![](./pics/tui.png)
+
+还有 WebUI 
+
+![](./pics/webui.png)
+
+还可以通过 NapCat 接入 QQ，远程操作电脑；亦或是加入群聊，陪网友吹水，帮助你管理群聊。
+
+![](./pics/qq私聊.png)
+
+![](./pics/qq群聊管理.png)
+
 
 ## 如何安装？
 
@@ -38,155 +53,56 @@ miyu config
 
 - 从源码构建
 
-  需要安装 Rust 1.96 或更新版本、C 编译工具链、`pkg-config` 和 ALSA 开发库，图片显示功能依赖 `chafa`。Arch Linux、Fedora 和 Ubuntu 24.04 均已验证可构建。
-
   ```
   git clone https://github.com/SHORiN-KiWATA/Miyu.git
   cd Miyu
-  cargo build --release --locked
-  ./target/release/miyu --version
+  cargo build --release
   ```
 
-  安装只需复制单个 `miyu` 可执行文件（例如 `cp ./target/release/miyu ~/.local/bin/`）。
 
-### 后台服务
+安装完成后可以运行 `miyu init` 初始化配置和状态文件；也可以直接运行 `miyu daemon start`，首次启动会自动初始化。
 
-`miyu` 使用一个统一的 daemon（由同一个可执行文件启动，无需额外安装）承载本地 IPC、WebUI 和所有已启用的通讯平台。daemon 在 WebUI 与通讯平台监听端口都绑定成功后才会报告就绪；REPL、shell hook、终端客户端和 WebUI 共用其中的会话与运行状态。重新编译后无需手动重启：客户端通过构建指纹发现旧 daemon 会自动将其替换。
+## 如何使用？
 
-模型客户端、工具注册表和 MCP 等较重的 AI 运行资源不会随 daemon 冷启动加载，而是在第一次 AI 请求时按需初始化；初始化后会在 daemon 生命周期内按有效配置复用，配置热重载时自动清理。`miyu web` 没有独立的启动或停止状态，它只会确保统一 daemon 正在运行，然后显示 WebUI 地址。
+> 与 `miyu` 运行最适配的是 `kitty`终端
 
-daemon 的 WebUI 默认优先监听 `8300`；仅当 `8300` 已被占用时，才会自动选择一个空闲端口。`miyu daemon start` 和 `miyu daemon status` 会逐行显示全部实际访问地址与端口。
-
-```text
-miyu daemon start        # 启动 daemon 并显示整体状态
-miyu daemon stop         # 停止 daemon
-miyu daemon restart      # 重启 daemon
-miyu daemon status       # 查看 IPC、WebUI、AI 引擎和通讯平台状态
-miyu daemon logs         # 先显示最近 50 行日志，再持续跟随
-miyu daemon logs -n 200  # 仅显示最近 200 行并退出
-miyu web                 # 确保 daemon 已启动并显示 WebUI 地址
-```
-
-设置 `MIYU_DIRECT=1` 可临时绕过 daemon，使用原有单进程模式。
-
-daemon 模式下 TUI 的 `/models`、`/config`、`/variant`、`/undo`、`/pop`、`/compact`、`/reset`、`/reset all`、`/history`、`/clear` 和 `/help` 均可用，token/context 状态由 daemon 提供。
-
-  各发行版依赖示例：
+- REPL TUI 交互模式
 
   ```
-  # Arch Linux
-  sudo pacman -S --needed rust cargo pkgconf alsa-lib gcc
-
-  # Fedora
-  sudo dnf install cargo rust rust-std-static pkgconf-pkg-config alsa-lib-devel gcc
-
-  # Ubuntu 24.04
-  sudo apt install curl build-essential pkg-config libasound2-dev ca-certificates
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-  . "$HOME/.cargo/env"
+  miyu
   ```
 
-### 界面语言
+- webui 局域网网页
 
-Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。在 `miyu config` 的“全局设置 / Global Settings”中可将“界面语言 / Interface language”设为：
+  ```
+  miyu web
+  ```
 
-- `auto`：默认值，跟随系统 locale
-- `en`：英文
-- `zh`：简体中文
+- shell hook 终端集成
 
-`MIYU_LANG=en` 或 `MIYU_LANG=zh` 可以临时覆盖配置。语言选择优先级为 `MIYU_LANG`、`display.language`、系统 locale；在配置 TUI 中保存后，下次启动 Miyu 时生效。
+  最好的集成效果要求使用 `fish`，`zsh` 和`bash` 只能做到单行对话，`fish` 可以完整无缝集成。
+  
+  ```
+  miyu fish-init
+  ```
 
-### 子代理模型档位池
+### 重要配置调整
 
-主对话模型完全由你手选；档位池只作用于**子代理**：AI 开启子代理（task 工具）时按任务复杂度自主选择 `cheap`（简单任务）、`balanced`（普通任务）或 `strong`（复杂任务），请求在该档位的模型池内像主模型池一样负载均衡。
+运行 `miyu config` 命令打开配置 TUI。
 
-在 `miyu config` 的“配置子代理档位池”中为每个档位从已配置的文本模型里勾选模型（WebUI 的 设置 → 模型池 同样可配）。模型从文本模型中移除时会自动同步移出档位池。未配置或临时不可用的档位自动回退主模型池（回退提示会随工具结果返回给 AI，不打扰使用）。子代理实际使用的模型会记录进审计会话，可追溯用量。
+- 供应商和模型
 
-```jsonc
-"subagent_tiers": {
-  "cheap":    [ { "provider_id": "opencode", "model": "gemini-3.5-flash-lite" } ],
-  "balanced": [ { "provider_id": "opencode", "model": "claude-haiku-4-5" },
-                { "provider_id": "opencode", "model": "kimi-k2.5" } ],
-  "strong":   [ { "provider_id": "opencode", "model": "claude-sonnet-4-6" } ]
-}
-```
+  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的。
 
-### 接入通讯平台（腾讯 QQ）
+- 自定义提示词
 
-Miyu 可以通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot v11 反向 WebSocket 接入腾讯 QQ，支持私聊、群聊、图片和文件。每个 QQ 私聊或群聊映射到稳定的专属会话，群内所有成员共享群会话；QQ 历史不会出现在 WebUI 的会话列表中。
+  `miyu`的默认提示词是无法修改的。你可以在`自定义提示词`中新建属于自己的 AI 人格，还可以配置 `用户身份` 让对话更加沉浸。 
 
-配置入口：`miyu config` → “接入通讯平台” → “腾讯 QQ”。最小配置只需启用并确认端口。NapCat 侧在网络配置中新建“WebSocket 客户端”，地址填 `ws://<Miyu 所在机器>:<端口>/ws`，本机默认是 `ws://localhost:8300/ws`，消息格式选 **Array**。旧地址 `/onebot/v11/ws` 仅为兼容保留。
+### 用户资源与 Skill
 
-反向 WebSocket Token 留空时只接受本机回环连接；NapCat 与 Miyu 跨机器部署时必须设置 Token，并在 NapCat 填入同一个值。端口、Token 和启用状态保存后立即生效；新端口绑定失败时会保留原监听器。
+Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.jsonc`、主题和 shell 集成；`~/.miyu/data` 存放 prompts、identities、persona-avatars、scripts 和 skills；运行状态与 Skill 草稿位于 `~/.miyu/state`。
 
-QQ 的访问规则如下：管理员绕过私聊/群聊准入和限流，并始终可以使用完整电脑工具；群里仍需 @ 机器人或使用额外触发关键词。私聊白名单不受限流，非白名单私聊使用各自的每会话限流。白名单群和非白名单群分别使用按群共享的限流。`allow_non_admin_host_tools` 只允许私聊白名单中的非管理员使用完整电脑工具，其他非管理员仅获得通讯平台安全工具。
-
-“接入通讯平台”中的“命令触发前缀”默认为 `/`，“命令列表”可分别把内置命令设为“所有人”或“仅管理员”。目前提供 `/reset`，默认仅管理员可用；它会清空当前 QQ 私聊或群聊会话的历史和排队消息，但保留会话绑定、人格、长期记忆和全局 token 用量。群聊命令不需要 @ 机器人，仍遵守平台准入和限流规则。这里的管理员只取自腾讯 QQ 配置中的“管理员 QQ 号”，不会把 QQ 群主或群管理员自动视为 Miyu 管理员。
-
-“私聊/群聊专属配置”按对方 QQ 号或群号设置文本模型池、多模态模型池和额外提示词，不再需要填写机器人 QQ 号。任一模型池留空即继承终端/WebUI 的全局模型池；两个池都继承时该会话配置也会正常保存。额外提示词只进入对应 QQ 会话，不影响终端和 WebUI。多模态池中的模型必须声明支持 `image` 输入。
-
-“QQ 插件配置”目前提供 Rust 原生、编译进 Miyu 的“回复处理”插件。默认在回复超过 300 字时转成长图，并移除最后一个可见文本段末尾的中文句号，也可切换为 OneBot 合并转发。以下命令仅管理员可用，设置只覆盖当前 QQ 会话：
-
-```text
-/回复处理 状态
-/回复处理 阈值 500
-/回复处理 阈值 开
-/回复处理 阈值 关
-/回复处理 模式 图片
-/回复处理 模式 转发
-/回复处理 恢复默认
-```
-
-Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user` 工具，可发送文本、本地图片和文件，不能借此向其他 QQ 或群发送消息。
-
-```jsonc
-"platforms": {
-  "command_prefix": "/",
-  "commands": {
-    "reset": { "permission": "admin_only" }
-  },
-  "qq": {
-    "enabled": true,
-    "reverse_ws_port": 8300,
-    "access_token": "与 NapCat 一致",
-    "admin_users": [ 12345678 ],
-    "allow_non_admin_host_tools": false,
-    "private_chats": {
-      "whitelist": [ 12345678 ],
-      "allow_non_whitelist": true,
-      "non_whitelist_rate_per_minute": 3
-    },
-    "group_chats": {
-      "whitelist": [ 87654321 ],
-      "trigger_keywords": [ "/miyu" ],
-      "whitelist_rate_per_minute": 30,
-      "allow_non_whitelist": true,
-      "non_whitelist_rate_per_minute": 10
-    },
-    "conversations": [
-      {
-        "conversation": { "kind": "group", "id": "87654321" },
-        "text_models": [ { "provider_id": "openai", "model": "gpt-5" } ],
-        "multimodal_models": [ { "provider_id": "openai", "model": "gpt-5" } ],
-        "extra_prompt": "这是一个 QQ 群聊，请保持回复简洁自然。"
-      },
-      {
-        "conversation": { "kind": "private", "id": "12345678" }
-      }
-    ],
-    "plugins": {
-      "reply_processor": {
-        "enabled": true,
-        "settings": { "threshold": 300, "mode": "image" }
-      }
-    },
-    "asset_base_url": "http://192.168.1.2:8300", // NapCat 获取大文件的地址；同机通常可留空
-    "max_reply_chars": 3000
-  }
-}
-```
-
-跨机器发送文件时，`asset_base_url` 必须是 NapCat 能访问到的 Miyu HTTP 地址。Miyu 使用短期随机 URL 流式提供最大 50 MiB 的文件；URL 获取失败时，16 MiB 以内会自动改用 base64 发送。
+旧版本位于 `config` 下的用户资源会在冲突预检后自动迁移到 `data`，迁移不会覆盖现有目标。Skill 遵循 Agent Skills 的 `SKILL.md` 目录格式。可以直接要求 Miyu 创建或更新 Skill：Miyu 会先编辑隔离草稿，校验后再原子发布。人格 Skill 优先于同名全局 Skill，Skill 内的 `scripts/` 只作为资源，不会自动注册成工具。
 
 ### 内置插件
 
@@ -199,7 +115,7 @@ Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user
 
   ![](./pics/nvidiafuckyou.png)
 
-  Miyu 自带了一些表情，存放在`/usr/share/miyu`，对应的用户空间目录是`~/.local/share/miyu`。表情库是跟随人格的，如果你在设置里新建了自己的人格，那么就无法使用 Miyu 的默认表情。你可以准备一些图片，把路径给 Ai，让其保存到表情库。届时会自动调用识图模型对图片进行分析并保存。Miyu 默认使用 opencode 公共模型服务中的多模态模型进行识图，所以即使不配置自己的多模态模型也可以看图片。
+  Miyu 自带了一些表情，存放在`/usr/share/miyu`，对应的用户空间目录位于`~/.miyu/data`。表情库是跟随人格的，如果你在设置里新建了自己的人格，那么就无法使用 Miyu 的默认表情。你可以准备一些图片，把路径给 Ai，让其保存到表情库。届时会自动调用识图模型对图片进行分析并保存。Miyu 默认使用 opencode 公共模型服务中的多模态模型进行识图，所以即使不配置自己的多模态模型也可以看图片。
 
 - 玄学算命
 
@@ -255,7 +171,7 @@ Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user
 
 - 搜图
 
-  Miyu 还能帮你找图片喔！搜图会根据网络环境并行使用多个来源，并通过视觉模型筛选相关且安全的结果。图片会默认保存至`XDG图片目录/Miyu`。
+  Miyu 还能帮你找图片喔！搜图会根据网络环境并行使用多个来源，并通过视觉模型筛选相关且安全的结果。图片会默认保存至`~/.miyu/data/pictures/web-images`。
 
   >NSFW 禁止！
 
@@ -263,7 +179,7 @@ Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user
 
 - 生图
 
-  支持 OpenAI 的画图服务喔。图片会默认保存至`XDG图片目录/Miyu`。
+  支持 OpenAI 的画图服务喔。图片会默认保存至`~/.miyu/data/pictures/generated-images`。
 
   >这个功能默认用不了，要自己在插件设置里开启并配置 API
 
@@ -331,7 +247,11 @@ Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user
 
 - 记忆系统
 
-  Miyu 的记忆由两部分组成，其一是“曾经发生的事”，其二是“信息中的知识点”。对话时会根据用户消息自动召回条目，这是联想功能。
+  Miyu 的记忆分为短期日记、长期日记和知识点。每个成功完成的对话轮次会立即写入短期日记；同一人格累计 14 条未整理日记后，由独立后台线程并行提炼长期知识点和有回溯价值的长期经历，不会阻塞正常回复。成功整理的短期日记默认保留 14 天，每次有效联想会刷新保留时间；召回达到 3 次时会立即进入长期化整理。尚未成功整理的原文超期后会退出自动联想但不会丢失，后台仍可继续整理；整理成功后再物理清理。已经长期化的日记不再刷新短期原文的清理时间。
+
+  联想会同时检索三类记忆，并使用 `jieba-rs` 中文分词进行低成本匹配。Embedding 后续可以作为可选辅助接入，但不是记忆系统运行的前提。长期知识点和长期日记会随时间衰减为“已遗忘”，不物理删除；显式搜索仍可找回。
+
+  `/reset` 只清理当前会话，不删除人格记忆；终端或 WebUI 的 `/reset all` 会清空当前人格的短期日记、长期日记、知识点、修订记录和待整理状态。主体记忆在一个事务中清理，淘汰上下文随后独立清理。即使后台模型当时正在整理，旧结果也会因数据库身份或记忆代数变化而被拒绝，不能在清理后重新写回；重置前已经启动的其他会话也不能再写入旧日记。
 
   ![](./pics/记忆.png)
 
@@ -353,49 +273,23 @@ Agent 在 QQ 会话中还会获得仅指向当前会话的 `send_message_to_user
 
 </details>
 
-## 做出贡献
-
-<details><summary>[展开/收起] 如果你想要一同开发 Miyu 请先阅读下面的内容</summary>
-<br>
-
-### 设计理念
-
-Miyu 的定位是桌面助手，不是 Coding Agent，她更注重拟真、系统集成度、实用、日常排障等方面。Miyu 应该开箱即用，并且足够轻量，不开发超重的 3D 桌宠，不使用 GUI 框架，也不设计需要学习成本的 CLI 选项，尽量通过自然语言和无缝无感的触发方式进行所有的操作。
-
-以下是一些可能的方向：
-
-- 提升系统日常排障能力、系统维护能力
-
-  作为桌面助手，尤其是 Linux 桌面端助手，对日常问题的排障能力是重重之中。她应当能够解决日用系统会遇到的问题，如输入法异常、显卡驱动异常、桌面软件崩溃等。
-
-- 知识和信息
-
-  扩充默认的知识库。增加对软件推荐、游戏兼容性调查、时事新闻、学习辅助等非开发场景下会出现的情景的处理能力。增加知识和信息检索的时效性和可靠性也是关键点。
-
-- 提升角色扮演能力，提高对话娱乐性和拟真度
-
-  需要更多像“发送表情包”、“玄学算命”那样提升对话时的趣味性或拟真度的功能。TTS、语音对话等重要功能也在日程上。
-
-- 提高和系统的无缝集成
-
-  不使用任何命令作为触发器，能够直接使用自然语言开启对话。目前是通过 Command Not Found 内容交给 Miyu 的方式做到和终端的无缝集成，但是逐行解释命令的特点导致提示词包含多行内容时每一行都会调用一次，如何支持多行无缝对话是一个需要研究的点。
-  
-  终端以外的集成也值得研究，例如做成守护进程，拥有持续运行的能力，监听系统事件，在特定事件发生时做出特定反应等。
-
-- 优化功能和修复 BUG
-
-  在不变更设计语义，不影响现有功能效果的前提下优化运行表现，修复 BUG。已知目前流式输出兼容和工具调用兼容有点问题，不是所有模型都正常。
-
-### 如何 PR
-
-PR时必须提供功能的设计理念，作用场景和实际意义。一个 PR 必须仅包含一个功能，若包含多个功能，应当拆分后提交多个 PR。
-
-</details>
-
-
 ## 致谢
 
-- [opencode](https://github.com/anomalyco/opencode) 最好的开源 Coding Agent。
+#### 功能参考
+
+- [Opencode](https://github.com/anomalyco/opencode) 
+- [Claude Code](https://github.com/anthropics/claude-code)
+- [Astrbot](https://github.com/AstrBotDevs/AstrBot) 
+- [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 
+
+#### 插件设计参考
+
+- [Yue-bin/astrbot_plugin_maskoff](https://github.com/Yue-bin/astrbot_plugin_maskoff)
+- [nuomicici/astrbot_plugin_GroupMemberQuery](nuomicici/astrbot_plugin_GroupMemberQuery)
+- [advent259141/Astrbot_plugin_Heartflow](advent259141/Astrbot_plugin_Heartflow)
+- [Railgun19457/astrbot_plugin_image_generation](Railgun19457/astrbot_plugin_image_generation)
+- [xiewoc/astrbot_plugin_weather_wttr_in](xiewoc/astrbot_plugin_weather_wttr_in)
+- [muyouzhi6/astrbot_plugin_recall_cancel](muyouzhi6/astrbot_plugin_recall_cancel)
 
 ## 许可
 

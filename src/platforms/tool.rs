@@ -60,8 +60,8 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
         ToolSpec::new(
             "send_message_to_user",
             t(
-                "Send text, local images, or local files to the current messaging-platform conversation. Use this only when the content must be delivered as a native attachment; it cannot target another conversation.",
-                "向当前通讯平台会话发送文本、本地图片或本地文件。仅在内容必须作为原生附件发送时使用，不能指定其他会话。",
+                "Send text, local images, or local files to the current messaging-platform conversation. Use native attachments only for content that another tool has not already emitted in this turn; the host delivers tool-emitted images automatically. This tool cannot target another conversation.",
+                "向当前通讯平台会话发送文本、本地图片或本地文件。仅发送本轮中尚未由其他工具发布的原生附件；工具已发布的图片会由宿主自动投递。此工具不能指定其他会话。",
             ),
             parameters,
             move |arguments| {

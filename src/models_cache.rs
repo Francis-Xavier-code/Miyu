@@ -342,19 +342,30 @@ fn retain_configured_models(
             selected_model_ids.insert(provider.default_model.clone());
         }
     }
-    let platform_models = config.platforms.qq.conversations.iter().flat_map(|route| {
+    let conversation_models = config.platforms.qq.conversations.iter().flat_map(|route| {
         route
             .text_models
             .iter()
             .flatten()
             .chain(route.multimodal_models.iter().flatten())
     });
+    let real_context_models = config
+        .platforms
+        .qq
+        .plugins
+        .get(crate::config::REAL_CONTEXT_PLUGIN_ID)
+        .and_then(|instance| crate::config::RealContextPluginSettings::from_instance(instance).ok())
+        .and_then(|settings| settings.text_models)
+        .unwrap_or_default();
     for choice in config
         .active_provider_models
         .iter()
         .flatten()
         .chain(config.active_multimodal_provider_models.iter().flatten())
-        .chain(platform_models)
+        .chain(config.platforms.qq.text_models.iter().flatten())
+        .chain(config.platforms.qq.multimodal_models.iter().flatten())
+        .chain(conversation_models)
+        .chain(real_context_models.iter())
     {
         selected
             .entry(choice.provider_id.clone())
@@ -737,9 +748,31 @@ mod tests {
     fn compact_cache_retains_models_used_only_by_platform_routes() {
         let mut config = crate::config::AppConfig::default();
         let provider_id = config.providers[0].id.clone();
-        config.providers[0]
-            .models
-            .extend(["route-text".to_string(), "route-vision".to_string()]);
+        config.providers[0].models.extend([
+            "route-text".to_string(),
+            "route-vision".to_string(),
+            "platform-text".to_string(),
+            "context-text".to_string(),
+        ]);
+        config.platforms.qq.text_models = Some(vec![crate::config::ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "platform-text".to_string(),
+        }]);
+        let mut real_context = crate::config::PlatformPluginInstanceConfig::default();
+        crate::config::merge_real_context_settings(
+            &mut real_context,
+            &crate::config::RealContextPluginSettings {
+                text_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "context-text".to_string(),
+                }]),
+                ..Default::default()
+            },
+        );
+        config.platforms.qq.plugins.insert(
+            crate::config::REAL_CONTEXT_PLUGIN_ID.to_string(),
+            real_context,
+        );
         config
             .platforms
             .qq
@@ -749,15 +782,20 @@ mod tests {
                     kind: crate::config::PlatformConversationKind::Group,
                     id: "20000".to_string(),
                 },
+                persona: crate::config::PlatformPersonaOverride::Inherit,
+                text_models_inheritance: crate::config::PlatformModelPoolInheritance::Platform,
                 text_models: Some(vec![crate::config::ActiveProviderModelConfig {
                     provider_id: provider_id.clone(),
                     model: "route-text".to_string(),
                 }]),
+                multimodal_models_inheritance:
+                    crate::config::PlatformModelPoolInheritance::Platform,
                 multimodal_models: Some(vec![crate::config::ActiveProviderModelConfig {
                     provider_id: provider_id.clone(),
                     model: "route-vision".to_string(),
                 }]),
                 extra_prompt: String::new(),
+                session_limits: None,
             });
         let mut data = HashMap::from([(
             provider_id.clone(),
@@ -765,6 +803,8 @@ mod tests {
                 (config.providers[0].default_model.clone(), model(128_000)),
                 ("route-text".to_string(), model(64_000)),
                 ("route-vision".to_string(), model(96_000)),
+                ("platform-text".to_string(), model(64_000)),
+                ("context-text".to_string(), model(64_000)),
                 ("unused-model".to_string(), model(32_000)),
             ]),
         )]);
@@ -774,6 +814,8 @@ mod tests {
         let retained = &data[&provider_id];
         assert!(retained.contains_key("route-text"));
         assert!(retained.contains_key("route-vision"));
+        assert!(retained.contains_key("platform-text"));
+        assert!(retained.contains_key("context-text"));
         assert!(!retained.contains_key("unused-model"));
     }
 

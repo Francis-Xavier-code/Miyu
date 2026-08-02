@@ -44,6 +44,7 @@ pub type QuestionAnswers = Vec<Vec<String>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuestionResponse {
     Answered(QuestionAnswers),
+    Closed,
     Cancelled,
     Unavailable(String),
 }
@@ -211,6 +212,14 @@ pub fn unavailable_tool_output(reason: &str) -> String {
     .unwrap_or_else(|_| "{\"status\":\"unavailable\"}".to_string())
 }
 
+pub fn closed_tool_output() -> String {
+    serde_json::to_string(&json!({
+        "status": "closed",
+        "instruction": "The user closed the answer interface without providing answers. Continue the current response without assuming an answer.",
+    }))
+    .unwrap_or_else(|_| "{\"status\":\"closed\"}".to_string())
+}
+
 pub fn assistant_exchange_text(exchange: &QuestionExchange) -> String {
     let mut output = String::from("补充确认：");
     for (index, question) in exchange.questions.iter().enumerate() {
@@ -325,5 +334,14 @@ mod tests {
         let text = assistant_exchange_text(&exchange);
         assert!(text.contains("全部: 修改全部相关文件"));
         assert!(text.contains("可输入自定义答案"));
+    }
+
+    #[test]
+    fn closed_output_continues_without_an_answer() {
+        let output: serde_json::Value = serde_json::from_str(&closed_tool_output()).unwrap();
+        assert_eq!(output["status"], "closed");
+        assert!(output["instruction"]
+            .as_str()
+            .is_some_and(|instruction| instruction.contains("without providing answers")));
     }
 }

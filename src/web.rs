@@ -2,25 +2,31 @@ use crate::agent::{
     archive_and_delete_visible_turns, Agent, AgentEvent, AgentMode, AgentTurnControl,
 };
 use crate::cli::{build_tool_registry, WebArgs};
-use crate::config::{ActiveProviderModelConfig, AppConfig};
+use crate::config::{ActiveProviderModelConfig, AppConfig, PromptAudience};
 use crate::i18n::text as t;
 use crate::ipc::{
     self, Command as IpcCommand, Frame as IpcFrame, ImageAttachment, Request as IpcRequest,
 };
-use crate::llm::{ChatResult, ChatStreamKind, OpenAiCompatibleClient, Usage};
-use crate::memory::MemoryStore;
+use crate::llm::{
+    thinking_variant_options_for_model, ChatResult, ChatStreamKind, OpenAiCompatibleClient,
+    ThinkingVariantOptions, ThinkingVariantPreferences, Usage,
+};
+use crate::memory::{
+    MemoryAccess, MemoryOrganizer, MemoryOrganizerHandle, MemoryOrigin, MemoryStore,
+};
 use crate::paths::MiyuPaths;
 use crate::question::{self, QuestionAnswers, QuestionRequest, QuestionResponse};
 use crate::state::{
-    ImageAsset, QueuedPrompt, StateStore, Turn, TurnFollowup, TurnStatus, UsageSnapshot,
+    ArtifactAsset, ImageAsset, PlatformPluginScopeKey, QueuedPrompt, StateStore, Turn,
+    TurnFollowup, TurnStatus, UsageSnapshot, UserAttachment,
 };
 use crate::tools::{self, CommandOutputStream};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, ORIGIN, REFERRER_POLICY,
-    RETRY_AFTER, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+    COOKIE, HOST, ORIGIN, REFERRER_POLICY, RETRY_AFTER, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -47,6 +53,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
@@ -54,6 +61,10 @@ use crate::platforms::{self, PlatformRuntime};
 
 const JSON_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const PERSONA_ASSET_LIMIT: usize = 8 * 1024 * 1024;
+const ATTACHMENT_BODY_LIMIT: usize = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_TEXT_ATTACHMENT_BYTES: usize = 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 12;
 const DEFAULT_BOARD_TITLE: &str = "今天想聊些什么？";
 const DEFAULT_BOARD_SUBTITLE: &str = "从一个问题、计划或此刻的想法开始。";
 const DEFAULT_STARTER_PROMPTS: [&str; 4] = [
@@ -66,6 +77,7 @@ const MAX_CONTENT_CHARS: usize = 20_000;
 const MAX_PROMPT_DOCUMENT_CHARS: usize = 200_000;
 const MAX_PROMPT_DOCUMENTS: usize = 128;
 const MAX_SECRET_CHARS: usize = 100_000;
+const MAX_THINKING_VARIANT_UPDATES: usize = 64;
 const EVENT_CAPACITY: usize = 4096;
 const AUTH_COOKIE: &str = "miyu_session";
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
@@ -151,6 +163,7 @@ impl DaemonState {
             events.clone(),
             questions.clone(),
             turn_engine.clone(),
+            None,
         )?;
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
         Ok((
@@ -369,13 +382,51 @@ impl WebAuth {
 pub(crate) struct RunInfo {
     pub(crate) session_id: Arc<str>,
     pub(crate) mode: AgentMode,
+    pub(crate) audience: PromptAudience,
     /// Signals cancellation to the turn task; the task selects on the
     /// paired receiver.
     pub(crate) cancel: tokio::sync::watch::Sender<bool>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) queue_target: Option<crate::state::RunningTurnQueueTarget>,
+    pub(crate) supersede: Arc<crate::agent::TurnSupersedeSignal>,
+    pub(crate) platform_followup: Option<Arc<platforms::PlatformFollowupRun>>,
+    pub(crate) operation: RunOperation,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RunOperation {
+    Create,
+    Redo { turn_id: String, input_id: String },
+}
+
+impl RunOperation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Redo { .. } => "redo",
+        }
+    }
+
+    fn turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Create => None,
+            Self::Redo { turn_id, .. } => Some(turn_id),
+        }
+    }
+
+    fn input_id(&self) -> Option<&str> {
+        match self {
+            Self::Create => None,
+            Self::Redo { input_id, .. } => Some(input_id),
+        }
+    }
 }
 
 impl RunInfo {
     pub(crate) fn request_cancel(&self) {
+        if let Some(followup) = self.platform_followup.as_ref() {
+            followup.close();
+        }
         let _ = self.cancel.send(true);
     }
 }
@@ -406,6 +457,22 @@ impl ManagerState {
             .values()
             .any(|info| &*info.session_id == session_id)
     }
+
+    pub(crate) fn session_has_redo(&self, session_id: &str) -> bool {
+        self.active_runs.values().any(|info| {
+            &*info.session_id == session_id && matches!(info.operation, RunOperation::Redo { .. })
+        })
+    }
+
+    fn session_runs_match_audience(&self, session_id: &str, audience: PromptAudience) -> bool {
+        let mut runs = self
+            .active_runs
+            .values()
+            .filter(|info| &*info.session_id == session_id);
+        runs.next().is_some_and(|first| {
+            first.audience == audience && runs.all(|info| info.audience == audience)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -420,15 +487,30 @@ pub(crate) enum ActorCommand {
         run_id: String,
         session_id: Arc<str>,
         content: String,
+        display_content: String,
+        attachment_run_id: Option<String>,
         mode: AgentMode,
         images: Vec<Option<ImageAttachment>>,
         cwd: Option<std::path::PathBuf>,
+        audience: PromptAudience,
         /// Platform-only per-turn overrides. CLI/WebUI turns leave this empty.
         profile: Option<platforms::TurnProfile>,
         cancel: tokio::sync::watch::Receiver<bool>,
     },
+    RedoTurn {
+        run_id: String,
+        session_id: Arc<str>,
+        candidate: crate::state::RedoCandidate,
+        prompts: Vec<RedoWebPrompt>,
+        mode: AgentMode,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    },
     SetModels {
         models: Vec<ActiveProviderModelConfig>,
+        reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
+    },
+    SetThinkingVariants {
+        updates: Vec<ThinkingVariantUpdate>,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ApplyConfig {
@@ -438,7 +520,13 @@ pub(crate) enum ActorCommand {
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ResetConversation {
+        session_id: Arc<str>,
         all: bool,
+        reset_shared_state: bool,
+        reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
+    },
+    ResetPersonaState {
+        config: Box<AppConfig>,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ClearSessionContent {
@@ -447,16 +535,20 @@ pub(crate) enum ActorCommand {
     },
     SwitchSession {
         session_id: String,
+        release_reservation: bool,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     Undo {
+        session_id: Arc<str>,
         reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
     },
     Pop {
+        session_id: Arc<str>,
         turn_ids: Vec<String>,
         reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
     },
     Compact {
+        session_id: Arc<str>,
         reply: oneshot::Sender<std::result::Result<Value, AdminFailure>>,
     },
     Shutdown,
@@ -470,6 +562,13 @@ pub(crate) enum AdminFailure {
 
 #[derive(Debug)]
 pub(crate) enum PlatformSessionResetError {
+    Busy,
+    Unavailable,
+    Internal(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum PlatformPersonaResetError {
     Busy,
     Unavailable,
     Internal(String),
@@ -639,11 +738,38 @@ impl QuestionBroker {
             .remove(question_id)
             .ok_or(AnswerFailure::NotFound)?;
         let run_id = pending.run_id;
+        if pending.responder.is_closed() {
+            return Err(AnswerFailure::Gone);
+        }
+        before_resume(&run_id, &answers);
         pending
             .responder
             .send(QuestionResponse::Answered(answers.clone()))
             .map_err(|_| AnswerFailure::Gone)?;
-        before_resume(&run_id, &answers);
+        Ok(())
+    }
+
+    fn close<F>(
+        &self,
+        question_id: &str,
+        before_resume: F,
+    ) -> std::result::Result<(), AnswerFailure>
+    where
+        F: FnOnce(&str),
+    {
+        let mut all_pending = self.pending.lock().unwrap();
+        let pending = all_pending
+            .remove(question_id)
+            .ok_or(AnswerFailure::NotFound)?;
+        let run_id = pending.run_id;
+        if pending.responder.is_closed() {
+            return Err(AnswerFailure::Gone);
+        }
+        before_resume(&run_id);
+        pending
+            .responder
+            .send(QuestionResponse::Closed)
+            .map_err(|_| AnswerFailure::Gone)?;
         Ok(())
     }
 
@@ -670,15 +796,21 @@ struct RunEventMapper {
     events: EventHub,
     questions: QuestionBroker,
     state_store: StateStore,
+    manager: Arc<Mutex<ManagerState>>,
     turn_id: Option<String>,
-    tool_counter: u64,
     active_tools: Vec<ActiveTool>,
+    queue_ingress: Option<Arc<crate::agent::QueueIngressBarrier>>,
+    operation: &'static str,
+    redo_input_id: Option<String>,
+    redo_display_content: Option<String>,
+    command_output_lines: usize,
 }
 
 struct ActiveTool {
     id: String,
     name: String,
-    event_name: String,
+    display_name: String,
+    command_output: Option<crate::render::CommandOutputTail>,
 }
 
 impl RunEventMapper {
@@ -687,15 +819,26 @@ impl RunEventMapper {
         events: EventHub,
         questions: QuestionBroker,
         state_store: StateStore,
+        manager: Arc<Mutex<ManagerState>>,
+        queue_ingress: Option<Arc<crate::agent::QueueIngressBarrier>>,
+        operation: &'static str,
+        redo_input_id: Option<String>,
+        redo_display_content: Option<String>,
+        command_output_lines: usize,
     ) -> Self {
         Self {
             run_id,
             events,
             questions,
             state_store,
+            manager,
             turn_id: None,
-            tool_counter: 0,
             active_tools: Vec::new(),
+            queue_ingress,
+            operation,
+            redo_input_id,
+            redo_display_content,
+            command_output_lines,
         }
     }
 
@@ -703,12 +846,15 @@ impl RunEventMapper {
         self.events.publish(kind, data);
     }
 
-    fn next_tool(&mut self, event_name: String) -> ActiveTool {
-        self.tool_counter = self.tool_counter.saturating_add(1);
+    fn next_tool(&self, call_id: String, event_name: String) -> ActiveTool {
+        let name = real_tool_name(&event_name).to_string();
+        let display_name = tools::readable_tool_name(&event_name);
         ActiveTool {
-            id: format!("{}_tool_{}", self.run_id, self.tool_counter),
-            name: real_tool_name(&event_name).to_string(),
-            event_name,
+            id: call_id,
+            command_output: (name == "run_command")
+                .then(|| crate::render::CommandOutputTail::new(self.command_output_lines)),
+            name,
+            display_name,
         }
     }
 
@@ -716,11 +862,29 @@ impl RunEventMapper {
         match event {
             AgentEvent::TurnStarted { turn_id } => {
                 self.turn_id = Some(turn_id.clone());
+                if let Some(run) = self
+                    .manager
+                    .lock()
+                    .unwrap()
+                    .active_runs
+                    .get_mut(&self.run_id)
+                {
+                    run.turn_id = Some(turn_id.clone());
+                    run.queue_target = Some(self.state_store.queue_target(turn_id.clone()));
+                }
                 self.publish(
                     "turn.started",
-                    json!({ "run_id": self.run_id, "turn_id": turn_id }),
+                    json!({
+                        "run_id": self.run_id,
+                        "turn_id": turn_id,
+                        "operation": self.operation,
+                        "input_id": self.redo_input_id,
+                        "display_content": self.redo_display_content,
+                    }),
                 );
             }
+            AgentEvent::RawReasoning(_) => {}
+            AgentEvent::FlushJournal => {}
             AgentEvent::Chunk(chunk) => match chunk.kind {
                 ChatStreamKind::Content => self.publish(
                     "assistant.delta",
@@ -748,22 +912,41 @@ impl RunEventMapper {
                 "reasoning.title",
                 json!({ "run_id": self.run_id, "title": title }),
             ),
-            AgentEvent::ToolCall { name, arguments } => {
-                let tool = self.next_tool(name);
+            AgentEvent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                if let Some(queue_ingress) = self.queue_ingress.as_ref() {
+                    queue_ingress.tool_started(&call_id);
+                }
+                let tool = self.next_tool(call_id, name);
                 self.publish(
                     "tool.started",
                     json!({
                         "run_id": self.run_id,
                         "tool_id": tool.id,
                         "name": tool.name,
-                        "display_name": tools::readable_tool_name(&tool.event_name),
+                        "display_name": tool.display_name,
                         "arguments": arguments,
                     }),
                 );
                 self.active_tools.push(tool);
             }
-            AgentEvent::ToolProgress { name, message } => {
-                let (tool_id, tool_name) = self.tool_identity(&name);
+            AgentEvent::ToolPreparing { name } => self.publish(
+                "tool.preparing",
+                json!({
+                    "run_id": self.run_id,
+                    "name": tools::readable_tool_name(&name),
+                    "tool_name": name,
+                }),
+            ),
+            AgentEvent::ToolProgress {
+                call_id,
+                name,
+                message,
+            } => {
+                let (tool_id, tool_name) = self.tool_identity(&call_id, &name);
                 self.publish(
                     "tool.progress",
                     json!({
@@ -775,14 +958,25 @@ impl RunEventMapper {
                 );
             }
             AgentEvent::CommandOutput {
+                call_id,
                 name,
                 stream,
                 chunk,
             } => {
-                let (tool_id, tool_name) = self.tool_identity(&name);
-                let stream = match stream {
+                let stream_name = match stream {
                     CommandOutputStream::Stdout => "stdout",
                     CommandOutputStream::Stderr => "stderr",
+                };
+                let (tool_id, tool_name, preview) = if let Some(tool) =
+                    self.active_tools.iter_mut().find(|tool| tool.id == call_id)
+                {
+                    let preview = tool.command_output.as_mut().map(|output| {
+                        output.push(stream, &chunk);
+                        output.preview()
+                    });
+                    (tool.id.clone(), tool.name.clone(), preview)
+                } else {
+                    (call_id.clone(), real_tool_name(&name).to_string(), None)
                 };
                 self.publish(
                     "tool.output",
@@ -790,37 +984,54 @@ impl RunEventMapper {
                         "run_id": self.run_id,
                         "tool_id": tool_id,
                         "name": tool_name,
-                        "stream": stream,
+                        "stream": stream_name,
                         "output": String::from_utf8_lossy(&chunk),
+                        "preview": preview,
                     }),
                 );
             }
-            AgentEvent::ToolResult { name, ok, output } => {
-                // Parallel tools finish out of order — match by event name
-                // instead of assuming the most recently started tool.
-                let tool = self
+            AgentEvent::ToolResult {
+                call_id,
+                name,
+                ok,
+                output,
+            } => {
+                if let Some(queue_ingress) = self.queue_ingress.as_ref() {
+                    queue_ingress.tool_finished(&call_id);
+                }
+                let mut tool = self
                     .active_tools
                     .iter()
-                    .position(|tool| tool.event_name == name)
-                    .or_else(|| (self.active_tools.len() == 1).then_some(0))
+                    .position(|tool| tool.id == call_id)
                     .map(|index| self.active_tools.remove(index))
-                    .unwrap_or_else(|| self.next_tool(name));
+                    .unwrap_or_else(|| self.next_tool(call_id, name));
+                let preview = tool.command_output.as_mut().map(|output| {
+                    output.finalize();
+                    output.preview()
+                });
                 self.publish(
                     "tool.finished",
                     json!({
                         "run_id": self.run_id,
                         "tool_id": tool.id,
                         "name": tool.name,
+                        "display_name": tool.display_name,
                         "ok": ok,
                         "output": output,
+                        "preview": preview,
                     }),
                 );
             }
             AgentEvent::PrepareForExternalOutput { ready } => {
                 let _ = ready.send(false);
             }
-            AgentEvent::Image { name, path, alt } => {
-                let (tool_id, tool_name) = self.tool_identity(&name);
+            AgentEvent::Image {
+                call_id,
+                name,
+                path,
+                alt,
+            } => {
+                let (tool_id, tool_name) = self.tool_identity(&call_id, &name);
                 let hide_caption = tool_name == "show_meme";
                 let Some(turn_id) = self.turn_id.as_deref() else {
                     self.publish(
@@ -852,7 +1063,8 @@ impl RunEventMapper {
                             run_id = %self.run_id,
                             tool = %tool_name,
                             error = %error,
-                            "failed to persist a WebUI image"
+                            "{}",
+                            t("failed to persist a WebUI image", "WebUI 图像保存失败")
                         );
                         self.publish(
                             "tool.image",
@@ -866,11 +1078,61 @@ impl RunEventMapper {
                     }
                 }
             }
-            AgentEvent::AskQuestion { request, responder } => {
+            AgentEvent::Artifact {
+                call_id,
+                name,
+                path,
+                title,
+            } => {
+                let (tool_id, tool_name) = self.tool_identity(&call_id, &name);
+                let Some(turn_id) = self.turn_id.as_deref() else {
+                    self.publish(
+                        "tool.artifact",
+                        json!({
+                            "run_id": self.run_id,
+                            "tool_id": tool_id,
+                            "name": tool_name,
+                            "error": "artifact could not be associated with the current turn",
+                        }),
+                    );
+                    return;
+                };
+                match self
+                    .state_store
+                    .save_artifact_asset(turn_id, Some(&tool_id), &path, &title)
+                {
+                    Ok(asset) => self.publish(
+                        "tool.artifact",
+                        json!({
+                            "run_id": self.run_id,
+                            "tool_id": tool_id,
+                            "name": tool_name,
+                            "artifact": SafeArtifactAsset::from(asset),
+                        }),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(run_id = %self.run_id, tool = %tool_name, error = %error, "failed to persist a WebUI artifact");
+                        self.publish(
+                            "tool.artifact",
+                            json!({
+                                "run_id": self.run_id,
+                                "tool_id": tool_id,
+                                "name": tool_name,
+                                "error": "file could not be added to the WebUI preview",
+                            }),
+                        );
+                    }
+                }
+            }
+            AgentEvent::AskQuestion {
+                call_id,
+                request,
+                responder,
+            } => {
                 let question_id = self
                     .questions
                     .insert(&self.run_id, request.clone(), responder);
-                let (tool_id, tool_name) = self.tool_identity("ask_question");
+                let (tool_id, tool_name) = self.tool_identity(&call_id, "ask_question");
                 self.publish(
                     "question.requested",
                     json!({
@@ -897,6 +1159,14 @@ impl RunEventMapper {
                     "model": model,
                 }),
             ),
+            AgentEvent::GenerationSuperseded { prompt_ids } => self.publish(
+                "generation.superseded",
+                json!({
+                    "run_id": self.run_id,
+                    "turn_id": self.turn_id,
+                    "prompt_ids": prompt_ids,
+                }),
+            ),
             AgentEvent::SpinnerTick => {}
             AgentEvent::CompactStart => {
                 self.publish("context.compact_start", json!({ "run_id": self.run_id }))
@@ -915,25 +1185,12 @@ impl RunEventMapper {
         }
     }
 
-    fn tool_identity(&self, fallback: &str) -> (String, String) {
-        // Prefer the active tool whose event name matches; with parallel
-        // tools the "latest started" heuristic attributes progress to the
-        // wrong tool. A single active tool keeps the legacy fallback.
+    fn tool_identity(&self, call_id: &str, fallback: &str) -> (String, String) {
         self.active_tools
             .iter()
-            .find(|tool| tool.event_name == fallback)
-            .or_else(|| (self.active_tools.len() == 1).then(|| &self.active_tools[0]))
+            .find(|tool| tool.id == call_id)
             .map(|tool| (tool.id.clone(), tool.name.clone()))
-            .unwrap_or_else(|| {
-                (
-                    format!(
-                        "{}_tool_{}",
-                        self.run_id,
-                        self.tool_counter.saturating_add(1)
-                    ),
-                    real_tool_name(fallback).to_string(),
-                )
-            })
+            .unwrap_or_else(|| (call_id.to_string(), real_tool_name(fallback).to_string()))
     }
 }
 
@@ -952,7 +1209,7 @@ impl ApiError {
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(error = %error, "WebUI request failed");
+        tracing::error!(error = %error, "{}", t("WebUI request failed", "WebUI 请求失败"));
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
 }
@@ -974,10 +1231,17 @@ struct EventsQuery {
 }
 
 #[derive(Deserialize)]
+struct AttachmentQuery {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTurnRequest {
     content: String,
     mode: String,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
     /// Target session; defaults to the global current session. The turn runs
     /// there without moving the current pointer (per-view WebUI sessions).
     #[serde(default)]
@@ -988,9 +1252,48 @@ struct CreateTurnRequest {
 #[serde(deny_unknown_fields)]
 struct QueuePromptRequest {
     content: String,
+    run_id: String,
+    turn_id: String,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
     /// Target session; defaults to the global current session.
     #[serde(default)]
     session_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnUpdateMode {
+    Followup,
+    Supersede,
+}
+
+pub(crate) struct TurnUpdateRequest {
+    pub(crate) run_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) session_id: Option<Arc<str>>,
+    pub(crate) audience: PromptAudience,
+    pub(crate) content: String,
+    pub(crate) display_content: String,
+    pub(crate) attachments: Vec<crate::state::QueuedPromptAttachment>,
+    pub(crate) uploaded_attachment_ids: Vec<String>,
+    pub(crate) mode: TurnUpdateMode,
+}
+
+pub(crate) struct TurnUpdateReceipt {
+    pub(crate) run_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) session_id: Arc<str>,
+    pub(crate) prompt: QueuedPrompt,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedoTurnRequest {
+    expected_revision: i64,
+    input_id: String,
+    #[serde(default)]
+    content: Option<String>,
+    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -1005,10 +1308,155 @@ struct SetModelsRequest {
     models: Vec<ActiveProviderModelConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThinkingVariantUpdate {
+    provider_id: String,
+    model: String,
+    selected: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetThinkingVariantsRequest {
+    updates: Vec<ThinkingVariantUpdate>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginRequest {
     password: String,
+}
+
+const QQ_GROUP_MANAGEMENT_PLUGIN_ID: &str = "qq_group_management";
+const QQ_GROUP_MANAGEMENT_PLATFORM: &str = "onebot";
+
+#[derive(Deserialize)]
+struct QqGroupHistoryQuery {
+    account_id: String,
+    group_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QqGroupHistoryClearRequest {
+    account_id: String,
+    group_id: String,
+    kind: String,
+}
+
+fn qq_group_scope(
+    account_id: &str,
+    group_id: &str,
+) -> std::result::Result<PlatformPluginScopeKey, ApiError> {
+    if !valid_qq_id(account_id) || !valid_qq_id(group_id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "account_id and group_id must be numeric QQ ids",
+        ));
+    }
+    Ok(PlatformPluginScopeKey {
+        plugin_id: QQ_GROUP_MANAGEMENT_PLUGIN_ID.to_string(),
+        platform: QQ_GROUP_MANAGEMENT_PLATFORM.to_string(),
+        account_id: account_id.to_string(),
+        conversation_kind: "group".to_string(),
+        conversation_id: group_id.to_string(),
+    })
+}
+
+fn valid_qq_id(value: &str) -> bool {
+    (5..=12).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+async fn qq_group_history_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<QqGroupHistoryQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let scope = qq_group_scope(&query.account_id, &query.group_id)?;
+    let offenders = state
+        .state_store
+        .plugin_get_json::<Value>(&scope, "offender_history")
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| json!({}));
+    let kicks = state
+        .state_store
+        .plugin_get_json::<Value>(&scope, "kick_history")
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| json!([]));
+    let connected_accounts = state
+        .platforms
+        .onebot
+        .lock()
+        .unwrap()
+        .connected_accounts()
+        .into_iter()
+        .map(|account| account.to_string())
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "account_id": query.account_id,
+        "group_id": query.group_id,
+        "offenders": offenders.clone(),
+        "kicks": kicks.clone(),
+        "offender_history": offenders,
+        "kick_history": kicks,
+        "connected_accounts": connected_accounts,
+    }))
+    .into_response())
+}
+
+async fn qq_group_history_clear_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<QqGroupHistoryClearRequest>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let scope = qq_group_scope(&request.account_id, &request.group_id)?;
+    let key = match request.kind.as_str() {
+        "offenders" => "offender_history",
+        "kicks" => "kick_history",
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "kind must be offenders or kicks",
+            ))
+        }
+    };
+    state
+        .state_store
+        .plugin_delete_key(&scope, key)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+async fn qq_group_offender_delete_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<QqGroupHistoryQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    if !valid_qq_id(&user_id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "user_id must be a numeric QQ id",
+        ));
+    }
+    let scope = qq_group_scope(&query.account_id, &query.group_id)?;
+    state
+        .state_store
+        .plugin_update_json::<HashMap<String, Value>, _>(&scope, "offender_history", |current| {
+            let mut records = current.unwrap_or_default();
+            records.remove(&user_id);
+            Ok(if records.is_empty() {
+                None
+            } else {
+                Some(records)
+            })
+        })
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1113,6 +1561,7 @@ struct BootstrapResponse {
     /// Every turn currently running, across all sessions.
     runs: Vec<Value>,
     persona: PersonaIdentity,
+    redo_candidate: Option<SafeRedoCandidate>,
 }
 
 #[derive(Serialize)]
@@ -1120,6 +1569,7 @@ struct Capabilities {
     multi_conversation: bool,
     attachments: bool,
     queue: bool,
+    redo: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -1137,6 +1587,7 @@ pub(crate) struct SafeQueuedPrompt {
     id: String,
     content: String,
     submitted_at: String,
+    attachments: Vec<SafeUserAttachment>,
 }
 
 #[derive(Serialize)]
@@ -1165,6 +1616,33 @@ struct SafeTurn {
     question_exchanges: Vec<crate::question::QuestionExchange>,
     followups: Vec<SafeFollowup>,
     assets: Vec<SafeImageAsset>,
+    artifacts: Vec<SafeArtifactAsset>,
+    attachments: Vec<SafeUserAttachment>,
+    revision: i64,
+}
+
+#[derive(Serialize)]
+struct SafeRedoCandidate {
+    turn_id: String,
+    revision: i64,
+    input_id: String,
+    input_kind: &'static str,
+    content: String,
+}
+
+impl From<crate::state::RedoCandidate> for SafeRedoCandidate {
+    fn from(candidate: crate::state::RedoCandidate) -> Self {
+        Self {
+            turn_id: candidate.turn_id,
+            revision: candidate.revision,
+            input_id: candidate.input_id,
+            input_kind: match candidate.input_kind {
+                crate::state::RedoInputKind::Initial => "initial",
+                crate::state::RedoInputKind::Followup => "followup",
+            },
+            content: candidate.display_content,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1176,6 +1654,19 @@ struct SafeFollowup {
     preceding_assistant_reasoning: Option<String>,
     provider_id: Option<String>,
     model: Option<String>,
+    attachments: Vec<SafeUserAttachment>,
+}
+
+#[derive(Clone, Serialize)]
+struct SafeUserAttachment {
+    id: String,
+    url: String,
+    name: String,
+    mime: String,
+    kind: String,
+    size: u64,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Serialize)]
@@ -1187,6 +1678,18 @@ struct SafeImageAsset {
     height: u32,
     alt: String,
     hide_caption: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct SafeArtifactAsset {
+    id: String,
+    url: String,
+    name: String,
+    mime: String,
+    kind: String,
+    type_label: String,
+    size: u64,
+    updated_at: String,
 }
 
 #[derive(Serialize)]
@@ -1205,6 +1708,11 @@ struct ModelResponse {
     models: Vec<SafeModel>,
     display: WebDisplayConfig,
     context: ContextSnapshot,
+}
+
+#[derive(Serialize)]
+struct ThinkingVariantsResponse {
+    options: Vec<ThinkingVariantOptions>,
 }
 
 pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
@@ -1244,7 +1752,11 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         {
             tracing::warn!(
                 requested_port = args.port,
-                "Miyu WebUI default port is occupied; selecting an ephemeral port"
+                "{}",
+                t(
+                    "Miyu WebUI default port is occupied; selecting an ephemeral port",
+                    "Miyu WebUI 默认端口已被占用；将选择临时端口"
+                )
             );
             tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, 0))
                 .await
@@ -1270,6 +1782,9 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         )]),
     }));
     let turn_engine = TurnEngineState::default();
+    let memory_organizer = MemoryOrganizer::spawn()?;
+    let memory_organizer_handle = memory_organizer.handle();
+    memory_organizer_handle.wake(config.clone(), paths.clone(), state_store.clone());
     let (actor_tx, actor_join) = spawn_actor(
         config,
         paths.clone(),
@@ -1278,13 +1793,14 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         events.clone(),
         questions.clone(),
         turn_engine.clone(),
+        Some(memory_organizer_handle),
     )?;
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
     let state = DaemonState {
         auth: WebAuth::new(password.as_deref()),
         boot_id,
         web_port: port,
-        web_public: args.public,
+        web_public: true,
         paths,
         manager,
         state_store,
@@ -1310,26 +1826,29 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     }
     std::io::stdout().flush().ok();
 
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .into_future();
-    tokio::pin!(server);
-    let serve_result = tokio::select! {
-        result = &mut server => result,
-        _ = shutdown_signal() => Ok(()),
-        _ = shutdown_rx.recv() => Ok(()),
+    let serve_result = {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result,
+            _ = shutdown_signal() => Ok(()),
+            _ = shutdown_rx.recv() => Ok(()),
+        }
     };
     let _ = actor_tx.send(ActorCommand::Shutdown);
-    state.platforms.qq_listener.shutdown(&state);
+    state.platforms.qq_listener.shutdown(&state).await;
     ipc_task.abort();
     let _ = ipc_task.await;
-    drop(ipc_lease);
     let actor_result = tokio::task::spawn_blocking(move || actor_join.join())
         .await
         .context("joining WebUI actor task")?
         .map_err(|_| anyhow::anyhow!("WebUI actor thread panicked"))?;
+    memory_organizer.shutdown();
+    drop(ipc_lease);
     serve_result.context("serving Miyu WebUI")?;
     actor_result
 }
@@ -1411,7 +1930,11 @@ fn start_ipc_server(
             let (stream, _) = match listener.accept().await {
                 Ok(connection) => connection,
                 Err(error) => {
-                    tracing::warn!(error = %error, "Miyu IPC listener stopped");
+                    tracing::warn!(
+                        error = %error,
+                        "{}",
+                        t("Miyu IPC listener stopped", "Miyu IPC 监听器已停止")
+                    );
                     break;
                 }
             };
@@ -1423,7 +1946,14 @@ fn start_ipc_server(
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(error) = handle_ipc_connection(connection_state, stream).await {
-                    tracing::debug!(error = %error, "Miyu IPC connection closed with an error");
+                    tracing::debug!(
+                        error = %error,
+                        "{}",
+                        t(
+                            "Miyu IPC connection closed with an error",
+                            "Miyu IPC 连接因错误关闭"
+                        )
+                    );
                 }
             });
         }
@@ -1444,7 +1974,9 @@ async fn handle_ipc_connection(
     else {
         return Ok(());
     };
-    if request.version != ipc::PROTOCOL_VERSION {
+    if request.version != ipc::PROTOCOL_VERSION
+        && !matches!(&request.command, IpcCommand::Ping | IpcCommand::Shutdown)
+    {
         ipc::send(
             &mut stream,
             &IpcFrame::Error {
@@ -1500,10 +2032,54 @@ async fn handle_ipc_connection(
             )
             .await?;
         }
+        IpcCommand::GetSessionState { target } => {
+            let record = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record,
+                Err(message) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    return Ok(());
+                }
+            };
+            ipc::send(
+                &mut stream,
+                &IpcFrame::AdminResult {
+                    state: session_state_for(&state, &record.session_id)?,
+                    data: json!({}),
+                },
+            )
+            .await?;
+        }
         IpcCommand::ReloadConfig => {
             let current_config = state.manager.lock().unwrap().config.clone();
-            let next_config = AppConfig::load_or_default(&state.paths)?;
-            let prompts = read_prompt_documents(&next_config, &state.paths)?;
+            let next_config = match AppConfig::load_or_default(&state.paths) {
+                Ok(config) => config,
+                Err(error) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::Error {
+                            message: format!(
+                                "invalid configuration: {}",
+                                safe_error_message(error)
+                            ),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let prompts = match read_prompt_documents(&next_config, &state.paths) {
+                Ok(prompts) => prompts,
+                Err(error) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::Error {
+                            message: safe_error_message(error),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let qq_listener = match state
                 .platforms
                 .qq_listener
@@ -1530,7 +2106,16 @@ async fn handle_ipc_connection(
                     return Ok(());
                 }
             };
-            reserve_admin(&state.manager).map_err(|error| anyhow::anyhow!(error.message))?;
+            if let Err(error) = reserve_admin(&state.manager) {
+                ipc::send(
+                    &mut stream,
+                    &IpcFrame::Error {
+                        message: error.message,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
@@ -1544,19 +2129,39 @@ async fn handle_ipc_connection(
             {
                 release_admin(&state.manager);
                 let _ = current_config.save(&state.paths);
-                anyhow::bail!("Miyu core worker is unavailable");
+                ipc::send(
+                    &mut stream,
+                    &IpcFrame::Error {
+                        message: "Miyu core worker is unavailable".to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
             }
             match receiver.await {
                 Ok(Ok(())) => {
                     qq_listener.commit();
-                    ipc::send(
-                        &mut stream,
-                        &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
-                            data: json!({}),
-                        },
-                    )
-                    .await?
+                    match session_state(&state.manager, &state.state_store) {
+                        Ok(session) => {
+                            ipc::send(
+                                &mut stream,
+                                &IpcFrame::AdminResult {
+                                    state: session,
+                                    data: json!({}),
+                                },
+                            )
+                            .await?
+                        }
+                        Err(error) => {
+                            ipc::send(
+                                &mut stream,
+                                &IpcFrame::Error {
+                                    message: safe_error_message(error),
+                                },
+                            )
+                            .await?
+                        }
+                    }
                 }
                 Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
                     let _ = current_config.save(&state.paths);
@@ -1565,17 +2170,69 @@ async fn handle_ipc_connection(
                 Err(_) => {
                     release_admin(&state.manager);
                     let _ = current_config.save(&state.paths);
-                    anyhow::bail!("Miyu core stopped while reloading configuration");
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::Error {
+                            message: "Miyu core stopped while reloading configuration".to_string(),
+                        },
+                    )
+                    .await?
                 }
             }
         }
-        IpcCommand::ResetConversation { all } => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+        IpcCommand::ResetConversation { all, target } => {
+            let reset_shared_state = matches!(&target, ipc::SessionRef::Current);
+            let target_record = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record,
+                Err(message) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    return Ok(());
+                }
+            };
+            if all {
+                let config = state.manager.lock().unwrap().config.clone();
+                match reset_platform_persona_state(&state, &config).await {
+                    Ok(sessions) => {
+                        let target_state = session_state_for(&state, &target_record.session_id)?;
+                        ipc::send(
+                            &mut stream,
+                            &IpcFrame::AdminResult {
+                                state: target_state,
+                                data: json!({ "sessions": sessions }),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(PlatformPersonaResetError::Busy) => {
+                        ipc::send(
+                            &mut stream,
+                            &IpcFrame::Error {
+                                message: "Miyu is busy with another operation".to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(PlatformPersonaResetError::Unavailable) => {
+                        anyhow::bail!("Miyu core worker is unavailable");
+                    }
+                    Err(PlatformPersonaResetError::Internal(message)) => {
+                        ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    }
+                }
+                return Ok(());
+            }
+            let session_id: Arc<str> = target_record.session_id.into();
+            reserve_admin_for_session(&state.manager, &session_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
-                .send(ActorCommand::ResetConversation { all, reply })
+                .send(ActorCommand::ResetConversation {
+                    session_id: session_id.clone(),
+                    all,
+                    reset_shared_state,
+                    reply,
+                })
                 .is_err()
             {
                 release_admin(&state.manager);
@@ -1586,7 +2243,7 @@ async fn handle_ipc_connection(
                     ipc::send(
                         &mut stream,
                         &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
+                            state: session_state_for(&state, &session_id)?,
                             data: json!({}),
                         },
                     )
@@ -1601,11 +2258,26 @@ async fn handle_ipc_connection(
                 }
             }
         }
-        IpcCommand::Undo => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+        IpcCommand::Undo { target } => {
+            let record = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record,
+                Err(message) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    return Ok(());
+                }
+            };
+            let session_id: Arc<str> = record.session_id.into();
+            reserve_admin_for_session(&state.manager, &session_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
-            if state.actor_tx.send(ActorCommand::Undo { reply }).is_err() {
+            if state
+                .actor_tx
+                .send(ActorCommand::Undo {
+                    session_id: session_id.clone(),
+                    reply,
+                })
+                .is_err()
+            {
                 release_admin(&state.manager);
                 anyhow::bail!("Miyu core worker is unavailable");
             }
@@ -1614,7 +2286,7 @@ async fn handle_ipc_connection(
                     ipc::send(
                         &mut stream,
                         &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
+                            state: session_state_for(&state, &session_id)?,
                             data,
                         },
                     )
@@ -1629,13 +2301,25 @@ async fn handle_ipc_connection(
                 }
             }
         }
-        IpcCommand::Pop { turn_ids } => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+        IpcCommand::Pop { target, turn_ids } => {
+            let record = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record,
+                Err(message) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    return Ok(());
+                }
+            };
+            let session_id: Arc<str> = record.session_id.into();
+            reserve_admin_for_session(&state.manager, &session_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
-                .send(ActorCommand::Pop { turn_ids, reply })
+                .send(ActorCommand::Pop {
+                    session_id: session_id.clone(),
+                    turn_ids,
+                    reply,
+                })
                 .is_err()
             {
                 release_admin(&state.manager);
@@ -1646,7 +2330,7 @@ async fn handle_ipc_connection(
                     ipc::send(
                         &mut stream,
                         &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
+                            state: session_state_for(&state, &session_id)?,
                             data,
                         },
                     )
@@ -1661,13 +2345,24 @@ async fn handle_ipc_connection(
                 }
             }
         }
-        IpcCommand::Compact => {
-            reserve_admin_for_session(&state.manager, &state.state_store.session_id())
+        IpcCommand::Compact { target } => {
+            let record = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record,
+                Err(message) => {
+                    ipc::send(&mut stream, &IpcFrame::Error { message }).await?;
+                    return Ok(());
+                }
+            };
+            let session_id: Arc<str> = record.session_id.into();
+            reserve_admin_for_session(&state.manager, &session_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             let (reply, receiver) = oneshot::channel();
             if state
                 .actor_tx
-                .send(ActorCommand::Compact { reply })
+                .send(ActorCommand::Compact {
+                    session_id: session_id.clone(),
+                    reply,
+                })
                 .is_err()
             {
                 release_admin(&state.manager);
@@ -1678,7 +2373,7 @@ async fn handle_ipc_connection(
                     ipc::send(
                         &mut stream,
                         &IpcFrame::AdminResult {
-                            state: session_state(&state.manager, &state.state_store)?,
+                            state: session_state_for(&state, &session_id)?,
                             data,
                         },
                     )
@@ -1701,6 +2396,71 @@ async fn handle_ipc_connection(
             session_id,
         } => {
             handle_ipc_turn(&state, &mut stream, content, mode, images, cwd, session_id).await?;
+        }
+        IpcCommand::QueueTurnUpdate {
+            run_id,
+            turn_id,
+            content,
+            display_content,
+            images,
+            supersede,
+        } => {
+            let attachments = images
+                .into_iter()
+                .flatten()
+                .map(|image| match image {
+                    ImageAttachment::Binary { mime, data } => {
+                        crate::state::QueuedPromptAttachment::Binary {
+                            mime,
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+                        }
+                    }
+                    ImageAttachment::Path { path } => {
+                        crate::state::QueuedPromptAttachment::Path { path }
+                    }
+                })
+                .collect();
+            match enqueue_turn_update(
+                &state,
+                TurnUpdateRequest {
+                    run_id,
+                    turn_id,
+                    session_id: None,
+                    audience: PromptAudience::Owner,
+                    content,
+                    display_content,
+                    attachments,
+                    uploaded_attachment_ids: Vec::new(),
+                    mode: if supersede {
+                        TurnUpdateMode::Supersede
+                    } else {
+                        TurnUpdateMode::Followup
+                    },
+                },
+            ) {
+                Ok(receipt) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::TurnUpdateAccepted {
+                            run_id: receipt.run_id,
+                            turn_id: receipt.turn_id,
+                            prompt_id: receipt.prompt.prompt_id,
+                            seq: receipt.prompt.seq,
+                            submitted_at: receipt.prompt.submitted_at,
+                        },
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::Error {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await?;
+                }
+            }
         }
         IpcCommand::Cancel { run_id } => {
             let cancelled = {
@@ -1783,7 +2543,7 @@ async fn handle_session_command(
         IpcCommand::ListSessions { include_archived } => {
             let current = store.session_id();
             let sessions = store
-                .list_sessions(&persona, include_archived)
+                .list_local_sessions(&persona, include_archived)
                 .map_err(|error| safe_error_message(&error))?;
             let sessions: Vec<Value> = sessions
                 .iter()
@@ -1808,14 +2568,7 @@ async fn handle_session_command(
             Ok(json!({ "session": session_record_json(&record) }))
         }
         IpcCommand::SwitchSession { target } => {
-            let record = resolve_session_ref(state, &target)?;
-            if record.kind != "user" {
-                return Err(t(
-                    "only user sessions can be switched to",
-                    "只能切换到用户会话",
-                )
-                .to_string());
-            }
+            let record = resolve_local_session_ref(state, &target)?;
             if record.archived {
                 store
                     .set_session_archived(&record.session_id, false)
@@ -1825,7 +2578,7 @@ async fn handle_session_command(
             Ok(json!({ "session": session_record_json(&record) }))
         }
         IpcCommand::RenameSession { target, name } => {
-            let record = resolve_session_ref(state, &target)?;
+            let record = resolve_local_session_ref(state, &target)?;
             let name = name.trim();
             if name.is_empty() {
                 return Err(t("session name cannot be empty", "会话名称不能为空").to_string());
@@ -1840,7 +2593,7 @@ async fn handle_session_command(
             Ok(json!({}))
         }
         IpcCommand::ArchiveSession { target, archived } => {
-            let record = resolve_session_ref(state, &target)?;
+            let record = resolve_local_session_ref(state, &target)?;
             if archived
                 && state
                     .manager
@@ -1868,26 +2621,27 @@ async fn handle_session_command(
             Ok(json!({}))
         }
         IpcCommand::DeleteSession { target } => {
-            let record = resolve_session_ref(state, &target)?;
-            if state
-                .manager
-                .lock()
-                .unwrap()
-                .session_has_runs(&record.session_id)
-            {
-                return Err(t(
-                    "the session has a reply in progress",
-                    "该会话有回复正在进行",
-                )
-                .to_string());
-            }
+            let record = resolve_local_session_ref(state, &target)?;
+            reserve_admin_for_session(&state.manager, &record.session_id)
+                .map_err(|error| error.message)?;
             if &*store.session_id() == record.session_id.as_str() {
-                let fallback = fallback_session_id(state, &record.session_id)?;
-                switch_session_via_actor(state, fallback).await?;
+                let fallback = match fallback_session_id(state, &record.session_id) {
+                    Ok(fallback) => fallback,
+                    Err(error) => {
+                        release_admin(&state.manager);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = switch_session_via_actor_reserved(state, fallback).await {
+                    release_admin(&state.manager);
+                    return Err(error);
+                }
             }
-            store
+            let result = store
                 .delete_session(&record.session_id)
-                .map_err(|error| safe_error_message(&error))?;
+                .map_err(|error| safe_error_message(&error));
+            release_admin(&state.manager);
+            result?;
             state.events.publish(
                 "session.deleted",
                 json!({ "session_id": record.session_id }),
@@ -1895,7 +2649,7 @@ async fn handle_session_command(
             Ok(json!({}))
         }
         IpcCommand::SetWorkspace { target, path } => {
-            let record = resolve_session_ref(state, &target)?;
+            let record = resolve_local_session_ref(state, &target)?;
             let workspace = match path {
                 Some(path) => {
                     if !path.is_dir() {
@@ -1986,6 +2740,11 @@ struct CreateSessionRequest {
     name: Option<String>,
     #[serde(default)]
     switch: bool,
+}
+
+#[derive(Deserialize)]
+struct ResetConversationRequest {
+    session_id: Option<String>,
 }
 
 async fn create_session_http(
@@ -2101,6 +2860,13 @@ async fn session_turns_http(
             .or_default()
             .push(asset);
     }
+    let mut artifacts_by_turn = HashMap::<String, Vec<ArtifactAsset>>::new();
+    for artifact in store.load_artifact_assets().map_err(ApiError::internal)? {
+        artifacts_by_turn
+            .entry(artifact.turn_id.clone())
+            .or_default()
+            .push(artifact);
+    }
     let turns: Vec<SafeTurn> = store
         .load_turns()
         .map_err(ApiError::internal)?
@@ -2108,7 +2874,8 @@ async fn session_turns_http(
         .filter(|turn| !turn.is_summary)
         .map(|turn| {
             let assets = assets_by_turn.remove(&turn.turn_id).unwrap_or_default();
-            SafeTurn::from_turn(turn, assets)
+            let artifacts = artifacts_by_turn.remove(&turn.turn_id).unwrap_or_default();
+            SafeTurn::from_turn(turn, assets, artifacts)
         })
         .collect();
     let running_target = store
@@ -2135,15 +2902,27 @@ async fn session_turns_http(
                 "run_id": run_id,
                 "session_id": &*info.session_id,
                 "mode": mode_name(info.mode),
+                "operation": info.operation.name(),
+                "turn_id": info.operation.turn_id(),
+                "input_id": info.operation.input_id(),
             })
         })
         .collect();
+    let redo_candidate = if runs.is_empty() {
+        store
+            .redo_candidate()
+            .map_err(ApiError::internal)?
+            .map(SafeRedoCandidate::from)
+    } else {
+        None
+    };
     let mut response = Json(json!({
         "session_id": session_id,
         "turns": turns,
         "queued_prompts": queued_prompts,
         "running_turn_id": running_target.as_ref().map(|target| target.turn_id.as_str()),
         "runs": runs,
+        "redo_candidate": redo_candidate,
     }))
     .into_response();
     response
@@ -2170,11 +2949,12 @@ async fn delete_session_http(
     Ok(Json(data).into_response())
 }
 
-fn resolve_session_ref(
+fn resolve_local_session_ref(
     state: &DaemonState,
     target: &ipc::SessionRef,
 ) -> std::result::Result<crate::state::SessionRecord, String> {
     let store = &state.state_store;
+    let persona = active_persona_scope(state);
     let record = match target {
         ipc::SessionRef::Current => store
             .session_record(&store.session_id())
@@ -2183,10 +2963,30 @@ fn resolve_session_ref(
             .session_record(id)
             .map_err(|error| safe_error_message(&error))?,
         ipc::SessionRef::Name { name } => store
-            .find_session_by_name(&active_persona_scope(state), name)
+            .find_local_session_by_name(&persona, name)
             .map_err(|error| safe_error_message(&error))?,
     };
-    record.ok_or_else(|| t("session not found", "找不到该会话").to_string())
+    let Some(record) = record else {
+        return Err(t("session not found", "找不到该会话").to_string());
+    };
+    let is_platform = store
+        .is_platform_session(&record.session_id)
+        .map_err(|error| safe_error_message(&error))?;
+    if record.persona != persona || record.kind != "user" || is_platform {
+        return Err(t("session not found", "找不到该会话").to_string());
+    }
+    Ok(record)
+}
+
+fn resolve_available_local_session_ref(
+    state: &DaemonState,
+    target: &ipc::SessionRef,
+) -> std::result::Result<crate::state::SessionRecord, String> {
+    let record = resolve_local_session_ref(state, target)?;
+    if record.archived {
+        return Err(t("session is archived", "会话已归档").to_string());
+    }
+    Ok(record)
 }
 
 /// Most recently updated other unarchived user session, or a fresh default
@@ -2222,7 +3022,11 @@ async fn switch_session_via_actor(
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
-        .send(ActorCommand::SwitchSession { session_id, reply })
+        .send(ActorCommand::SwitchSession {
+            session_id,
+            release_reservation: true,
+            reply,
+        })
         .is_err()
     {
         release_admin(&state.manager);
@@ -2235,6 +3039,29 @@ async fn switch_session_via_actor(
             release_admin(&state.manager);
             Err("Miyu core stopped while switching sessions".to_string())
         }
+    }
+}
+
+async fn switch_session_via_actor_reserved(
+    state: &DaemonState,
+    session_id: String,
+) -> std::result::Result<(), String> {
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::SwitchSession {
+            session_id,
+            release_reservation: false,
+            reply,
+        })
+        .is_err()
+    {
+        return Err("Miyu core worker is unavailable".to_string());
+    }
+    match receiver.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => Err(message),
+        Err(_) => Err("Miyu core stopped while switching sessions".to_string()),
     }
 }
 
@@ -2267,18 +3094,10 @@ fn resolve_turn_session(
     match session_id {
         None => Ok(state.state_store.session_id()),
         Some(session_id) => {
-            let record = state
-                .state_store
-                .session_record(&session_id)
-                .map_err(|error| safe_error_message(&error))?
-                .ok_or_else(|| t("session not found", "找不到该会话").to_string())?;
-            if record.kind != "user" {
-                return Err(t(
-                    "turns can only run in user sessions",
-                    "只能在用户会话中发起对话",
-                )
-                .to_string());
-            }
+            let record = resolve_available_local_session_ref(
+                state,
+                &ipc::SessionRef::Id { id: session_id },
+            )?;
             Ok(record.session_id.into())
         }
     }
@@ -2342,7 +3161,13 @@ async fn handle_ipc_turn(
                 RunInfo {
                     session_id: session_id.clone(),
                     mode,
+                    audience: PromptAudience::Owner,
                     cancel: cancel_tx,
+                    turn_id: None,
+                    queue_target: None,
+                    supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                    platform_followup: None,
+                    operation: RunOperation::Create,
                 },
             );
             false
@@ -2366,10 +3191,13 @@ async fn handle_ipc_turn(
         .send(ActorCommand::StartTurn {
             run_id: run_id.clone(),
             session_id,
+            display_content: content.clone(),
             content,
+            attachment_run_id: None,
             mode,
             images,
             cwd,
+            audience: PromptAudience::Owner,
             profile: None,
             cancel: cancel_rx,
         })
@@ -2468,8 +3296,29 @@ fn router(state: DaemonState) -> Router {
             post(upload_persona_asset).layer(DefaultBodyLimit::max(PERSONA_ASSET_LIMIT)),
         )
         .route("/api/config", get(get_config).put(update_config))
+        .route(
+            "/api/qq-group-management/history",
+            get(qq_group_history_http),
+        )
+        .route(
+            "/api/qq-group-management/history/clear",
+            post(qq_group_history_clear_http),
+        )
+        .route(
+            "/api/qq-group-management/offenders/{user_id}",
+            delete(qq_group_offender_delete_http),
+        )
         .route("/api/events", get(events))
         .route("/api/assets/{asset_id}", get(image_asset))
+        .route("/api/artifacts/{asset_id}", get(artifact_asset))
+        .route(
+            "/api/attachments",
+            post(upload_user_attachment).layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),
+        )
+        .route(
+            "/api/attachments/{attachment_id}",
+            get(user_attachment).delete(delete_user_attachment),
+        )
         .route(
             "/api/platform-assets/{token}",
             get(platforms::platform_asset),
@@ -2487,12 +3336,24 @@ fn router(state: DaemonState) -> Router {
             post(activate_session_http),
         )
         .route("/api/sessions/{session_id}/turns", get(session_turns_http))
+        .route(
+            "/api/sessions/{session_id}/turns/{turn_id}/redo",
+            post(redo_turn),
+        )
         .route("/api/turns", post(create_turn))
         .route("/api/queue", post(queue_prompt))
-        .route("/api/queue/{prompt_id}", delete(remove_queue_prompt))
+        .route(
+            "/api/runs/{run_id}/turns/{turn_id}/queue/{prompt_id}",
+            delete(remove_queue_prompt),
+        )
         .route("/api/runs/{run_id}/cancel", post(cancel_run))
+        .route("/api/questions/{question_id}", delete(close_question))
         .route("/api/questions/{question_id}/answer", post(answer_question))
         .route("/api/models/active", put(set_models))
+        .route(
+            "/api/models/thinking-variants",
+            get(get_thinking_variants).put(set_thinking_variants),
+        )
         .route("/api/conversation/reset", post(reset_conversation))
         // OneBot v11 reverse-WS endpoint: NapCat connects here as a WS
         // client. Gated by platforms.qq config, not web auth.
@@ -2550,11 +3411,12 @@ async fn persona_avatar(
         (manager.config.clone(), prompts)
     };
     let path = if let Some(path) = query.get("path").filter(|p| !p.is_empty()) {
-        if std::path::Path::new(path).is_absolute() {
-            std::path::PathBuf::from(path)
-        } else {
-            state.paths.config_dir.join(path)
-        }
+        managed_persona_asset_path(&state.paths, path).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid managed persona asset path",
+            )
+        })?
     } else if query.contains_key("board") {
         active_persona_board_path(&config, &prompts, &state.paths)
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "persona board image not found"))?
@@ -2566,6 +3428,10 @@ async fn persona_avatar(
             "persona avatar not found",
         ));
     };
+    if path.starts_with(state.paths.persona_avatars_dir()) {
+        validate_managed_persona_asset_file(&state.paths, &path)
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "persona avatar not found"))?;
+    }
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "persona avatar not found"))?;
@@ -2635,16 +3501,21 @@ async fn upload_persona_asset(
     };
     let hash = format!("{:x}", Sha256::digest(&body));
     let relative = format!("persona-avatars/{hash}.{extension}");
-    let directory = state.paths.config_dir.join("persona-avatars");
-    let destination = state.paths.config_dir.join(&relative);
-    tokio::fs::create_dir_all(directory)
+    let directory = state.paths.persona_avatars_dir();
+    let destination = directory.join(format!("{hash}.{extension}"));
+    tokio::fs::create_dir_all(&directory)
         .await
         .map_err(ApiError::internal)?;
-    if !destination.exists() {
-        tokio::fs::write(&destination, &body)
-            .await
-            .map_err(ApiError::internal)?;
+    let directory_metadata = tokio::fs::symlink_metadata(&directory)
+        .await
+        .map_err(ApiError::internal)?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "persona asset directory is unsafe",
+        ));
     }
+    store_persona_asset(&directory, &destination, &hash, &body).await?;
     let config = state.manager.lock().unwrap().config.clone();
     if let Ok(prompts) = read_prompt_documents(&config, &state.paths) {
         cleanup_persona_assets(&state.paths, &prompts, &prompts);
@@ -2653,6 +3524,86 @@ async fn upload_persona_asset(
         "path": relative,
         "preview_url": format!("/api/persona/avatar?path={relative}"),
     })))
+}
+
+async fn store_persona_asset(
+    directory: &FilePath,
+    destination: &FilePath,
+    expected_hash: &str,
+    body: &[u8],
+) -> std::result::Result<(), ApiError> {
+    let replace_corrupt = match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            match verify_persona_asset_hash(destination, expected_hash).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.status == StatusCode::CONFLICT => true,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(_) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "persona asset destination is unsafe",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+
+    let temporary = directory.join(format!(
+        ".upload-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await
+        .map_err(ApiError::internal)?;
+    let write_result = async {
+        file.write_all(body).await?;
+        file.sync_all().await?;
+        if replace_corrupt {
+            tokio::fs::rename(&temporary, destination).await
+        } else {
+            tokio::fs::hard_link(&temporary, destination).await
+        }
+    }
+    .await;
+    match write_result {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            let directory = tokio::fs::File::open(directory)
+                .await
+                .map_err(ApiError::internal)?;
+            directory.sync_all().await.map_err(ApiError::internal)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            verify_persona_asset_hash(destination, expected_hash).await
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            Err(ApiError::internal(error))
+        }
+    }
+}
+
+async fn verify_persona_asset_hash(
+    path: &FilePath,
+    expected_hash: &str,
+) -> std::result::Result<(), ApiError> {
+    let bytes = tokio::fs::read(path).await.map_err(ApiError::internal)?;
+    if bytes.len() > PERSONA_ASSET_LIMIT || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "persona asset cache entry is corrupted",
+        ));
+    }
+    Ok(())
 }
 
 fn text_asset(content: &'static str, content_type: &'static str) -> Response {
@@ -2797,6 +3748,9 @@ async fn bootstrap(
                     "run_id": run_id,
                     "session_id": &*info.session_id,
                     "mode": mode_name(info.mode),
+                    "operation": info.operation.name(),
+                    "turn_id": info.operation.turn_id(),
+                    "input_id": info.operation.input_id(),
                 })
             })
             .collect();
@@ -2826,6 +3780,17 @@ async fn bootstrap(
             .or_default()
             .push(asset);
     }
+    let mut artifacts_by_turn = HashMap::<String, Vec<ArtifactAsset>>::new();
+    for artifact in state
+        .state_store
+        .load_artifact_assets()
+        .map_err(ApiError::internal)?
+    {
+        artifacts_by_turn
+            .entry(artifact.turn_id.clone())
+            .or_default()
+            .push(artifact);
+    }
     let turns = state
         .state_store
         .load_turns()
@@ -2834,7 +3799,8 @@ async fn bootstrap(
         .filter(|turn| !turn.is_summary)
         .map(|turn| {
             let assets = assets_by_turn.remove(&turn.turn_id).unwrap_or_default();
-            SafeTurn::from_turn(turn, assets)
+            let artifacts = artifacts_by_turn.remove(&turn.turn_id).unwrap_or_default();
+            SafeTurn::from_turn(turn, assets, artifacts)
         })
         .collect();
     let usage = state
@@ -2870,6 +3836,15 @@ async fn bootstrap(
         &config,
         &read_prompt_documents(&config, &state.paths).map_err(ApiError::internal)?,
     );
+    let redo_candidate = if active_run_id.is_none() {
+        state
+            .state_store
+            .redo_candidate()
+            .map_err(ApiError::internal)?
+            .map(SafeRedoCandidate::from)
+    } else {
+        None
+    };
     let mut response = Json(BootstrapResponse {
         version: env!("CARGO_PKG_VERSION"),
         boot_id: state.boot_id.to_string(),
@@ -2885,13 +3860,15 @@ async fn bootstrap(
         usage,
         capabilities: Capabilities {
             multi_conversation: true,
-            attachments: false,
+            attachments: true,
             queue: true,
+            redo: true,
         },
         sessions,
         current_session_id,
         runs,
         persona,
+        redo_candidate,
     })
     .into_response();
     response
@@ -2933,6 +3910,8 @@ async fn update_config(
             format!("invalid configuration: {}", safe_error_message(error)),
         )
     })?;
+    reconcile_qq_persona_references(&mut candidate, &request.prompts);
+    candidate.normalize_platform_model_routes();
     restore_config_secrets(&mut candidate, &current, &request.secrets)?;
     validate_config_candidate(&candidate)?;
     validate_prompt_documents(&candidate, &request.prompts)?;
@@ -2975,7 +3954,11 @@ async fn update_config(
             return Err(ApiError::new(StatusCode::BAD_REQUEST, message));
         }
         Ok(Err(AdminFailure::Internal(message))) => {
-            tracing::error!(error = %message, "WebUI configuration update failed");
+            tracing::error!(
+                error = %message,
+                "{}",
+                t("WebUI configuration update failed", "WebUI 配置更新失败")
+            );
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 safe_error_message(&message),
@@ -3003,7 +3986,7 @@ fn cleanup_persona_assets(
     previous: &PromptDocuments,
     current: &PromptDocuments,
 ) {
-    let directory = paths.config_dir.join("persona-avatars");
+    let directory = paths.persona_avatars_dir();
     let Ok(entries) = std::fs::read_dir(&directory) else {
         return;
     };
@@ -3018,8 +4001,12 @@ fn cleanup_persona_assets(
                 ]
             })
             .flatten()
-            .filter(|path| path.starts_with("persona-avatars/"))
-            .map(|path| path.trim_start_matches("persona-avatars/").to_string())
+            .filter_map(|path| resolve_persona_asset_path(paths, path))
+            .filter_map(|path| {
+                path.strip_prefix(&directory)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().to_string())
+            })
             .collect::<HashSet<_>>()
     };
     let previous = referenced(previous);
@@ -3034,6 +4021,18 @@ fn cleanup_persona_assets(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
+        if name.starts_with(".upload-") {
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
         let bytes = name.as_bytes();
         let managed_name = bytes.len() >= 68
             && bytes[64] == b'.'
@@ -3043,12 +4042,6 @@ fn cleanup_persona_assets(
             continue;
         }
         let old_reference = previous.contains(&name);
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= std::time::Duration::from_secs(24 * 60 * 60));
         if old_reference || stale {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -3095,6 +4088,301 @@ async fn image_asset(
         .headers_mut()
         .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     Ok(response)
+}
+
+async fn artifact_asset(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    if asset_id.len() > 96
+        || asset_id.is_empty()
+        || !asset_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "artifact not found"));
+    }
+    let Some(artifact) = state
+        .state_store
+        .load_artifact_asset(&asset_id)
+        .map_err(ApiError::internal)?
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "artifact not found"));
+    };
+    let inline = matches!(
+        artifact.asset.kind.as_str(),
+        "markdown" | "text" | "code" | "json" | "pdf" | "html"
+    );
+    let disposition = format!(
+        "{}; filename*=UTF-8''{}",
+        if inline { "inline" } else { "attachment" },
+        urlencoding::encode(&artifact.asset.file_name)
+    );
+    let mut response = artifact.bytes.into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.asset.mime).map_err(ApiError::internal)?,
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(ApiError::internal)?,
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if artifact.asset.kind == "html" {
+        response.headers_mut().insert(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:",
+            ),
+        );
+    }
+    Ok(response)
+}
+
+async fn upload_user_attachment(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<AttachmentQuery>,
+    body: Bytes,
+) -> std::result::Result<Json<SafeUserAttachment>, ApiError> {
+    require_mutation(&headers, &state)?;
+    let session_id =
+        resolve_turn_session(&state, Some(query.session_id)).map_err(session_api_error)?;
+    if body.is_empty() || body.len() > ATTACHMENT_BODY_LIMIT {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachment must be between 1 byte and 10 MiB",
+        ));
+    }
+    let encoded_name = headers
+        .get("x-miyu-filename")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "attachment filename is required"))?;
+    let decoded_name = urlencoding::decode(encoded_name)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "attachment filename is invalid"))?;
+    let file_name = sanitize_attachment_file_name(&decoded_name)?;
+    let (kind, mime, width, height) = inspect_user_attachment(&file_name, &body)?;
+    let attachment = UserAttachment {
+        attachment_id: random_id("att", 24),
+        file_name,
+        mime,
+        kind,
+        size_bytes: body.len() as u64,
+        width,
+        height,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let store = state.state_store.pinned(&session_id);
+    store
+        .purge_stale_user_attachments()
+        .map_err(ApiError::internal)?;
+    store
+        .save_user_attachment(&attachment, &body)
+        .map_err(ApiError::internal)?;
+    Ok(Json(SafeUserAttachment::from(attachment)))
+}
+
+async fn user_attachment(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    validate_attachment_id(&attachment_id)?;
+    let Some(attachment) = state
+        .state_store
+        .load_user_attachment_by_id(&attachment_id)
+        .map_err(ApiError::internal)?
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "attachment not found"));
+    };
+    let inline = attachment.attachment.kind == "image";
+    let mut response = attachment.bytes.into_response();
+    let content_type = if inline {
+        attachment.attachment.mime.as_str()
+    } else {
+        "application/octet-stream"
+    };
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type).map_err(ApiError::internal)?,
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&attachment.attachment.size_bytes.to_string())
+            .map_err(ApiError::internal)?,
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        attachment_content_disposition(&attachment.attachment.file_name, inline)?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    Ok(response)
+}
+
+async fn delete_user_attachment(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<AttachmentQuery>,
+    Path(attachment_id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    require_mutation(&headers, &state)?;
+    validate_attachment_id(&attachment_id)?;
+    let session_id =
+        resolve_turn_session(&state, Some(query.session_id)).map_err(session_api_error)?;
+    let deleted = state
+        .state_store
+        .pinned(&session_id)
+        .delete_staged_user_attachment(&attachment_id)
+        .map_err(ApiError::internal)?;
+    if !deleted {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "attachment not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_attachment_id(attachment_id: &str) -> std::result::Result<(), ApiError> {
+    if attachment_id.len() <= 96
+        && !attachment_id.is_empty()
+        && attachment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, "attachment not found"))
+}
+
+fn sanitize_attachment_file_name(value: &str) -> std::result::Result<String, ApiError> {
+    let name = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(180)
+        .collect::<String>();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "attachment filename is invalid",
+        ));
+    }
+    Ok(name)
+}
+
+fn inspect_user_attachment(
+    file_name: &str,
+    bytes: &[u8],
+) -> std::result::Result<(String, String, u32, u32), ApiError> {
+    if let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
+        if let Some(format) = reader.format() {
+            if matches!(
+                format,
+                image::ImageFormat::Png
+                    | image::ImageFormat::Jpeg
+                    | image::ImageFormat::WebP
+                    | image::ImageFormat::Gif
+            ) {
+                let (width, height) = reader.into_dimensions().map_err(|_| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "attachment image is invalid")
+                })?;
+                if width == 0
+                    || height == 0
+                    || width > 40_000
+                    || height > 40_000
+                    || u64::from(width) * u64::from(height) > 40_000_000
+                {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "attachment image dimensions are outside the safety limit",
+                    ));
+                }
+                return Ok((
+                    "image".to_string(),
+                    format.to_mime_type().to_string(),
+                    width,
+                    height,
+                ));
+            }
+        }
+    }
+    if bytes.len() > MAX_TEXT_ATTACHMENT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "text attachment exceeds the 1 MiB limit",
+        ));
+    }
+    std::str::from_utf8(bytes).map_err(|_| {
+        ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "attachment is not UTF-8 text",
+        )
+    })?;
+    let extension = FilePath::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const TEXT_EXTENSIONS: &[&str] = &[
+        "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "log", "rs", "js", "jsx", "ts",
+        "tsx", "py", "go", "java", "c", "cc", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "kt",
+        "kts", "sh", "bash", "zsh", "fish", "toml", "yaml", "yml", "xml", "html", "css", "scss",
+        "sql",
+    ];
+    if !TEXT_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported attachment type",
+        ));
+    }
+    let mime = match extension.as_str() {
+        "md" | "markdown" => "text/markdown",
+        "json" | "jsonl" => "application/json",
+        "csv" => "text/csv",
+        "html" => "text/html",
+        "css" => "text/css",
+        _ => "text/plain",
+    };
+    Ok(("text".to_string(), mime.to_string(), 0, 0))
+}
+
+fn attachment_content_disposition(
+    file_name: &str,
+    inline: bool,
+) -> std::result::Result<HeaderValue, ApiError> {
+    let fallback = file_name
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+        .take(80)
+        .collect::<String>();
+    let fallback = if fallback.is_empty() {
+        "attachment"
+    } else {
+        &fallback
+    };
+    let disposition = if inline { "inline" } else { "attachment" };
+    let value = format!(
+        "{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        urlencoding::encode(file_name)
+    );
+    HeaderValue::from_str(&value).map_err(ApiError::internal)
 }
 
 async fn events(
@@ -3167,62 +4455,328 @@ fn record_to_sse(record: EventRecord) -> Event {
         .data(record.data)
 }
 
-pub(crate) fn enqueue_running_prompt(
+pub(crate) fn enqueue_turn_update(
     state: &DaemonState,
-    store: &StateStore,
-    session_id: &str,
-    content: &str,
-    attachments: &[crate::state::QueuedPromptAttachment],
-) -> std::result::Result<(Option<String>, Option<String>, SafeQueuedPrompt), ApiError> {
-    let active_run_id = {
-        let manager = state.manager.lock().unwrap();
-        if manager.admin_busy {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "Miyu is busy with another operation",
-            ));
-        }
-        manager.run_in_session(session_id).cloned()
-    };
-    let prompt_id = random_id("queued", 18);
-    store.recover_stale_turns().map_err(ApiError::internal)?;
-    let target = store
-        .running_turn_queue_target()
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "there is no active reply to follow up",
-            )
-        })?;
-    if target.queue_session_id.is_none() || target.owner_pid.is_none() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "the running turn cannot accept messages from this WebUI",
-        ));
+    request: TurnUpdateRequest,
+) -> Result<TurnUpdateReceipt> {
+    let manager = state.manager.lock().unwrap();
+    if manager.admin_busy {
+        bail!("Miyu is busy with another operation");
     }
-    let prompt = store
-        .enqueue_prompt_for_target(&target, &prompt_id, content, content, attachments)
-        .map_err(ApiError::internal)?;
-    // Turns run with per-turn queue identities, so follow-ups always route
-    // via the running turn's recorded queue target.
-    Ok((
-        active_run_id,
-        Some(target.turn_id),
-        SafeQueuedPrompt::from(prompt),
-    ))
-}
-
-pub(crate) fn publish_queued_prompt(
-    state: &DaemonState,
-    run_id: Option<&str>,
-    turn_id: Option<&str>,
-    prompt: &SafeQueuedPrompt,
-) {
+    let run = manager
+        .active_runs
+        .get(&request.run_id)
+        .context("active run not found")?;
+    if run.audience != request.audience {
+        bail!("the active reply belongs to a different request source");
+    }
+    if request
+        .session_id
+        .as_deref()
+        .is_some_and(|session_id| session_id != &*run.session_id)
+    {
+        bail!("the active reply belongs to a different conversation");
+    }
+    if run.turn_id.as_deref() != Some(request.turn_id.as_str()) {
+        bail!("the active run no longer owns the requested turn");
+    }
+    let target = run
+        .queue_target
+        .clone()
+        .context("the active turn is not ready to accept follow-up messages")?;
+    if target.turn_id != request.turn_id {
+        bail!("the active run queue target changed");
+    }
+    let session_id = run.session_id.clone();
+    let supersede = run.supersede.clone();
+    let prompt_id = random_id("queued", 18);
+    let store = state.state_store.pinned(&session_id);
+    store.recover_stale_turns()?;
+    let prompt = store.enqueue_prompt_for_target_with_uploads(
+        &target,
+        &prompt_id,
+        &request.content,
+        &request.display_content,
+        &request.attachments,
+        &request.uploaded_attachment_ids,
+    )?;
+    if request.mode == TurnUpdateMode::Supersede {
+        supersede.trigger();
+    }
     state.events.publish(
         "queue.added",
-        json!({ "run_id": run_id, "turn_id": turn_id, "prompt": prompt }),
+        json!({
+            "session_id": &*session_id,
+            "run_id": request.run_id,
+            "turn_id": request.turn_id,
+            "mode": match request.mode {
+                TurnUpdateMode::Followup => "followup",
+                TurnUpdateMode::Supersede => "supersede",
+            },
+            "prompt": SafeQueuedPrompt::from(prompt.clone()),
+        }),
     );
+    Ok(TurnUpdateReceipt {
+        run_id: request.run_id,
+        turn_id: request.turn_id,
+        session_id,
+        prompt,
+    })
+}
+
+struct PreparedWebAttachments {
+    content: String,
+    images: Vec<Option<ImageAttachment>>,
+}
+
+pub(crate) struct RedoWebPrompt {
+    prompt_id: String,
+    content: String,
+    display_content: String,
+    images: Vec<Option<ImageAttachment>>,
+}
+
+fn prepare_web_attachments(
+    store: &StateStore,
+    display_content: &str,
+    attachment_ids: &[String],
+) -> std::result::Result<PreparedWebAttachments, ApiError> {
+    if attachment_ids.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("a message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments"),
+        ));
+    }
+    let unique = attachment_ids.iter().collect::<HashSet<_>>();
+    if unique.len() != attachment_ids.len()
+        || attachment_ids
+            .iter()
+            .any(|id| validate_attachment_id(id).is_err())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "attachment ids are invalid",
+        ));
+    }
+    let attachments = store
+        .load_staged_user_attachments(attachment_ids)
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    prepare_web_attachment_data(display_content, attachments)
+}
+
+fn prepare_web_attachment_data(
+    display_content: &str,
+    attachments: Vec<crate::state::UserAttachmentData>,
+) -> std::result::Result<PreparedWebAttachments, ApiError> {
+    if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("a message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments"),
+        ));
+    }
+    let total_bytes = attachments
+        .iter()
+        .map(|attachment| attachment.attachment.size_bytes)
+        .sum::<u64>();
+    if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachments exceed the 32 MiB per-message limit",
+        ));
+    }
+    let mut content = if display_content.is_empty() {
+        "请查看附件。".to_string()
+    } else {
+        display_content.to_string()
+    };
+    let mut images = Vec::new();
+    for attachment in attachments {
+        if attachment.attachment.kind == "image" {
+            images.push(Some(ImageAttachment::Binary {
+                mime: attachment.attachment.mime,
+                data: attachment.bytes,
+            }));
+            continue;
+        }
+        let text = std::str::from_utf8(&attachment.bytes)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "text attachment is not UTF-8"))?;
+        let name = escape_attachment_attribute(&attachment.attachment.file_name);
+        let mime = escape_attachment_attribute(&attachment.attachment.mime);
+        content.push_str(&format!(
+            "\n\n<user-attachment name=\"{name}\" mime=\"{mime}\">\n{text}\n</user-attachment>"
+        ));
+    }
+    Ok(PreparedWebAttachments { content, images })
+}
+
+fn escape_attachment_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn validate_message_content(
+    content: String,
+    has_attachments: bool,
+) -> std::result::Result<String, ApiError> {
+    if content.trim().is_empty() && has_attachments {
+        return Ok(String::new());
+    }
+    validate_content(content)
+}
+
+async fn redo_turn(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path((session_id, turn_id)): Path<(String, String)>,
+    Json(request): Json<RedoTurnRequest>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
+    let mode = parse_mode(&request.mode)?;
+    let store = state.state_store.pinned_for_turn(&session_id);
+    let candidate = store
+        .redo_candidate()
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "the last input cannot be redone"))?;
+    if candidate.turn_id != turn_id
+        || candidate.input_id != request.input_id
+        || candidate.revision != request.expected_revision
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "the conversation changed before redo could start",
+        ));
+    }
+
+    let mut prompts = Vec::new();
+    match candidate.input_kind {
+        crate::state::RedoInputKind::Initial => {
+            let attachments = store
+                .load_user_attachment_data_for_turn(&turn_id)
+                .map_err(ApiError::internal)?;
+            let display_content = validate_message_content(
+                request
+                    .content
+                    .unwrap_or_else(|| candidate.display_content.clone()),
+                !attachments.is_empty(),
+            )?;
+            let prepared = prepare_web_attachment_data(&display_content, attachments)?;
+            prompts.push(RedoWebPrompt {
+                prompt_id: candidate.input_id.clone(),
+                content: prepared.content,
+                display_content,
+                images: prepared.images,
+            });
+        }
+        crate::state::RedoInputKind::Followup => {
+            let batch = store
+                .load_redo_batch_prompts(&turn_id, &candidate.batch_prompt_ids)
+                .map_err(ApiError::internal)?;
+            for prompt in batch {
+                if !prompt.attachments.is_empty() {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        "this follow-up uses non-durable attachments and cannot be redone",
+                    ));
+                }
+                let attachments = store
+                    .load_user_attachment_data_for_prompt(&prompt.prompt_id)
+                    .map_err(ApiError::internal)?;
+                let display_content = if prompt.prompt_id == candidate.input_id {
+                    validate_message_content(
+                        request
+                            .content
+                            .clone()
+                            .unwrap_or_else(|| prompt.display_content.clone()),
+                        !attachments.is_empty(),
+                    )?
+                } else {
+                    prompt.display_content
+                };
+                let prepared = prepare_web_attachment_data(&display_content, attachments)?;
+                prompts.push(RedoWebPrompt {
+                    prompt_id: prompt.prompt_id,
+                    content: prepared.content,
+                    display_content,
+                    images: prepared.images,
+                });
+            }
+        }
+    }
+
+    let run_id = random_id("run", 18);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut manager = state.manager.lock().unwrap();
+        if manager.admin_busy || manager.session_has_runs(&session_id) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "Miyu is busy in this conversation",
+            ));
+        }
+        manager.active_runs.insert(
+            run_id.clone(),
+            RunInfo {
+                session_id: session_id.clone().into(),
+                mode,
+                audience: PromptAudience::External,
+                cancel: cancel_tx,
+                turn_id: Some(turn_id.clone()),
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Redo {
+                    turn_id: turn_id.clone(),
+                    input_id: candidate.input_id.clone(),
+                },
+            },
+        );
+    }
+    if state
+        .actor_tx
+        .send(ActorCommand::RedoTurn {
+            run_id: run_id.clone(),
+            session_id: session_id.into(),
+            candidate,
+            prompts,
+            mode,
+            cancel: cancel_rx,
+        })
+        .is_err()
+    {
+        finish_run(&state.manager, &run_id, None);
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent worker is unavailable",
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "run_id": run_id,
+            "turn_id": turn_id,
+            "operation": "redo",
+        })),
+    )
+        .into_response())
+}
+
+fn unique_run_target(
+    manager: &ManagerState,
+    session_id: &str,
+    audience: PromptAudience,
+) -> Option<(String, String)> {
+    let mut runs = manager.active_runs.iter().filter(|(_, run)| {
+        &*run.session_id == session_id && run.audience == audience && run.turn_id.is_some()
+    });
+    let (run_id, run) = runs.next()?;
+    if runs.next().is_some() {
+        return None;
+    }
+    Some((run_id.clone(), run.turn_id.clone()?))
 }
 
 async fn create_turn(
@@ -3231,7 +4785,8 @@ async fn create_turn(
     Json(request): Json<CreateTurnRequest>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
-    let content = validate_content(request.content)?;
+    let attachment_ids = request.attachment_ids;
+    let display_content = validate_message_content(request.content, !attachment_ids.is_empty())?;
     let mode = parse_mode(&request.mode)?;
     let session_id = resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
     state
@@ -3241,20 +4796,50 @@ async fn create_turn(
     // A running turn in the *target* session gets the message as a queued
     // follow-up (composer tray UX); other sessions run in parallel.
     let target_store = state.state_store.pinned(&session_id);
+    let prepared = prepare_web_attachments(&target_store, &display_content, &attachment_ids)?;
     if target_store
         .has_running_turns()
         .map_err(ApiError::internal)?
+        && state
+            .manager
+            .lock()
+            .unwrap()
+            .session_runs_match_audience(&session_id, PromptAudience::External)
     {
-        let (run_id, turn_id, prompt) =
-            enqueue_running_prompt(&state, &target_store, &session_id, &content, &[])?;
-        publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &prompt);
+        let (run_id, turn_id) = unique_run_target(
+            &state.manager.lock().unwrap(),
+            &session_id,
+            PromptAudience::External,
+        )
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "the running turn is not ready or is ambiguous",
+            )
+        })?;
+        let receipt = enqueue_turn_update(
+            &state,
+            TurnUpdateRequest {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                session_id: Some(session_id.clone()),
+                audience: PromptAudience::External,
+                content: prepared.content,
+                display_content,
+                attachments: Vec::new(),
+                uploaded_attachment_ids: attachment_ids,
+                mode: TurnUpdateMode::Followup,
+            },
+        )
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+        let prompt = SafeQueuedPrompt::from(receipt.prompt);
         return Ok((
             StatusCode::ACCEPTED,
             Json(json!({
                 "queued": true,
                 "prompt": prompt,
-                "run_id": run_id,
-                "running_turn_id": turn_id,
+                "run_id": receipt.run_id,
+                "running_turn_id": receipt.turn_id,
             })),
         )
             .into_response());
@@ -3263,10 +4848,10 @@ async fn create_turn(
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     {
         let mut manager = state.manager.lock().unwrap();
-        if manager.admin_busy {
+        if manager.admin_busy || manager.session_has_runs(&session_id) {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "Miyu is busy with another operation",
+                "Miyu is busy in this conversation",
             ));
         }
         manager.active_runs.insert(
@@ -3274,24 +4859,38 @@ async fn create_turn(
             RunInfo {
                 session_id: session_id.clone(),
                 mode,
+                audience: PromptAudience::External,
                 cancel: cancel_tx,
+                turn_id: None,
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Create,
             },
         );
+    }
+    if let Err(error) = target_store.reserve_user_attachments(&attachment_ids, &run_id) {
+        finish_run(&state.manager, &run_id, None);
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, error.to_string()));
     }
     if state
         .actor_tx
         .send(ActorCommand::StartTurn {
             run_id: run_id.clone(),
             session_id,
-            content,
+            display_content,
+            content: prepared.content,
+            attachment_run_id: (!attachment_ids.is_empty()).then_some(run_id.clone()),
             mode,
-            images: Vec::new(),
+            images: prepared.images,
             cwd: None,
+            audience: PromptAudience::External,
             profile: None,
             cancel: cancel_rx,
         })
         .is_err()
     {
+        let _ = target_store.release_user_attachments_for_run(&run_id);
         finish_run(&state.manager, &run_id, None);
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3307,19 +4906,34 @@ async fn queue_prompt(
     Json(request): Json<QueuePromptRequest>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
-    let content = validate_content(request.content)?;
+    let attachment_ids = request.attachment_ids;
+    let display_content = validate_message_content(request.content, !attachment_ids.is_empty())?;
     let session_id = resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
     let store = state.state_store.pinned(&session_id);
-    let (run_id, turn_id, safe) =
-        enqueue_running_prompt(&state, &store, &session_id, &content, &[])?;
-    publish_queued_prompt(&state, run_id.as_deref(), turn_id.as_deref(), &safe);
+    let prepared = prepare_web_attachments(&store, &display_content, &attachment_ids)?;
+    let receipt = enqueue_turn_update(
+        &state,
+        TurnUpdateRequest {
+            run_id: request.run_id,
+            turn_id: request.turn_id,
+            session_id: Some(session_id),
+            audience: PromptAudience::External,
+            content: prepared.content,
+            display_content,
+            attachments: Vec::new(),
+            uploaded_attachment_ids: attachment_ids,
+            mode: TurnUpdateMode::Followup,
+        },
+    )
+    .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    let safe = SafeQueuedPrompt::from(receipt.prompt);
     Ok((StatusCode::ACCEPTED, Json(safe)).into_response())
 }
 
 async fn remove_queue_prompt(
     State(state): State<DaemonState>,
     headers: HeaderMap,
-    Path(prompt_id): Path<String>,
+    Path((run_id, turn_id, prompt_id)): Path<(String, String, String)>,
 ) -> std::result::Result<StatusCode, ApiError> {
     require_mutation(&headers, &state)?;
     if prompt_id.len() > 96
@@ -3333,38 +4947,40 @@ async fn remove_queue_prompt(
             "queued prompt not found",
         ));
     }
-    let current_session = state.state_store.session_id();
-    let run_id = state
-        .manager
-        .lock()
-        .unwrap()
-        .run_in_session(&current_session)
-        .cloned();
-    let target = state
+    let manager = state.manager.lock().unwrap();
+    let run = manager
+        .active_runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "queued prompt target not found"))?;
+    if run.audience != PromptAudience::External || run.turn_id.as_deref() != Some(&turn_id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "queued prompt target not found",
+        ));
+    }
+    let target = run
+        .queue_target
+        .clone()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "the active turn is not ready"))?;
+    let session_id = run.session_id.clone();
+    drop(manager);
+    let removed = state
         .state_store
-        .running_turn_queue_target()
+        .pinned(&session_id)
+        .remove_queued_prompt_for_target(&target, &prompt_id)
         .map_err(ApiError::internal)?;
-    let removed = match target.as_ref() {
-        Some(target) => state
-            .state_store
-            .remove_queued_prompt_for_target(target, &prompt_id)
-            .map_err(ApiError::internal)?,
-        None => state
-            .state_store
-            .remove_queued_prompt(&prompt_id)
-            .map_err(ApiError::internal)?,
-    };
     if !removed {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "queued prompt not found",
         ));
-    }
+    };
     state.events.publish(
         "queue.removed",
         json!({
+            "session_id": &*session_id,
             "run_id": run_id,
-            "turn_id": target.as_ref().map(|target| target.turn_id.as_str()),
+            "turn_id": turn_id,
             "prompt_id": prompt_id,
         }),
     );
@@ -3436,6 +5052,107 @@ async fn answer_question(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn close_question(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(question_id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    require_mutation(&headers, &state)?;
+    match state.questions.close(&question_id, |run_id| {
+        state.events.publish(
+            "question.closed",
+            json!({
+                "run_id": run_id,
+                "question_id": question_id,
+            }),
+        );
+    }) {
+        Ok(()) => {}
+        Err(AnswerFailure::NotFound) => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "pending question not found",
+            ));
+        }
+        Err(AnswerFailure::Gone) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the question is no longer awaiting an answer",
+            ));
+        }
+        Err(AnswerFailure::Invalid(_)) => unreachable!("closing a question has no answer payload"),
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_thinking_variants(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let config = state.manager.lock().unwrap().config.clone();
+    let options =
+        active_thinking_variant_options(&config, &state.paths).map_err(ApiError::internal)?;
+    let mut response = Json(ThinkingVariantsResponse { options }).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn set_thinking_variants(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<SetThinkingVariantsRequest>,
+) -> std::result::Result<Json<ThinkingVariantsResponse>, ApiError> {
+    require_mutation(&headers, &state)?;
+    let updates = validate_thinking_variant_updates(request.updates)?;
+    reserve_admin(&state.manager)?;
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::SetThinkingVariants { updates, reply })
+        .is_err()
+    {
+        release_admin(&state.manager);
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent worker is unavailable",
+        ));
+    }
+    match receiver.await {
+        Ok(Ok(())) => {}
+        Ok(Err(AdminFailure::Invalid(message))) => {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, message));
+        }
+        Ok(Err(AdminFailure::Internal(message))) => {
+            tracing::error!(
+                error = %message,
+                "{}",
+                t(
+                    "WebUI thinking variant update failed",
+                    "WebUI 思考程度更新失败"
+                )
+            );
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                safe_error_message(&message),
+            ));
+        }
+        Err(_) => {
+            release_admin(&state.manager);
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent worker stopped before updating the thinking variant",
+            ));
+        }
+    }
+    let config = state.manager.lock().unwrap().config.clone();
+    let options =
+        active_thinking_variant_options(&config, &state.paths).map_err(ApiError::internal)?;
+    Ok(Json(ThinkingVariantsResponse { options }))
+}
+
 async fn set_models(
     State(state): State<DaemonState>,
     headers: HeaderMap,
@@ -3443,8 +5160,7 @@ async fn set_models(
 ) -> std::result::Result<Json<ModelResponse>, ApiError> {
     require_mutation(&headers, &state)?;
     let models = validate_model_selection(request.models)?;
-    require_no_running_turn(&state.state_store)?;
-    reserve_admin(&state.manager)?;
+    reserve_admin_light(&state.manager)?;
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
@@ -3463,7 +5179,11 @@ async fn set_models(
             return Err(ApiError::new(StatusCode::BAD_REQUEST, message));
         }
         Ok(Err(AdminFailure::Internal(message))) => {
-            tracing::error!(error = %message, "WebUI model update failed");
+            tracing::error!(
+                error = %message,
+                "{}",
+                t("WebUI model update failed", "WebUI 模型更新失败")
+            );
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 safe_error_message(&message),
@@ -3488,10 +5208,15 @@ async fn set_models(
 async fn reset_conversation(
     State(state): State<DaemonState>,
     headers: HeaderMap,
+    Json(request): Json<ResetConversationRequest>,
 ) -> std::result::Result<StatusCode, ApiError> {
     require_mutation(&headers, &state)?;
-    if state
-        .state_store
+    let session_id = request
+        .session_id
+        .unwrap_or_else(|| state.state_store.session_id().to_string());
+    require_local_web_session(&state, &session_id)?;
+    let store = state.state_store.pinned(&session_id);
+    if store
         .has_running_turns()
         .map_err(ApiError::internal)?
     {
@@ -3500,11 +5225,16 @@ async fn reset_conversation(
             "a conversation turn is already running",
         ));
     }
-    reserve_admin_for_session(&state.manager, &state.state_store.session_id())?;
+    reserve_admin_for_session(&state.manager, &session_id)?;
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
-        .send(ActorCommand::ResetConversation { all: false, reply })
+        .send(ActorCommand::ResetConversation {
+            session_id: session_id.into(),
+            all: false,
+            reset_shared_state: false,
+            reply,
+        })
         .is_err()
     {
         release_admin(&state.manager);
@@ -3519,7 +5249,11 @@ async fn reset_conversation(
             Err(ApiError::new(StatusCode::CONFLICT, message))
         }
         Ok(Err(AdminFailure::Internal(message))) => {
-            tracing::error!(error = %message, "WebUI conversation reset failed");
+            tracing::error!(
+                error = %message,
+                "{}",
+                t("WebUI conversation reset failed", "WebUI 对话重置失败")
+            );
             Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 safe_error_message(&message),
@@ -3535,6 +5269,7 @@ async fn reset_conversation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_actor(
     config: AppConfig,
     paths: MiyuPaths,
@@ -3543,6 +5278,7 @@ fn spawn_actor(
     events: EventHub,
     questions: QuestionBroker,
     turn_engine: TurnEngineState,
+    memory_organizer: Option<MemoryOrganizerHandle>,
 ) -> Result<(mpsc::UnboundedSender<ActorCommand>, JoinHandle<Result<()>>)> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let join = std::thread::Builder::new()
@@ -3564,6 +5300,7 @@ fn spawn_actor(
                 events,
                 questions,
                 turn_engine,
+                memory_organizer,
                 receiver,
             )));
             Ok(())
@@ -3581,6 +5318,7 @@ async fn actor_loop(
     events: EventHub,
     questions: QuestionBroker,
     turn_engine: TurnEngineState,
+    memory_organizer: Option<MemoryOrganizerHandle>,
     mut receiver: mpsc::UnboundedReceiver<ActorCommand>,
 ) {
     let mut agent: Option<Agent> = None;
@@ -3591,24 +5329,18 @@ async fn actor_loop(
                 run_id,
                 session_id,
                 content,
+                display_content,
+                attachment_run_id,
                 mode,
                 images,
                 cwd,
+                audience,
                 profile,
                 cancel,
             } => {
-                // Serial turn-entry maintenance in the scheduler: stale-turn
-                // recovery is owner-pid safe, and the prompt-change reset is
-                // only attempted while this is the sole active run (it wipes
-                // session history and must never race a concurrent turn).
+                // Stale-turn recovery is owner-pid safe. Prompt maintenance is
+                // performed after per-turn platform overrides are applied.
                 let _ = state_store.recover_stale_turns();
-                if manager.lock().unwrap().active_runs.len() <= 1 {
-                    if let Ok(prompt) = config.system_prompt(&paths) {
-                        let _ = state_store
-                            .pinned(&session_id)
-                            .reset_if_prompt_changed(&prompt);
-                    }
-                }
                 let store = state_store.pinned_for_turn(&session_id);
                 // Per-turn workspace: a workspace bound to the session wins,
                 // otherwise the calling client's cwd, otherwise the daemon
@@ -3632,13 +5364,61 @@ async fn actor_loop(
                     questions.clone(),
                     run_id,
                     session_id.clone(),
-                    content,
+                    TurnTaskInput::Create {
+                        content,
+                        display_content,
+                        attachment_run_id,
+                        images,
+                    },
                     mode,
-                    images,
+                    audience,
                     profile,
                     cancel,
                     resource_cache.clone(),
                     turn_engine.clone(),
+                    memory_organizer.clone(),
+                );
+                tokio::task::spawn_local(crate::tools::workspace::with_workspace(
+                    workspace,
+                    crate::tools::workspace::with_session(session_id, task),
+                ));
+            }
+            ActorCommand::RedoTurn {
+                run_id,
+                session_id,
+                candidate,
+                prompts,
+                mode,
+                cancel,
+            } => {
+                let _ = state_store.recover_stale_turns();
+                let store = state_store.pinned_for_turn(&session_id);
+                let workspace = store
+                    .session_record(&session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.workspace.map(std::path::PathBuf::from))
+                    .filter(|path| path.is_dir())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let task = run_turn_task(
+                    config.clone(),
+                    paths.clone(),
+                    store,
+                    state_store.clone(),
+                    manager.clone(),
+                    events.clone(),
+                    questions.clone(),
+                    run_id,
+                    session_id.clone(),
+                    TurnTaskInput::Redo { candidate, prompts },
+                    mode,
+                    PromptAudience::External,
+                    None,
+                    cancel,
+                    resource_cache.clone(),
+                    turn_engine.clone(),
+                    memory_organizer.clone(),
                 );
                 tokio::task::spawn_local(crate::tools::workspace::with_workspace(
                     workspace,
@@ -3661,6 +5441,14 @@ async fn actor_loop(
                     } else {
                         TurnEngineState::COLD
                     });
+                }
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
+            ActorCommand::SetThinkingVariants { updates, reply } => {
+                let result = apply_thinking_variant_updates(&mut agent, &config, &paths, &updates);
+                if result.is_ok() {
+                    resource_cache.lock().unwrap().clear();
                 }
                 release_admin(&manager);
                 let _ = reply.send(result);
@@ -3693,7 +5481,12 @@ async fn actor_loop(
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::ResetConversation { all, reply } => {
+            ActorCommand::ResetConversation {
+                session_id,
+                all,
+                reset_shared_state,
+                reply,
+            } => {
                 let result = reset_actor_conversation(
                     &mut agent,
                     &config,
@@ -3701,8 +5494,29 @@ async fn actor_loop(
                     &state_store,
                     &manager,
                     &events,
+                    &session_id,
                     all,
+                    reset_shared_state,
                 );
+                release_admin(&manager);
+                let _ = reply.send(result);
+            }
+            ActorCommand::ResetPersonaState {
+                config: reset_config,
+                reply,
+            } => {
+                let result = reset_actor_persona_state(
+                    &mut agent,
+                    &config,
+                    &reset_config,
+                    &paths,
+                    &state_store,
+                    &manager,
+                    &events,
+                );
+                if result.is_ok() {
+                    resource_cache.lock().unwrap().clear();
+                }
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
@@ -3717,7 +5531,11 @@ async fn actor_loop(
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::SwitchSession { session_id, reply } => {
+            ActorCommand::SwitchSession {
+                session_id,
+                release_reservation,
+                reply,
+            } => {
                 let result = switch_actor_session(
                     agent.as_ref(),
                     &config,
@@ -3726,7 +5544,9 @@ async fn actor_loop(
                     &events,
                     &session_id,
                 );
-                release_admin(&manager);
+                if release_reservation {
+                    release_admin(&manager);
+                }
                 let _ = reply.send(result);
             }
             ActorCommand::Shutdown => {
@@ -3743,24 +5563,34 @@ async fn actor_loop(
                 }
                 break;
             }
-            ActorCommand::Undo { reply } => {
+            ActorCommand::Undo { session_id, reply } => {
                 let result = (|| -> std::result::Result<Value, AdminFailure> {
-                    let (removed, prompt) = state_store
+                    let store = state_store.pinned(&session_id);
+                    let (removed, prompt) = store
                         .undo_last_turn()
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = actor_context(&agent, &config, &state_store)
-                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    if &*state_store.session_id() == &*session_id {
+                        manager.lock().unwrap().context =
+                            actor_context(&agent, &config, &state_store).map_err(|error| {
+                                AdminFailure::Internal(safe_error_message(&error))
+                            })?;
+                    }
                     Ok(json!({ "removed": removed, "prompt": prompt }))
                 })();
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::Pop { turn_ids, reply } => {
+            ActorCommand::Pop {
+                session_id,
+                turn_ids,
+                reply,
+            } => {
                 let result = (|| -> std::result::Result<Value, AdminFailure> {
                     if turn_ids.is_empty() {
                         return Ok(json!({ "turns": 0, "archived": false }));
                     }
-                    let turns = state_store
+                    let store = state_store.pinned(&session_id);
+                    let turns = store
                         .oldest_evictable_visible_turns(usize::MAX)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     let selected = turns
@@ -3774,35 +5604,60 @@ async fn actor_loop(
                     }
                     let memory = MemoryStore::new(&config, &paths);
                     let memory_config = config.memory_config();
-                    archive_and_delete_visible_turns(&state_store, &memory, &selected)
+                    archive_and_delete_visible_turns(&store, &memory, &selected)
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = actor_context(&agent, &config, &state_store)
-                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    if &*state_store.session_id() == &*session_id {
+                        manager.lock().unwrap().context =
+                            actor_context(&agent, &config, &state_store).map_err(|error| {
+                                AdminFailure::Internal(safe_error_message(&error))
+                            })?;
+                    }
                     let data = json!({
                         "turns": selected.len(),
                         "archived": memory_config.enabled && memory_config.evicted_context_enabled
                     });
-                    events.publish("conversation.pop", data.clone());
+                    let mut event_data = data.clone();
+                    event_data["session_id"] = json!(&*session_id);
+                    events.publish("conversation.pop", event_data);
                     Ok(data)
                 })();
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::Compact { reply } => {
+            ActorCommand::Compact { session_id, reply } => {
                 let result = async {
-                    let agent = ensure_actor_agent(
-                        &mut agent,
-                        &config,
-                        &paths,
-                        &state_store,
-                        &turn_engine,
-                    )?;
-                    let compact = agent
-                        .compact_now(|_| Ok(()))
-                        .await
-                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
-                    manager.lock().unwrap().context = current_context(agent)
-                        .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+                    let updates_default = &*state_store.session_id() == &*session_id;
+                    let compact = if updates_default {
+                        let agent = ensure_actor_agent(
+                            &mut agent,
+                            &config,
+                            &paths,
+                            &state_store,
+                            &turn_engine,
+                        )?;
+                        let compact = agent
+                            .compact_now(|_| Ok(()))
+                            .await
+                            .map_err(|error| {
+                                AdminFailure::Internal(safe_error_message(&error))
+                            })?;
+                        manager.lock().unwrap().context = current_context(agent).map_err(|error| {
+                            AdminFailure::Internal(safe_error_message(&error))
+                        })?;
+                        compact
+                    } else {
+                        let store = state_store.pinned(&session_id);
+                        let target_agent = build_actor_agent(&config, &paths, &store)
+                            .map_err(|error| {
+                                AdminFailure::Internal(safe_error_message(&error))
+                            })?;
+                        target_agent
+                            .compact_now(|_| Ok(()))
+                            .await
+                            .map_err(|error| {
+                                AdminFailure::Internal(safe_error_message(&error))
+                            })?
+                    };
                     Ok::<Value, AdminFailure>(json!({
                         "compacted": compact.is_some(),
                         "usage": compact.as_ref().and_then(|result| result.usage.clone()),
@@ -3830,6 +5685,54 @@ fn trim_process_memory() {
 #[cfg(not(target_os = "linux"))]
 fn trim_process_memory() {}
 
+struct AttachmentRunGuard {
+    store: StateStore,
+    run_id: Option<String>,
+}
+
+enum TurnTaskInput {
+    Create {
+        content: String,
+        display_content: String,
+        attachment_run_id: Option<String>,
+        images: Vec<Option<ImageAttachment>>,
+    },
+    Redo {
+        candidate: crate::state::RedoCandidate,
+        prompts: Vec<RedoWebPrompt>,
+    },
+}
+
+fn into_pasted_images(
+    images: Vec<Option<ImageAttachment>>,
+) -> Vec<Option<crate::clipboard::PastedImage>> {
+    images
+        .into_iter()
+        .map(|image| {
+            image.map(|image| match image {
+                ImageAttachment::Binary { mime, data } => crate::clipboard::PastedImage::Binary(
+                    crate::clipboard::ClipboardImage::new(mime, data),
+                ),
+                ImageAttachment::Path { path } => crate::clipboard::PastedImage::Path(path),
+            })
+        })
+        .collect()
+}
+
+impl AttachmentRunGuard {
+    fn new(store: StateStore, run_id: Option<String>) -> Self {
+        Self { store, run_id }
+    }
+}
+
+impl Drop for AttachmentRunGuard {
+    fn drop(&mut self) {
+        if let Some(run_id) = self.run_id.as_deref() {
+            let _ = self.store.release_user_attachments_for_run(run_id);
+        }
+    }
+}
+
 /// Executes one turn as a self-contained task. Multiple turn tasks run
 /// concurrently on the actor's LocalSet — each with its own Agent, a
 /// StateStore pinned to the turn's session, and an independent cancel signal.
@@ -3844,15 +5747,26 @@ async fn run_turn_task(
     questions: QuestionBroker,
     run_id: String,
     session_id: Arc<str>,
-    content: String,
+    input: TurnTaskInput,
     mode: AgentMode,
-    images: Vec<Option<ImageAttachment>>,
+    audience: PromptAudience,
     profile: Option<platforms::TurnProfile>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
     resource_cache: Arc<Mutex<TurnResourceCache>>,
     turn_engine: TurnEngineState,
+    memory_organizer: Option<MemoryOrganizerHandle>,
 ) {
+    let attachment_run_id = match &input {
+        TurnTaskInput::Create {
+            attachment_run_id, ..
+        } => attachment_run_id.clone(),
+        TurnTaskInput::Redo { .. } => None,
+    };
+    let _attachment_guard = AttachmentRunGuard::new(base_store.clone(), attachment_run_id.clone());
     if let Some(profile) = &profile {
+        if let Some(active_persona) = &profile.active_persona {
+            config.prompt.active_persona.clone_from(active_persona);
+        }
         if let Some(models) = &profile.text_models {
             config.active_provider_models = Some(models.clone());
         }
@@ -3868,11 +5782,25 @@ async fn run_turn_task(
     let events = &events;
     let questions = &questions;
     let run_id = run_id.as_str();
+    let operation = match &input {
+        TurnTaskInput::Create { .. } => "create",
+        TurnTaskInput::Redo { .. } => "redo",
+    };
     events.publish(
         "run.started",
-        json!({ "run_id": run_id, "session_id": &*session_id, "mode": mode_name(mode) }),
+        json!({
+            "run_id": run_id,
+            "session_id": &*session_id,
+            "mode": mode_name(mode),
+            "operation": operation,
+        }),
     );
-    let title_seed: String = content.chars().take(80).collect();
+    let title_seed: String = match &input {
+        TurnTaskInput::Create { content, .. } => content.chars().take(80).collect(),
+        TurnTaskInput::Redo { candidate, .. } => {
+            candidate.display_content.chars().take(80).collect()
+        }
+    };
     let warming = !turn_engine.is_ready();
     if warming {
         turn_engine.set(TurnEngineState::INITIALIZING);
@@ -3881,6 +5809,7 @@ async fn run_turn_task(
         let platform_context = profile
             .as_ref()
             .and_then(|profile| profile.platform.as_deref());
+        let local_webui = is_local_webui_request(audience, profile.is_some());
         let resources = resource_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("turn resource cache is poisoned"))?
@@ -3901,6 +5830,36 @@ async fn run_turn_task(
         } else {
             resources.chat_tools.clone()
         };
+        if !restricted {
+            if let Some(context) = platform_context {
+                tools::rescope_platform_memory_tools(
+                    &mut normal_tools,
+                    &config,
+                    &paths,
+                    context,
+                    false,
+                );
+                tools::rescope_platform_memory_tools(
+                    &mut plan_tools,
+                    &config,
+                    &paths,
+                    context,
+                    true,
+                );
+            }
+        }
+        if local_webui && config.tools.enabled {
+            tools::register_webui_artifact_tools(&mut normal_tools, &paths, &session_id);
+            tools::register_webui_artifact_tools(&mut plan_tools, &paths, &session_id);
+        }
+        if profile
+            .as_ref()
+            .is_some_and(|profile| !profile.memory_write_enabled)
+        {
+            normal_tools.unregister("remember_fact");
+            plan_tools.unregister("remember_fact");
+            chat_tools.unregister("remember_fact");
+        }
         if platform_context.is_none() && config.tools.enabled {
             tools::register_ask_question(&mut normal_tools);
             tools::register_ask_question(&mut plan_tools);
@@ -3921,21 +5880,102 @@ async fn run_turn_task(
             AgentMode::Plan => plan_tools.clone(),
             AgentMode::Chat => chat_tools.clone(),
         };
-        let mut agent = Agent::new(
+        let mut agent = Agent::new_for_audience(
             config.clone(),
             &paths,
             store.clone(),
             resources.client.clone(),
             active_tools,
             mode,
+            audience,
         )?;
-        if let Some(profile) = &profile {
-            agent.set_runtime_system_context(profile.system_context.clone())?;
+        let mut runtime_system_context = profile
+            .as_ref()
+            .map(|profile| profile.system_context.clone())
+            .unwrap_or_default();
+        if local_webui && matches!(mode, AgentMode::Normal | AgentMode::Plan) {
+            let manifest = tools::webui_artifact_manifest(&paths, &session_id)
+                .unwrap_or_else(|_| "（Artifact 清单暂时不可用）".to_string());
+            runtime_system_context.push(format!(
+                "<artifact-workspace>\n{manifest}\n使用 read_artifact 和 apply_artifact_patch 按文件名操作已有 Artifact；不要用 glob 搜索托管目录，也不要猜测 ~/.miyu 路径。\n</artifact-workspace>"
+            ));
+            runtime_system_context.push(
+                "<artifact-policy>\n\
+                你正在 Miyu WebUI 中工作，并且拥有 Artifact 展示工具。\n\
+                - 当用户明确要求报告、文档、网页、表格、数据文件、独立代码文件或其他可下载成品时，必须创建或展示 Artifact。\n\
+                - 对由你直接编写的文本交付物，优先调用 create_artifact；filename 必须带正确扩展名。\n\
+                - 对命令或其他工具已经生成的文件，调用 present_artifact。\n\
+                - 更新已有 Artifact 时先使用 read_artifact，再使用 apply_artifact_patch 做局部修改；补丁路径只写 Artifact 文件名。除非用户明确要求完全重写，否则不要用 create_artifact 覆盖全文。\n\
+                - 内容完成并自检后再发布。普通项目源码修改、配置修改、测试夹具和简短回答不要发布为 Artifact。\n\
+                - Artifact 是回答的一部分；发布成功后再用简短文字告知用户。\n\
+                </artifact-policy>"
+                    .to_string(),
+            );
         }
-        Ok((
-            agent,
-            AgentTurnControl::new(mode, normal_tools, plan_tools, chat_tools),
-        ))
+        if !runtime_system_context.is_empty() {
+            agent.set_runtime_system_context(runtime_system_context)?;
+        }
+        if let Some(profile) = &profile {
+            agent.set_memory_writes_enabled(profile.memory_write_enabled);
+            agent.set_session_history_suppressed(profile.suppress_session_history);
+            if let Some(namespace) = profile.image_cache_namespace.as_deref() {
+                agent.set_image_platform(
+                    namespace,
+                    profile.image_source_label.as_deref().unwrap_or(namespace),
+                );
+            }
+            if let Some(context) = profile.platform.as_deref() {
+                let principal = context.principal().stable_key();
+                agent.set_memory_request_context(
+                    if context.is_admin {
+                        MemoryAccess::Privileged
+                    } else {
+                        MemoryAccess::principal(principal.clone())
+                    },
+                    Some(principal),
+                    context.sender_display_name.clone(),
+                );
+                agent.set_memory_origin(MemoryOrigin {
+                    kind: "platform".to_string(),
+                    platform: context.conversation.platform.clone(),
+                    account_id: context.conversation.account_id.clone(),
+                    conversation_kind: context.conversation.kind.as_str().to_string(),
+                    conversation_id: context.conversation.conversation_id.clone(),
+                    sender_id: context.sender_id.clone(),
+                    sender_display_name: context.sender_display_name.clone(),
+                    session_id: session_id.to_string(),
+                    message_id: context
+                        .inbound_event()
+                        .map(|event| event.message_id.clone())
+                        .unwrap_or_default(),
+                });
+            }
+            if let Some(context) = profile.platform.clone() {
+                agent.set_platform_context_images(context, profile.context_images.clone());
+            }
+        }
+        if let Some(organizer) = memory_organizer.clone() {
+            agent.set_memory_organizer(organizer);
+        }
+        agent.prepare_for_turn()?;
+        let mut control = AgentTurnControl::new(mode, normal_tools, plan_tools, chat_tools);
+        if let Some(signal) = manager
+            .lock()
+            .unwrap()
+            .active_runs
+            .get(run_id)
+            .map(|run| run.supersede.clone())
+        {
+            control.set_supersede_signal(signal);
+        }
+        if let Some(ingress) = profile
+            .as_ref()
+            .and_then(|profile| profile.followup.as_ref())
+            .map(|followup| followup.ingress())
+        {
+            control.set_queue_ingress(ingress);
+        }
+        Ok((agent, control))
     })();
     let (mut agent, control) = match setup {
         Ok(setup) => {
@@ -3949,7 +5989,12 @@ async fn run_turn_task(
             questions.cancel_run(run_id);
             finish_run(manager, run_id, None);
             let message = safe_error_message(&error);
-            tracing::error!(run_id, error = %error, "WebUI agent run setup failed");
+            tracing::error!(
+                run_id,
+                error = %error,
+                "{}",
+                t("WebUI agent run setup failed", "WebUI 智能体运行初始化失败")
+            );
             events.publish(
                 "run.failed",
                 json!({ "run_id": run_id, "session_id": &*session_id, "message": message }),
@@ -3957,45 +6002,89 @@ async fn run_turn_task(
             return;
         }
     };
+    if let TurnTaskInput::Create {
+        display_content, ..
+    } = &input
+    {
+        agent.set_turn_persistence(display_content.clone(), attachment_run_id);
+    }
     // The daemon-wide context snapshot tracks the *current* session; a turn
     // for another session must not overwrite it.
     let updates_context = || *base_store.session_id() == *session_id;
     let agent = &mut agent;
+    let (redo_input_id, redo_display_content) = match &input {
+        TurnTaskInput::Redo { candidate, prompts } => (
+            Some(candidate.input_id.clone()),
+            prompts.last().map(|prompt| prompt.display_content.clone()),
+        ),
+        TurnTaskInput::Create { .. } => (None, None),
+    };
 
     let mapper = Arc::new(Mutex::new(RunEventMapper::new(
         run_id.to_string(),
         events.clone(),
         questions.clone(),
         store.clone(),
+        manager.clone(),
+        profile
+            .as_ref()
+            .and_then(|profile| profile.followup.as_ref())
+            .map(|followup| followup.ingress()),
+        operation,
+        redo_input_id,
+        redo_display_content,
+        config.display.command_output_lines,
     )));
-    let chat_outcome = {
-        let callback_mapper = mapper.clone();
-        let images = images
-            .into_iter()
-            .map(|image| {
-                image.map(|image| match image {
-                    ImageAttachment::Binary { mime, data } => {
-                        crate::clipboard::PastedImage::Binary(
-                            crate::clipboard::ClipboardImage::new(mime, data),
-                        )
+    let chat_outcome = match input {
+        TurnTaskInput::Create {
+            content, images, ..
+        } => {
+            let callback_mapper = mapper.clone();
+            let images = into_pasted_images(images);
+            let chat = agent.chat_stream_with_control(&content, &images, &control, move |event| {
+                callback_mapper.lock().unwrap().handle(event);
+                Ok(())
+            });
+            tokio::pin!(chat);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut chat => break TurnOutcome::Finished(result),
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            questions.cancel_run(run_id);
+                            break TurnOutcome::Cancelled;
+                        }
                     }
-                    ImageAttachment::Path { path } => crate::clipboard::PastedImage::Path(path),
+                }
+            }
+        }
+        TurnTaskInput::Redo { candidate, prompts } => {
+            let callback_mapper = mapper.clone();
+            let prompts = prompts
+                .into_iter()
+                .map(|prompt| crate::agent::RedoPromptInput {
+                    prompt_id: prompt.prompt_id,
+                    content: prompt.content,
+                    display_content: prompt.display_content,
+                    images: into_pasted_images(prompt.images),
                 })
-            })
-            .collect::<Vec<_>>();
-        let chat = agent.chat_stream_with_control(&content, &images, &control, move |event| {
-            callback_mapper.lock().unwrap().handle(event);
-            Ok(())
-        });
-        tokio::pin!(chat);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut chat => break TurnOutcome::Finished(result),
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        questions.cancel_run(run_id);
-                        break TurnOutcome::Cancelled;
+                .collect();
+            let chat =
+                agent.redo_stream_with_control(&candidate, prompts, &control, move |event| {
+                    callback_mapper.lock().unwrap().handle(event);
+                    Ok(())
+                });
+            tokio::pin!(chat);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut chat => break TurnOutcome::Finished(result),
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            questions.cancel_run(run_id);
+                            break TurnOutcome::Cancelled;
+                        }
                     }
                 }
             }
@@ -4251,6 +6340,89 @@ enum OverflowOutcome {
     Cancelled,
 }
 
+fn active_thinking_variant_options(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+) -> Result<Vec<ThinkingVariantOptions>> {
+    crate::models_cache::ensure_active_metadata(paths, config);
+    let preferences = ThinkingVariantPreferences::load(paths);
+    config
+        .active_provider_model_choices()
+        .into_iter()
+        .map(|choice| {
+            let provider = config.provider(Some(&choice.provider_id))?;
+            Ok(thinking_variant_options_for_model(
+                provider,
+                &choice.model,
+                preferences.selected(&choice.provider_id, &choice.model),
+            ))
+        })
+        .collect()
+}
+
+fn apply_thinking_variant_updates(
+    agent: &mut Option<Agent>,
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    updates: &[ThinkingVariantUpdate],
+) -> std::result::Result<(), AdminFailure> {
+    let options = active_thinking_variant_options(config, paths)
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+    for update in updates {
+        let option = options
+            .iter()
+            .find(|option| option.provider_id == update.provider_id && option.model == update.model)
+            .ok_or_else(|| {
+                AdminFailure::Invalid(format!(
+                    "inactive model: {} / {}",
+                    update.provider_id, update.model
+                ))
+            })?;
+        if let Some(selected) = &update.selected {
+            if !option.variants.iter().any(|variant| variant == selected) {
+                return Err(AdminFailure::Invalid(format!(
+                    "thinking variant is unavailable for {} / {}: {}",
+                    update.provider_id, update.model, selected
+                )));
+            }
+        }
+    }
+
+    let selections = updates
+        .iter()
+        .map(|update| {
+            (
+                update.provider_id.clone(),
+                update.model.clone(),
+                update.selected.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_client = agent
+        .as_ref()
+        .map(|current| {
+            let mut client = current.cloned_client();
+            client
+                .set_thinking_variants(&selections)
+                .map_err(|error| AdminFailure::Invalid(safe_error_message(error)))?;
+            Ok(client)
+        })
+        .transpose()?;
+
+    let mut preferences = ThinkingVariantPreferences::load(paths);
+    for update in updates {
+        preferences.set(&update.provider_id, &update.model, update.selected.clone());
+    }
+    preferences
+        .save(paths)
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+
+    if let (Some(agent), Some(client)) = (agent.as_mut(), next_client) {
+        agent.replace_client(client);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rebuild_for_models(
     agent: &mut Option<Agent>,
@@ -4354,9 +6526,20 @@ fn rebuild_for_config(
     next_config.prune_subagent_tiers();
     let previous_prompts = read_prompt_documents(config, paths)
         .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
+    let persona_changes = persona_document_changes(&previous_prompts, prompts);
+    let mut persona_db_guard = PersonaDbRenameGuard::new(state_store.clone(), &persona_changes)
+        .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
     let previous_scope = config.active_persona_scope();
     let next_scope = next_config.active_persona_scope();
-    let persona_changed = previous_scope != next_scope;
+    let migrated_previous_scope = persona_changes
+        .iter()
+        .find_map(|(old_name, new_name)| {
+            (crate::config::persona_scope_name(old_name) == previous_scope)
+                .then(|| new_name.as_deref().map(crate::config::persona_scope_name))
+                .flatten()
+        })
+        .unwrap_or_else(|| previous_scope.clone());
+    let persona_changed = migrated_previous_scope != next_scope;
     let previous_session_id = state_store.session_id().to_string();
     let target_session_id = if persona_changed {
         session_for_persona(state_store, manager, &next_scope)
@@ -4366,7 +6549,7 @@ fn rebuild_for_config(
     };
     if persona_changed {
         state_store
-            .set_persona_current_session(&previous_scope, &previous_session_id)
+            .set_persona_current_session(&migrated_previous_scope, &previous_session_id)
             .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
     }
     let target_state_store = if persona_changed {
@@ -4457,6 +6640,13 @@ fn rebuild_for_config(
         }
         if let Err(error) = state_store.set_persona_current_session(&next_scope, &target_session_id)
         {
+            let _ = state_store.switch_session(&previous_session_id);
+            restore_file_backups(&prompt_backups);
+            restore_persona_scope_backups(&scope_backups);
+            restore_file_backups(std::slice::from_ref(&config_backup));
+            if let Some(backup) = &system_prompt_backup {
+                restore_file_backups(std::slice::from_ref(backup));
+            }
             return Err(AdminFailure::Internal(safe_error_message(error)));
         }
     }
@@ -4464,10 +6654,22 @@ fn rebuild_for_config(
     *agent = next_agent;
     *config = next_config.clone();
     let mut manager = manager.lock().unwrap();
+    let migrated_session_ids = persona_changes
+        .iter()
+        .filter_map(|(old_name, new_name)| {
+            let old_scope = crate::config::persona_scope_name(old_name);
+            let new_scope = new_name.as_deref().map(crate::config::persona_scope_name)?;
+            manager
+                .persona_session_ids
+                .remove(&old_scope)
+                .map(|session_id| (new_scope, session_id))
+        })
+        .collect::<Vec<_>>();
+    manager.persona_session_ids.extend(migrated_session_ids);
     if persona_changed {
         manager
             .persona_session_ids
-            .insert(previous_scope, previous_session_id);
+            .insert(migrated_previous_scope, previous_session_id);
         manager
             .persona_session_ids
             .insert(next_scope, target_session_id.clone());
@@ -4481,7 +6683,25 @@ fn rebuild_for_config(
             json!({ "session_id": target_session_id }),
         );
     }
+    persona_db_guard.commit();
     finalize_persona_scope_backups(&scope_backups);
+    for (old_name, new_name) in &persona_changes {
+        if new_name.is_none() {
+            if let Err(error) =
+                state_store.delete_persona_scope(&crate::config::persona_scope_name(old_name))
+            {
+                tracing::warn!(
+                    %error,
+                    %old_name,
+                    "{}",
+                    t(
+                        "deleted persona state cleanup failed",
+                        "已删除角色的状态清理失败"
+                    )
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4572,29 +6792,76 @@ fn reset_actor_conversation(
     state_store: &StateStore,
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
+    session_id: &str,
     all: bool,
+    reset_shared_state: bool,
+) -> std::result::Result<(), AdminFailure> {
+    let mut reset = || -> Result<Option<ContextSnapshot>> {
+        let store = state_store.pinned(session_id);
+        store.clear_session_content()?;
+        if reset_shared_state {
+            store.reset_conversation_usage()?;
+            let memory = MemoryStore::new(config, paths);
+            if all {
+                memory.reset_all(false)?;
+            } else {
+                memory.clear_evicted_context()?;
+                memory.clear_pending_events()?;
+            }
+            tools::clear_aur_review_state(paths)?;
+        }
+        if &*state_store.session_id() == session_id {
+            if let Some(agent) = agent.as_mut() {
+                agent.reset_memory()?;
+                agent.prepare_for_turn()?;
+                current_context(agent).map(Some)
+            } else {
+                cold_context(config, &store).map(Some)
+            }
+        } else {
+            Ok(None)
+        }
+    };
+    let context = reset().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
+    if let Some(context) = context {
+        manager.lock().unwrap().context = context;
+    }
+    events.publish("conversation.reset", json!({ "session_id": session_id }));
+    Ok(())
+}
+
+fn reset_actor_persona_state(
+    agent: &mut Option<Agent>,
+    daemon_config: &AppConfig,
+    reset_config: &AppConfig,
+    paths: &MiyuPaths,
+    state_store: &StateStore,
+    manager: &Arc<Mutex<ManagerState>>,
+    events: &EventHub,
 ) -> std::result::Result<(), AdminFailure> {
     let mut reset = || -> Result<ContextSnapshot> {
-        state_store.reset_conversation()?;
-        let memory = MemoryStore::new(config, paths);
-        if all {
-            memory.reset_all(false)?;
-        } else {
-            memory.clear_evicted_context()?;
-            memory.clear_pending_events()?;
+        let persona = reset_config.active_persona_scope();
+        state_store.reset_persona_contexts(&persona, "onebot")?;
+        MemoryStore::new(reset_config, paths).reset_all(true)?;
+        if persona != daemon_config.active_persona_scope() {
+            return Ok(manager.lock().unwrap().context);
         }
         tools::clear_aur_review_state(paths)?;
+        state_store.reset_conversation_usage()?;
         if let Some(agent) = agent.as_mut() {
             agent.reset_memory()?;
             agent.prepare_for_turn()?;
             current_context(agent)
         } else {
-            cold_context(config, state_store)
+            cold_context(daemon_config, state_store)
         }
     };
     let context = reset().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     manager.lock().unwrap().context = context;
-    events.publish("conversation.reset", json!({}));
+    events.publish(
+        "conversation.reset",
+        json!({ "scope": "persona", "persona": reset_config.active_persona_scope() }),
+    );
     Ok(())
 }
 
@@ -4659,7 +6926,12 @@ fn finish_failed_run(
     let context = current_context(agent).ok().filter(|_| updates_context);
     finish_run(manager, run_id, context);
     let message = safe_error_message(error);
-    tracing::error!(run_id, error = %error, "WebUI agent run failed");
+    tracing::error!(
+        run_id,
+        error = %error,
+        "{}",
+        t("WebUI agent run failed", "WebUI 智能体运行失败")
+    );
     events.publish(
         "run.failed",
         json!({ "run_id": run_id, "session_id": session_id, "message": message }),
@@ -4678,7 +6950,15 @@ fn finish_completed_with_context_error(
     error: &anyhow::Error,
 ) {
     let message = safe_error_message(error);
-    tracing::error!(run_id, error = %error, "WebUI post-turn context maintenance failed");
+    tracing::error!(
+        run_id,
+        error = %error,
+        "{}",
+        t(
+            "WebUI post-turn context maintenance failed",
+            "WebUI 回合后上下文维护失败"
+        )
+    );
     events.publish(
         "context.error",
         json!({ "run_id": run_id, "session_id": session_id, "message": message }),
@@ -4697,7 +6977,11 @@ pub(crate) fn finish_run(
     if let Some(context) = context {
         manager.context = context;
     }
-    manager.active_runs.remove(run_id);
+    if let Some(run) = manager.active_runs.remove(run_id) {
+        if let Some(followup) = run.platform_followup {
+            followup.close();
+        }
+    }
 }
 
 fn publish_completed(
@@ -4732,19 +7016,23 @@ fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
 }
 
 fn build_actor_agent(config: &AppConfig, paths: &MiyuPaths, state: &StateStore) -> Result<Agent> {
+    let mut agent = build_session_agent(config, paths, state)?;
+    agent.prepare_for_turn()?;
+    Ok(agent)
+}
+
+fn build_session_agent(config: &AppConfig, paths: &MiyuPaths, state: &StateStore) -> Result<Agent> {
     crate::models_cache::ensure_active_metadata(paths, config);
     let client = OpenAiCompatibleClient::from_config(config, paths)?;
     let registry = build_tool_registry(config, paths, AgentMode::Normal, true)?;
-    let mut agent = Agent::new(
+    Agent::new(
         config.clone(),
         paths,
         state.clone(),
         client,
         registry,
         AgentMode::Normal,
-    )?;
-    agent.prepare_for_turn()?;
-    Ok(agent)
+    )
 }
 
 fn ensure_actor_agent<'a>(
@@ -4805,6 +7093,29 @@ fn session_state(
             .map(|record| record.name.clone())
             .unwrap_or_default(),
         workspace: record.and_then(|record| record.workspace),
+    })
+}
+
+fn session_state_for(state: &DaemonState, session_id: &str) -> Result<ipc::SessionState> {
+    let record = state
+        .state_store
+        .session_record(session_id)?
+        .with_context(|| format!("session not found: {session_id}"))?;
+    let current_session_id = state.state_store.session_id();
+    let context = if &*current_session_id == session_id {
+        state.manager.lock().unwrap().context
+    } else {
+        let config = state.manager.lock().unwrap().config.clone();
+        let store = state.state_store.pinned(session_id);
+        current_context(&build_session_agent(&config, &state.paths, &store)?)?
+    };
+    Ok(ipc::SessionState {
+        context_tokens: context.tokens,
+        context_window: context.window,
+        cumulative_tokens: context.cumulative_tokens,
+        session_id: record.session_id,
+        session_name: record.name,
+        workspace: record.workspace,
     })
 }
 
@@ -4892,7 +7203,136 @@ pub(crate) async fn clear_platform_session_content(
     }
 }
 
-/// Light admin reservation (session switching): serializes against other
+pub(crate) async fn reset_platform_persona_state(
+    state: &DaemonState,
+    config: &AppConfig,
+) -> std::result::Result<usize, PlatformPersonaResetError> {
+    let persona = config.active_persona_scope();
+    let session_ids = state
+        .state_store
+        .persona_reset_session_ids(&persona, "onebot")
+        .map_err(|error| PlatformPersonaResetError::Internal(safe_error_message(error)))?;
+    let bindings = state
+        .state_store
+        .platform_session_bindings(&persona, "onebot")
+        .map_err(|error| PlatformPersonaResetError::Internal(safe_error_message(error)))?;
+    let targets = session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+
+    {
+        let mut manager = state.manager.lock().unwrap();
+        if manager.admin_busy {
+            return Err(PlatformPersonaResetError::Busy);
+        }
+        manager.admin_busy = true;
+        for run in manager
+            .active_runs
+            .values()
+            .filter(|run| targets.contains(&*run.session_id))
+        {
+            run.request_cancel();
+        }
+    }
+
+    let tickets = session_ids
+        .iter()
+        .map(|session_id| state.platforms.preempt_session_turns(session_id))
+        .collect::<Vec<_>>();
+    let leases = match tokio::time::timeout(Duration::from_secs(10), async {
+        let mut leases = Vec::with_capacity(tickets.len());
+        for ticket in tickets {
+            leases.push(ticket.acquire().await.expect("exclusive platform ticket"));
+        }
+        leases
+    })
+    .await
+    {
+        Ok(leases) => leases,
+        Err(_) => {
+            release_admin(&state.manager);
+            return Err(PlatformPersonaResetError::Busy);
+        }
+    };
+
+    for _ in 0..200 {
+        let running = state
+            .manager
+            .lock()
+            .unwrap()
+            .active_runs
+            .values()
+            .any(|run| targets.contains(&*run.session_id));
+        if !running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if state
+        .manager
+        .lock()
+        .unwrap()
+        .active_runs
+        .values()
+        .any(|run| targets.contains(&*run.session_id))
+    {
+        drop(leases);
+        release_admin(&state.manager);
+        return Err(PlatformPersonaResetError::Busy);
+    }
+
+    let plugins = match state.platforms.plugins() {
+        Ok(plugins) => plugins,
+        Err(error) => {
+            drop(leases);
+            release_admin(&state.manager);
+            return Err(PlatformPersonaResetError::Internal(safe_error_message(
+                error,
+            )));
+        }
+    };
+    let reset_context = crate::platforms::plugins::PlatformPersonaResetContext {
+        config,
+        paths: &state.paths,
+        bindings: &bindings,
+    };
+    if let Err(error) = plugins.after_persona_reset(&reset_context).await {
+        drop(leases);
+        release_admin(&state.manager);
+        return Err(PlatformPersonaResetError::Internal(safe_error_message(
+            error,
+        )));
+    }
+
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::ResetPersonaState {
+            config: Box::new(config.clone()),
+            reply,
+        })
+        .is_err()
+    {
+        drop(leases);
+        release_admin(&state.manager);
+        return Err(PlatformPersonaResetError::Unavailable);
+    }
+    let result = match receiver.await {
+        Ok(Ok(())) => Ok(session_ids.len()),
+        Ok(Err(AdminFailure::Invalid(message) | AdminFailure::Internal(message))) => {
+            Err(PlatformPersonaResetError::Internal(message))
+        }
+        Err(_) => {
+            release_admin(&state.manager);
+            Err(PlatformPersonaResetError::Unavailable)
+        }
+    };
+    drop(leases);
+    result
+}
+
+/// Light admin reservation (session/model updates): serializes against other
 /// admin operations but is allowed while turns are running.
 fn reserve_admin_light(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
@@ -4970,6 +7410,16 @@ fn config_response(
         &mut secret_states,
         "plugins.image_generation.api_keys",
         &mut redacted.plugins.image_generation.api_keys,
+    );
+    redact_api_quota_provider(
+        &mut secret_states,
+        "plugins.api_quota.deepseek",
+        &mut redacted.plugins.api_quota.deepseek,
+    );
+    redact_api_quota_provider(
+        &mut secret_states,
+        "plugins.api_quota.openrouter",
+        &mut redacted.plugins.api_quota.openrouter,
     );
     let mut config_value = serde_json::to_value(&redacted).map_err(ApiError::internal)?;
     if let Value::Object(config_object) = &mut config_value {
@@ -5065,12 +7515,7 @@ fn active_persona_avatar_path(
         .iter()
         .find(|document| document.name == active)
         .and_then(|document| document.avatar_path.as_deref())?;
-    let path = PathBuf::from(value.trim());
-    Some(if path.is_absolute() {
-        path
-    } else {
-        paths.config_dir.join(path)
-    })
+    resolve_persona_asset_path(paths, value)
 }
 
 fn active_persona_board_path(
@@ -5084,12 +7529,75 @@ fn active_persona_board_path(
         .iter()
         .find(|document| document.name == active)
         .and_then(|document| document.board_image_path.as_deref())?;
-    let path = PathBuf::from(value.trim());
+    resolve_persona_asset_path(paths, value)
+}
+
+fn resolve_persona_asset_path(paths: &MiyuPaths, value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if persona_asset_uses_managed_namespace(value) {
+        return managed_persona_asset_path(paths, value);
+    }
+    let path = PathBuf::from(value);
+    if let Some(path) = paths.migrated_resource_path(&path) {
+        return Some(path);
+    }
     Some(if path.is_absolute() {
         path
     } else {
         paths.config_dir.join(path)
     })
+}
+
+fn managed_persona_asset_path(paths: &MiyuPaths, value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.contains('\\') || value.chars().any(char::is_control) {
+        return None;
+    }
+    let mut components = std::path::Path::new(value).components();
+    while matches!(
+        components.clone().next(),
+        Some(std::path::Component::CurDir)
+    ) {
+        components.next();
+    }
+    if !matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "persona-avatars")
+    {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in components {
+        match component {
+            std::path::Component::Normal(component) => normalized.push(component),
+            _ => return None,
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+    Some(paths.persona_avatars_dir().join(normalized))
+}
+
+fn persona_asset_uses_managed_namespace(value: &str) -> bool {
+    std::path::Path::new(value)
+        .components()
+        .find(|component| !matches!(component, std::path::Component::CurDir))
+        .is_some_and(|component| {
+            matches!(component, std::path::Component::Normal(name) if name == "persona-avatars")
+        })
+}
+
+fn validate_managed_persona_asset_file(paths: &MiyuPaths, path: &FilePath) -> Result<()> {
+    let root_path = paths.persona_avatars_dir();
+    let root_metadata = std::fs::symlink_metadata(&root_path)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("managed persona asset directory is unsafe");
+    }
+    let root = std::fs::canonicalize(root_path)?;
+    let canonical = std::fs::canonicalize(path)?;
+    if !canonical.starts_with(&root) || !std::fs::metadata(&canonical)?.is_file() {
+        bail!("managed persona asset escapes its resource directory");
+    }
+    Ok(())
 }
 
 fn redact_secret_list(states: &mut HashMap<String, bool>, key: &str, values: &mut Vec<String>) {
@@ -5098,6 +7606,45 @@ fn redact_secret_list(states: &mut HashMap<String, bool>, key: &str, values: &mu
         values.iter().any(|value| !value.trim().is_empty()),
     );
     values.clear();
+}
+
+fn redact_api_quota_provider(
+    states: &mut HashMap<String, bool>,
+    prefix: &str,
+    provider: &mut crate::config::ApiQuotaProviderConfig,
+) {
+    if provider.accounts.is_empty() {
+        provider
+            .accounts
+            .push(crate::config::ApiQuotaAccountConfig {
+                id: "account-1".to_string(),
+                name: "默认账号".to_string(),
+                api_key: provider.api_key.clone(),
+            });
+    } else if !provider.api_key.trim().is_empty() && provider.accounts[0].api_key.trim().is_empty()
+    {
+        provider.accounts[0].api_key = provider.api_key.clone();
+    }
+    provider.api_key.clear();
+    let mut used_ids = HashSet::with_capacity(provider.accounts.len());
+    for (index, account) in provider.accounts.iter_mut().enumerate() {
+        if account.id.trim().is_empty() || !used_ids.insert(account.id.clone()) {
+            let mut number = index + 1;
+            loop {
+                let candidate = format!("account-{number}");
+                if used_ids.insert(candidate.clone()) {
+                    account.id = candidate;
+                    break;
+                }
+                number += 1;
+            }
+        }
+    }
+    for (index, account) in provider.accounts.iter_mut().enumerate() {
+        let key = format!("{prefix}.accounts.{index}.api_key");
+        states.insert(key, !account.api_key.trim().is_empty());
+        account.api_key.clear();
+    }
 }
 
 fn restore_config_secrets(
@@ -5168,6 +7715,21 @@ fn restore_config_secrets(
         None => current.plugins.exchange_rate.api_key.clone(),
     };
 
+    restore_api_quota_provider(
+        &mut candidate.plugins.api_quota.deepseek,
+        &current.plugins.api_quota.deepseek,
+        mutations,
+        &mut recognized,
+        "plugins.api_quota.deepseek",
+    )?;
+    restore_api_quota_provider(
+        &mut candidate.plugins.api_quota.openrouter,
+        &current.plugins.api_quota.openrouter,
+        mutations,
+        &mut recognized,
+        "plugins.api_quota.openrouter",
+    )?;
+
     let onebot_token_key = "platforms.qq.access_token";
     recognized.insert(onebot_token_key.to_string());
     candidate.platforms.qq.access_token = match mutations.get(onebot_token_key) {
@@ -5184,6 +7746,46 @@ fn restore_config_secrets(
             format!("unknown secret field: {key}"),
         ));
     }
+    Ok(())
+}
+
+fn restore_api_quota_provider(
+    candidate: &mut crate::config::ApiQuotaProviderConfig,
+    current: &crate::config::ApiQuotaProviderConfig,
+    mutations: &HashMap<String, SecretMutation>,
+    recognized: &mut HashSet<String>,
+    prefix: &str,
+) -> std::result::Result<(), ApiError> {
+    for (index, account) in candidate.accounts.iter_mut().enumerate() {
+        let key = format!("{prefix}.accounts.{index}.api_key");
+        recognized.insert(key.clone());
+        let mut existing = current
+            .accounts
+            .iter()
+            .find(|item| !account.id.is_empty() && item.id == account.id)
+            .or_else(|| {
+                current
+                    .accounts
+                    .iter()
+                    .find(|item| item.id.is_empty() && item.name == account.name)
+            })
+            .map(|item| item.api_key.clone())
+            .or_else(|| {
+                (index == 0 && current.accounts.is_empty()).then(|| current.api_key.clone())
+            })
+            .unwrap_or_default();
+        if existing.is_empty() && index == 0 && !current.api_key.trim().is_empty() {
+            existing = current.api_key.clone();
+        }
+        account.api_key = match mutations.get(&key) {
+            Some(SecretMutation::Set(value)) => {
+                normalize_single_secret(value, &key)?.unwrap_or_default()
+            }
+            Some(SecretMutation::Clear) => String::new(),
+            None => existing,
+        };
+    }
+    candidate.api_key.clear();
     Ok(())
 }
 
@@ -5291,6 +7893,25 @@ fn validate_prompt_documents(
 ) -> std::result::Result<(), ApiError> {
     validate_prompt_document_list("persona", &prompts.personas)?;
     validate_prompt_document_list("identity", &prompts.identities)?;
+    let mut persona_scopes = HashMap::<String, &str>::new();
+    for document in &prompts.personas {
+        if document.name.eq_ignore_ascii_case("system-prompt.md") {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "system-prompt.md is reserved and cannot be used as a persona",
+            ));
+        }
+        let scope = crate::config::persona_scope_name(&document.name);
+        if let Some(existing) = persona_scopes.insert(scope.clone(), &document.name) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "persona names map to the same persistent scope: {existing} and {} ({scope})",
+                    document.name
+                ),
+            ));
+        }
+    }
     if !config.prompt.active_persona.trim().is_empty()
         && !prompts
             .personas
@@ -5301,6 +7922,21 @@ fn validate_prompt_documents(
             StatusCode::BAD_REQUEST,
             "the active persona does not exist",
         ));
+    }
+    for route in &config.platforms.qq.conversations {
+        let Some(name) = route.persona.custom_name() else {
+            continue;
+        };
+        if !prompts
+            .personas
+            .iter()
+            .any(|document| document.name == name)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("QQ conversation persona does not exist: {name}"),
+            ));
+        }
     }
     if !config.prompt.active_identity.trim().is_empty()
         && !prompts
@@ -5314,6 +7950,28 @@ fn validate_prompt_documents(
         ));
     }
     Ok(())
+}
+
+fn reconcile_qq_persona_references(config: &mut AppConfig, prompts: &PromptDocuments) {
+    let renames = prompts
+        .personas
+        .iter()
+        .filter_map(|document| {
+            document
+                .original_name
+                .as_deref()
+                .filter(|original| *original != document.name)
+                .map(|original| (original.to_string(), document.name.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for route in &mut config.platforms.qq.conversations {
+        let Some(current) = route.persona.custom_name() else {
+            continue;
+        };
+        if let Some(next) = renames.get(current) {
+            route.persona = crate::config::PlatformPersonaOverride::Custom { name: next.clone() };
+        }
+    }
 }
 
 fn validate_prompt_document_list(
@@ -5440,6 +8098,9 @@ fn read_prompt_document_dir(
         if !name.ends_with(".md") {
             continue;
         }
+        if with_avatar_metadata && name.eq_ignore_ascii_case("system-prompt.md") {
+            continue;
+        }
         let content = std::fs::read_to_string(entry.path())?;
         let metadata = with_avatar_metadata
             .then(|| read_prompt_metadata(&entry.path()))
@@ -5496,6 +8157,83 @@ struct PersonaScopeBackup {
     original: PathBuf,
     staged: PathBuf,
     destination: Option<PathBuf>,
+}
+
+struct PersonaDbRenameGuard {
+    state: StateStore,
+    renames: Vec<(String, String)>,
+    committed: bool,
+}
+
+impl PersonaDbRenameGuard {
+    fn new(state: StateStore, changes: &[(String, Option<String>)]) -> Result<Self> {
+        let renames = changes
+            .iter()
+            .filter_map(|(old_name, new_name)| {
+                let new_name = new_name.as_deref()?;
+                let old_scope = crate::config::persona_scope_name(old_name);
+                let new_scope = crate::config::persona_scope_name(new_name);
+                (old_scope != new_scope).then_some((old_scope, new_scope))
+            })
+            .collect::<Vec<_>>();
+        migrate_persona_db_scopes(&state, &renames)?;
+        Ok(Self {
+            state,
+            renames,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PersonaDbRenameGuard {
+    fn drop(&mut self) {
+        if self.committed || self.renames.is_empty() {
+            return;
+        }
+        let reverse = self
+            .renames
+            .iter()
+            .map(|(old, new)| (new.clone(), old.clone()))
+            .collect::<Vec<_>>();
+        let _ = migrate_persona_db_scopes(&self.state, &reverse);
+    }
+}
+
+fn migrate_persona_db_scopes(state: &StateStore, renames: &[(String, String)]) -> Result<()> {
+    let staged = renames
+        .iter()
+        .map(|(old, new)| {
+            (
+                old.clone(),
+                format!("persona-migration-{}", random_token(18)),
+                new.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (staged_count, (old, temporary, _)) in staged.iter().enumerate() {
+        if let Err(error) = state.rename_persona_scope(old, temporary) {
+            for (old, temporary, _) in staged[..staged_count].iter().rev() {
+                let _ = state.rename_persona_scope(temporary, old);
+            }
+            return Err(error);
+        }
+    }
+    for (finalized, (_, temporary, new)) in staged.iter().enumerate() {
+        if let Err(error) = state.rename_persona_scope(temporary, new) {
+            for (_, temporary, new) in staged[..finalized].iter().rev() {
+                let _ = state.rename_persona_scope(new, temporary);
+            }
+            for (old, temporary, _) in staged.iter().rev() {
+                let _ = state.rename_persona_scope(temporary, old);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn apply_prompt_documents(
@@ -5555,21 +8293,7 @@ fn apply_persona_scope_changes(
     next: &PromptDocuments,
     paths: &MiyuPaths,
 ) -> Result<Vec<PersonaScopeBackup>> {
-    let mut changes = Vec::<(String, Option<String>)>::new();
-    for document in &current.personas {
-        let represented = next.personas.iter().find(|next_document| {
-            next_document.original_name.as_deref() == Some(document.name.as_str())
-                || next_document.original_name.is_none() && next_document.name == document.name
-        });
-        match represented {
-            Some(next_document) if next_document.name != document.name => {
-                changes.push((document.name.clone(), Some(next_document.name.clone())));
-            }
-            None => changes.push((document.name.clone(), None)),
-            _ => {}
-        }
-    }
-
+    let changes = persona_document_changes(current, next);
     let mut backups = Vec::new();
     let stage_result = (|| -> Result<()> {
         for (change_index, (old_name, new_name)) in changes.iter().enumerate() {
@@ -5634,6 +8358,27 @@ fn apply_persona_scope_changes(
         return Err(error);
     }
     Ok(backups)
+}
+
+fn persona_document_changes(
+    current: &PromptDocuments,
+    next: &PromptDocuments,
+) -> Vec<(String, Option<String>)> {
+    let mut changes = Vec::new();
+    for document in &current.personas {
+        let represented = next.personas.iter().find(|next_document| {
+            next_document.original_name.as_deref() == Some(document.name.as_str())
+                || next_document.original_name.is_none() && next_document.name == document.name
+        });
+        match represented {
+            Some(next_document) if next_document.name != document.name => {
+                changes.push((document.name.clone(), Some(next_document.name.clone())));
+            }
+            None => changes.push((document.name.clone(), None)),
+            _ => {}
+        }
+    }
+    changes
 }
 
 fn restore_persona_scope_backups(backups: &[PersonaScopeBackup]) {
@@ -5804,7 +8549,7 @@ fn safe_multimodal_models(config: &AppConfig) -> Vec<SafeModel> {
 }
 
 impl SafeTurn {
-    fn from_turn(turn: Turn, assets: Vec<ImageAsset>) -> Self {
+    fn from_turn(turn: Turn, assets: Vec<ImageAsset>, artifacts: Vec<ArtifactAsset>) -> Self {
         let assets = assets
             .into_iter()
             .map(|asset| {
@@ -5821,7 +8566,7 @@ impl SafeTurn {
                 TurnStatus::Interrupted => "interrupted",
             },
             active_context: !turn.hidden,
-            user_content: turn.user_content,
+            user_content: turn.display_content,
             assistant_content: redact_internal_assistant_text(&turn.assistant_content),
             assistant_reasoning: turn
                 .assistant_reasoning
@@ -5835,7 +8580,46 @@ impl SafeTurn {
             question_exchanges: turn.question_exchanges,
             followups: turn.followups.into_iter().map(SafeFollowup::from).collect(),
             assets,
+            artifacts: artifacts.into_iter().map(SafeArtifactAsset::from).collect(),
+            attachments: turn
+                .attachments
+                .into_iter()
+                .map(SafeUserAttachment::from)
+                .collect(),
+            revision: turn.revision,
         }
+    }
+}
+
+impl From<ArtifactAsset> for SafeArtifactAsset {
+    fn from(asset: ArtifactAsset) -> Self {
+        Self {
+            url: format!("/api/artifacts/{}", asset.asset_id),
+            id: asset.asset_id,
+            name: asset.file_name,
+            mime: asset.mime,
+            kind: asset.kind,
+            type_label: artifact_type_label(&asset.source_key),
+            size: asset.size_bytes,
+            updated_at: asset.updated_at,
+        }
+    }
+}
+
+fn artifact_type_label(source_key: &str) -> String {
+    let extension = FilePath::new(source_key)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    match extension.as_str() {
+        "MARKDOWN" => "MD".to_string(),
+        "HTML" | "HTM" => "HTML".to_string(),
+        "JSONL" => "JSONL".to_string(),
+        "JSON" => "JSON".to_string(),
+        "PDF" => "PDF".to_string(),
+        value if value.len() <= 6 && !value.is_empty() => value.to_string(),
+        _ => "FILE".to_string(),
     }
 }
 
@@ -5898,6 +8682,11 @@ impl From<TurnFollowup> for SafeFollowup {
                 .map(|reasoning| redact_internal_assistant_text(&reasoning)),
             provider_id: followup.preceding_assistant_provider_id,
             model: followup.preceding_assistant_model,
+            attachments: followup
+                .uploaded_attachments
+                .into_iter()
+                .map(SafeUserAttachment::from)
+                .collect(),
         }
     }
 }
@@ -5908,6 +8697,26 @@ impl From<QueuedPrompt> for SafeQueuedPrompt {
             id: prompt.prompt_id,
             content: prompt.display_content,
             submitted_at: prompt.submitted_at,
+            attachments: prompt
+                .uploaded_attachments
+                .into_iter()
+                .map(SafeUserAttachment::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<UserAttachment> for SafeUserAttachment {
+    fn from(attachment: UserAttachment) -> Self {
+        Self {
+            url: format!("/api/attachments/{}", attachment.attachment_id),
+            id: attachment.attachment_id,
+            name: attachment.file_name,
+            mime: attachment.mime,
+            kind: attachment.kind,
+            size: attachment.size_bytes,
+            width: attachment.width,
+            height: attachment.height,
         }
     }
 }
@@ -6026,6 +8835,46 @@ fn validate_model_selection(
     Ok(validated)
 }
 
+fn validate_thinking_variant_updates(
+    updates: Vec<ThinkingVariantUpdate>,
+) -> std::result::Result<Vec<ThinkingVariantUpdate>, ApiError> {
+    if updates.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "at least one thinking variant update is required",
+        ));
+    }
+    if updates.len() > MAX_THINKING_VARIANT_UPDATES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("at most {MAX_THINKING_VARIANT_UPDATES} thinking variants can be updated"),
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(updates.len());
+    let mut validated = Vec::with_capacity(updates.len());
+    for update in updates {
+        let provider_id = validate_short_field(update.provider_id, "provider_id", 200)?;
+        let model = validate_short_field(update.model, "model", 500)?;
+        let selected = update
+            .selected
+            .map(|selected| validate_short_field(selected, "selected", 200))
+            .transpose()?;
+        if !seen.insert((provider_id.clone(), model.clone())) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "duplicate provider/model thinking variant update",
+            ));
+        }
+        validated.push(ThinkingVariantUpdate {
+            provider_id,
+            model,
+            selected,
+        });
+    }
+    Ok(validated)
+}
+
 fn parse_mode(mode: &str) -> std::result::Result<AgentMode, ApiError> {
     match mode {
         "normal" => Ok(AgentMode::Normal),
@@ -6044,6 +8893,10 @@ fn mode_name(mode: AgentMode) -> &'static str {
         AgentMode::Plan => "plan",
         AgentMode::Chat => "chat",
     }
+}
+
+fn is_local_webui_request(audience: PromptAudience, has_turn_profile: bool) -> bool {
+    audience == PromptAudience::External && !has_turn_profile
 }
 
 fn real_tool_name(event_name: &str) -> &str {
@@ -6159,6 +9012,13 @@ mod tests {
     use crate::question::{QuestionOption, QuestionPrompt};
     use crate::state::PlatformSessionBindingKey;
 
+    #[test]
+    fn artifact_tools_are_scoped_to_local_webui_requests() {
+        assert!(is_local_webui_request(PromptAudience::External, false));
+        assert!(!is_local_webui_request(PromptAudience::Owner, false));
+        assert!(!is_local_webui_request(PromptAudience::External, true));
+    }
+
     fn test_paths(root: &FilePath) -> MiyuPaths {
         MiyuPaths {
             config_dir: root.join("config"),
@@ -6176,10 +9036,446 @@ mod tests {
         }
     }
 
+    #[test]
+    fn managed_persona_assets_use_the_resource_directory_and_reject_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(temp.path());
+        paths.skills_dir = paths.data_dir.join("skills");
+        paths.scripts_dir = paths.data_dir.join("scripts");
+
+        assert_eq!(
+            managed_persona_asset_path(&paths, "persona-avatars/avatar.png"),
+            Some(paths.data_dir.join("persona-avatars/avatar.png"))
+        );
+        assert!(managed_persona_asset_path(&paths, "/etc/passwd").is_none());
+        assert!(managed_persona_asset_path(&paths, "persona-avatars/../secret").is_none());
+        assert_eq!(
+            managed_persona_asset_path(&paths, "persona-avatars/nested/file.png"),
+            Some(paths.data_dir.join("persona-avatars/nested/file.png"))
+        );
+        assert_eq!(
+            resolve_persona_asset_path(&paths, "./persona-avatars/avatar.png"),
+            Some(paths.data_dir.join("persona-avatars/avatar.png"))
+        );
+        assert!(resolve_persona_asset_path(&paths, "persona-avatars/../../secret").is_none());
+        assert_eq!(
+            resolve_persona_asset_path(&paths, "avatars/custom.png"),
+            Some(paths.config_dir.join("avatars/custom.png"))
+        );
+        assert_eq!(
+            resolve_persona_asset_path(&paths, "scripts/images/custom.png"),
+            Some(paths.data_dir.join("scripts/images/custom.png"))
+        );
+        assert_eq!(
+            resolve_persona_asset_path(
+                &paths,
+                &paths
+                    .config_dir
+                    .join("persona-avatars/absolute.png")
+                    .display()
+                    .to_string(),
+            ),
+            Some(paths.data_dir.join("persona-avatars/absolute.png"))
+        );
+    }
+
+    #[tokio::test]
+    async fn persona_asset_store_is_atomic_and_rejects_corrupt_cache_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("persona-avatars");
+        std::fs::create_dir_all(&directory).unwrap();
+        let body = b"persona asset";
+        let hash = format!("{:x}", Sha256::digest(body));
+        let destination = directory.join(format!("{hash}.png"));
+
+        store_persona_asset(&directory, &destination, &hash, body)
+            .await
+            .unwrap();
+        store_persona_asset(&directory, &destination, &hash, body)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+
+        std::fs::write(&destination, b"corrupt").unwrap();
+        store_persona_asset(&directory, &destination, &hash, body)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+    }
+
+    #[test]
+    fn persona_asset_cleanup_normalizes_managed_reference_paths() {
+        fn prompts(path: String) -> PromptDocuments {
+            PromptDocuments {
+                personas: vec![PromptDocument {
+                    name: "Persona.md".to_string(),
+                    content: String::new(),
+                    avatar_path: Some(path),
+                    board_image_path: None,
+                    board_title: None,
+                    board_subtitle: None,
+                    starter_prompts: None,
+                    original_name: None,
+                }],
+                identities: Vec::new(),
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(temp.path());
+        paths.skills_dir = paths.data_dir.join("skills");
+        let directory = paths.persona_avatars_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = format!("{}.png", "a".repeat(64));
+        let asset = directory.join(&name);
+        std::fs::write(&asset, "image").unwrap();
+
+        cleanup_persona_assets(
+            &paths,
+            &prompts(format!("persona-avatars/{name}")),
+            &prompts(format!("./persona-avatars/{name}")),
+        );
+        assert!(asset.is_file());
+    }
+
+    #[test]
+    fn system_prompt_resource_is_not_exposed_as_a_persona_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(temp.path());
+        paths.skills_dir = paths.data_dir.join("skills");
+        let prompts = paths.prompts_dir();
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("system-prompt.md"), "fallback").unwrap();
+        std::fs::write(prompts.join("Persona.md"), "persona").unwrap();
+
+        let documents = read_prompt_documents(&AppConfig::default(), &paths).unwrap();
+        assert_eq!(documents.personas.len(), 1);
+        assert_eq!(documents.personas[0].name, "Persona.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_persona_asset_validation_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(temp.path());
+        paths.skills_dir = paths.data_dir.join("skills");
+        let directory = paths.persona_avatars_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+        let outside = temp.path().join("outside.png");
+        std::fs::write(&outside, "image").unwrap();
+        let managed = directory.join("avatar.png");
+        symlink(&outside, &managed).unwrap();
+
+        assert!(validate_managed_persona_asset_file(&paths, &managed).is_err());
+    }
+
     fn test_daemon_with_actor(
         root: &FilePath,
     ) -> (DaemonState, std::thread::JoinHandle<Result<()>>) {
         DaemonState::for_test_with_actor(test_paths(root), 8300).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ipc_session_list_excludes_platform_owned_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let local = state
+            .state_store
+            .create_session(&persona, "local", "user", None)
+            .unwrap();
+        let platform = state
+            .state_store
+            .create_session(&persona, "platform", "user", None)
+            .unwrap();
+        state
+            .state_store
+            .bind_platform_session(
+                &PlatformSessionBindingKey {
+                    platform: "onebot".to_string(),
+                    account_id: "10000".to_string(),
+                    conversation_kind: "group".to_string(),
+                    conversation_id: "20000".to_string(),
+                    participant_id: None,
+                    persona: persona.clone(),
+                },
+                &platform.session_id,
+            )
+            .unwrap();
+
+        let data = handle_session_command(
+            &state,
+            IpcCommand::ListSessions {
+                include_archived: false,
+            },
+        )
+        .await
+        .unwrap();
+        let ids = data["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|session| session["session_id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&local.session_id.as_str()));
+        assert!(!ids.contains(&platform.session_id.as_str()));
+    }
+
+    #[test]
+    fn target_session_state_does_not_move_the_default_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let default_session_id = state.state_store.session_id();
+        let local = state
+            .state_store
+            .create_session(&persona, "repl local", "user", None)
+            .unwrap();
+
+        let snapshot = session_state_for(&state, &local.session_id).unwrap();
+
+        assert_eq!(snapshot.session_id, local.session_id);
+        assert_eq!(&*state.state_store.session_id(), &*default_session_id);
+    }
+
+    #[tokio::test]
+    async fn creating_a_repl_session_does_not_move_the_default_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let default_session_id = state.state_store.session_id();
+
+        let data = handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: Some("repl local".to_string()),
+                switch: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            data["session"]["session_id"].as_str(),
+            Some(default_session_id.as_ref())
+        );
+        assert_eq!(&*state.state_store.session_id(), &*default_session_id);
+    }
+
+    #[tokio::test]
+    async fn actor_undo_is_scoped_to_the_requested_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) = test_daemon_with_actor(temp.path());
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let default_session_id = state.state_store.session_id();
+        let default_store = state.state_store.pinned(&default_session_id);
+        default_store
+            .start_turn("default-turn", "default", std::process::id())
+            .unwrap();
+        default_store
+            .complete_turn("default-turn", "default reply", None)
+            .unwrap();
+        let local = state
+            .state_store
+            .create_session(&persona, "repl local", "user", None)
+            .unwrap();
+        let local_store = state.state_store.pinned(&local.session_id);
+        local_store
+            .start_turn("local-turn", "local", std::process::id())
+            .unwrap();
+        local_store
+            .complete_turn("local-turn", "local reply", None)
+            .unwrap();
+
+        let (reply, receiver) = oneshot::channel();
+        state
+            .actor_tx
+            .send(ActorCommand::Undo {
+                session_id: local.session_id.clone().into(),
+                reply,
+            })
+            .unwrap();
+        receiver.await.unwrap().unwrap();
+
+        assert!(local_store.load_turns().unwrap().is_empty());
+        assert_eq!(default_store.load_turns().unwrap().len(), 1);
+        assert_eq!(&*state.state_store.session_id(), &*default_session_id);
+        state.actor_tx.send(ActorCommand::Shutdown).unwrap();
+        actor_join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn local_session_resolution_rejects_platform_ids_and_prefers_local_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let local = state
+            .state_store
+            .create_session(&persona, "shared", "user", None)
+            .unwrap();
+        let platform = state
+            .state_store
+            .create_session(&persona, "shared", "user", None)
+            .unwrap();
+        state
+            .state_store
+            .bind_platform_session(
+                &PlatformSessionBindingKey {
+                    platform: "onebot".to_string(),
+                    account_id: "10000".to_string(),
+                    conversation_kind: "private".to_string(),
+                    conversation_id: "20000".to_string(),
+                    participant_id: Some("20000".to_string()),
+                    persona,
+                },
+                &platform.session_id,
+            )
+            .unwrap();
+
+        let resolved = resolve_local_session_ref(
+            &state,
+            &ipc::SessionRef::Name {
+                name: "SHARED".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.session_id, local.session_id);
+        assert!(resolve_local_session_ref(
+            &state,
+            &ipc::SessionRef::Id {
+                id: platform.session_id,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn attachment_validation_accepts_utf8_code_and_rejects_unknown_binary() {
+        let (kind, mime, width, height) =
+            inspect_user_attachment("main.rs", b"fn main() {}\n").unwrap();
+        assert_eq!(kind, "text");
+        assert_eq!(mime, "text/plain");
+        assert_eq!((width, height), (0, 0));
+        assert!(inspect_user_attachment("payload.bin", &[0xff, 0xfe, 0xfd]).is_err());
+        assert!(inspect_user_attachment("notes.exe", b"plain text").is_err());
+    }
+
+    #[test]
+    fn attachment_download_header_preserves_utf8_filename() {
+        let value = attachment_content_disposition("报告 1.md", false)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(value.starts_with("attachment;"));
+        assert!(value.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A%201.md"));
+    }
+
+    #[tokio::test]
+    async fn busy_config_reload_returns_an_error_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) = test_daemon_with_actor(temp.path());
+        state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .save(&state.paths)
+            .unwrap();
+        let (cancel, _cancel_rx) = tokio::sync::watch::channel(false);
+        state.manager.lock().unwrap().active_runs.insert(
+            "busy-run".to_string(),
+            RunInfo {
+                session_id: state.state_store.session_id().into(),
+                mode: AgentMode::Normal,
+                audience: PromptAudience::External,
+                cancel,
+                turn_id: None,
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Create,
+            },
+        );
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let task = tokio::spawn(async move { handle_ipc_connection(server_state, server).await });
+        ipc::send(&mut client, &IpcRequest::new(IpcCommand::ReloadConfig))
+            .await
+            .unwrap();
+        let response = ipc::receive::<IpcFrame>(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response,
+            IpcFrame::Error { message } if message.contains("busy with another operation")
+        ));
+        task.await.unwrap().unwrap();
+
+        state.manager.lock().unwrap().active_runs.clear();
+        state.actor_tx.send(ActorCommand::Shutdown).unwrap();
+        actor_join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn qq_group_history_scope_and_offender_deletion_are_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        let scope = qq_group_scope("123456", "234567").unwrap();
+        store
+            .plugin_put_json(
+                &scope,
+                "offender_history",
+                &json!({
+                    "345678": { "user_id": "345678", "ban_count": 2 },
+                    "456789": { "user_id": "456789", "ban_count": 1 }
+                }),
+            )
+            .unwrap();
+        store
+            .plugin_update_json::<HashMap<String, Value>, _>(
+                &scope,
+                "offender_history",
+                |current| {
+                    let mut records = current.unwrap_or_default();
+                    records.remove("345678");
+                    Ok(Some(records))
+                },
+            )
+            .unwrap();
+        let remaining = store
+            .plugin_get_json::<HashMap<String, Value>>(&scope, "offender_history")
+            .unwrap()
+            .unwrap();
+        assert!(!remaining.contains_key("345678"));
+        assert!(remaining.contains_key("456789"));
+        assert_eq!(scope.platform, "onebot");
+        assert_eq!(scope.conversation_kind, "group");
     }
 
     #[tokio::test]
@@ -6208,7 +9504,13 @@ mod tests {
             RunInfo {
                 session_id: other.session_id.clone().into(),
                 mode: AgentMode::Normal,
+                audience: PromptAudience::Internal,
                 cancel: other_cancel,
+                turn_id: None,
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Create,
             },
         );
         assert!(
@@ -6231,7 +9533,13 @@ mod tests {
             RunInfo {
                 session_id: target.session_id.clone().into(),
                 mode: AgentMode::Normal,
+                audience: PromptAudience::External,
                 cancel: target_cancel,
+                turn_id: None,
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Create,
             },
         );
         assert!(matches!(
@@ -6420,7 +9728,13 @@ mod tests {
                 RunInfo {
                     session_id: "default".into(),
                     mode: AgentMode::Normal,
+                    audience: PromptAudience::Owner,
                     cancel: cancel_tx,
+                    turn_id: None,
+                    queue_target: None,
+                    supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                    platform_followup: None,
+                    operation: RunOperation::Create,
                 },
             )]),
             admin_busy: false,
@@ -6432,6 +9746,101 @@ mod tests {
             persona_session_ids: HashMap::new(),
         }));
         (manager, cancel_rx)
+    }
+
+    #[test]
+    fn active_turn_queue_never_crosses_prompt_audiences() {
+        let (manager, _cancel_rx) = manager_with_run("owner_run");
+        let manager = manager.lock().unwrap();
+
+        assert!(manager.session_runs_match_audience("default", PromptAudience::Owner));
+        assert!(!manager.session_runs_match_audience("default", PromptAudience::External));
+        assert!(!manager.session_runs_match_audience("missing", PromptAudience::Owner));
+    }
+
+    #[test]
+    fn light_admin_reservation_allows_running_turns_and_serializes_mutations() {
+        let (manager, _cancel_rx) = manager_with_run("active_run");
+
+        assert!(reserve_admin(&manager).is_err());
+        assert!(reserve_admin_light(&manager).is_ok());
+        assert!(reserve_admin_light(&manager).is_err());
+        assert_eq!(manager.lock().unwrap().active_runs.len(), 1);
+
+        release_admin(&manager);
+        assert!(reserve_admin_light(&manager).is_ok());
+        release_admin(&manager);
+    }
+
+    #[test]
+    fn turn_updates_are_routed_to_the_exact_run_and_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let session_id = state.state_store.session_id();
+        let first_store = state.state_store.pinned_for_turn(&session_id);
+        let second_store = state.state_store.pinned_for_turn(&session_id);
+        first_store
+            .start_turn("turn-first", "first", std::process::id())
+            .unwrap();
+        second_store
+            .start_turn("turn-second", "second", std::process::id())
+            .unwrap();
+        let mut manager = state.manager.lock().unwrap();
+        for (run_id, turn_id, store) in [
+            ("run-first", "turn-first", &first_store),
+            ("run-second", "turn-second", &second_store),
+        ] {
+            let (cancel, _cancel_rx) = tokio::sync::watch::channel(false);
+            manager.active_runs.insert(
+                run_id.to_string(),
+                RunInfo {
+                    session_id: session_id.clone(),
+                    mode: AgentMode::Normal,
+                    audience: PromptAudience::External,
+                    cancel,
+                    turn_id: Some(turn_id.to_string()),
+                    queue_target: Some(store.queue_target(turn_id)),
+                    supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                    platform_followup: None,
+                    operation: RunOperation::Create,
+                },
+            );
+        }
+        drop(manager);
+
+        enqueue_turn_update(
+            &state,
+            TurnUpdateRequest {
+                run_id: "run-first".to_string(),
+                turn_id: "turn-first".to_string(),
+                session_id: Some(session_id.clone()),
+                audience: PromptAudience::External,
+                content: "follow first".to_string(),
+                display_content: "follow first".to_string(),
+                attachments: Vec::new(),
+                uploaded_attachment_ids: Vec::new(),
+                mode: TurnUpdateMode::Followup,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first_store.load_queued_prompts().unwrap().len(), 1);
+        assert!(second_store.load_queued_prompts().unwrap().is_empty());
+        assert!(enqueue_turn_update(
+            &state,
+            TurnUpdateRequest {
+                run_id: "run-first".to_string(),
+                turn_id: "turn-second".to_string(),
+                session_id: Some(session_id),
+                audience: PromptAudience::External,
+                content: "wrong target".to_string(),
+                display_content: "wrong target".to_string(),
+                attachments: Vec::new(),
+                uploaded_attachment_ids: Vec::new(),
+                mode: TurnUpdateMode::Followup,
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -6562,12 +9971,93 @@ mod tests {
     }
 
     #[test]
+    fn thinking_variant_validation_distinguishes_model_default_and_named_default() {
+        let updates = validate_thinking_variant_updates(vec![
+            ThinkingVariantUpdate {
+                provider_id: " provider ".to_string(),
+                model: "model-one".to_string(),
+                selected: None,
+            },
+            ThinkingVariantUpdate {
+                provider_id: "provider".to_string(),
+                model: "model-two".to_string(),
+                selected: Some(" default ".to_string()),
+            },
+        ])
+        .unwrap();
+        assert_eq!(updates[0].provider_id, "provider");
+        assert_eq!(updates[0].selected, None);
+        assert_eq!(updates[1].selected.as_deref(), Some("default"));
+
+        assert!(validate_thinking_variant_updates(vec![
+            ThinkingVariantUpdate {
+                provider_id: "provider".to_string(),
+                model: "model".to_string(),
+                selected: None,
+            },
+            ThinkingVariantUpdate {
+                provider_id: " provider ".to_string(),
+                model: " model ".to_string(),
+                selected: Some("high".to_string()),
+            },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn thinking_variant_updates_validate_before_persisting_and_can_clear_a_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let choice = config
+            .active_provider_model_choices()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut preferences = ThinkingVariantPreferences::load(&paths);
+        preferences.set(
+            &choice.provider_id,
+            &choice.model,
+            Some("previous-selection".to_string()),
+        );
+        preferences.save(&paths).unwrap();
+
+        let mut agent = None;
+        let invalid = ThinkingVariantUpdate {
+            provider_id: choice.provider_id.clone(),
+            model: choice.model.clone(),
+            selected: Some("definitely-not-a-real-variant".to_string()),
+        };
+        assert!(matches!(
+            apply_thinking_variant_updates(&mut agent, &config, &paths, &[invalid]),
+            Err(AdminFailure::Invalid(_))
+        ));
+        assert_eq!(
+            ThinkingVariantPreferences::load(&paths).selected(&choice.provider_id, &choice.model),
+            Some("previous-selection")
+        );
+
+        let clear = ThinkingVariantUpdate {
+            provider_id: choice.provider_id.clone(),
+            model: choice.model.clone(),
+            selected: None,
+        };
+        apply_thinking_variant_updates(&mut agent, &config, &paths, &[clear]).unwrap();
+        assert_eq!(
+            ThinkingVariantPreferences::load(&paths).selected(&choice.provider_id, &choice.model),
+            None
+        );
+    }
+
+    #[test]
     fn config_response_never_serializes_secret_values() {
         let mut config = AppConfig::default();
         config.providers[0].api_key = Some("provider-secret".to_string());
         config.plugins.web.tavily_api_keys = vec!["tavily-secret".to_string()];
         config.plugins.exchange_rate.api_key = "exchange-secret".to_string();
         config.plugins.image_generation.api_keys = vec!["image-secret".to_string()];
+        config.plugins.api_quota.deepseek.api_key = "deepseek-secret".to_string();
+        config.plugins.api_quota.openrouter.api_key = "openrouter-secret".to_string();
         let paths = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
             config_dir: paths.path().join("config"),
@@ -6598,8 +10088,18 @@ mod tests {
         assert!(!serialized.contains("tavily-secret"));
         assert!(!serialized.contains("exchange-secret"));
         assert!(!serialized.contains("image-secret"));
+        assert!(!serialized.contains("deepseek-secret"));
+        assert!(!serialized.contains("openrouter-secret"));
         assert_eq!(response.secret_states["providers.0.api_key"], true);
         assert_eq!(response.secret_states["plugins.web.tavily_api_keys"], true);
+        assert_eq!(
+            response.secret_states["plugins.api_quota.deepseek.accounts.0.api_key"],
+            true
+        );
+        assert_eq!(
+            response.secret_states["plugins.api_quota.openrouter.accounts.0.api_key"],
+            true
+        );
         assert!(response.config.get("memory").is_some());
     }
 
@@ -6624,6 +10124,86 @@ mod tests {
         let mutations = HashMap::from([("providers.0.api_key".to_string(), SecretMutation::Clear)]);
         restore_config_secrets(&mut candidate, &current, &mutations).unwrap();
         assert_eq!(candidate.providers[0].api_key, None);
+    }
+
+    #[test]
+    fn api_quota_secrets_are_preserved_set_and_cleared() {
+        let mut current = AppConfig::default();
+        current.plugins.api_quota.deepseek.api_key = "deepseek-old".to_string();
+        current.plugins.api_quota.openrouter.api_key = "openrouter-old".to_string();
+        let mut candidate = current.clone();
+        candidate.plugins.api_quota.deepseek.accounts =
+            vec![crate::config::ApiQuotaAccountConfig {
+                id: "account-1".to_string(),
+                name: "默认账号".to_string(),
+                api_key: String::new(),
+            }];
+        candidate.plugins.api_quota.openrouter.accounts =
+            vec![crate::config::ApiQuotaAccountConfig {
+                id: "account-1".to_string(),
+                name: "默认账号".to_string(),
+                api_key: String::new(),
+            }];
+        candidate.plugins.api_quota.deepseek.api_key.clear();
+        candidate.plugins.api_quota.openrouter.api_key.clear();
+
+        restore_config_secrets(&mut candidate, &current, &HashMap::new()).unwrap();
+        assert_eq!(
+            candidate.plugins.api_quota.deepseek.accounts[0].api_key,
+            "deepseek-old"
+        );
+        assert_eq!(
+            candidate.plugins.api_quota.openrouter.accounts[0].api_key,
+            "openrouter-old"
+        );
+
+        let mutations = HashMap::from([
+            (
+                "plugins.api_quota.deepseek.accounts.0.api_key".to_string(),
+                SecretMutation::Set("deepseek-new".to_string()),
+            ),
+            (
+                "plugins.api_quota.openrouter.accounts.0.api_key".to_string(),
+                SecretMutation::Clear,
+            ),
+        ]);
+        restore_config_secrets(&mut candidate, &current, &mutations).unwrap();
+        assert_eq!(
+            candidate.plugins.api_quota.deepseek.accounts[0].api_key,
+            "deepseek-new"
+        );
+        assert!(candidate.plugins.api_quota.openrouter.accounts[0]
+            .api_key
+            .is_empty());
+    }
+
+    #[test]
+    fn api_quota_account_ids_prevent_deleted_key_reuse() {
+        let mut current = AppConfig::default();
+        current.plugins.api_quota.deepseek.accounts[0] = crate::config::ApiQuotaAccountConfig {
+            id: "old-id".to_string(),
+            name: "账号 2".to_string(),
+            api_key: "old-secret".to_string(),
+        };
+        let mut candidate = current.clone();
+        candidate.plugins.api_quota.deepseek.accounts[0] = crate::config::ApiQuotaAccountConfig {
+            id: "new-id".to_string(),
+            name: "账号 2".to_string(),
+            api_key: String::new(),
+        };
+
+        restore_config_secrets(&mut candidate, &current, &HashMap::new()).unwrap();
+        assert!(candidate.plugins.api_quota.deepseek.accounts[0]
+            .api_key
+            .is_empty());
+
+        candidate.plugins.api_quota.deepseek.accounts[0].id = "old-id".to_string();
+        candidate.plugins.api_quota.deepseek.accounts[0].name = "重命名账号".to_string();
+        restore_config_secrets(&mut candidate, &current, &HashMap::new()).unwrap();
+        assert_eq!(
+            candidate.plugins.api_quota.deepseek.accounts[0].api_key,
+            "old-secret"
+        );
     }
 
     #[test]
@@ -6712,6 +10292,42 @@ mod tests {
         assert!(!published);
     }
 
+    #[test]
+    fn closing_question_resumes_run_without_answers() {
+        let broker = QuestionBroker::new();
+        let (responder, mut response) = oneshot::channel();
+        let question_id = broker.insert("run_test", sample_question(), responder);
+        let mut resumed_run = None;
+
+        broker
+            .close(&question_id, |run_id| {
+                assert!(response.try_recv().is_err());
+                resumed_run = Some(run_id.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(resumed_run.as_deref(), Some("run_test"));
+        assert!(matches!(
+            response.try_recv().unwrap(),
+            QuestionResponse::Closed
+        ));
+        assert!(!broker.pending.lock().unwrap().contains_key(&question_id));
+    }
+
+    #[test]
+    fn closed_question_receiver_does_not_publish_close_event() {
+        let broker = QuestionBroker::new();
+        let (responder, response) = oneshot::channel();
+        drop(response);
+        let question_id = broker.insert("run_test", sample_question(), responder);
+        let mut published = false;
+
+        let result = broker.close(&question_id, |_| published = true);
+
+        assert!(matches!(result, Err(AnswerFailure::Gone)));
+        assert!(!published);
+    }
+
     fn sample_question() -> QuestionRequest {
         QuestionRequest {
             questions: vec![QuestionPrompt {
@@ -6732,5 +10348,135 @@ mod tests {
         assert!(validate_content("x".repeat(MAX_CONTENT_CHARS)).is_ok());
         let error = validate_content("界".repeat(MAX_CONTENT_CHARS + 1)).unwrap_err();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    #[test]
+    fn web_persona_rename_updates_qq_routes_and_deletion_is_rejected() {
+        let mut config = AppConfig::default();
+        config
+            .platforms
+            .qq
+            .conversations
+            .push(crate::config::PlatformModelRoute {
+                conversation: crate::config::PlatformConversationConfig {
+                    kind: crate::config::PlatformConversationKind::Group,
+                    id: "42".to_string(),
+                },
+                persona: crate::config::PlatformPersonaOverride::Custom {
+                    name: "Old.md".to_string(),
+                },
+                text_models_inheritance: crate::config::PlatformModelPoolInheritance::Platform,
+                text_models: None,
+                multimodal_models_inheritance:
+                    crate::config::PlatformModelPoolInheritance::Platform,
+                multimodal_models: None,
+                extra_prompt: String::new(),
+                session_limits: None,
+            });
+        let renamed: PromptDocuments = serde_json::from_value(json!({
+            "personas": [{
+                "name": "New.md",
+                "content": "persona",
+                "original_name": "Old.md"
+            }],
+            "identities": []
+        }))
+        .unwrap();
+
+        reconcile_qq_persona_references(&mut config, &renamed);
+        assert_eq!(
+            config.platforms.qq.conversations[0].persona.custom_name(),
+            Some("New.md")
+        );
+        assert!(validate_prompt_documents(&config, &renamed).is_ok());
+        assert!(validate_prompt_documents(&config, &PromptDocuments::default()).is_err());
+    }
+
+    #[test]
+    fn web_persona_renames_use_the_original_reference_snapshot() {
+        let route = |id: &str, persona: &str| crate::config::PlatformModelRoute {
+            conversation: crate::config::PlatformConversationConfig {
+                kind: crate::config::PlatformConversationKind::Group,
+                id: id.to_string(),
+            },
+            persona: crate::config::PlatformPersonaOverride::Custom {
+                name: persona.to_string(),
+            },
+            text_models_inheritance: crate::config::PlatformModelPoolInheritance::Platform,
+            text_models: None,
+            multimodal_models_inheritance: crate::config::PlatformModelPoolInheritance::Platform,
+            multimodal_models: None,
+            extra_prompt: String::new(),
+            session_limits: None,
+        };
+        let mut config = AppConfig::default();
+        config.platforms.qq.conversations = vec![route("1", "A.md"), route("2", "B.md")];
+        let prompts: PromptDocuments = serde_json::from_value(json!({
+            "personas": [
+                {"name": "B.md", "content": "A", "original_name": "A.md"},
+                {"name": "C.md", "content": "B", "original_name": "B.md"}
+            ],
+            "identities": []
+        }))
+        .unwrap();
+
+        reconcile_qq_persona_references(&mut config, &prompts);
+
+        assert_eq!(
+            config.platforms.qq.conversations[0].persona.custom_name(),
+            Some("B.md")
+        );
+        assert_eq!(
+            config.platforms.qq.conversations[1].persona.custom_name(),
+            Some("C.md")
+        );
+    }
+
+    #[test]
+    fn web_rejects_persona_names_with_colliding_persistent_scopes() {
+        let prompts: PromptDocuments = serde_json::from_value(json!({
+            "personas": [
+                {"name": "A B.md", "content": "first"},
+                {"name": "A@B.md", "content": "second"}
+            ],
+            "identities": []
+        }))
+        .unwrap();
+
+        assert!(validate_prompt_documents(&AppConfig::default(), &prompts).is_err());
+    }
+
+    #[test]
+    fn web_persona_scope_batch_migration_supports_swaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let store = StateStore::new(&paths).unwrap();
+        let first = store.create_session("a", "first", "user", None).unwrap();
+        let second = store.create_session("b", "second", "user", None).unwrap();
+
+        migrate_persona_db_scopes(
+            &store,
+            &[
+                ("a".to_string(), "b".to_string()),
+                ("b".to_string(), "a".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .session_record(&first.session_id)
+                .unwrap()
+                .unwrap()
+                .persona,
+            "b"
+        );
+        assert_eq!(
+            store
+                .session_record(&second.session_id)
+                .unwrap()
+                .unwrap()
+                .persona,
+            "a"
+        );
     }
 }

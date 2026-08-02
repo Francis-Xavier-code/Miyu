@@ -19,7 +19,7 @@
   "scripts": { "display_name": "脚本工具组", "summary": "用户脚本工具。" },
   "scripting": { "display_name": "脚本管理工具组", "summary": "注册和注销本地脚本工具。" },
   "shell": { "display_name": "Shell 工具组", "summary": "执行终端命令。" },
-  "skills": { "display_name": "技能工具组", "summary": "加载和使用技能说明。" },
+  "skills": { "display_name": "技能工具组", "summary": "加载、创建、更新、删除和发布技能。" },
   "systeminfo": { "display_name": "系统信息工具组", "summary": "系统状态、剪贴板和服务状态查询。" },
   "utility": { "display_name": "实用工具组", "summary": "计算、哈希、编码和汇率等通用工具。" },
   "web": { "display_name": "联网工具组", "summary": "网络搜索、网页读取和天气查询。" }

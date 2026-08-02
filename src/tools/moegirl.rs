@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -38,13 +38,8 @@ async fn query(args: Value) -> Result<String> {
             site.api,
             urlencoding::encode(q)
         );
-        let data: Value = client()
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response = client().get(url).send().await?.error_for_status()?;
+        let data: Value = http_response::read_json(response, MAX_PAGE_BYTES).await?;
         if mode == "search" {
             return Ok(serde_json::to_string_pretty(&data)?);
         }
@@ -76,11 +71,12 @@ async fn fetch_page(site: Site, title: &str) -> Result<String> {
         },
         Err(_) => fetch_page_via_api(site, title).await?,
     };
+    let markdown = html_conversion::to_markdown(html).await?;
     Ok(format!(
         "Source: {}{}\n\n{}",
         site.page,
         urlencoding::encode(title),
-        clip(&html2md::parse_html(&html))
+        clip(&markdown)
     ))
 }
 
@@ -90,13 +86,9 @@ async fn fetch_page_via_api(site: Site, title: &str) -> Result<String> {
         site.api,
         urlencoding::encode(title)
     );
-    let data: Value = client()
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let response = client().get(url).send().await?.error_for_status()?;
+    let data: Value =
+        http_response::read_json(response, http_response::MAX_HTML_RESPONSE_BYTES).await?;
     let html = data
         .pointer("/parse/text/*")
         .and_then(Value::as_str)
@@ -109,14 +101,7 @@ async fn fetch_page_via_api(site: Site, title: &str) -> Result<String> {
 }
 
 async fn limited_text(response: reqwest::Response) -> Result<String> {
-    if response.content_length().unwrap_or(0) > MAX_PAGE_BYTES as u64 {
-        bail!("Moegirlpedia page too large")
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_PAGE_BYTES {
-        bail!("Moegirlpedia page too large")
-    }
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    http_response::read_text(response, MAX_PAGE_BYTES).await
 }
 
 fn clip(value: &str) -> String {

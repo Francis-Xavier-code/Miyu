@@ -1,6 +1,8 @@
 mod alarm;
+mod api_quota;
 mod apply_patch;
 mod archlinux;
+mod artifact;
 mod ask_question;
 mod calculator;
 mod caniplayonlinux_query;
@@ -14,6 +16,8 @@ mod edit_replace;
 mod exchange_rate;
 mod fcitx_wiki;
 mod hash_codec;
+mod html_conversion;
+mod http_response;
 mod image_generation;
 mod kitty_image;
 pub mod knowledge_base;
@@ -54,7 +58,8 @@ pub use registry::{
     ToolProgressEvent, ToolRegistry, ToolSpec,
 };
 pub(crate) use scripts::rescan_scripts;
-pub use skills::register_skills;
+pub(crate) use skills::{apply_skill_refresh, prepare_skill_refresh};
+pub use skills::{register_authoring as register_skill_authoring, register_skills};
 
 pub fn register_ask_question(registry: &mut ToolRegistry) {
     ask_question::register(registry);
@@ -123,6 +128,10 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "run_command" => t("Run command", "运行命令"),
         "apply_patch" => t("Apply patch", "应用补丁"),
+        "apply_artifact_patch" => t("Edit preview file", "修改预览文件"),
+        "create_artifact" => t("Create preview file", "创建预览文件"),
+        "read_artifact" => t("Read preview file", "读取预览文件"),
+        "present_artifact" => t("Preview file", "预览文件"),
         "ask_question" => t("Ask user", "询问用户"),
         "task" => t("Subagent", "子代理"),
         "read_file" => t("Read file", "读取文件"),
@@ -178,6 +187,7 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "aur_check_status" => t("Check AUR status", "查询 AUR 状态"),
         "archlinux_official_package_query" => t("Query Arch package", "查询 Arch 官方包"),
         "query_deepseek_status" => t("Check DeepSeek status", "查询 DeepSeek 状态"),
+        "query_api_quota" => t("Query API quota", "查询大模型 API 额度"),
         "pacman_search" => t("Search packages", "搜索软件包"),
         "archwiki_query" => t("Query ArchWiki", "查询 ArchWiki"),
         "archlinux_news" => t("Arch news", "Arch 新闻"),
@@ -200,6 +210,11 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "draw_fortune_lot" => t("Draw fortune", "吉凶占"),
         "roll_dice" => t("Roll dice", "掷骰子"),
         "load_skill" => t("Load skill", "加载技能"),
+        "create_skill" => t("Create skill draft", "创建技能草稿"),
+        "update_skill" => t("Update skill draft", "更新技能草稿"),
+        "delete_skill" => t("Delete skill", "删除技能"),
+        "publish_skill" => t("Publish skill", "发布技能"),
+        "list_skill_drafts" => t("Skill drafts", "技能草稿"),
         "load_tools" => t("Load", "加载"),
         "register_script" => t("Register script", "注册脚本"),
         "unregister_script" => t("Unregister script", "注销脚本"),
@@ -279,6 +294,9 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     hash_codec::register(&mut registry);
     calculator::register(&mut registry);
     deepseek_status::register(&mut registry);
+    if config.plugins.api_quota.enabled {
+        api_quota::register(&mut registry, config.plugins.api_quota.clone());
+    }
     vision::register_print(&mut registry, config.clone());
     if config.plugins.memes.enabled {
         memes::register(&mut registry, config.clone(), paths.clone());
@@ -340,6 +358,63 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     registry
 }
 
+pub fn register_webui_artifact_tools(
+    registry: &mut ToolRegistry,
+    paths: &MiyuPaths,
+    session_id: &str,
+) {
+    artifact::register_webui(registry, paths, session_id);
+}
+
+pub fn webui_artifact_manifest(paths: &MiyuPaths, session_id: &str) -> anyhow::Result<String> {
+    artifact::managed_manifest(paths, session_id)
+}
+
+pub(crate) fn rescope_platform_memory_tools(
+    registry: &mut ToolRegistry,
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    context: &crate::platforms::PlatformTurnContext,
+    readonly: bool,
+) {
+    if !config.tools.enabled || !config.memory_config().enabled {
+        return;
+    }
+    for name in [
+        "remember_fact",
+        "search_evicted_context",
+        "recall_past_events",
+        "recall_memories",
+    ] {
+        registry.unregister(name);
+    }
+    let principal = context.principal().stable_key();
+    let access = if context.is_admin {
+        crate::memory::MemoryAccess::Privileged
+    } else {
+        crate::memory::MemoryAccess::principal(principal.clone())
+    };
+    if readonly {
+        memory::register_readonly_with_context(
+            registry,
+            config.clone(),
+            paths.clone(),
+            access,
+            Some(principal),
+            context.sender_display_name.clone(),
+        );
+    } else {
+        memory::register_with_context(
+            registry,
+            config.clone(),
+            paths.clone(),
+            access,
+            Some(principal),
+            context.sender_display_name.clone(),
+        );
+    }
+}
+
 pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     default_tools::register_readonly(&mut registry);
@@ -353,6 +428,9 @@ pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry 
     }
     if config.plugins.man.enabled {
         man::register(&mut registry);
+    }
+    if config.plugins.api_quota.enabled {
+        api_quota::register(&mut registry, config.plugins.api_quota.clone());
     }
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
@@ -408,6 +486,12 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
     }
+    if config.plugins.api_quota.enabled {
+        api_quota::register(&mut registry, config.plugins.api_quota.clone());
+    }
+    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+        load_tools::register(&mut registry);
+    }
     registry
 }
 
@@ -431,6 +515,9 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     }
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
+    }
+    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+        load_tools::register(&mut registry);
     }
     registry
 }
@@ -510,7 +597,6 @@ mod tests {
             "write_file",
             "apply_patch",
             "vision_analyze",
-            "load_tools",
             "task",
         ] {
             assert!(!names.iter().any(|name| name == forbidden), "{forbidden}");
@@ -521,6 +607,97 @@ mod tests {
                 ToolPermission::ReadOnly
             );
         }
+        assert!(registry.contains("load_tools"));
+        let visible = registry.lazy_definitions(&Default::default());
+        assert!(visible
+            .iter()
+            .any(|definition| definition.function.name == "load_tools"));
+        assert!(!visible
+            .iter()
+            .any(|definition| definition.function.name == "draw_zhouyi_hexagram"));
+    }
+
+    #[test]
+    fn skill_authoring_tools_are_normal_mode_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let normal = crate::cli::build_tool_registry(
+            &config,
+            &paths,
+            crate::agent::AgentMode::Normal,
+            false,
+        )
+        .unwrap();
+        let plan =
+            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Plan, false)
+                .unwrap();
+        let chat =
+            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Chat, false)
+                .unwrap();
+
+        for name in [
+            "create_skill",
+            "update_skill",
+            "delete_skill",
+            "publish_skill",
+            "list_skill_drafts",
+        ] {
+            assert!(normal.contains(name), "{name}");
+            assert!(!plan.contains(name), "{name}");
+            assert!(!chat.contains(name), "{name}");
+        }
+        assert!(normal.contains("load_skill"));
+        assert!(plan.contains("load_skill"));
+        assert!(!chat.contains("load_skill"));
+    }
+
+    #[test]
+    fn artifact_tools_are_only_added_by_the_webui_registration_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let mut registry = builtin_registry(&config, &paths);
+        assert!(!registry.contains("create_artifact"));
+        assert!(!registry.contains("present_artifact"));
+
+        register_webui_artifact_tools(&mut registry, &paths, "sess_webui");
+        for name in [
+            "create_artifact",
+            "read_artifact",
+            "apply_artifact_patch",
+            "present_artifact",
+        ] {
+            assert_eq!(
+                registry.permission(name).unwrap(),
+                ToolPermission::Presentation,
+                "{name}"
+            );
+        }
+        let definitions = registry.definitions();
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.function.name == "create_artifact"));
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.function.name == "present_artifact"));
+    }
+
+    #[tokio::test]
+    async fn restricted_platform_can_load_the_divination_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let registry = restricted_platform_registry(&AppConfig::default(), &paths);
+
+        let output = registry
+            .call("load_tools", r#"{"names":["group:divination"]}"#)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let loaded = value["loaded_tools"].as_array().unwrap();
+        assert!(loaded.iter().any(|name| name == "draw_zhouyi_hexagram"));
+        assert!(loaded.iter().any(|name| name == "draw_tarot_card"));
+        assert!(loaded.iter().any(|name| name == "draw_fortune_lot"));
     }
 }
 

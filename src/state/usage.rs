@@ -1,7 +1,23 @@
 use crate::llm::Usage;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+fn usage_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn write_state(path: &Path, state: &UsageState) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    writeln!(file, "{}", serde_json::to_string_pretty(state)?)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct UsageState {
@@ -56,6 +72,7 @@ pub fn add_auxiliary_usage(path: &Path, usage: &Usage) -> Result<()> {
 }
 
 fn add_usage_with_scope(path: &Path, usage: &Usage, is_conversation: bool) -> Result<()> {
+    let _guard = usage_lock().lock().unwrap();
     let mut state = if path.exists() {
         let raw = std::fs::read_to_string(path)?;
         serde_json::from_str(&raw).unwrap_or_default()
@@ -66,16 +83,18 @@ fn add_usage_with_scope(path: &Path, usage: &Usage, is_conversation: bool) -> Re
     state.prompt_tokens += usage.prompt_tokens;
     state.completion_tokens += usage.completion_tokens;
     state.total_tokens += usage.effective_total_tokens();
-    state.conversation_tokens += usage.effective_total_tokens();
+    if is_conversation {
+        state.conversation_tokens += usage.effective_total_tokens();
+    }
     state.last_usage = Some(usage.clone());
     if is_conversation {
         state.last_conversation_usage = Some(usage.clone());
     }
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&state)?))?;
-    Ok(())
+    write_state(path, &state)
 }
 
 pub fn snapshot(path: &Path) -> Result<UsageSnapshot> {
+    let _guard = usage_lock().lock().unwrap();
     if !path.exists() {
         return Ok(UsageSnapshot::default());
     }
@@ -85,6 +104,7 @@ pub fn snapshot(path: &Path) -> Result<UsageSnapshot> {
 }
 
 pub fn clear_last_usage(path: &Path) -> Result<()> {
+    let _guard = usage_lock().lock().unwrap();
     if !path.exists() {
         return Ok(());
     }
@@ -92,11 +112,11 @@ pub fn clear_last_usage(path: &Path) -> Result<()> {
     let mut state = serde_json::from_str::<UsageState>(&raw).unwrap_or_default();
     state.last_usage = None;
     state.last_conversation_usage = None;
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&state)?))?;
-    Ok(())
+    write_state(path, &state)
 }
 
 pub fn reset_conversation(path: &Path) -> Result<()> {
+    let _guard = usage_lock().lock().unwrap();
     if !path.exists() {
         return Ok(());
     }
@@ -105,8 +125,7 @@ pub fn reset_conversation(path: &Path) -> Result<()> {
     state.conversation_tokens = 0;
     state.last_usage = None;
     state.last_conversation_usage = None;
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&state)?))?;
-    Ok(())
+    write_state(path, &state)
 }
 
 #[cfg(test)]

@@ -4,7 +4,8 @@ use crate::tools::patch_preview::write_with_patch_preview;
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 
 pub fn register(registry: &mut ToolRegistry) {
     registry.register(ToolSpec::new_with_progress(
@@ -35,18 +36,97 @@ pub fn register(registry: &mut ToolRegistry) {
     ).writes());
 }
 
+pub fn register_artifact(registry: &mut ToolRegistry, root: PathBuf, session_id: &str) {
+    let session_id = session_id.to_string();
+    registry.register(ToolSpec::new_with_progress(
+        "apply_artifact_patch",
+        agent_text(
+            "Apply a patch to files in the current managed Artifact workspace. Paths must be plain Artifact file names. Supports Add File and Update File; deletion is not supported.",
+            "对当前托管 Artifact 工作区中的文件应用补丁。路径必须是 Artifact 文件名。支持 Add File 和 Update File，不支持删除。",
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "patchText": {
+                    "type": "string",
+                    "description": "Full patch text wrapped in *** Begin Patch / *** End Patch. Use plain Artifact file names in headers."
+                }
+            },
+            "required": ["patchText"],
+            "additionalProperties": false
+        }),
+        move |args, progress| {
+            let root = root.clone();
+            let session_id = session_id.clone();
+            async move {
+                progress.report(format!(
+                    "__tool_phase__~ {}",
+                    t("prepare patch", "准备修改")
+                ));
+                tokio::task::yield_now().await;
+                apply_artifact_patch(args, progress, &root, &session_id)
+            }
+        },
+    ).presentation());
+}
+
 fn apply_patch(args: Value, progress: ToolProgress) -> Result<String> {
+    apply_patch_with(args, progress, path_arg, false)
+}
+
+fn apply_artifact_patch(
+    args: Value,
+    progress: ToolProgress,
+    root: &Path,
+    session_id: &str,
+) -> Result<String> {
+    let session_dir = ensure_artifact_session_dir(root, session_id)?;
+    apply_patch_with(
+        args,
+        progress,
+        |value| artifact_patch_path(&session_dir, value),
+        true,
+    )
+}
+
+fn apply_patch_with<F>(
+    args: Value,
+    progress: ToolProgress,
+    resolve_path: F,
+    managed_artifact: bool,
+) -> Result<String>
+where
+    F: Fn(&str) -> Result<PathBuf>,
+{
     let patch_text = args
         .get("patchText")
         .or_else(|| args.get("patch_text"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("patchText is required"))?;
-    let operations = parse_patch(patch_text)?;
+    let operations = parse_patch_with(patch_text, &resolve_path)?;
     if operations.is_empty() {
         bail!("patch rejected: empty patch")
     }
+    if managed_artifact
+        && operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Delete { .. }))
+    {
+        bail!("Artifact patches do not support Delete File")
+    }
 
     let changes = preflight_operations(operations)?;
+    if managed_artifact {
+        for change in &changes {
+            if change.after.len() > super::artifact::MAX_ARTIFACT_BYTES {
+                bail!(
+                    "Artifact exceeds the {} byte limit: {}",
+                    super::artifact::MAX_ARTIFACT_BYTES,
+                    change.path.display()
+                )
+            }
+        }
+    }
 
     for change in &changes {
         progress.report(format!(
@@ -71,17 +151,31 @@ fn apply_patch(args: Value, progress: ToolProgress) -> Result<String> {
                     &progress,
                     Map::new(),
                 )?;
+                if managed_artifact {
+                    std::fs::set_permissions(&change.path, std::fs::Permissions::from_mode(0o600))?;
+                    progress.report_artifact(change.path.clone(), String::new());
+                }
             }
         }
+        let reported_path = if managed_artifact {
+            change
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            display_path_for_progress(&change.path)
+        };
         files.push(json!({
-            "path": display_path_for_progress(&change.path),
+            "path": reported_path,
             "operation": change.kind.as_str(),
         }));
     }
 
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
-        "operation": "apply_patch",
+        "operation": if managed_artifact { "apply_artifact_patch" } else { "apply_patch" },
         "files_changed": files.len(),
         "files": files,
     }))?)
@@ -152,6 +246,13 @@ struct FileChange {
 }
 
 fn parse_patch(raw: &str) -> Result<Vec<Operation>> {
+    parse_patch_with(raw, &path_arg)
+}
+
+fn parse_patch_with<F>(raw: &str, resolve_path: &F) -> Result<Vec<Operation>>
+where
+    F: Fn(&str) -> Result<PathBuf>,
+{
     let normalized = strip_wrappers(raw)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
@@ -189,12 +290,12 @@ fn parse_patch(raw: &str) -> Result<Vec<Operation>> {
                 index += 1;
             }
             operations.push(Operation::Add {
-                path: path_arg(path)?,
+                path: resolve_path(path)?,
                 lines: content,
             });
         } else if let Some(path) = header_value(line, "*** Delete File:") {
             operations.push(Operation::Delete {
-                path: path_arg(path)?,
+                path: resolve_path(path)?,
             });
             index += 1;
         } else if let Some(path) = header_value(line, "*** Update File:") {
@@ -202,7 +303,7 @@ fn parse_patch(raw: &str) -> Result<Vec<Operation>> {
             let mut move_to = None;
             if index < end {
                 if let Some(target) = header_value(lines[index], "*** Move to:") {
-                    move_to = Some(path_arg(target)?);
+                    move_to = Some(resolve_path(target)?);
                     index += 1;
                 }
             }
@@ -262,7 +363,7 @@ fn parse_patch(raw: &str) -> Result<Vec<Operation>> {
                 bail!("apply_patch verification failed: Update File requires at least one hunk")
             }
             operations.push(Operation::Update {
-                path: path_arg(path)?,
+                path: resolve_path(path)?,
                 move_to,
                 hunks,
             });
@@ -604,6 +705,52 @@ fn path_arg(value: &str) -> Result<PathBuf> {
     })
 }
 
+fn ensure_artifact_session_dir(root: &Path, session_id: &str) -> Result<PathBuf> {
+    validate_single_component(session_id, "session id")?;
+    ensure_private_directory(root)?;
+    let session_dir = root.join(session_id);
+    ensure_private_directory(&session_dir)?;
+    Ok(session_dir)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "Artifact workspace path is not a directory: {}",
+                path.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(path)?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn artifact_patch_path(session_dir: &Path, value: &str) -> Result<PathBuf> {
+    let value = value.trim();
+    validate_single_component(value, "Artifact file name")?;
+    if value.chars().count() > 180 || value.chars().any(char::is_control) {
+        bail!("Artifact file name is invalid")
+    }
+    let path = session_dir.join(value);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("Artifact patch target is not a regular file: {value}")
+        }
+    }
+    Ok(path)
+}
+
+fn validate_single_component(value: &str, label: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("{label} must be a single safe path component")
+    }
+    Ok(())
+}
+
 fn display_path_for_progress(path: &Path) -> String {
     crate::tools::patch_preview::display_path(path)
 }
@@ -729,5 +876,84 @@ mod tests {
         assert!(apply_patch(json!({ "patchText": patch }), ToolProgress::default()).is_err());
         assert!(source.exists());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn artifact_patch_adds_and_updates_managed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("artifacts");
+        let session_dir = root.join("sess_test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let report = session_dir.join("report.md");
+        std::fs::write(&report, "# Report\n\nOld text.\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: report.md\n@@ report\n # Report\n \n-Old text.\n+Updated text.\n*** Add File: notes.txt\n+Follow up.\n*** End Patch";
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let output = apply_artifact_patch(
+            json!({"patchText": patch}),
+            ToolProgress::new(sender),
+            &root,
+            "sess_test",
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(payload["operation"], "apply_artifact_patch");
+        assert_eq!(payload["files_changed"], 2);
+        assert_eq!(payload["files"][0]["path"], "report.md");
+        assert!(!output.contains(temp.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            "# Report\n\nUpdated text.\n"
+        );
+        let notes = session_dir.join("notes.txt");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "Follow up.\n");
+        for path in [&report, &notes] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let artifacts = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                super::super::ToolProgressEvent::Artifact { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts, [report, notes]);
+    }
+
+    #[test]
+    fn artifact_patch_rejects_unsafe_paths_delete_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("artifacts");
+        let session_dir = root.join("sess_test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let report = session_dir.join("report.md");
+        std::fs::write(&report, "original\n").unwrap();
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "outside\n").unwrap();
+        symlink(&outside, session_dir.join("link.md")).unwrap();
+
+        for patch in [
+            "*** Begin Patch\n*** Add File: ../escape.md\n+bad\n*** End Patch",
+            "*** Begin Patch\n*** Add File: nested/file.md\n+bad\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: report.md\n*** End Patch",
+            "*** Begin Patch\n*** Update File: link.md\n@@ patch\n-outside\n+changed\n*** End Patch",
+        ] {
+            assert!(apply_artifact_patch(
+                json!({"patchText": patch}),
+                ToolProgress::default(),
+                &root,
+                "sess_test",
+            )
+            .is_err());
+        }
+
+        assert_eq!(std::fs::read_to_string(report).unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
+        assert!(!temp.path().join("escape.md").exists());
     }
 }

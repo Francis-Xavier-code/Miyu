@@ -101,10 +101,13 @@ pub fn is_zh() -> bool {
 }
 
 pub fn text(en: &'static str, zh: &'static str) -> &'static str {
-    if is_zh() {
-        zh
-    } else {
-        en
+    text_for(locale(), en, zh)
+}
+
+pub fn text_for(locale: Locale, en: &'static str, zh: &'static str) -> &'static str {
+    match locale {
+        Locale::En => en,
+        Locale::Zh => zh,
     }
 }
 
@@ -148,6 +151,12 @@ mod tests {
         assert_eq!(UiLanguage::parse("zh"), Some(UiLanguage::Zh));
         assert_eq!(UiLanguage::parse(""), None);
         assert_eq!(UiLanguage::parse("fr"), None);
+    }
+
+    #[test]
+    fn explicit_locale_text_does_not_depend_on_global_state() {
+        assert_eq!(text_for(Locale::En, "English", "中文"), "English");
+        assert_eq!(text_for(Locale::Zh, "English", "中文"), "中文");
     }
 
     #[test]

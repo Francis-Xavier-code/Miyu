@@ -36,10 +36,45 @@ const MIGRATIONS: &[Migration] = &[
         name: "platform_sessions_and_plugin_state",
         apply: apply_v3_platform_sessions_and_plugin_state,
     },
+    Migration {
+        version: 4,
+        name: "platform_meme_refs",
+        apply: apply_v4_platform_meme_refs,
+    },
+    Migration {
+        version: 5,
+        name: "user_attachments",
+        apply: apply_v5_user_attachments,
+    },
+    Migration {
+        version: 6,
+        name: "turn_redo_checkpoints",
+        apply: apply_v6_turn_redo_checkpoints,
+    },
+    Migration {
+        version: 7,
+        name: "turn_redo_backups",
+        apply: apply_v7_turn_redo_backups,
+    },
+    Migration {
+        version: 8,
+        name: "artifact_assets",
+        apply: apply_v8_artifact_assets,
+    },
+    Migration {
+        version: 9,
+        name: "platform_access_control",
+        apply: apply_v9_platform_access_control,
+    },
+    Migration {
+        version: 10,
+        name: "turn_generation_journal",
+        apply: apply_v10_turn_generation_journal,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 3;
+pub const LATEST_VERSION: i64 = 10;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -401,6 +436,267 @@ fn apply_v3_platform_sessions_and_plugin_state(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+/// v4: persistent links between platform messages and meme-library entries.
+fn apply_v4_platform_meme_refs(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE platform_meme_refs (
+            platform          TEXT NOT NULL,
+            account_id        TEXT NOT NULL,
+            conversation_kind TEXT NOT NULL,
+            conversation_id   TEXT NOT NULL,
+            message_id        TEXT NOT NULL,
+            library           TEXT NOT NULL,
+            meme_id           TEXT NOT NULL,
+            direction         TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+            created_at        TEXT NOT NULL,
+            PRIMARY KEY (
+                platform, account_id, conversation_kind, conversation_id,
+                message_id, library, meme_id
+            )
+        );
+        CREATE INDEX idx_platform_meme_refs_meme
+            ON platform_meme_refs(library, meme_id);",
+    )?;
+    Ok(())
+}
+
+/// v5: durable WebUI user attachments and separate user-visible turn text.
+fn apply_v5_user_attachments(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "display_content", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute(
+        "UPDATE turns SET display_content = user_content WHERE display_content = ''",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE user_attachments (
+            attachment_id TEXT PRIMARY KEY,
+            session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+            turn_id       TEXT REFERENCES turns(turn_id) ON DELETE CASCADE,
+            prompt_id     TEXT REFERENCES queued_prompts(prompt_id) ON DELETE CASCADE,
+            run_id        TEXT,
+            file_name     TEXT NOT NULL,
+            mime          TEXT NOT NULL,
+            kind          TEXT NOT NULL CHECK (kind IN ('image', 'text')),
+            size_bytes    INTEGER NOT NULL CHECK (size_bytes >= 0),
+            width         INTEGER NOT NULL DEFAULT 0,
+            height        INTEGER NOT NULL DEFAULT 0,
+            data          BLOB NOT NULL,
+            created_at    TEXT NOT NULL,
+            CHECK (
+                (turn_id IS NOT NULL) + (prompt_id IS NOT NULL) + (run_id IS NOT NULL) <= 1
+            )
+        );
+        CREATE INDEX idx_user_attachments_session
+            ON user_attachments(session_id, created_at, attachment_id);
+        CREATE INDEX idx_user_attachments_turn
+            ON user_attachments(turn_id, created_at, attachment_id);
+        CREATE INDEX idx_user_attachments_prompt
+            ON user_attachments(prompt_id, created_at, attachment_id);
+        CREATE INDEX idx_user_attachments_run ON user_attachments(run_id);",
+    )?;
+    Ok(())
+}
+
+/// v6: optimistic turn revisions and a bounded replay checkpoint for redoing
+/// the last consumed follow-up batch without storing the full conversation.
+fn apply_v6_turn_redo_checkpoints(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "revision", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "CREATE TABLE turn_redo_checkpoints (
+            turn_id          TEXT PRIMARY KEY REFERENCES turns(turn_id) ON DELETE CASCADE,
+            version          INTEGER NOT NULL,
+            batch_prompt_ids TEXT NOT NULL,
+            payload          BLOB,
+            unavailable_reason TEXT,
+            created_at       TEXT NOT NULL,
+            CHECK ((payload IS NULL) != (unavailable_reason IS NULL))
+        );",
+    )?;
+    create_turn_redo_backup_tables(conn)?;
+    Ok(())
+}
+
+/// v7 repairs databases that reached v6 before redo failure backups were
+/// introduced. Fresh databases already have these tables through v6.
+fn apply_v7_turn_redo_backups(conn: &Connection) -> Result<()> {
+    create_turn_redo_backup_tables(conn)
+}
+
+fn apply_v8_artifact_assets(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS artifact_assets (
+            asset_id    TEXT PRIMARY KEY,
+            turn_id     TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+            tool_id     TEXT,
+            source_key  TEXT NOT NULL,
+            file_name   TEXT NOT NULL,
+            mime        TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            size_bytes  INTEGER NOT NULL,
+            data        BLOB NOT NULL,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            UNIQUE(turn_id, source_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_assets_turn
+            ON artifact_assets(turn_id, updated_at, asset_id);",
+    )?;
+    Ok(())
+}
+
+/// v9: durable platform access grants and an append-only audit trail.
+///
+/// The account scope is deliberately separate from the platform account id:
+/// `*` represents a grant shared by every account on a platform, while a
+/// concrete id leaves room for narrower policies later without changing the
+/// schema. Miyu currently writes only the global scope for QQ.
+fn apply_v9_platform_access_control(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS platform_access_grants (
+            platform                    TEXT NOT NULL,
+            account_scope               TEXT NOT NULL,
+            permission                  TEXT NOT NULL,
+            subject_kind                TEXT NOT NULL,
+            subject_id                  TEXT NOT NULL,
+            granted_by_platform         TEXT NOT NULL,
+            granted_by_account_id       TEXT NOT NULL,
+            granted_by_user_id          TEXT NOT NULL,
+            granted_conversation_kind  TEXT NOT NULL,
+            granted_conversation_id    TEXT NOT NULL,
+            granted_message_id         TEXT NOT NULL,
+            created_at                  TEXT NOT NULL,
+            PRIMARY KEY (
+                platform, account_scope, permission, subject_kind, subject_id
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS platform_access_audit (
+            audit_id                   TEXT PRIMARY KEY,
+            operation                  TEXT NOT NULL,
+            platform                   TEXT NOT NULL,
+            account_scope              TEXT NOT NULL,
+            permission                 TEXT NOT NULL,
+            subject_kind               TEXT NOT NULL,
+            subject_id                 TEXT NOT NULL,
+            actor_platform             TEXT NOT NULL,
+            actor_account_id           TEXT NOT NULL,
+            actor_user_id              TEXT NOT NULL,
+            actor_conversation_kind    TEXT NOT NULL,
+            actor_conversation_id      TEXT NOT NULL,
+            actor_message_id           TEXT NOT NULL,
+            created_at                 TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_platform_access_audit_target
+            ON platform_access_audit(
+                platform, account_scope, permission, subject_kind, subject_id,
+                created_at
+            );",
+    )?;
+    Ok(())
+}
+
+/// v10: append-only semantic events for streamed turn recovery.
+///
+/// The existing columns on `turns` remain the compatibility projection used
+/// by completed conversations. These tables are the durable source for a
+/// running/interrupted generation, so a partial response never requires
+/// rewriting an ever-growing JSON value.
+fn apply_v10_turn_generation_journal(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS turn_journal_segments (
+            turn_id       TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+            revision      INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'running'
+                          CHECK (status IN ('running', 'completed', 'interrupted', 'superseded')),
+            started_at    TEXT NOT NULL,
+            finished_at   TEXT,
+            PRIMARY KEY (turn_id, revision, segment_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_journal_segments_active
+            ON turn_journal_segments(turn_id, revision, status, segment_index);
+
+        CREATE TABLE IF NOT EXISTS turn_journal_events (
+            event_id      INTEGER PRIMARY KEY,
+            turn_id       TEXT NOT NULL,
+            revision      INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            kind          TEXT NOT NULL,
+            call_id       TEXT,
+            name          TEXT,
+            text_payload  TEXT,
+            blob_payload  BLOB,
+            ok            INTEGER,
+            created_at    TEXT NOT NULL,
+            FOREIGN KEY (turn_id, revision, segment_index)
+                REFERENCES turn_journal_segments(turn_id, revision, segment_index)
+                ON DELETE CASCADE,
+            CHECK (text_payload IS NOT NULL OR blob_payload IS NOT NULL OR kind IN (
+                'reasoning_start', 'reasoning_reset', 'reasoning_part_start',
+                'reasoning_part_end', 'generation_superseded'
+            ))
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_journal_events_order
+            ON turn_journal_events(turn_id, revision, segment_index, event_id);
+
+        CREATE TABLE IF NOT EXISTS turn_redo_artifact_backups (
+            turn_id    TEXT NOT NULL REFERENCES turn_redo_backups(turn_id) ON DELETE CASCADE,
+            asset_id   TEXT NOT NULL,
+            tool_id    TEXT,
+            source_key TEXT NOT NULL,
+            file_name  TEXT NOT NULL,
+            mime       TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            data       BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (turn_id, asset_id)
+        );
+
+        INSERT OR IGNORE INTO turn_journal_segments
+            (turn_id, revision, segment_index, status, started_at)
+        SELECT turn_id, revision, 0,
+               CASE status WHEN 'completed' THEN 'completed'
+                           WHEN 'interrupted' THEN 'interrupted'
+                           ELSE 'running' END,
+               COALESCE(user_timestamp, datetime('now'))
+        FROM turns
+        WHERE status IN ('running', 'interrupted');",
+    )?;
+    Ok(())
+}
+
+fn create_turn_redo_backup_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS turn_redo_backups (
+            turn_id    TEXT PRIMARY KEY REFERENCES turns(turn_id) ON DELETE CASCADE,
+            revision   INTEGER NOT NULL,
+            payload    BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS turn_redo_question_backups (
+            turn_id        TEXT NOT NULL REFERENCES turn_redo_backups(turn_id) ON DELETE CASCADE,
+            exchange_index INTEGER NOT NULL,
+            payload        TEXT NOT NULL,
+            PRIMARY KEY (turn_id, exchange_index)
+        );
+        CREATE TABLE IF NOT EXISTS turn_redo_image_backups (
+            turn_id   TEXT NOT NULL REFERENCES turn_redo_backups(turn_id) ON DELETE CASCADE,
+            asset_id  TEXT NOT NULL,
+            tool_id   TEXT,
+            mime      TEXT NOT NULL,
+            width     INTEGER NOT NULL,
+            height    INTEGER NOT NULL,
+            alt       TEXT NOT NULL,
+            data      BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (turn_id, asset_id)
+        );",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -447,6 +743,43 @@ mod tests {
             user_version(&conn).unwrap(),
             MIGRATIONS.last().unwrap().version
         );
+    }
+
+    #[test]
+    fn v7_repairs_v6_database_missing_redo_backup_tables() {
+        let mut conn = open_migrated();
+        conn.execute_batch(
+            "DROP TABLE turn_redo_image_backups;
+             DROP TABLE turn_redo_question_backups;
+             DROP TABLE turn_redo_backups;
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
+        for table in [
+            "turn_redo_checkpoints",
+            "turn_redo_backups",
+            "turn_redo_question_backups",
+            "turn_redo_image_backups",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing repaired table: {table}");
+        }
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]
@@ -567,7 +900,7 @@ mod tests {
     #[test]
     fn v3_platform_tables_enforce_uniqueness_and_session_cascade() {
         let conn = open_migrated();
-        assert_eq!(user_version(&conn).unwrap(), 3);
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
         conn.execute(
             "INSERT INTO sessions (session_id, persona, name, created_at, updated_at)
              VALUES ('platform-session', 'miyu', 'platform', 'now', 'now')",
@@ -625,5 +958,99 @@ mod tests {
         assert_eq!(binding_count, 0);
         // Plugin state is scoped to the external conversation, not a session.
         assert_eq!(plugin_count, 1);
+    }
+
+    #[test]
+    fn v4_platform_meme_refs_enforce_identity_and_direction() {
+        let conn = open_migrated();
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
+        conn.execute(
+            "INSERT INTO platform_meme_refs (
+                platform, account_id, conversation_kind, conversation_id,
+                message_id, library, meme_id, direction, created_at
+             ) VALUES ('onebot', '10000', 'group', '20000', 'message-1',
+                       'default', 'meme-1', 'inbound', 'now')",
+            [],
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "INSERT INTO platform_meme_refs (
+                    platform, account_id, conversation_kind, conversation_id,
+                    message_id, library, meme_id, direction, created_at
+                 ) VALUES ('onebot', '10000', 'group', '20000', 'message-1',
+                           'default', 'meme-1', 'inbound', 'later')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO platform_meme_refs (
+                    platform, account_id, conversation_kind, conversation_id,
+                    message_id, library, meme_id, direction, created_at
+                 ) VALUES ('onebot', '10000', 'group', '20000', 'message-2',
+                           'default', 'meme-1', 'sideways', 'now')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v4_migrates_an_existing_v3_database_without_losing_platform_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_v1_baseline(&conn).unwrap();
+        apply_v2_sessions(&conn).unwrap();
+        apply_v3_platform_sessions_and_plugin_state(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute(
+            "INSERT INTO platform_plugin_kv (
+                plugin_id, platform, account_id, conversation_kind,
+                conversation_id, key, value_json, updated_at
+             ) VALUES ('reply_processor', 'onebot', '10000', 'group',
+                       '20000', 'recent_images', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
+        let plugin_rows: i64 = conn
+            .query_row("SELECT count(*) FROM platform_plugin_kv", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(plugin_rows, 1);
+        let meme_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'platform_meme_refs'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(meme_table_exists);
+    }
+
+    #[test]
+    fn v9_creates_platform_access_and_audit_tables() {
+        let conn = open_migrated();
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
+        for table in ["platform_access_grants", "platform_access_audit"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                    )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing access-control table: {table}");
+        }
     }
 }

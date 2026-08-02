@@ -7,13 +7,13 @@ use crate::ipc::{self, Command as IpcCommand, Frame as IpcFrame, Request as IpcR
 use crate::llm::{
     ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions, Usage,
 };
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryOrganizer, MemoryStore};
 use crate::paths::MiyuPaths;
 use crate::render;
 use crate::shell;
 use crate::state::{QueuedPrompt, QueuedPromptAttachment, StateStore, Turn, TurnStatus};
 use crate::tools;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Local};
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -22,7 +22,7 @@ use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
-use crossterm::style::Print;
+use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -325,7 +325,14 @@ pub fn parse() -> Cli {
 fn parse_args(mut args: Vec<OsString>) -> std::result::Result<Cli, clap::Error> {
     let debug = extract_debug_flag(&mut args);
     let matches = localized_command().try_get_matches_from(args)?;
+    let web_port_explicit = matches
+        .subcommand_matches("web")
+        .and_then(|web| web.value_source("port"))
+        == Some(clap::parser::ValueSource::CommandLine);
     let mut cli = Cli::from_arg_matches(&matches)?;
+    if let Some(Command::Web(args)) = &mut cli.command {
+        args.port_explicit = web_port_explicit;
+    }
     cli.debug |= debug;
     Ok(cli)
 }
@@ -463,8 +470,8 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         ),
         (
             "init",
-            "Create default config and state files",
-            "创建默认配置和状态文件",
+            "Create default config and state files; use <shell>-init for shell hooks",
+            "创建默认配置和状态文件；Shell 集成请使用对应的 <shell>-init 命令",
         ),
         (
             "paths",
@@ -636,8 +643,8 @@ fn localize_web_command(command: clap::Command) -> clap::Command {
         .mut_arg("port", |arg| arg.help(t("Local TCP port", "本地 TCP 端口")))
         .mut_arg("password", |arg| {
             arg.help(t(
-                "Require a password; omit the value to enter it securely",
-                "要求访问密码；省略参数值时安全输入",
+                "Prompt securely for a required password",
+                "安全输入所需的访问密码",
             ))
         })
         .mut_arg("password_file", |arg| {
@@ -675,14 +682,18 @@ fn localize_daemon_command(mut command: clap::Command) -> clap::Command {
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
     }
-    command.mut_subcommand("logs", |subcommand| {
-        subcommand.mut_arg("lines", |arg| {
-            arg.help(t(
-                "Print only the most recent N lines and exit",
-                "仅输出最近 N 行后退出",
-            ))
+    command
+        .mut_arg("port", |arg| {
+            arg.help(t("WebUI TCP port", "WebUI TCP 端口"))
         })
-    })
+        .mut_subcommand("logs", |subcommand| {
+            subcommand.mut_arg("lines", |arg| {
+                arg.help(t(
+                    "Print only the most recent N lines and exit",
+                    "仅输出最近 N 行后退出",
+                ))
+            })
+        })
 }
 
 fn localize_kb_command(mut command: clap::Command) -> clap::Command {
@@ -870,20 +881,23 @@ pub struct WebArgs {
     #[arg(long, default_value_t = ipc::DEFAULT_WEB_PORT)]
     pub port: u16,
 
-    #[arg(short = 'p', long, num_args = 0..=1, default_missing_value = "")]
+    #[arg(short = 'p', long, num_args = 0, default_missing_value = "")]
     pub password: Option<String>,
 
     #[arg(long, value_name = "PATH", conflicts_with = "password")]
     pub password_file: Option<PathBuf>,
 
-    #[arg(long)]
-    pub public: bool,
+    #[arg(skip)]
+    pub port_explicit: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
+    #[arg(long, value_name = "PORT", global = true)]
+    pub port: Option<u16>,
+
     #[command(subcommand)]
-    pub command: DaemonCommand,
+    pub command: Option<DaemonCommand>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -908,7 +922,7 @@ impl std::fmt::Debug for WebArgs {
             .field("port", &self.port)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("password_file", &self.password_file)
-            .field("public", &self.public)
+            .field("port_explicit", &self.port_explicit)
             .finish()
     }
 }
@@ -1120,17 +1134,31 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
     if cli.clipboard_paste {
         return run_clipboard_paste(&paths);
     }
-    let _logging_guard = match crate::logging::init(&paths, cli.debug) {
-        Ok(guard) => Some(guard),
-        Err(err) => {
-            eprintln!(
-                "{}: {err:#}",
-                t(
-                    "warning: diagnostic logging is unavailable",
-                    "警告：诊断日志不可用"
-                )
-            );
-            None
+    // A log viewer must not append its own startup record to the file it is
+    // about to display. Apart from being confusing, that made `-n 1` return
+    // the viewer's initialization line instead of the daemon's latest event.
+    let skip_diagnostic_logging = matches!(
+        &cli.command,
+        Some(Command::Daemon(DaemonArgs {
+            command: Some(DaemonCommand::Logs(_)),
+            ..
+        }))
+    );
+    let _logging_guard = if skip_diagnostic_logging {
+        None
+    } else {
+        match crate::logging::init(&paths, cli.debug) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                eprintln!(
+                    "{}: {err:#}",
+                    t(
+                        "warning: diagnostic logging is unavailable",
+                        "警告：诊断日志不可用"
+                    )
+                );
+                None
+            }
         }
     };
     let mode = if cli.plan {
@@ -1188,7 +1216,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Config(args)) => {
             let saved = run_config(&paths, args).await?;
-            if ipc::daemon_info(&paths).await.is_some() {
+            if saved && ipc::daemon_info(&paths).await.is_some() {
                 reload_daemon_if_running(&paths).await
             } else {
                 if saved {
@@ -1239,10 +1267,17 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
                 Some(scope) => bail!("{}: {scope}", t("unknown reset scope", "未知 reset 范围")),
             };
             if ipc::daemon_info(&paths).await.is_some() {
-                send_ipc_admin(&paths, IpcCommand::ResetConversation { all }).await?;
+                send_ipc_admin(
+                    &paths,
+                    IpcCommand::ResetConversation {
+                        all,
+                        target: crate::ipc::SessionRef::Current,
+                    },
+                )
+                .await?;
                 print_reset_message(all);
             } else {
-                run_reset(&paths, args.scope.as_deref())?;
+                run_reset(&paths, args.scope.as_deref()).await?;
             }
             Ok(())
         }
@@ -1288,29 +1323,22 @@ fn initialize_models_cache(paths: &MiyuPaths) {
 }
 
 async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
-    if args.public && args.password.is_none() && args.password_file.is_none() {
-        bail!(
-            "{}",
-            t(
-                "--public requires --password or --password-file",
-                "--public 必须同时使用 --password 或 --password-file"
-            )
-        );
-    }
     if let Some(info) = ipc::daemon_info(paths).await {
-        if args.password.is_some() || args.password_file.is_some() {
-            bail!(
-                "{}",
-                t(
-                    "the running Miyu daemon already owns Web authentication; restart it to change the password",
-                    "当前 Miyu daemon 已接管 Web 认证；如需修改密码请先重启 daemon"
-                )
-            );
+        if info.build_id == ipc::BUILD_ID {
+            if args.port_explicit || args.password.is_some() || args.password_file.is_some() {
+                bail!(
+                    "{}",
+                    t(
+                        "the running Miyu daemon already owns Web settings; restart it to change them",
+                        "当前 Miyu daemon 已接管 Web 设置；如需修改请先重启 daemon"
+                    )
+                );
+            }
+            for url in ipc::web_access_urls(info.web_port) {
+                println!("Miyu WebUI: {url}");
+            }
+            return Ok(());
         }
-        for url in ipc::web_access_urls(info.web_port) {
-            println!("Miyu WebUI: {url}");
-        }
-        return Ok(());
     }
 
     if args.password.as_deref() == Some("") {
@@ -1319,40 +1347,110 @@ async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
             "WebUI 密码：",
         ))?);
     }
-    let mut daemon_args = vec![
-        OsString::from("--port"),
-        OsString::from(args.port.to_string()),
-    ];
-    if args.public {
-        daemon_args.push(OsString::from("--public"));
-    }
-    if let Some(password) = args.password.as_deref() {
-        daemon_args.push(OsString::from(format!("--password={password}")));
-    }
-    if let Some(path) = args.password_file.as_ref() {
-        daemon_args.push(OsString::from("--password-file"));
-        daemon_args.push(path.as_os_str().to_owned());
-    }
-    let info = ipc::ensure_daemon(paths, &daemon_args).await?;
+    let launch = web_launch_config(paths, &args)?;
+    let info = ipc::ensure_daemon(paths, launch.as_ref()).await?;
     for url in ipc::web_access_urls(info.web_port) {
         println!("Miyu WebUI: {url}");
     }
     Ok(())
 }
 
+fn web_launch_config(paths: &MiyuPaths, args: &WebArgs) -> Result<Option<ipc::DaemonLaunchConfig>> {
+    if !args.port_explicit && args.password.is_none() && args.password_file.is_none() {
+        return Ok(None);
+    }
+    let password_file = match args.password.as_deref() {
+        Some("") => bail!(
+            "{}",
+            t("WebUI password cannot be empty", "WebUI 密码不能为空")
+        ),
+        Some(password) if password.chars().count() > 1_024 => bail!(
+            "{}",
+            t(
+                "WebUI password cannot exceed 1,024 characters",
+                "WebUI 密码不能超过 1,024 个字符"
+            )
+        ),
+        Some(password) => Some(ipc::stage_managed_web_password(paths, password)?),
+        None => args
+            .password_file
+            .as_deref()
+            .map(|path| ipc::stage_web_password_file(paths, path))
+            .transpose()?,
+    };
+    Ok(Some(ipc::DaemonLaunchConfig {
+        port: args.port,
+        password_file,
+    }))
+}
+
 async fn run_daemon_command(paths: &MiyuPaths, args: DaemonArgs) -> Result<()> {
-    match args.command {
+    let command = args.command.unwrap_or(DaemonCommand::Start);
+    if args.port.is_some() && !matches!(command, DaemonCommand::Start | DaemonCommand::Restart) {
+        bail!(
+            "{}",
+            t(
+                "--port only applies to daemon start or restart",
+                "--port 仅适用于 daemon start 或 restart"
+            )
+        );
+    }
+
+    match command {
         DaemonCommand::Start => {
-            ipc::ensure_daemon(paths, &[]).await?;
-            print_daemon_status(paths).await
+            let launch = args
+                .port
+                .map(|port| ipc::daemon_launch_config_with_port(paths, port))
+                .transpose()?;
+            if launch.is_some()
+                && ipc::daemon_info(paths)
+                    .await
+                    .is_some_and(|info| info.build_id == ipc::BUILD_ID)
+            {
+                bail!(
+                    "{}",
+                    t(
+                        "the running Miyu daemon already owns Web settings; use `miyu daemon restart` to change the port",
+                        "当前 Miyu daemon 已接管 Web 设置；如需修改端口请使用 `miyu daemon restart`"
+                    )
+                );
+            }
+            ipc::ensure_daemon(paths, launch.as_ref()).await?;
+            let refreshed = MiyuPaths::new()?;
+            print_daemon_status(&refreshed).await
         }
         DaemonCommand::Stop => stop_daemon(paths).await,
         DaemonCommand::Restart => {
-            if ipc::daemon_info(paths).await.is_some() {
-                stop_daemon(paths).await?;
+            let pending_launch = if let Some(port) = args.port {
+                Some(ipc::daemon_launch_config_with_port(paths, port)?)
+            } else {
+                match ipc::daemon_info(paths).await {
+                    Some(info) => ipc::recover_daemon_launch_if_missing(paths, info.pid)?,
+                    None => None,
+                }
+            };
+            if let Err(error) = stop_daemon(paths).await {
+                if let Some(launch) = &pending_launch {
+                    ipc::discard_daemon_launch_candidate(paths, launch);
+                }
+                return Err(error);
+            };
+            let refreshed = match MiyuPaths::new() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    if let Some(launch) = &pending_launch {
+                        ipc::discard_daemon_launch_candidate(paths, launch);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = ipc::ensure_daemon(&refreshed, pending_launch.as_ref()).await {
+                if let Some(launch) = &pending_launch {
+                    ipc::discard_daemon_launch_candidate(&refreshed, launch);
+                }
+                return Err(error);
             }
-            ipc::ensure_daemon(paths, &[]).await?;
-            print_daemon_status(paths).await
+            print_daemon_status(&refreshed).await
         }
         DaemonCommand::Status => print_daemon_status(paths).await,
         DaemonCommand::Logs(args) => run_daemon_logs(paths, args).await,
@@ -1360,12 +1458,11 @@ async fn run_daemon_command(paths: &MiyuPaths, args: DaemonArgs) -> Result<()> {
 }
 
 async fn stop_daemon(paths: &MiyuPaths) -> Result<()> {
-    if ipc::daemon_info(paths).await.is_none() {
+    let Some(info) = ipc::daemon_info(paths).await else {
         println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
         return Ok(());
-    }
-    send_ipc_command(paths, IpcCommand::Shutdown).await?;
-    ipc::wait_for_daemon_exit(paths, Duration::from_secs(5)).await?;
+    };
+    ipc::shutdown_daemon(paths, &info).await?;
     println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
     Ok(())
 }
@@ -1444,6 +1541,7 @@ fn daemon_web_status_lines(label: &str, urls: &[String]) -> Vec<String> {
 }
 
 async fn run_daemon_logs(paths: &MiyuPaths, args: DaemonLogsArgs) -> Result<()> {
+    let ansi = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if let Some(lines) = args.lines {
         if !(1..=100_000).contains(&lines) {
             bail!(
@@ -1454,19 +1552,204 @@ async fn run_daemon_logs(paths: &MiyuPaths, args: DaemonLogsArgs) -> Result<()> 
                 )
             );
         }
-        for line in recent_daemon_log_lines(paths, lines)? {
-            println!("{line}");
-        }
+        let snapshot = recent_daemon_log_snapshot(paths, lines)?;
+        write_daemon_log_lines(&snapshot.lines, ansi)?;
         return Ok(());
     }
 
-    for line in recent_daemon_log_lines(paths, 50)? {
-        println!("{line}");
-    }
-    if ipc::daemon_info(paths).await.is_none() {
+    let snapshot = recent_daemon_log_snapshot(paths, 50)?;
+    write_daemon_log_lines(&snapshot.lines, ansi)?;
+    // The cursor is tied to the exact EOF captured by the snapshot reader.
+    // Bytes appended while the snapshot is printed or while the status probe
+    // runs are therefore consumed by follow instead of being skipped.
+    let cursor = snapshot.cursor;
+    let Some(daemon) = ipc::daemon_info(paths).await else {
         bail!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
+    };
+    follow_daemon_log(paths, ansi, cursor, daemon.pid).await
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedDaemonLogLine<'a> {
+    timestamp: &'a str,
+    level: &'a str,
+    module: &'a str,
+    message: &'a str,
+}
+
+fn parse_daemon_log_line(line: &str) -> Option<ParsedDaemonLogLine<'_>> {
+    let timestamp_end = line.find(char::is_whitespace)?;
+    let timestamp = &line[..timestamp_end];
+    DateTime::parse_from_rfc3339(timestamp).ok()?;
+
+    let remainder = line[timestamp_end..].trim_start();
+    let level_end = remainder.find(char::is_whitespace)?;
+    let level = &remainder[..level_end];
+    if !matches!(level, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR") {
+        return None;
     }
-    follow_daemon_log(paths).await
+
+    let remainder = remainder[level_end..].trim_start();
+    let (module, message) = remainder
+        .split_once(": ")
+        .filter(|(candidate, _)| is_miyu_log_target(candidate))
+        .unwrap_or(("miyu", remainder));
+    Some(ParsedDaemonLogLine {
+        timestamp,
+        level,
+        module,
+        message,
+    })
+}
+
+fn is_miyu_log_target(value: &str) -> bool {
+    value == "miyu"
+        || value
+            .strip_prefix("miyu::")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn format_daemon_log_line(line: &str, ansi: bool) -> String {
+    let mut decision_color = None;
+    format_daemon_log_line_with_state(line, ansi, &mut decision_color)
+}
+
+fn format_daemon_log_line_with_state(
+    line: &str,
+    ansi: bool,
+    decision_color: &mut Option<Color>,
+) -> String {
+    let Some(parsed) = parse_daemon_log_line(line) else {
+        if let Some(color) = active_reply_log_color(line) {
+            *decision_color = Some(color);
+        }
+        return decision_color.map_or_else(
+            || line.to_string(),
+            |color| color_log_part(line.to_string(), color, ansi),
+        );
+    };
+    *decision_color = active_reply_log_color(parsed.message);
+    let timestamp = DateTime::parse_from_rfc3339(parsed.timestamp)
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%H:%M:%S%.3f")
+                .to_string()
+        })
+        .unwrap_or_else(|_| parsed.timestamp.to_string());
+    let timestamp = color_log_part(format!("[{timestamp}]"), Color::DarkGreen, ansi);
+    let level = color_log_part(
+        format!("[{}]", parsed.level),
+        log_level_color(parsed.level),
+        ansi,
+    );
+    let module = color_log_part(format!("[{}]", parsed.module), Color::DarkCyan, ansi);
+    if parsed.message.is_empty() {
+        format!("{timestamp} {level} {module}")
+    } else {
+        format!(
+            "{timestamp} {level} {module} {}",
+            decision_color.map_or_else(
+                || parsed.message.to_string(),
+                |color| color_log_part(parsed.message.to_string(), color, ansi),
+            )
+        )
+    }
+}
+
+fn active_reply_log_color(value: &str) -> Option<Color> {
+    match value.trim_start().lines().next().unwrap_or_default() {
+        "【续聊窗口判断：回复】"
+        | "【主动回复判断：回复】"
+        | "[Continuation decision: reply]"
+        | "[Active reply decision: reply]" => Some(Color::Green),
+        "【续聊窗口判断：不回复】"
+        | "【主动回复判断：不回复】"
+        | "[Continuation decision: no reply]"
+        | "[Active reply decision: no reply]" => Some(Color::DarkGrey),
+        _ => None,
+    }
+}
+
+fn log_level_color(level: &str) -> Color {
+    match level {
+        "ERROR" => Color::Red,
+        "WARN" => Color::Yellow,
+        "INFO" => Color::Green,
+        "DEBUG" => Color::Cyan,
+        _ => Color::DarkGrey,
+    }
+}
+
+fn color_log_part(value: String, color: Color, ansi: bool) -> String {
+    if ansi {
+        format!("{}", value.with(color))
+    } else {
+        value
+    }
+}
+
+fn write_daemon_log_lines(lines: &[String], ansi: bool) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let mut decision_color = None;
+    for line in lines {
+        writeln!(
+            output,
+            "{}",
+            format_daemon_log_line_with_state(line, ansi, &mut decision_color)
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct DaemonLogStreamFormatter {
+    pending: Vec<u8>,
+    decision_color: Option<Color>,
+}
+
+impl DaemonLogStreamFormatter {
+    fn push(&mut self, bytes: &[u8], ansi: bool, output: &mut impl Write) -> io::Result<()> {
+        self.pending.extend_from_slice(bytes);
+        let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(());
+        };
+        let remainder = self.pending.split_off(last_newline + 1);
+        let complete = std::mem::replace(&mut self.pending, remainder);
+        for mut line in complete[..last_newline].split(|byte| *byte == b'\n') {
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            write_daemon_log_line_bytes(line, ansi, &mut self.decision_color, output)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, ansi: bool, output: &mut impl Write) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut line = std::mem::take(&mut self.pending);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        write_daemon_log_line_bytes(&line, ansi, &mut self.decision_color, output)
+    }
+}
+
+fn write_daemon_log_line_bytes(
+    line: &[u8],
+    ansi: bool,
+    decision_color: &mut Option<Color>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "{}",
+        format_daemon_log_line_with_state(&String::from_utf8_lossy(line), ansi, decision_color,)
+    )
 }
 
 fn daemon_log_files(paths: &MiyuPaths) -> Result<Vec<PathBuf>> {
@@ -1484,39 +1767,120 @@ fn daemon_log_files(paths: &MiyuPaths) -> Result<Vec<PathBuf>> {
         Err(error) => return Err(error.into()),
     };
     files.sort();
-    if files.is_empty() {
-        let fallback = paths.logs_dir().join("daemon.log");
-        if fallback.is_file() {
-            files.push(fallback);
-        }
+    // The daemon's inherited stdout/stderr goes to daemon.log. Keep it in
+    // the history even when tracing has already created rolling log files;
+    // startup failures and panics can happen before the tracing layer writes
+    // anything useful.
+    let fallback = paths.logs_dir().join("daemon.log");
+    if fallback.is_file() && !files.iter().any(|path| path == &fallback) {
+        // Treat the unstructured process stream as the oldest source for the
+        // bounded recent view. The newest rolling file remains last.
+        files.insert(0, fallback);
     }
     Ok(files)
 }
 
-fn recent_daemon_log_lines(paths: &MiyuPaths, limit: usize) -> Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
+fn is_daemon_fallback_log(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("daemon.log")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonLogFollowCursor {
+    current: Option<PathBuf>,
+    current_offset: u64,
+    fallback: Option<PathBuf>,
+    fallback_offset: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DaemonLogSnapshot {
+    lines: Vec<String>,
+    cursor: DaemonLogFollowCursor,
+}
+
+fn daemon_log_follow_cursor_for_files(
+    files: &[PathBuf],
+    offsets: &[(PathBuf, u64)],
+) -> DaemonLogFollowCursor {
+    let fallback = files
+        .iter()
+        .find(|path| is_daemon_fallback_log(path))
+        .cloned();
+    let current = files
+        .iter()
+        .rev()
+        .find(|path| !is_daemon_fallback_log(path))
+        .cloned()
+        .or_else(|| fallback.clone());
+    let file_offset = |path: Option<&PathBuf>| {
+        path.and_then(|path| {
+            offsets
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, offset)| *offset)
+        })
+        .unwrap_or_else(|| {
+            path.and_then(|path| std::fs::metadata(path).ok())
+                .map_or(0, |metadata| metadata.len())
+        })
+    };
+    DaemonLogFollowCursor {
+        current_offset: file_offset(current.as_ref()),
+        fallback_offset: file_offset(fallback.as_ref()),
+        current,
+        fallback,
     }
+}
+
+fn recent_daemon_log_snapshot(paths: &MiyuPaths, limit: usize) -> Result<DaemonLogSnapshot> {
+    let files = daemon_log_files(paths)?;
+    if limit == 0 {
+        return Ok(DaemonLogSnapshot {
+            lines: Vec::new(),
+            cursor: daemon_log_follow_cursor_for_files(&files, &[]),
+        });
+    }
+    // Record the initial EOF of every source before reading any tails. A
+    // writer that appends after this point is intentionally left for follow;
+    // it can never be lost in the snapshot-to-follow hand-off.
+    let mut offsets = files
+        .iter()
+        .map(|path| {
+            let offset = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            (path.clone(), offset)
+        })
+        .collect::<Vec<_>>();
     let mut lines = Vec::with_capacity(limit.min(1024));
-    for path in daemon_log_files(paths)?.into_iter().rev() {
+    for path in files.iter().rev() {
         let remaining = limit.saturating_sub(lines.len());
         if remaining == 0 {
             break;
         }
-        let mut file_lines = tail_file_lines(&path, remaining)?;
+        let (mut file_lines, end_offset) = tail_file_lines_with_end(path, remaining)?;
+        if let Some((_, offset)) = offsets.iter_mut().find(|(candidate, _)| candidate == path) {
+            *offset = end_offset;
+        }
         file_lines.extend(lines);
         lines = file_lines;
     }
     if lines.len() > limit {
         lines.drain(..lines.len() - limit);
     }
-    Ok(lines)
+    Ok(DaemonLogSnapshot {
+        lines,
+        cursor: daemon_log_follow_cursor_for_files(&files, &offsets),
+    })
 }
 
-fn tail_file_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+fn recent_daemon_log_lines(paths: &MiyuPaths, limit: usize) -> Result<Vec<String>> {
+    Ok(recent_daemon_log_snapshot(paths, limit)?.lines)
+}
+
+fn tail_file_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<String>, u64)> {
     const CHUNK: usize = 8192;
     let mut file = std::fs::File::open(path)?;
     let mut position = file.seek(SeekFrom::End(0))?;
+    let end_offset = position;
     let mut bytes = Vec::new();
     let mut newline_count = 0usize;
     while position > 0 && newline_count <= limit {
@@ -1534,43 +1898,245 @@ fn tail_file_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
     if lines.len() > limit {
         lines.drain(..lines.len() - limit);
     }
-    Ok(lines)
+    Ok((lines, end_offset))
 }
 
-async fn follow_daemon_log(paths: &MiyuPaths) -> Result<()> {
-    let mut current = daemon_log_files(paths)?.into_iter().last();
-    let mut offset = current
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map_or(0, |metadata| metadata.len());
+#[derive(Debug, Eq, PartialEq)]
+struct DaemonLogDelta {
+    bytes: Vec<u8>,
+    next_offset: u64,
+    reset: bool,
+}
+
+fn read_daemon_log_delta(path: &Path, offset: u64) -> Result<DaemonLogDelta> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let reset = len < offset;
+    let start = if reset { 0 } else { offset };
+    if len == start {
+        return Ok(DaemonLogDelta {
+            bytes: Vec::new(),
+            next_offset: start,
+            reset,
+        });
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok(DaemonLogDelta {
+        bytes,
+        next_offset: file.stream_position()?,
+        reset,
+    })
+}
+
+fn write_daemon_log_delta(
+    path: &Path,
+    offset: &mut u64,
+    formatter: &mut DaemonLogStreamFormatter,
+    ansi: bool,
+    output: &mut impl Write,
+) -> Result<bool> {
+    let delta = read_daemon_log_delta(path, *offset)?;
+    if delta.reset {
+        formatter.finish(ansi, output)?;
+    }
+    *offset = delta.next_offset;
+    if delta.bytes.is_empty() {
+        return Ok(false);
+    }
+    formatter.push(&delta.bytes, ansi, output)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn daemon_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn daemon_process_alive(_pid: u32) -> bool {
+    // The IPC probe remains the authoritative check on platforms without a
+    // portable process-existence primitive.
+    true
+}
+
+fn finish_daemon_log_formatters(
+    ansi: bool,
+    current: Option<&PathBuf>,
+    fallback: Option<&PathBuf>,
+    formatter: &mut DaemonLogStreamFormatter,
+    fallback_formatter: &mut DaemonLogStreamFormatter,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    if fallback == current {
+        fallback_formatter.finish(ansi, output)?;
+    } else {
+        formatter.finish(ansi, output)?;
+        fallback_formatter.finish(ansi, output)?;
+    }
+    output.flush()
+}
+
+async fn follow_daemon_log(
+    paths: &MiyuPaths,
+    ansi: bool,
+    cursor: DaemonLogFollowCursor,
+    initial_pid: u32,
+) -> Result<()> {
+    let mut current = cursor.current;
+    let mut offset = cursor.current_offset;
+    let mut fallback = cursor.fallback;
+    let mut fallback_offset = cursor.fallback_offset;
     let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut formatter = DaemonLogStreamFormatter::default();
+    let mut fallback_formatter = DaemonLogStreamFormatter::default();
+    let mut known_pid = Some(initial_pid);
+    let mut daemon_misses = 0_u8;
+
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => {
+                let mut stdout = io::stdout().lock();
+                finish_daemon_log_formatters(
+                    ansi,
+                    current.as_ref(),
+                    fallback.as_ref(),
+                    &mut formatter,
+                    &mut fallback_formatter,
+                    &mut stdout,
+                )?;
+                return Ok(());
+            },
             _ = interval.tick() => {
-                let latest = daemon_log_files(paths)?.into_iter().last();
+                let files = daemon_log_files(paths)?;
+                let latest = files
+                    .iter()
+                    .rev()
+                    .find(|path| !is_daemon_fallback_log(path))
+                    .cloned()
+                    .or_else(|| files.iter().find(|path| is_daemon_fallback_log(path)).cloned());
+                let latest_fallback = files.iter().find(|path| is_daemon_fallback_log(path)).cloned();
+                if latest_fallback != fallback {
+                    let mut stdout = io::stdout().lock();
+                    if fallback.as_ref().is_some_and(|path| path.is_file()) {
+                        write_daemon_log_delta(
+                            fallback.as_ref().unwrap(),
+                            &mut fallback_offset,
+                            &mut fallback_formatter,
+                            ansi,
+                            &mut stdout,
+                        )?;
+                    }
+                    fallback_formatter.finish(ansi, &mut stdout)?;
+                    stdout.flush()?;
+                    fallback = latest_fallback;
+                    fallback_offset = 0;
+                }
                 if latest != current {
+                    let mut stdout = io::stdout().lock();
+                    if let Some(previous) = current
+                        .as_ref()
+                        .filter(|path| path.is_file() && Some(*path) != fallback.as_ref())
+                    {
+                        write_daemon_log_delta(
+                            previous,
+                            &mut offset,
+                            &mut formatter,
+                            ansi,
+                            &mut stdout,
+                        )?;
+                    }
+                    formatter.finish(ansi, &mut stdout)?;
+                    stdout.flush()?;
                     current = latest;
                     offset = 0;
                 }
-                let Some(path) = current.as_ref() else { continue };
-                let mut file = std::fs::File::open(path)?;
-                let len = file.metadata()?.len();
-                if len < offset {
-                    offset = 0;
+                let mut changed = false;
+                let mut stdout = io::stdout().lock();
+                if let Some(path) = fallback.as_ref().filter(|path| path.is_file()) {
+                    changed |= write_daemon_log_delta(
+                        path,
+                        &mut fallback_offset,
+                        &mut fallback_formatter,
+                        ansi,
+                        &mut stdout,
+                    )?;
                 }
-                if len == offset {
-                    if ipc::daemon_info(paths).await.is_none() {
-                        return Ok(());
+                if current.as_ref() != fallback.as_ref() {
+                    if let Some(path) = current.as_ref().filter(|path| path.is_file()) {
+                        changed |= write_daemon_log_delta(
+                            path,
+                            &mut offset,
+                            &mut formatter,
+                            ansi,
+                            &mut stdout,
+                        )?;
                     }
+                }
+                stdout.flush()?;
+                drop(stdout);
+
+                if changed {
+                    daemon_misses = 0;
                     continue;
                 }
-                file.seek(SeekFrom::Start(offset))?;
-                let mut bytes = Vec::with_capacity(usize::try_from(len - offset).unwrap_or(0));
-                file.read_to_end(&mut bytes)?;
-                offset = len;
-                print!("{}", String::from_utf8_lossy(&bytes));
-                io::stdout().flush()?;
+
+                if let Some(info) = ipc::daemon_info(paths).await {
+                    known_pid = Some(info.pid);
+                    daemon_misses = 0;
+                    continue;
+                }
+
+                // `daemon_info` deliberately has a short timeout. A busy
+                // daemon can miss one or more probes while still being alive;
+                // use the last known PID and a small grace window before
+                // treating the stream as finished.
+                let alive = known_pid.is_some_and(daemon_process_alive);
+                let socket_exists = paths.ipc_socket().exists();
+                if socket_exists && (alive || known_pid.is_none()) {
+                    daemon_misses = 0;
+                    continue;
+                }
+                daemon_misses = daemon_misses.saturating_add(1);
+                if daemon_misses < 3 {
+                    continue;
+                }
+
+                let mut stdout = io::stdout().lock();
+                if let Some(path) = fallback.as_ref().filter(|path| path.is_file()) {
+                    write_daemon_log_delta(
+                        path,
+                        &mut fallback_offset,
+                        &mut fallback_formatter,
+                        ansi,
+                        &mut stdout,
+                    )?;
+                }
+                if current.as_ref() != fallback.as_ref() {
+                    if let Some(path) = current.as_ref().filter(|path| path.is_file()) {
+                        write_daemon_log_delta(
+                            path,
+                            &mut offset,
+                            &mut formatter,
+                            ansi,
+                            &mut stdout,
+                        )?;
+                    }
+                }
+                finish_daemon_log_formatters(
+                    ansi,
+                    current.as_ref(),
+                    fallback.as_ref(),
+                    &mut formatter,
+                    &mut fallback_formatter,
+                    &mut stdout,
+                )?;
+                return Ok(());
             }
         }
     }
@@ -1578,7 +2144,14 @@ async fn follow_daemon_log(paths: &MiyuPaths) -> Result<()> {
 
 async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
     if ipc::daemon_info(paths).await.is_some() {
-        send_ipc_command(paths, IpcCommand::ReloadConfig).await?;
+        send_ipc_command(paths, IpcCommand::ReloadConfig)
+            .await
+            .with_context(|| {
+                t(
+                    "configuration was saved, but the running daemon did not reload it",
+                    "配置已保存，但正在运行的 daemon 未能重新加载配置",
+                )
+            })?;
     }
     Ok(())
 }
@@ -1653,8 +2226,6 @@ fn run_init(paths: &MiyuPaths, kind: InitKind) -> Result<()> {
     )?;
     if interactive {
         println!("\n{}\n", t("Initialization complete.", "初始化完成。"));
-        std::thread::sleep(Duration::from_millis(420));
-        prompt_shell_init_menu(paths)?;
     } else {
         println!(
             "{} {}",
@@ -1672,100 +2243,6 @@ fn print_init_step(interactive: bool, label: &str, value: &str) -> Result<()> {
         io::stdout().flush()?;
     }
     Ok(())
-}
-
-fn prompt_shell_init_menu(paths: &MiyuPaths) -> Result<()> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(());
-    }
-    println!("{}", t("Integrate with shell?", "是否集成到 shell？"));
-    println!(
-        "{}\n",
-        t(
-            "After integration, you can chat in natural language directly in the terminal.",
-            "集成后可在终端直接使用自然语言交流。"
-        )
-    );
-    match select_shell_hook()? {
-        Some("fish") => shell::fish::install(paths),
-        Some("bash") => shell::bash::install(paths),
-        Some("zsh") => shell::zsh::install(paths),
-        _ => Ok(()),
-    }
-}
-
-fn select_shell_hook() -> Result<Option<&'static str>> {
-    let options = [
-        (t("Skip", "跳过"), None),
-        ("fish", Some("fish")),
-        ("bash", Some("bash")),
-        ("zsh", Some("zsh")),
-    ];
-    let detected = shell::current_parent_shell();
-    let mut selected = detected
-        .as_deref()
-        .and_then(|shell| options.iter().position(|(_, value)| *value == Some(shell)))
-        .unwrap_or(0);
-    let mut stdout = io::stdout();
-    let (_, menu_row) = cursor::position()?;
-    execute!(stdout, Hide)?;
-    struct ShellMenuGuard;
-    impl Drop for ShellMenuGuard {
-        fn drop(&mut self) {
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), Show);
-        }
-    }
-    let _guard = ShellMenuGuard;
-    loop {
-        queue!(
-            stdout,
-            MoveTo(0, menu_row),
-            Clear(ClearType::FromCursorDown)
-        )?;
-        for (index, (label, _)) in options.iter().enumerate() {
-            if index == selected {
-                queue!(stdout, Print(format!("> {label}\n")))?;
-            } else {
-                queue!(stdout, Print(format!("  {label}\n")))?;
-            }
-        }
-        queue!(
-            stdout,
-            Print(format!(
-                "\n\x1b[2m{}\x1b[0m",
-                t(
-                    "Up/Down or j/k to choose, Enter to confirm, Esc/q to skip",
-                    "↑/↓ 或 j/k 选择，Enter 确认，Esc/q 跳过"
-                )
-            ))
-        )?;
-        stdout.flush()?;
-        terminal::enable_raw_mode()?;
-        let key = read_shell_menu_key();
-        terminal::disable_raw_mode()?;
-        match key? {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                execute!(stdout, Show)?;
-                return Ok(None);
-            }
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => {
-                execute!(stdout, Show)?;
-                return Ok(options[selected].1);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn read_shell_menu_key() -> Result<KeyCode> {
-    loop {
-        if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-            return Ok(code);
-        }
-    }
 }
 
 fn remove_shell_hooks(paths: &MiyuPaths) -> Result<()> {
@@ -1924,7 +2401,14 @@ async fn run_pop_via_daemon(paths: &MiyuPaths, args: PopArgs) -> Result<()> {
         print_nothing_to_pop();
         return Ok(());
     }
-    let (_, data) = send_ipc_admin(paths, IpcCommand::Pop { turn_ids }).await?;
+    let (_, data) = send_ipc_admin(
+        paths,
+        IpcCommand::Pop {
+            target: crate::ipc::SessionRef::Current,
+            turn_ids,
+        },
+    )
+    .await?;
     let turns = data
         .get("turns")
         .and_then(serde_json::Value::as_u64)
@@ -2653,13 +3137,18 @@ fn inline_fuzzy_lines(item_count: usize) -> u16 {
 /// as `inline_pop_select` (editor suspended, cooked mode on entry). `lines`
 /// are the rendered rows and `search` the parallel fuzzy-match texts.
 /// Returns the selected index, or `None` when cancelled.
-fn inline_single_select(title: &str, lines: &[String], search: &[String]) -> Result<Option<usize>> {
+fn inline_single_select(
+    title: &str,
+    lines: &[String],
+    search: &[String],
+    initial_selected: usize,
+) -> Result<Option<usize>> {
     let menu_lines = inline_fuzzy_lines(lines.len());
     reserve_inline_fuzzy_space(menu_lines)?;
     let mut session = InlineRawMode::start()?;
     let matcher = SkimMatcherV2::default();
     let mut query = String::new();
-    let mut selected = 0usize;
+    let mut selected = initial_selected.min(lines.len().saturating_sub(1));
     let mut scroll = 0usize;
     let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
     let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
@@ -3133,6 +3622,9 @@ async fn run_chat_with_images(
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    let memory_organizer = MemoryOrganizer::spawn()?;
+    let memory_organizer_handle = memory_organizer.handle();
+    memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
     let registry = build_tool_registry(
         &config,
@@ -3155,6 +3647,7 @@ async fn run_chat_with_images(
         registry,
         AgentMode::Normal,
     )?;
+    agent.set_memory_organizer(memory_organizer_handle);
     agent.prepare_for_turn()?;
     let mut renderer = render::StreamRenderer::new(
         reasoning_mode,
@@ -3336,6 +3829,9 @@ async fn run_chat_with_options(
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    let memory_organizer = MemoryOrganizer::spawn()?;
+    let memory_organizer_handle = memory_organizer.handle();
+    memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
     let registry =
         build_tool_registry(&config, paths, mode, crate::question_tui::available(plain))?;
@@ -3355,6 +3851,7 @@ async fn run_chat_with_options(
     let show_mixed_model_endpoint = show_mixed_model_endpoint(&config, false);
     let display_config = config.clone();
     let mut agent = Agent::new(config, paths, state.clone(), client, registry, mode)?;
+    agent.set_memory_organizer(memory_organizer_handle);
     agent.prepare_for_turn()?;
     let mut renderer = render::StreamRenderer::new(
         reasoning_mode,
@@ -3440,20 +3937,30 @@ async fn try_run_remote_chat(
     images: &[Option<crate::clipboard::PastedImage>],
     session_override: Option<String>,
 ) -> Result<Option<RemoteTurnSummary>> {
+    let refreshed_paths = if direct_mode_requested() {
+        None
+    } else {
+        // ensure_daemon also restarts a daemon left over from an older build.
+        // Re-resolve paths because that shutdown may complete legacy layout migration.
+        ipc::ensure_daemon(paths, None).await?;
+        Some(MiyuPaths::new()?)
+    };
+    let paths = refreshed_paths.as_ref().unwrap_or(paths);
     let mut stream = if direct_mode_requested() {
         match ipc::connect(&paths.ipc_socket()).await {
             Ok(stream) => stream,
             Err(_) => return Ok(None),
         }
     } else {
-        // ensure_daemon also restarts a daemon left over from an older
-        // build, so a rebuilt CLI never talks to stale daemon code.
-        ipc::ensure_daemon(paths, &[]).await?;
         ipc::connect(&paths.ipc_socket()).await?
     };
     // Turns run in parallel daemon-side: a running turn in this session does
     // not block a new one (the old multi-process placeholder semantics).
     let state_probe = StateStore::new(paths)?;
+    let state_probe = session_override
+        .as_deref()
+        .map(|session_id| state_probe.pinned(session_id))
+        .unwrap_or(state_probe);
     ipc::send(
         &mut stream,
         &IpcRequest::new(IpcCommand::StartTurn {
@@ -3473,6 +3980,7 @@ async fn try_run_remote_chat(
         IpcFrame::Error { message } => bail!("{message}"),
         _ => bail!("Miyu core returned an invalid response"),
     };
+    let mut turn_id: Option<String> = None;
 
     let config = AppConfig::load_or_default(paths)?;
     let reasoning_mode = if show_reasoning == Some(false) {
@@ -3578,10 +4086,22 @@ async fn try_run_remote_chat(
                         LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
                         LiveEditorAction::EmptySubmit => {}
                         LiveEditorAction::Submit(submission) => {
-                            let queue_state = queue_state
-                                .as_ref()
-                                .expect("queue state exists when live REPL is attached");
-                            match persist_remote_queued_submission(queue_state, &submission) {
+                            let Some(target_turn_id) = turn_id.as_deref() else {
+                                live_tail.editor.input = submission.display_content.clone();
+                                live_tail.editor.cursor = live_tail.editor.input.chars().count();
+                                renderer.write_system_message(t(
+                                    "the reply is still starting; try sending the follow-up again",
+                                    "当前回复仍在启动，请稍后重新发送追加消息",
+                                ))?;
+                                live_tail.apply_renderer_frame(&mut renderer)?;
+                                continue;
+                            };
+                            match persist_remote_queued_submission(
+                                paths,
+                                &run_id,
+                                target_turn_id,
+                                &submission,
+                            ).await {
                                 Ok(prompt) => {
                                     live_tail.editor.record_history(&submission.content);
                                     if live_tail.external_output_active {
@@ -3653,6 +4173,12 @@ async fn try_run_remote_chat(
             continue;
         };
         match kind.as_str() {
+            "turn.started" => {
+                let id = ipc_text(&data, "turn_id");
+                if !id.is_empty() {
+                    turn_id = Some(id.to_string());
+                }
+            }
             "assistant.delta" => {
                 let delta = ipc_text(&data, "delta");
                 content.push_str(delta);
@@ -3709,6 +4235,7 @@ async fn try_run_remote_chat(
             "tool.started" => handle_agent_event(
                 &mut renderer,
                 AgentEvent::ToolCall {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
                     name: ipc_text(&data, "name").to_string(),
                     arguments: ipc_text(&data, "arguments").to_string(),
                 },
@@ -3716,6 +4243,7 @@ async fn try_run_remote_chat(
             "tool.progress" => handle_agent_event(
                 &mut renderer,
                 AgentEvent::ToolProgress {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
                     name: ipc_text(&data, "name").to_string(),
                     message: ipc_text(&data, "message").to_string(),
                 },
@@ -3723,6 +4251,7 @@ async fn try_run_remote_chat(
             "tool.output" => handle_agent_event(
                 &mut renderer,
                 AgentEvent::CommandOutput {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
                     name: ipc_text(&data, "name").to_string(),
                     stream: if ipc_text(&data, "stream") == "stderr" {
                         tools::CommandOutputStream::Stderr
@@ -3732,17 +4261,48 @@ async fn try_run_remote_chat(
                     chunk: ipc_text(&data, "output").as_bytes().to_vec(),
                 },
             )?,
-            "tool.finished" => handle_agent_event(
-                &mut renderer,
-                AgentEvent::ToolResult {
-                    name: ipc_text(&data, "name").to_string(),
-                    ok: data
-                        .get("ok")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                    output: ipc_text(&data, "output").to_string(),
-                },
-            )?,
+            "tool.finished" => {
+                handle_agent_event(
+                    &mut renderer,
+                    AgentEvent::ToolResult {
+                        call_id: ipc_text(&data, "tool_id").to_string(),
+                        name: ipc_text(&data, "name").to_string(),
+                        ok: data
+                            .get("ok")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        output: ipc_text(&data, "output").to_string(),
+                    },
+                )?;
+                if let Some(live) = live.as_deref_mut() {
+                    if live.external_output_active {
+                        live.external_output_active = false;
+                        live.output_cursor = cursor::position()?;
+                        live.resume_at(live.output_cursor)?;
+                        live.apply_renderer_frame(&mut renderer)?;
+                    }
+                }
+            }
+            "tool.image" => {
+                renderer.prepare_for_external_output()?;
+                if let Some(live) = live.as_deref_mut() {
+                    live.apply_renderer_frame(&mut renderer)?;
+                    synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+                    live.external_output_active = true;
+                }
+                let state = queue_state
+                    .as_ref()
+                    .expect("queue state exists for a remote turn");
+                let size = (ipc_text(&data, "name") == "show_meme")
+                    .then(|| tools::memes::configured_meme_size(&config.plugins.memes))
+                    .flatten();
+                if let Err(error) = render_remote_tool_image(state, &data, size).await {
+                    renderer.write_system_message(&format!(
+                        "{}: {error}",
+                        t("Could not display tool image", "工具图片显示失败")
+                    ))?;
+                }
+            }
             "question.requested" => {
                 renderer.prepare_for_external_output()?;
                 if let Some(live) = live.as_deref_mut() {
@@ -3766,7 +4326,10 @@ async fn try_run_remote_chat(
                         .await?;
                         renderer.start_waiting()?;
                     }
-                    crate::question::QuestionResponse::Cancelled
+                    // The terminal question UI maps its close gestures to Cancelled;
+                    // Closed is resolved by the WebUI broker and is unreachable here.
+                    crate::question::QuestionResponse::Closed
+                    | crate::question::QuestionResponse::Cancelled
                     | crate::question::QuestionResponse::Unavailable(_) => {
                         let _ = send_ipc_command(
                             paths,
@@ -3807,6 +4370,16 @@ async fn try_run_remote_chat(
                         live.consume_queued(&prompt_ids, consumed_mode)
                     })?;
                 }
+            }
+            "generation.superseded" => {
+                content.clear();
+                reasoning.clear();
+                handle_agent_event(
+                    &mut renderer,
+                    AgentEvent::ReasoningReset {
+                        received_at: Instant::now(),
+                    },
+                )?;
             }
             "context.compact_start" => handle_agent_event(&mut renderer, AgentEvent::CompactStart)?,
             "context.compact_delta" => handle_agent_event(
@@ -3903,12 +4476,17 @@ async fn try_run_remote_chat(
 async fn send_ipc_command(paths: &MiyuPaths, command: IpcCommand) -> Result<()> {
     let mut stream = ipc::connect(&paths.ipc_socket()).await?;
     ipc::send(&mut stream, &IpcRequest::new(command)).await?;
-    match ipc::receive::<IpcFrame>(&mut stream).await? {
+    validate_ipc_command_response(ipc::receive::<IpcFrame>(&mut stream).await?)
+}
+
+fn validate_ipc_command_response(frame: Option<IpcFrame>) -> Result<()> {
+    match frame {
         Some(IpcFrame::Ack) | Some(IpcFrame::Ready { .. }) | Some(IpcFrame::AdminResult { .. }) => {
             Ok(())
         }
         Some(IpcFrame::Error { message }) => bail!("{message}"),
-        _ => bail!("Miyu core returned an invalid response"),
+        Some(other) => bail!("Miyu core returned an unexpected response: {other:?}"),
+        None => bail!("Miyu core closed the connection without a response"),
     }
 }
 
@@ -3966,15 +4544,20 @@ fn display_session_name(name: &str) -> &str {
     }
 }
 
-fn apply_session_switch(
+fn apply_repl_session_switch(
     paths: &MiyuPaths,
     state: &ipc::SessionState,
+    active_session_id: &mut String,
     history: &mut Vec<String>,
     live_repl: &mut LiveReplTail,
     footer: &mut ReplFooterStatus,
     cumulative_tokens: &mut u64,
 ) -> Result<()> {
-    let store = StateStore::new(paths)?;
+    if state.session_id.is_empty() {
+        bail!("{}", t("session state has no id", "会话状态缺少 ID"));
+    }
+    let store = StateStore::new(paths)?.pinned(&state.session_id);
+    active_session_id.clone_from(&state.session_id);
     *history = load_repl_input_history(&store)?;
     live_repl.editor.history = history.clone();
     live_repl.editor.history_index = live_repl.editor.history.len();
@@ -4058,8 +4641,16 @@ fn session_ref_from_index(
         })
 }
 
-fn session_select_line(entry: &SessionListEntry) -> String {
-    let marker = if entry.is_current { "* " } else { "  " };
+fn session_entry_is_active(entry: &SessionListEntry, active_session_id: Option<&str>) -> bool {
+    active_session_id.map_or(entry.is_current, |session_id| entry.id == session_id)
+}
+
+fn session_select_line(entry: &SessionListEntry, active_session_id: Option<&str>) -> String {
+    let marker = if session_entry_is_active(entry, active_session_id) {
+        "* "
+    } else {
+        "  "
+    };
     let mut line = format!(
         "{marker}{}  {} {}",
         display_session_name(&entry.name),
@@ -4083,6 +4674,39 @@ fn session_select_search(entry: &SessionListEntry) -> String {
         entry.snippet,
         entry.workspace.as_deref().unwrap_or_default()
     )
+}
+
+fn session_initial_selection(
+    entries: &[SessionListEntry],
+    active_session_id: Option<&str>,
+) -> usize {
+    entries
+        .iter()
+        .position(|entry| session_entry_is_active(entry, active_session_id))
+        .unwrap_or(0)
+}
+
+fn select_session_target(
+    entries: &[SessionListEntry],
+    active_session_id: Option<&str>,
+) -> Result<Option<crate::ipc::SessionRef>> {
+    let lines = entries
+        .iter()
+        .map(|entry| session_select_line(entry, active_session_id))
+        .collect::<Vec<_>>();
+    let search = entries
+        .iter()
+        .map(session_select_search)
+        .collect::<Vec<_>>();
+    Ok(inline_single_select(
+        t("Select session", "选择会话"),
+        &lines,
+        &search,
+        session_initial_selection(entries, active_session_id),
+    )?
+    .map(|index| crate::ipc::SessionRef::Id {
+        id: entries[index].id.clone(),
+    }))
 }
 
 /// Resolves a user-typed `/session` / `/delete` argument into a session ref:
@@ -4123,30 +4747,41 @@ async fn resolve_repl_session_target(
     }
 }
 
-fn print_session_list(data: &serde_json::Value) {
-    let entries = session_list_entries(data);
+fn print_session_list(entries: &[SessionListEntry]) {
+    let ansi = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if entries.is_empty() {
-        println!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话"));
+        if ansi {
+            println!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话"));
+        } else {
+            println!("{}\n", t("no sessions", "没有会话"));
+        }
         return;
     }
     println!("{}", t("sessions:", "会话列表:"));
     for (index, entry) in entries.iter().enumerate() {
-        let name = display_session_name(&entry.name);
-        let turns = entry.turns;
-        let snippet = entry.snippet.as_str();
-        let workspace = entry
-            .workspace
-            .as_deref()
-            .map(|workspace| format!("  [{workspace}]"))
-            .unwrap_or_default();
-        let marker = if entry.is_current { "*" } else { " " };
-        let turns_label = t("turns", "轮");
-        println!(
-            "{marker}{:>3}. {name}  \x1b[2m{turns} {turns_label}  {snippet}{workspace}\x1b[0m",
-            index + 1
-        );
+        println!("{}", session_list_line(index + 1, entry, ansi));
     }
     println!();
+}
+
+fn session_list_line(index: usize, entry: &SessionListEntry, ansi: bool) -> String {
+    let name = display_session_name(&entry.name);
+    let workspace = entry
+        .workspace
+        .as_deref()
+        .map(|workspace| format!("  [{workspace}]"))
+        .unwrap_or_default();
+    let marker = if entry.is_current { "*" } else { " " };
+    let turns_label = t("turns", "轮");
+    let details = format!(
+        "{} {turns_label}  {}{workspace}",
+        entry.turns, entry.snippet
+    );
+    if ansi {
+        format!("{marker}{index:>3}. {name}  \x1b[2m{details}\x1b[0m")
+    } else {
+        format!("{marker}{index:>3}. {name}  {details}")
+    }
 }
 
 fn confirm_inline(live: &mut LiveReplTail, prompt: &str) -> Result<bool> {
@@ -4184,16 +4819,81 @@ async fn repl_ipc_admin(
     }
 }
 
+async fn repl_get_session_state(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+    target: crate::ipc::SessionRef,
+) -> Result<Option<ipc::SessionState>> {
+    Ok(repl_ipc_admin(paths, live, IpcCommand::GetSessionState { target })
+        .await?
+        .map(|(state, _)| state))
+}
+
+async fn repl_fallback_session_state(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+) -> Result<Option<ipc::SessionState>> {
+    let Some((_, data)) = repl_ipc_admin(
+        paths,
+        live,
+        IpcCommand::ListSessions {
+            include_archived: false,
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let entries = session_list_entries(&data);
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.is_current)
+        .or_else(|| entries.first())
+    else {
+        return Ok(None);
+    };
+    repl_get_session_state(
+        paths,
+        live,
+        crate::ipc::SessionRef::Id {
+            id: entry.id.clone(),
+        },
+    )
+    .await
+}
+
+async fn repl_active_or_default_state(
+    paths: &MiyuPaths,
+    active_session_id: &str,
+) -> Result<(ipc::SessionState, bool)> {
+    match send_ipc_admin(
+        paths,
+        IpcCommand::GetSessionState {
+            target: crate::ipc::SessionRef::Id {
+                id: active_session_id.to_string(),
+            },
+        },
+    )
+    .await
+    {
+        Ok((state, _)) => Ok((state, false)),
+        Err(_) => {
+            let (state, _) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
+            let changed = state.session_id != active_session_id;
+            Ok((state, changed))
+        }
+    }
+}
+
 /// Ensures the daemon is running, then sends one admin command; used by the
 /// one-shot session subcommands (`miyu new/session/rename/...`).
 async fn session_admin(
     paths: &MiyuPaths,
     command: IpcCommand,
 ) -> Result<(ipc::SessionState, serde_json::Value)> {
-    if ipc::daemon_info(paths).await.is_none() {
-        ipc::ensure_daemon(paths, &[]).await?;
-    }
-    send_ipc_admin(paths, command).await
+    ipc::ensure_daemon(paths, None).await?;
+    let refreshed = MiyuPaths::new()?;
+    send_ipc_admin(&refreshed, command).await
 }
 
 /// Resolves a `miyu session/delete` target argument outside the REPL:
@@ -4267,12 +4967,14 @@ async fn run_session_new(paths: &MiyuPaths, args: SessionNameArgs) -> Result<()>
 }
 
 async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
-    let Some(arg) = args
+    let arg = args
         .target
         .as_deref()
         .map(str::trim)
-        .filter(|arg| !arg.is_empty())
-    else {
+        .filter(|arg| !arg.is_empty());
+    let target = if let Some(arg) = arg {
+        resolve_cli_session_target(paths, arg).await?
+    } else {
         let (_, data) = session_admin(
             paths,
             IpcCommand::ListSessions {
@@ -4280,10 +4982,20 @@ async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Resu
             },
         )
         .await?;
-        print_session_list(&data);
-        return Ok(());
+        let entries = session_list_entries(&data);
+        if entries.is_empty() {
+            print_session_list(&entries);
+            return Ok(());
+        }
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            print_session_list(&entries);
+            return Ok(());
+        }
+        let Some(target) = select_session_target(&entries, None)? else {
+            return Ok(());
+        };
+        target
     };
-    let target = resolve_cli_session_target(paths, arg).await?;
     let (state, _) = session_admin(paths, IpcCommand::SwitchSession { target }).await?;
     println!(
         "{}: {}",
@@ -4444,6 +5156,51 @@ fn ipc_text<'a>(data: &'a serde_json::Value, key: &str) -> &'a str {
     data.get(key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
+}
+
+async fn render_remote_tool_image(
+    state: &StateStore,
+    event: &serde_json::Value,
+    size: Option<String>,
+) -> Result<()> {
+    let asset_id = remote_tool_image_asset_id(event)
+        .ok_or_else(|| anyhow::anyhow!("tool image event did not contain an asset id"))?;
+    let asset = state
+        .load_image_asset(asset_id)?
+        .ok_or_else(|| anyhow::anyhow!("tool image asset is no longer available"))?;
+    let preview = remote_image_preview(&asset)?;
+    tools::vision::print_image_file(preview.path(), size).await
+}
+
+fn remote_tool_image_asset_id(event: &serde_json::Value) -> Option<&str> {
+    event
+        .get("asset")
+        .and_then(|asset| asset.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn remote_image_preview(asset: &crate::state::ImageAssetData) -> Result<tempfile::NamedTempFile> {
+    let suffix = if asset.asset.mime == "image/gif" {
+        ".png"
+    } else {
+        match asset.asset.mime.as_str() {
+            "image/jpeg" => ".jpg",
+            "image/png" => ".png",
+            "image/webp" => ".webp",
+            "image/bmp" => ".bmp",
+            _ => ".img",
+        }
+    };
+    let mut preview = tempfile::Builder::new().suffix(suffix).tempfile()?;
+    if asset.asset.mime == "image/gif" {
+        image::load_from_memory(&asset.bytes)?
+            .write_to(preview.as_file_mut(), image::ImageFormat::Png)?;
+    } else {
+        preview.write_all(&asset.bytes)?;
+        preview.flush()?;
+    }
+    Ok(preview)
 }
 
 fn ipc_mode_name(mode: AgentMode) -> &'static str {
@@ -4692,11 +5449,14 @@ async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
 
 async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let _cursor_restore = ReplCursorRestore;
+    ipc::ensure_daemon(paths, None).await?;
+    let refreshed = MiyuPaths::new()?;
+    let paths = &refreshed;
     initialize_models_cache(paths);
-    ipc::ensure_daemon(paths, &[]).await?;
     let mut config = AppConfig::load_or_default(paths)?;
     let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
-    let history_state = StateStore::new(paths)?;
+    let mut active_session_id = daemon_state.session_id.clone();
+    let history_state = StateStore::new(paths)?.pinned(&active_session_id);
     let mut history = load_repl_input_history(&history_state)?;
     drop(history_state);
     let mut cumulative_tokens = daemon_state.cumulative_tokens;
@@ -4751,14 +5511,17 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             match command {
                 ReplSlashCommand::Exit => break,
                 ReplSlashCommand::Help => print_repl_help(),
-                ReplSlashCommand::History => run_history(
-                    paths,
-                    HistoryArgs {
-                        limit: 20,
-                        raw: false,
-                        no_thinking: false,
-                    },
-                )?,
+                ReplSlashCommand::History => {
+                    let state = StateStore::new(paths)?.pinned(&active_session_id);
+                    run_history_with_state(
+                        &state,
+                        HistoryArgs {
+                            limit: 20,
+                            raw: false,
+                            no_thinking: false,
+                        },
+                    )?
+                }
                 ReplSlashCommand::Clear => {
                     synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
                         live_repl.clear_screen()
@@ -4766,21 +5529,48 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 }
                 ReplSlashCommand::New => {
                     let name = command_args.trim();
-                    let Some((state, _)) = repl_ipc_admin(
+                    let Some((_, data)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
                         IpcCommand::CreateSession {
                             name: (!name.is_empty()).then(|| name.to_string()),
-                            switch: true,
+                            switch: false,
                         },
                     )
                     .await?
                     else {
                         continue;
                     };
-                    apply_session_switch(
+                    let Some(session_id) = data
+                        .get("session")
+                        .and_then(|session| session.get("session_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        repl_note(
+                            &mut live_repl,
+                            &format!(
+                                "\x1b[31m{}\x1b[0m\n",
+                                t("created session has no id", "新会话缺少 ID")
+                            ),
+                        )?;
+                        continue;
+                    };
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::GetSessionState {
+                            target: crate::ipc::SessionRef::Id { id: session_id },
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    apply_repl_session_switch(
                         paths,
                         &state,
+                        &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
@@ -4809,34 +5599,31 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             )?;
                             continue;
                         }
-                        let lines = entries.iter().map(session_select_line).collect::<Vec<_>>();
-                        let search = entries
-                            .iter()
-                            .map(session_select_search)
-                            .collect::<Vec<_>>();
-                        let Some(index) =
-                            inline_single_select(t("Select session", "选择会话"), &lines, &search)?
+                        let Some(target) =
+                            select_session_target(&entries, Some(&active_session_id))?
                         else {
                             continue;
                         };
-                        crate::ipc::SessionRef::Id {
-                            id: entries[index].id.clone(),
-                        }
+                        target
                     } else {
                         match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
                             Some(target) => target,
                             None => continue,
                         }
                     };
-                    let Some((state, _)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::SwitchSession { target })
-                            .await?
+                    let Some((state, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::GetSessionState { target },
+                    )
+                    .await?
                     else {
                         continue;
                     };
-                    apply_session_switch(
+                    apply_repl_session_switch(
                         paths,
                         &state,
+                        &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
@@ -4859,7 +5646,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         paths,
                         &mut live_repl,
                         IpcCommand::RenameSession {
-                            target: crate::ipc::SessionRef::Current,
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
                             name: name.clone(),
                         },
                     )
@@ -4876,11 +5665,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     }
                 }
                 ReplSlashCommand::Archive => {
-                    let Some((state, _)) = repl_ipc_admin(
+                    let Some((_, _)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
                         IpcCommand::ArchiveSession {
-                            target: crate::ipc::SessionRef::Current,
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
                             archived: true,
                         },
                     )
@@ -4892,9 +5683,14 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         &mut live_repl,
                         &format!("\x1b[2m{}\x1b[0m", t("session archived", "当前会话已归档")),
                     )?;
-                    apply_session_switch(
+                    let Some(state) = repl_fallback_session_state(paths, &mut live_repl).await?
+                    else {
+                        continue;
+                    };
+                    apply_repl_session_switch(
                         paths,
                         &state,
+                        &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
@@ -4904,13 +5700,21 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 ReplSlashCommand::Delete => {
                     let arg = command_args.trim();
                     let target = if arg.is_empty() {
-                        crate::ipc::SessionRef::Current
+                        crate::ipc::SessionRef::Id {
+                            id: active_session_id.clone(),
+                        }
                     } else {
                         match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
                             Some(target) => target,
                             None => continue,
                         }
                     };
+                    let Some(target_state) =
+                        repl_get_session_state(paths, &mut live_repl, target).await?
+                    else {
+                        continue;
+                    };
+                    let deleted_active = target_state.session_id == active_session_id;
                     if !confirm_inline(
                         &mut live_repl,
                         t(
@@ -4924,9 +5728,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         )?;
                         continue;
                     }
-                    let Some((state, _)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::DeleteSession { target })
-                            .await?
+                    let Some((_, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::DeleteSession {
+                            target: crate::ipc::SessionRef::Id {
+                                id: target_state.session_id,
+                            },
+                        },
+                    )
+                    .await?
                     else {
                         continue;
                     };
@@ -4934,20 +5745,34 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         &mut live_repl,
                         &format!("\x1b[2m{}\x1b[0m", t("session deleted", "会话已删除")),
                     )?;
-                    apply_session_switch(
-                        paths,
-                        &state,
-                        &mut history,
-                        &mut live_repl,
-                        &mut footer,
-                        &mut cumulative_tokens,
-                    )?;
+                    if deleted_active {
+                        let Some(state) =
+                            repl_fallback_session_state(paths, &mut live_repl).await?
+                        else {
+                            continue;
+                        };
+                        apply_repl_session_switch(
+                            paths,
+                            &state,
+                            &mut active_session_id,
+                            &mut history,
+                            &mut live_repl,
+                            &mut footer,
+                            &mut cumulative_tokens,
+                        )?;
+                    }
                 }
                 ReplSlashCommand::Workspace => {
                     let arg = command_args.trim();
                     if arg.is_empty() {
-                        let Some((state, _)) =
-                            repl_ipc_admin(paths, &mut live_repl, IpcCommand::GetStatus).await?
+                        let Some(state) = repl_get_session_state(
+                            paths,
+                            &mut live_repl,
+                            crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                        )
+                        .await?
                         else {
                             continue;
                         };
@@ -4972,7 +5797,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             paths,
                             &mut live_repl,
                             IpcCommand::SetWorkspace {
-                                target: crate::ipc::SessionRef::Current,
+                                target: crate::ipc::SessionRef::Id {
+                                    id: active_session_id.clone(),
+                                },
                                 path: None,
                             },
                         )
@@ -5006,7 +5833,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         paths,
                         &mut live_repl,
                         IpcCommand::SetWorkspace {
-                            target: crate::ipc::SessionRef::Current,
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
                             path: Some(path.clone()),
                         },
                     )
@@ -5025,12 +5854,25 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 }
                 ReplSlashCommand::Models => {
                     run_models(paths, ModelsArgs { index: None })?;
-                    let Some((state, _)) =
+                    let Some((_, _)) =
                         repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await?
                     else {
                         continue;
                     };
                     config = AppConfig::load(paths)?;
+                    let (state, changed) =
+                        repl_active_or_default_state(paths, &active_session_id).await?;
+                    if changed {
+                        apply_repl_session_switch(
+                            paths,
+                            &state,
+                            &mut active_session_id,
+                            &mut history,
+                            &mut live_repl,
+                            &mut footer,
+                            &mut cumulative_tokens,
+                        )?;
+                    }
                     cumulative_tokens = state.cumulative_tokens;
                     footer = ReplFooterStatus::from_config(
                         &config,
@@ -5048,13 +5890,26 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 }
                 ReplSlashCommand::Config => {
                     crate::config_tui::run(paths)?;
-                    let Some((state, _)) =
+                    let Some((_, _)) =
                         repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await?
                     else {
                         continue;
                     };
                     let refreshed = AppConfig::load(paths)?;
                     config = refreshed;
+                    let (state, changed) =
+                        repl_active_or_default_state(paths, &active_session_id).await?;
+                    if changed {
+                        apply_repl_session_switch(
+                            paths,
+                            &state,
+                            &mut active_session_id,
+                            &mut history,
+                            &mut live_repl,
+                            &mut footer,
+                            &mut cumulative_tokens,
+                        )?;
+                    }
                     cumulative_tokens = state.cumulative_tokens;
                     footer = ReplFooterStatus::from_config(
                         &config,
@@ -5093,13 +5948,26 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         "/variant",
                     )? {
                         VariantOutcome::Updated => {
-                            let Some((state, _)) =
+                            let Some((_, _)) =
                                 repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig)
                                     .await?
                             else {
                                 continue;
                             };
                             config = AppConfig::load(paths)?;
+                            let (state, changed) =
+                                repl_active_or_default_state(paths, &active_session_id).await?;
+                            if changed {
+                                apply_repl_session_switch(
+                                    paths,
+                                    &state,
+                                    &mut active_session_id,
+                                    &mut history,
+                                    &mut live_repl,
+                                    &mut footer,
+                                    &mut cumulative_tokens,
+                                )?;
+                            }
                             cumulative_tokens = state.cumulative_tokens;
                             footer = ReplFooterStatus::from_config(
                                 &config,
@@ -5121,8 +5989,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     }
                 }
                 ReplSlashCommand::Undo => {
-                    let Some((state, data)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Undo).await?
+                    let Some((state, data)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::Undo {
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                        },
+                    )
+                    .await?
                     else {
                         continue;
                     };
@@ -5155,7 +6031,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             continue;
                         }
                     };
-                    let state_store = StateStore::new(paths)?;
+                    let state_store = StateStore::new(paths)?.pinned(&active_session_id);
                     state_store.recover_stale_turns()?;
                     let candidates =
                         state_store.oldest_evictable_visible_turns(count.unwrap_or(usize::MAX))?;
@@ -5175,8 +6051,17 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             .filter_map(|(turn, selected)| selected.then_some(turn.turn_id))
                             .collect()
                     };
-                    let Some((state, data)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Pop { turn_ids }).await?
+                    let Some((state, data)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::Pop {
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                            turn_ids,
+                        },
+                    )
+                    .await?
                     else {
                         continue;
                     };
@@ -5209,8 +6094,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             t("compacting context…", "正在压缩上下文…")
                         ),
                     )?;
-                    let Some((state, data)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::Compact).await?
+                    let Some((state, data)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::Compact {
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                        },
+                    )
+                    .await?
                     else {
                         continue;
                     };
@@ -5277,7 +6170,12 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     let Some((state, _)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
-                        IpcCommand::ResetConversation { all },
+                        IpcCommand::ResetConversation {
+                            all,
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                        },
                     )
                     .await?
                     else {
@@ -5293,8 +6191,8 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         format!(
                             "\x1b[2m{}\x1b[0m\n",
                             t(
-                                "cleared current conversation history and all memory",
-                                "已清空当前会话历史与全部记忆"
+                                "cleared all active conversations, QQ contexts, memory, and generated skills for the current persona",
+                                "已清空当前人格的全部活动会话、QQ 上下文、记忆和自动技能"
                             )
                         )
                     } else {
@@ -5320,7 +6218,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             false,
             mode,
             &images,
-            None,
+            Some(active_session_id.clone()),
         )
         .await
         {
@@ -5351,6 +6249,19 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             Err(err) => {
                 let frame = format!("\x1b[31m{}: {err}\x1b[0m\n\n", t("error", "错误"));
                 live_repl.apply_output_frame(frame.as_bytes())?;
+                if let Ok((state, true)) =
+                    repl_active_or_default_state(paths, &active_session_id).await
+                {
+                    apply_repl_session_switch(
+                        paths,
+                        &state,
+                        &mut active_session_id,
+                        &mut history,
+                        &mut live_repl,
+                        &mut footer,
+                        &mut cumulative_tokens,
+                    )?;
+                }
             }
         }
     }
@@ -5369,6 +6280,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     let mut config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    let memory_organizer = MemoryOrganizer::spawn()?;
+    let memory_organizer_handle = memory_organizer.handle();
+    memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
     let mut client = OpenAiCompatibleClient::from_config(&config, paths)?;
     let mut mode = initial_mode;
     let mut input_history = load_repl_input_history(&state)?;
@@ -5391,6 +6305,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         initial_registry,
         mode,
     )?;
+    agent.set_memory_organizer(memory_organizer_handle);
     agent.prepare_for_turn()?;
     let mut footer =
         ReplFooterStatus::from_config(&config, agent.effective_context_tokens()?, None);
@@ -5597,7 +6512,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             continue;
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
-            run_reset(paths, None)?;
+            run_reset(paths, None).await?;
             input_history.clear();
             if let Some(live) = live_repl.as_mut() {
                 live.editor.history.clear();
@@ -5610,7 +6525,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().eq_ignore_ascii_case("all")
         {
-            run_reset(paths, Some("all"))?;
+            run_reset(paths, Some("all")).await?;
             input_history.clear();
             if let Some(live) = live_repl.as_mut() {
                 live.editor.history.clear();
@@ -7516,28 +8431,44 @@ fn persist_queued_submission(
 
 /// Queues a submission for the turn currently running in the daemon, using
 /// the cross-process queue target so the daemon consumes it mid-turn.
-fn persist_remote_queued_submission(
-    state: &StateStore,
+async fn persist_remote_queued_submission(
+    paths: &MiyuPaths,
+    run_id: &str,
+    turn_id: &str,
     submission: &LiveSubmission,
 ) -> Result<QueuedPrompt> {
-    let target = state
-        .running_turn_queue_target()?
-        .ok_or_else(|| anyhow::anyhow!("no running turn to queue for"))?;
-    let prompt_id = format!(
-        "queued_{}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0),
-        rand::random::<u16>()
-    );
-    state.enqueue_prompt_for_target(
-        &target,
-        &prompt_id,
-        &submission.content,
-        &submission.display_content,
-        &queued_prompt_attachments(&submission.images),
+    let mut stream = ipc::connect(&paths.ipc_socket()).await?;
+    ipc::send(
+        &mut stream,
+        &IpcRequest::new(IpcCommand::QueueTurnUpdate {
+            run_id: run_id.to_string(),
+            turn_id: turn_id.to_string(),
+            content: submission.content.clone(),
+            display_content: submission.display_content.clone(),
+            images: ipc_images(&submission.images),
+            supersede: false,
+        }),
     )
+    .await?;
+    match ipc::receive::<IpcFrame>(&mut stream).await? {
+        Some(IpcFrame::TurnUpdateAccepted {
+            prompt_id,
+            seq,
+            submitted_at,
+            ..
+        }) => Ok(QueuedPrompt {
+            prompt_id,
+            seq,
+            content: submission.content.clone(),
+            display_content: submission.display_content.clone(),
+            attachments: queued_prompt_attachments(&submission.images),
+            uploaded_attachments: Vec::new(),
+            submitted_at,
+        }),
+        Some(IpcFrame::Error { message }) => bail!("{message}"),
+        Some(_) => bail!("Miyu core returned an invalid queue response"),
+        None => bail!("Miyu core closed the queue connection"),
+    }
 }
 
 struct LiveRawMode {
@@ -9481,12 +10412,14 @@ fn truncate_visible_width(value: &str, max_width: usize) -> String {
 mod repl_input_tests {
     use super::*;
     use crate::llm::ChatStreamKind;
+    use std::os::unix::fs::PermissionsExt;
 
     fn sample_pop_turn(status: TurnStatus) -> Turn {
         Turn {
             turn_id: "turn-1".to_string(),
             seq: 1,
             user_content: "first prompt line\nsecond prompt line".to_string(),
+            display_content: "first prompt line\nsecond prompt line".to_string(),
             user_timestamp: "2026-07-19 10:42".to_string(),
             assistant_content: "first answer line\nsecond answer line".to_string(),
             assistant_reasoning: Some("private reasoning".to_string()),
@@ -9497,11 +10430,14 @@ mod repl_input_tests {
             tool_reports: vec!["hidden tool report".to_string()],
             question_exchanges: Vec::new(),
             followups: Vec::new(),
+            attachments: Vec::new(),
             hidden: false,
             is_summary: false,
             owner_pid: None,
             token_total: 0,
             token_usage_estimated: false,
+            revision: 0,
+            journal_events: Vec::new(),
         }
     }
 
@@ -9626,7 +10562,7 @@ mod repl_input_tests {
                 port: 4100,
                 password: None,
                 password_file: None,
-                public: false,
+                port_explicit: true,
             }))
         ));
 
@@ -9641,25 +10577,11 @@ mod repl_input_tests {
                 port: 8300,
                 password: None,
                 password_file: None,
-                public: false,
+                port_explicit: false,
             }))
         ));
 
-        let cli = parse_args(["miyu", "web", "-p", "secret"].map(OsString::from).to_vec()).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Web(WebArgs {
-                password: Some(password),
-                ..
-            })) if password == "secret"
-        ));
-
-        let cli = parse_args(
-            ["miyu", "web", "-p", "--public"]
-                .map(OsString::from)
-                .to_vec(),
-        )
-        .unwrap();
+        let cli = parse_args(["miyu", "web", "-p"].map(OsString::from).to_vec()).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Web(WebArgs {
@@ -9667,6 +10589,96 @@ mod repl_input_tests {
                 ..
             })) if password.is_empty()
         ));
+        for args in [
+            vec!["miyu", "web", "-p", "secret"],
+            vec!["miyu", "web", "--password=secret"],
+            vec!["miyu", "web", "-psecret"],
+        ] {
+            assert!(parse_args(args.into_iter().map(OsString::from).collect()).is_err());
+        }
+
+        let cli = parse_args(
+            ["miyu", "web", "--password-file", "/tmp/miyu-password"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebArgs {
+                password: None,
+                password_file: Some(path),
+                ..
+            })) if path == PathBuf::from("/tmp/miyu-password")
+        ));
+
+        assert!(parse_args(["miyu", "web", "--public"].map(OsString::from).to_vec(),).is_err());
+    }
+
+    #[test]
+    fn web_password_is_materialized_as_a_private_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let args = WebArgs {
+            port: 9400,
+            password: Some("very-secret".to_string()),
+            password_file: None,
+            port_explicit: false,
+        };
+
+        let launch = web_launch_config(&paths, &args).unwrap().unwrap();
+
+        assert_eq!(launch.port, 9400);
+        let password_file = launch.password_file.unwrap();
+        let password_dir = paths.managed_web_password_dir();
+        assert_eq!(password_file.parent(), Some(password_dir.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(&password_file).unwrap(),
+            "very-secret"
+        );
+        assert_eq!(
+            std::fs::metadata(password_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn bare_web_does_not_override_the_persisted_launch_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let args = WebArgs {
+            port: ipc::DEFAULT_WEB_PORT,
+            password: None,
+            password_file: None,
+            port_explicit: false,
+        };
+
+        assert!(web_launch_config(&paths, &args).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_password_file_is_copied_into_private_miyu_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let external = temp.path().join("external-password");
+        std::fs::write(&external, "file-secret\n").unwrap();
+        let args = WebArgs {
+            port: ipc::DEFAULT_WEB_PORT,
+            password: None,
+            password_file: Some(external.clone()),
+            port_explicit: false,
+        };
+
+        let launch = web_launch_config(&paths, &args).unwrap().unwrap();
+        let managed = launch.password_file.unwrap();
+        assert_ne!(managed, external);
+        let password_dir = paths.managed_web_password_dir();
+        assert_eq!(managed.parent(), Some(password_dir.as_path()));
+        assert_eq!(std::fs::read_to_string(managed).unwrap(), "file-secret");
     }
 
     #[test]
@@ -9680,16 +10692,20 @@ mod repl_input_tests {
             let cli = parse_args(["miyu", "daemon", arg].map(OsString::from).to_vec()).unwrap();
             let actual = match cli.command {
                 Some(Command::Daemon(DaemonArgs {
-                    command: DaemonCommand::Start,
+                    command: Some(DaemonCommand::Start),
+                    ..
                 })) => "start",
                 Some(Command::Daemon(DaemonArgs {
-                    command: DaemonCommand::Stop,
+                    command: Some(DaemonCommand::Stop),
+                    ..
                 })) => "stop",
                 Some(Command::Daemon(DaemonArgs {
-                    command: DaemonCommand::Restart,
+                    command: Some(DaemonCommand::Restart),
+                    ..
                 })) => "restart",
                 Some(Command::Daemon(DaemonArgs {
-                    command: DaemonCommand::Status,
+                    command: Some(DaemonCommand::Status),
+                    ..
                 })) => "status",
                 other => panic!("unexpected command: {other:?}"),
             };
@@ -9700,7 +10716,8 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Daemon(DaemonArgs {
-                command: DaemonCommand::Logs(DaemonLogsArgs { lines: None }),
+                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: None })),
+                ..
             }))
         ));
 
@@ -9713,9 +10730,62 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Daemon(DaemonArgs {
-                command: DaemonCommand::Logs(DaemonLogsArgs { lines: Some(25) }),
+                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: Some(25) })),
+                ..
             }))
         ));
+    }
+
+    #[test]
+    fn daemon_accepts_a_port_and_defaults_to_start() {
+        let cli = parse_args(
+            ["miyu", "daemon", "--port", "9412"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonArgs {
+                port: Some(9412),
+                command: None,
+            }))
+        ));
+
+        let cli = parse_args(
+            ["miyu", "daemon", "--port", "9412", "restart"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonArgs {
+                port: Some(9412),
+                command: Some(DaemonCommand::Restart),
+            }))
+        ));
+
+        let cli = parse_args(
+            ["miyu", "daemon", "start", "--port", "9412"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon(DaemonArgs {
+                port: Some(9412),
+                command: Some(DaemonCommand::Start),
+            }))
+        ));
+
+        assert!(parse_args(
+            ["miyu", "daemon", "--password"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -9738,6 +10808,305 @@ mod repl_input_tests {
                 "        http://192.168.1.2:8300",
             ]
         );
+    }
+
+    #[test]
+    fn daemon_log_formatter_parses_targets_and_preserves_multiline_content() {
+        let parsed = parse_daemon_log_line(
+            "2026-07-29T12:34:56.789Z  INFO miyu::qq: listener ready port=8090",
+        )
+        .unwrap();
+        assert_eq!(parsed.level, "INFO");
+        assert_eq!(parsed.module, "miyu::qq");
+        assert_eq!(parsed.message, "listener ready port=8090");
+
+        let rendered = format_daemon_log_line(
+            "2026-07-29T12:34:56.789Z  INFO miyu::qq: listener ready port=8090",
+            false,
+        );
+        assert!(!rendered.contains('\x1b'));
+        assert!(rendered.ends_with("[INFO] [miyu::qq] listener ready port=8090"));
+        assert_eq!(
+            format_daemon_log_line("判断原因：保留这一行原有的内容", true),
+            "判断原因：保留这一行原有的内容"
+        );
+    }
+
+    #[test]
+    fn daemon_log_formatter_supports_legacy_lines_and_tty_colors() {
+        let legacy = "2026-07-29T12:34:56.789Z  WARN OneBot connection closed reason=timeout";
+        let parsed = parse_daemon_log_line(legacy).unwrap();
+        assert_eq!(parsed.module, "miyu");
+        assert_eq!(parsed.message, "OneBot connection closed reason=timeout");
+
+        let rendered = format_daemon_log_line(legacy, true);
+        assert!(rendered.contains('\x1b'));
+        assert!(rendered.contains("[WARN]"));
+        assert!(rendered.ends_with("OneBot connection closed reason=timeout"));
+    }
+
+    #[test]
+    fn daemon_log_formatter_colors_entire_active_reply_decisions() {
+        let mut formatter = DaemonLogStreamFormatter::default();
+        let mut reply = Vec::new();
+        formatter
+            .push(
+                b"2026-07-29T12:34:56.789Z  INFO miyu::qq: \xe3\x80\x90\xe7\xbb\xad\xe8\x81\x8a\xe7\xaa\x97\xe5\x8f\xa3\xe5\x88\xa4\xe6\x96\xad\xef\xbc\x9a\xe5\x9b\x9e\xe5\xa4\x8d\xe3\x80\x91\n\xe7\xbb\x93\xe6\x9e\x9c\xef\xbc\x9a\xe5\x9b\x9e\xe5\xa4\x8d\n",
+                true,
+                &mut reply,
+            )
+            .unwrap();
+        let reply = String::from_utf8(reply).unwrap();
+        assert!(reply.lines().all(|line| line.contains('\x1b')));
+
+        let mut no_reply = Vec::new();
+        formatter
+            .push(
+                b"2026-07-29T12:34:57.789Z  INFO miyu::qq: \xe3\x80\x90\xe4\xb8\xbb\xe5\x8a\xa8\xe5\x9b\x9e\xe5\xa4\x8d\xe5\x88\xa4\xe6\x96\xad\xef\xbc\x9a\xe4\xb8\x8d\xe5\x9b\x9e\xe5\xa4\x8d\xe3\x80\x91\n\xe7\xbb\x93\xe6\x9e\x9c\xef\xbc\x9a\xe4\xb8\x8d\xe5\x9b\x9e\xe5\xa4\x8d\n",
+                true,
+                &mut no_reply,
+            )
+            .unwrap();
+        let no_reply = String::from_utf8(no_reply).unwrap();
+        assert!(no_reply.lines().all(|line| line.contains('\x1b')));
+        assert_ne!(reply, no_reply);
+
+        let mut reset = Vec::new();
+        formatter
+            .push(
+                b"2026-07-29T12:34:58.789Z  INFO miyu::qq: listener ready\nplain continuation\n",
+                false,
+                &mut reset,
+            )
+            .unwrap();
+        let reset = String::from_utf8(reset).unwrap();
+        assert!(reset.ends_with("[INFO] [miyu::qq] listener ready\nplain continuation\n"));
+    }
+
+    #[test]
+    fn daemon_log_formatter_recognizes_english_active_reply_decisions() {
+        assert_eq!(
+            active_reply_log_color("[Active reply decision: reply]\nResult: reply"),
+            Some(Color::Green)
+        );
+        assert_eq!(
+            active_reply_log_color("[Continuation decision: no reply]\nResult: no reply"),
+            Some(Color::DarkGrey)
+        );
+
+        let mut color = None;
+        let timestamp = format_daemon_log_line_with_state(
+            "2026-07-29T12:34:56.789Z  INFO miyu::qq: ",
+            true,
+            &mut color,
+        );
+        assert!(timestamp.contains("[INFO]"));
+        assert_eq!(color, None);
+        let title =
+            format_daemon_log_line_with_state("[Active reply decision: reply]", true, &mut color);
+        assert_eq!(color, Some(Color::Green));
+        assert!(title.contains('\x1b'));
+        assert!(
+            format_daemon_log_line_with_state("Result: reply", true, &mut color).contains('\x1b')
+        );
+    }
+
+    #[test]
+    fn daemon_log_stream_formatter_waits_for_complete_lines() {
+        let mut formatter = DaemonLogStreamFormatter::default();
+        let mut output = Vec::new();
+        formatter
+            .push(
+                b"2026-07-29T12:34:56.789Z  INFO miyu::qq: part",
+                false,
+                &mut output,
+            )
+            .unwrap();
+        assert!(output.is_empty());
+
+        formatter
+            .push(b"ial\n  continuation\nlast", false, &mut output)
+            .unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("[INFO] [miyu::qq] partial\n"));
+        assert!(rendered.ends_with("  continuation\n"));
+
+        let mut tail = Vec::new();
+        formatter.finish(false, &mut tail).unwrap();
+        assert_eq!(tail, b"last\n");
+    }
+
+    #[test]
+    fn recent_daemon_logs_keep_multiline_order_across_rotated_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let logs_dir = paths.logs_dir();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("miyu.2026-07-28.log"),
+            "2026-07-28T12:00:00Z  INFO miyu::qq: old event\n  old continuation\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs_dir.join("miyu.2026-07-29.log"),
+            "2026-07-29T12:00:00Z  WARN miyu::qq: new event\n  new continuation\n判断原因：保持多行\n",
+        )
+        .unwrap();
+
+        let lines = recent_daemon_log_lines(&paths, 4).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "  old continuation",
+                "2026-07-29T12:00:00Z  WARN miyu::qq: new event",
+                "  new continuation",
+                "判断原因：保持多行",
+            ]
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| format_daemon_log_line(line, false))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('\x1b'));
+        assert!(rendered.contains("[WARN] [miyu::qq] new event"));
+        assert!(rendered.ends_with("  new continuation\n判断原因：保持多行"));
+    }
+
+    #[test]
+    fn recent_daemon_logs_include_unstructured_daemon_stream_before_rotating_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let logs_dir = paths.logs_dir();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(logs_dir.join("daemon.log"), "startup banner\npanic: boom\n").unwrap();
+        std::fs::write(
+            logs_dir.join("miyu.2026-07-29.log"),
+            "2026-07-29T12:00:00Z  INFO miyu::qq: listener ready\n",
+        )
+        .unwrap();
+
+        let lines = recent_daemon_log_lines(&paths, 3).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "startup banner",
+                "panic: boom",
+                "2026-07-29T12:00:00Z  INFO miyu::qq: listener ready",
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_log_follow_cursor_starts_after_the_snapshot_for_each_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let logs_dir = paths.logs_dir();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let fallback = logs_dir.join("daemon.log");
+        let rotating = logs_dir.join("miyu.2026-07-29.log");
+        std::fs::write(&fallback, b"before fallback\n").unwrap();
+        std::fs::write(&rotating, b"before rotating\n").unwrap();
+
+        let snapshot = recent_daemon_log_snapshot(&paths, 10).unwrap();
+        assert_eq!(snapshot.lines, ["before fallback", "before rotating"]);
+        let cursor = snapshot.cursor;
+        assert_eq!(cursor.current, Some(rotating.clone()));
+        assert_eq!(cursor.fallback, Some(fallback.clone()));
+        assert_eq!(cursor.current_offset, 16);
+        assert_eq!(cursor.fallback_offset, 16);
+
+        let mut formatter = DaemonLogStreamFormatter::default();
+        let mut output = Vec::new();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rotating)
+            .unwrap()
+            .write_all(b"after rotating\n")
+            .unwrap();
+        let mut offset = cursor.current_offset;
+        assert!(
+            write_daemon_log_delta(&rotating, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        formatter.finish(false, &mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "after rotating\n");
+    }
+
+    #[test]
+    fn daemon_log_delta_avoids_duplicates_across_append_rotation_and_truncation() {
+        fn append(path: &Path, bytes: &[u8]) {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(bytes).unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("miyu.2026-07-28.log");
+        let current = temp.path().join("miyu.2026-07-29.log");
+        std::fs::write(&old, b"old partial").unwrap();
+
+        let mut formatter = DaemonLogStreamFormatter::default();
+        let mut output = Vec::new();
+        let mut old_offset = 0;
+        assert!(
+            write_daemon_log_delta(&old, &mut old_offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        assert!(output.is_empty());
+        append(&old, b" completed\nold tail\n");
+        assert!(
+            write_daemon_log_delta(&old, &mut old_offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        formatter.finish(false, &mut output).unwrap();
+
+        std::fs::write(
+            &current,
+            b"2026-07-29T12:00:00Z  INFO miyu::qq: first\n  continuation\n",
+        )
+        .unwrap();
+        let mut offset = 0;
+        assert!(
+            write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        assert!(
+            !write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+
+        append(&current, b"2026-07-29T12:00:01Z  INFO miyu::qq: \xe7\xbe");
+        assert!(
+            write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        append(&current, b"\xa4\xe8\x81\x8a\n");
+        assert!(
+            write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+
+        append(&current, b"dangling");
+        assert!(
+            write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        std::fs::write(&current, b"reset\n").unwrap();
+        assert!(
+            write_daemon_log_delta(&current, &mut offset, &mut formatter, false, &mut output,)
+                .unwrap()
+        );
+        assert_eq!(offset, 6);
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(!rendered.contains('\x1b'));
+        assert_eq!(rendered.matches("old partial completed").count(), 1);
+        assert_eq!(rendered.matches("old tail").count(), 1);
+        assert_eq!(rendered.matches("[INFO] [miyu::qq] first").count(), 1);
+        assert_eq!(rendered.matches("  continuation").count(), 1);
+        assert_eq!(rendered.matches("[INFO] [miyu::qq] 群聊").count(), 1);
+        assert_eq!(rendered.matches("dangling").count(), 1);
+        assert_eq!(rendered.matches("reset").count(), 1);
     }
 
     #[test]
@@ -9997,6 +11366,7 @@ mod repl_input_tests {
             content: "follow up".to_string(),
             display_content: "follow up".to_string(),
             attachments: Vec::new(),
+            uploaded_attachments: Vec::new(),
             submitted_at: String::new(),
         };
 
@@ -10478,6 +11848,28 @@ mod repl_input_tests {
     }
 
     #[test]
+    fn session_selection_defaults_to_the_current_entry() {
+        let entry = |id: &str, is_current: bool| SessionListEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_current,
+            turns: 0,
+            snippet: String::new(),
+            workspace: None,
+        };
+        let entries = vec![entry("default", true), entry("active", false)];
+
+        assert_eq!(session_initial_selection(&entries, Some("active")), 1);
+        assert_eq!(session_initial_selection(&entries, None), 0);
+        assert!(matches!(
+            session_ref_from_index(&entries, 2),
+            Some(crate::ipc::SessionRef::Id { id }) if id == "active"
+        ));
+        assert_eq!(session_initial_selection(&[entry("only", false)], None), 0);
+        assert!(!session_list_line(1, &entries[0], false).contains('\x1b'));
+    }
+
+    #[test]
     fn partial_slash_command_resolves_unique_match() {
         assert_eq!(resolve_repl_command("/model"), "/models");
         assert_eq!(resolve_repl_command("/compa"), "/compact");
@@ -10719,6 +12111,10 @@ mod repl_input_tests {
 
 fn run_history(paths: &MiyuPaths, args: HistoryArgs) -> Result<()> {
     let state = StateStore::new(paths)?;
+    run_history_with_state(&state, args)
+}
+
+fn run_history_with_state(state: &StateStore, args: HistoryArgs) -> Result<()> {
     for entry in state.history(args.limit)? {
         if args.raw {
             println!("{}", serde_json::to_string(&entry)?);
@@ -10817,13 +12213,42 @@ async fn run_kb(paths: &MiyuPaths, args: KbArgs) -> Result<()> {
 
 async fn run_update_default_kb(paths: &MiyuPaths) -> Result<()> {
     let config = AppConfig::load_or_default(paths)?;
-    let state = crate::default_kb::update(paths, &config)?;
+    let state = crate::default_kb::update(paths, &config, |stage| {
+        let mut stderr = io::stderr().lock();
+        let _ = write_default_kb_update_progress(&mut stderr, stage);
+    })?;
     println!(
         "{}: {}",
         t("updated default knowledge base", "已更新默认知识库"),
         state.shorin_wiki_commit
     );
     Ok(())
+}
+
+fn write_default_kb_update_progress(
+    output: &mut impl Write,
+    stage: crate::default_kb::UpdateStage,
+) -> io::Result<()> {
+    writeln!(output, "[default-kb] {}", stage.message())?;
+    output.flush()
+}
+
+#[cfg(test)]
+mod default_kb_progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_is_emitted_as_a_complete_line() {
+        let stage = crate::default_kb::UpdateStage::FetchingRepository;
+        let mut output = Vec::new();
+
+        write_default_kb_update_progress(&mut output, stage).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("[default-kb] {}\n", stage.message())
+        );
+    }
 }
 
 fn run_memory(paths: &MiyuPaths, args: MemoryArgs) -> Result<()> {
@@ -10909,7 +12334,7 @@ fn run_skills(paths: &MiyuPaths, args: SkillsArgs) -> Result<()> {
             for name in skill_names(paths)? {
                 let dir = paths.skills_dir.join(&name);
                 let raw = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
-                if raw.contains("generated_by: miyu") && dir.join(".disabled").exists() {
+                if crate::skills::is_generated_skill(&raw) && dir.join(".disabled").exists() {
                     std::fs::remove_dir_all(dir)?;
                     removed += 1;
                 }
@@ -10952,18 +12377,31 @@ fn skill_dir(paths: &MiyuPaths, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
+async fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
     let all = match scope {
         None => false,
         Some("all") => true,
         Some(scope) => bail!("{}: {scope}", t("unknown reset scope", "未知 reset 范围")),
     };
     let config = AppConfig::load_or_default(paths)?;
-    StateStore::new(paths)?.reset_conversation()?;
+    let state = StateStore::new(paths)?;
     let memory = MemoryStore::new(&config, paths);
     if all {
-        memory.reset_all(false)?;
+        let persona = config.active_persona_scope();
+        let bindings = state.platform_session_bindings(&persona, "onebot")?;
+        let plugins = crate::platforms::plugins::PlatformPluginRegistry::built_in()?;
+        plugins
+            .after_persona_reset(&crate::platforms::plugins::PlatformPersonaResetContext {
+                config: &config,
+                paths,
+                bindings: &bindings,
+            })
+            .await?;
+        state.reset_persona_contexts(&persona, "onebot")?;
+        state.reset_conversation_usage()?;
+        memory.reset_all(true)?;
     } else {
+        state.reset_conversation()?;
         memory.clear_evicted_context()?;
         memory.clear_pending_events()?;
     }
@@ -10975,8 +12413,8 @@ fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
 fn print_reset_message(all: bool) {
     let message = if all {
         t(
-            "cleared current conversation history and all memory",
-            "已清空当前会话历史与全部记忆",
+            "cleared all active conversations, QQ contexts, memory, and generated skills for the current persona",
+            "已清空当前人格的全部活动会话、QQ 上下文、记忆和自动技能",
         )
     } else {
         t("cleared current conversation history", "已清空当前会话历史")
@@ -11005,6 +12443,9 @@ pub(crate) fn build_tool_registry(
     };
     if config.tools.enabled && config.skills.enabled && mode != AgentMode::Chat {
         tools::register_skills(&mut registry, config, paths)?;
+        if mode == AgentMode::Normal {
+            tools::register_skill_authoring(&mut registry, config.clone(), paths.clone());
+        }
     }
     if config.tools.enabled && interactive_questions {
         tools::register_ask_question(&mut registry);
@@ -11016,6 +12457,8 @@ pub(crate) fn build_tool_registry(
 fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) -> Result<()> {
     match event {
         AgentEvent::TurnStarted { .. } => Ok(()),
+        AgentEvent::RawReasoning(_) => Ok(()),
+        AgentEvent::FlushJournal => Ok(()),
         AgentEvent::Chunk(chunk) => {
             renderer.write_chunk(chunk)?;
             renderer.tick_spinner()
@@ -11030,15 +12473,23 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             renderer.write_reasoning_title(&title)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ToolCall { name, arguments } => {
+        AgentEvent::ToolCall {
+            name, arguments, ..
+        } => {
             renderer.write_tool_call(&name, &arguments)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ToolResult { name, ok, output } => {
+        AgentEvent::ToolPreparing { name } => {
+            renderer.write_tool_preparing(&name)?;
+            renderer.tick_spinner()
+        }
+        AgentEvent::ToolResult {
+            name, ok, output, ..
+        } => {
             renderer.write_tool_result(&name, ok, &output)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ToolProgress { name, message } => {
+        AgentEvent::ToolProgress { name, message, .. } => {
             renderer.write_tool_progress(&name, &message)?;
             renderer.tick_spinner()
         }
@@ -11046,6 +12497,7 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             name,
             stream,
             chunk,
+            ..
         } => {
             renderer.write_command_output(&name, stream, &chunk)?;
             renderer.tick_spinner()
@@ -11055,8 +12507,10 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             let _ = ready.send(true);
             Ok(())
         }
-        AgentEvent::Image { .. } => Ok(()),
-        AgentEvent::AskQuestion { request, responder } => {
+        AgentEvent::Image { .. } | AgentEvent::Artifact { .. } => Ok(()),
+        AgentEvent::AskQuestion {
+            request, responder, ..
+        } => {
             renderer.prepare_for_external_output()?;
             let response = crate::question_tui::ask(&request).unwrap_or_else(|err| {
                 crate::question::QuestionResponse::Unavailable(err.to_string())
@@ -11068,6 +12522,7 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             Ok(())
         }
         AgentEvent::QueuedPromptsConsumed { .. } => Ok(()),
+        AgentEvent::GenerationSuperseded { .. } => Ok(()),
         AgentEvent::SpinnerTick => renderer.tick_spinner(),
         AgentEvent::CompactStart => {
             renderer.write_system_message(t("Compacting context...", "正在压缩上下文..."))?;
@@ -11083,5 +12538,78 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
         }
         AgentEvent::PopStart => renderer.tick_spinner(),
         AgentEvent::PopEnd => renderer.tick_spinner(),
+    }
+}
+
+#[cfg(test)]
+mod remote_tool_image_tests {
+    use super::*;
+    use image::{Delay, Frame, Rgba, RgbaImage};
+
+    #[test]
+    fn web_tool_image_event_exposes_asset_id_to_remote_cli() {
+        let event = serde_json::json!({
+            "run_id": "run-1",
+            "name": "show_meme",
+            "asset": { "id": "img-1", "mime": "image/gif" }
+        });
+        assert_eq!(remote_tool_image_asset_id(&event), Some("img-1"));
+        assert_eq!(remote_tool_image_asset_id(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn ipc_command_response_distinguishes_errors_and_closed_connections() {
+        assert!(validate_ipc_command_response(Some(IpcFrame::Ack)).is_ok());
+        let rejected = validate_ipc_command_response(Some(IpcFrame::Error {
+            message: "Miyu is busy with another operation".to_string(),
+        }))
+        .unwrap_err();
+        assert!(rejected.to_string().contains("busy with another operation"));
+
+        let closed = validate_ipc_command_response(None).unwrap_err();
+        assert!(closed
+            .to_string()
+            .contains("closed the connection without a response"));
+
+        let unexpected = validate_ipc_command_response(Some(IpcFrame::Accepted {
+            run_id: "run-test".to_string(),
+        }))
+        .unwrap_err();
+        assert!(unexpected.to_string().contains("unexpected response"));
+    }
+
+    #[test]
+    fn remote_gif_asset_is_converted_to_static_png() {
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            encoder
+                .encode_frames((0..2).map(|value| {
+                    Frame::from_parts(
+                        RgbaImage::from_pixel(32, 32, Rgba([value, 20, 40, 255])),
+                        0,
+                        0,
+                        Delay::from_numer_denom_ms(100, 1),
+                    )
+                }))
+                .unwrap();
+        }
+        let asset = crate::state::ImageAssetData {
+            asset: crate::state::ImageAsset {
+                asset_id: "img-gif".to_string(),
+                turn_id: "turn-1".to_string(),
+                tool_id: Some("tool-1".to_string()),
+                mime: "image/gif".to_string(),
+                width: 32,
+                height: 32,
+                alt: "animated meme".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            bytes: gif,
+        };
+        let preview = remote_image_preview(&asset).unwrap();
+        let bytes = std::fs::read(preview.path()).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 32);
     }
 }

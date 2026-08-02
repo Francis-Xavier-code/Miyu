@@ -1,17 +1,49 @@
 use super::{ToolRegistry, ToolSpec};
+use crate::clipboard::write_image_cache_file;
 use crate::config::{AppConfig, PrintImagePluginConfig};
 use crate::i18n::agent_text as t;
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
+use crate::platforms::{PlatformContextImageRef, PlatformImageData, PlatformTurnContext};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::process::Command;
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SCOPED_CONTEXT_FETCHES: usize = 4;
+const MAX_SCOPED_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_SCOPED_VISION_CALLS: usize = 6;
+
+#[derive(Clone, Debug)]
+struct ResolvedContextImage {
+    image: PlatformImageData,
+    digest: String,
+    cache_path: PathBuf,
+}
+
+struct ScopedVisionState {
+    allowed_paths: Vec<PathBuf>,
+    context_images: HashMap<String, PlatformContextImageRef>,
+    platform_context: Option<Arc<PlatformTurnContext>>,
+    allow_general_access: bool,
+    resolve_lock: tokio::sync::Mutex<()>,
+    resolved: Mutex<HashMap<String, ResolvedContextImage>>,
+    content_images: Mutex<HashMap<String, ResolvedContextImage>>,
+    analyses: Mutex<HashMap<(String, String), String>>,
+    calls: AtomicUsize,
+    fetches: AtomicUsize,
+    total_bytes: AtomicUsize,
+}
 
 pub fn register(
     registry: &mut ToolRegistry,
@@ -40,6 +72,105 @@ pub fn register(
             async move { analyze_image(args, config, paths).await }
         },
     ));
+}
+
+pub fn register_scoped_local(
+    registry: &mut ToolRegistry,
+    config: AppConfig,
+    paths: MiyuPaths,
+    allowed_images: Vec<PathBuf>,
+) {
+    register_scoped(
+        registry,
+        config,
+        paths,
+        allowed_images,
+        Vec::new(),
+        None,
+        false,
+    );
+}
+
+pub fn register_scoped_platform(
+    registry: &mut ToolRegistry,
+    config: AppConfig,
+    paths: MiyuPaths,
+    allowed_images: Vec<PathBuf>,
+    context_images: Vec<PlatformContextImageRef>,
+    platform_context: Arc<PlatformTurnContext>,
+) {
+    let allow_general_access = platform_context.host_tools_allowed();
+    register_scoped(
+        registry,
+        config,
+        paths,
+        allowed_images,
+        context_images,
+        Some(platform_context),
+        allow_general_access,
+    );
+}
+
+fn register_scoped(
+    registry: &mut ToolRegistry,
+    config: AppConfig,
+    paths: MiyuPaths,
+    allowed_images: Vec<PathBuf>,
+    context_images: Vec<PlatformContextImageRef>,
+    platform_context: Option<Arc<PlatformTurnContext>>,
+    allow_general_access: bool,
+) {
+    let allowed_paths = allowed_images
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let context_images = context_images
+        .into_iter()
+        .map(|image| (image.id.clone(), image))
+        .collect::<HashMap<_, _>>();
+    if allowed_paths.is_empty() && context_images.is_empty() {
+        return;
+    }
+    let state = Arc::new(ScopedVisionState {
+        allowed_paths,
+        context_images,
+        platform_context,
+        allow_general_access,
+        resolve_lock: tokio::sync::Mutex::new(()),
+        resolved: Mutex::new(HashMap::new()),
+        content_images: Mutex::new(HashMap::new()),
+        analyses: Mutex::new(HashMap::new()),
+        calls: AtomicUsize::new(0),
+        fetches: AtomicUsize::new(0),
+        total_bytes: AtomicUsize::new(0),
+    });
+    registry.register(ToolSpec::new(
+        "vision_analyze",
+        "分析图片。image 可以是本轮提示中的图片路径或 context_image_N；历史上下文图片会按需获取。",
+        json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string", "description": "本轮图片提示中列出的路径或历史图片 ID（如 context_image_1）。" },
+                "prompt": { "type": "string", "description": "图片分析问题或指令。默认简洁描述图片。" }
+            },
+            "required": ["image"],
+            "additionalProperties": false
+        }),
+        move |args| {
+            let config = config.clone();
+            let paths = paths.clone();
+            let state = state.clone();
+            async move { analyze_scoped_image(args, config, paths, state).await }
+        },
+    ));
+    registry.amend_description(
+        "vision_analyze",
+        if allow_general_access {
+            " 本轮历史图片 ID（context_image_N）会按需获取；也可继续使用普通本地路径或 URL。"
+        } else {
+            " 仅可分析当前消息、引用消息中的本轮路径，或此前群聊记录里明确列出的 context_image_N；不得使用其他路径或 URL。"
+        },
+    );
 }
 
 pub fn register_print(registry: &mut ToolRegistry, config: AppConfig) {
@@ -206,6 +337,181 @@ async fn analyze_image(args: Value, config: AppConfig, paths: MiyuPaths) -> Resu
     analyze_image_url_with_prompt(&config, &paths, &image_url, prompt).await
 }
 
+async fn analyze_scoped_image(
+    args: Value,
+    config: AppConfig,
+    paths: MiyuPaths,
+    state: Arc<ScopedVisionState>,
+) -> Result<String> {
+    let image = args
+        .get("image")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if image.is_empty() {
+        bail!("image is required")
+    }
+    if state.calls.fetch_add(1, Ordering::AcqRel) >= MAX_SCOPED_VISION_CALLS {
+        bail!("vision_analyze call limit reached for the current platform turn")
+    }
+    let prompt = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("请简洁描述这张图片，并指出重要细节。")
+        .trim();
+    if state.context_images.contains_key(image) {
+        let resolved = resolve_context_image(&paths, &state, image).await?;
+        let cache_key = (resolved.digest.clone(), prompt.to_string());
+        if let Some(cached) = state.analyses.lock().unwrap().get(&cache_key).cloned() {
+            return Ok(cached);
+        }
+        let image_url = image_data_url(&resolved.image.mime, &resolved.image.data);
+        let result = analyze_image_url_with_prompt(&config, &paths, &image_url, prompt).await?;
+        state
+            .analyses
+            .lock()
+            .unwrap()
+            .insert(cache_key, result.clone());
+        return Ok(result);
+    }
+    if state.allow_general_access {
+        return analyze_image(args, config, paths).await;
+    }
+    if image.starts_with("http://") || image.starts_with("https://") {
+        bail!("only images attached to the current platform turn are allowed")
+    }
+    let image = expand_path(image)
+        .canonicalize()
+        .context("failed to resolve the requested image")?;
+    if !state.allowed_paths.iter().any(|allowed| allowed == &image) {
+        bail!("image is not attached to the current platform turn")
+    }
+    analyze_local_image_with_prompt(&config, &paths, &image, prompt).await
+}
+
+async fn resolve_context_image(
+    paths: &MiyuPaths,
+    state: &ScopedVisionState,
+    image_id: &str,
+) -> Result<ResolvedContextImage> {
+    if let Some(resolved) = state.resolved.lock().unwrap().get(image_id).cloned() {
+        return Ok(resolved);
+    }
+    let _resolve_guard = state.resolve_lock.lock().await;
+    if let Some(resolved) = state.resolved.lock().unwrap().get(image_id).cloned() {
+        return Ok(resolved);
+    }
+    let source = state
+        .context_images
+        .get(image_id)
+        .context("context image ID is not available in the current platform turn")?
+        .clone();
+    let context = state
+        .platform_context
+        .as_ref()
+        .context("platform image lookup is unavailable")?;
+    if state
+        .fetches
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_SCOPED_CONTEXT_FETCHES).then_some(count + 1)
+        })
+        .is_err()
+    {
+        bail!("context image fetch limit reached for the current platform turn")
+    }
+    let images = match context.message_images_task(source.message_id.clone()).await {
+        Ok(images) => images,
+        Err(error) => {
+            state.fetches.fetch_sub(1, Ordering::AcqRel);
+            return Err(error).context("failed to retrieve the context image message");
+        }
+    };
+    let image = match images.into_iter().nth(source.image_index.saturating_sub(1)) {
+        Some(image) => image,
+        None => {
+            state.fetches.fetch_sub(1, Ordering::AcqRel);
+            bail!("the requested context image is no longer available")
+        }
+    };
+    if image.data.len() > MAX_IMAGE_BYTES {
+        state.fetches.fetch_sub(1, Ordering::AcqRel);
+        bail!("context image is too large: {} bytes", image.data.len())
+    }
+    let digest = hex::encode(Sha256::digest(&image.data));
+    if let Some(existing) = state.content_images.lock().unwrap().get(&digest).cloned() {
+        state
+            .resolved
+            .lock()
+            .unwrap()
+            .insert(image_id.to_string(), existing.clone());
+        return Ok(existing);
+    }
+    let previous = state
+        .total_bytes
+        .fetch_add(image.data.len(), Ordering::AcqRel);
+    if previous.saturating_add(image.data.len()) > MAX_SCOPED_TOTAL_BYTES {
+        state
+            .total_bytes
+            .fetch_sub(image.data.len(), Ordering::AcqRel);
+        state.fetches.fetch_sub(1, Ordering::AcqRel);
+        bail!("context image byte limit reached for the current platform turn")
+    }
+    let cache_path = match write_image_cache_file(
+        &paths.cache_dir,
+        Path::new("platform_images/qq"),
+        &image.mime,
+        &image.data,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            state
+                .total_bytes
+                .fetch_sub(image.data.len(), Ordering::AcqRel);
+            state.fetches.fetch_sub(1, Ordering::AcqRel);
+            return Err(error).context("failed to cache the context image");
+        }
+    };
+    let resolved = ResolvedContextImage {
+        image,
+        digest,
+        cache_path,
+    };
+    tracing::info!(
+        target: "miyu::qq",
+        image_id,
+        message_id = %source.message_id,
+        image_index = source.image_index,
+        bytes = resolved.image.data.len(),
+        cache_file = resolved
+            .cache_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image"),
+        "{}",
+        crate::i18n::text(
+            "OneBot context image prepared on demand",
+            "已按需准备 OneBot 上下文图片",
+        )
+    );
+    state
+        .resolved
+        .lock()
+        .unwrap()
+        .insert(image_id.to_string(), resolved.clone());
+    state
+        .content_images
+        .lock()
+        .unwrap()
+        .insert(resolved.digest.clone(), resolved.clone());
+    Ok(resolved)
+}
+
+fn image_data_url(mime: &str, data: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    format!("data:{mime};base64,{encoded}")
+}
+
 pub async fn analyze_local_image_with_prompt(
     config: &AppConfig,
     paths: &MiyuPaths,
@@ -226,21 +532,36 @@ pub async fn analyze_image_url_with_prompt(
     if !vision.enabled {
         bail!("vision plugin is disabled")
     }
-    let client = vision_client(config, paths)?;
-    let result = client
-        .chat_stream(
-            vec![
-                ChatMessage::system("请基于图片内容回答，不要编造看不见的信息。"),
-                ChatMessage::user_with_image(prompt, image_url.to_string()),
-            ],
-            Vec::new(),
-            |_| Ok(()),
-        )
-        .await?;
+    let client = vision_client(config, paths)?.with_request_timeouts(
+        Duration::from_secs(vision.response_header_timeout_seconds.max(1)),
+        Duration::from_secs(vision.stream_idle_timeout_seconds.max(1)),
+    );
+    let request = client.chat_stream(
+        vec![
+            ChatMessage::system("请基于图片内容回答，不要编造看不见的信息。"),
+            ChatMessage::user_with_image(prompt, image_url.to_string()),
+        ],
+        Vec::new(),
+        |_| Ok(()),
+    );
+    let result = with_image_timeout(vision.image_timeout_seconds, request).await?;
     if result.content.trim().is_empty() {
         bail!("vision model returned empty response")
     }
     Ok(result.content)
+}
+
+pub(crate) async fn with_image_timeout<T, F>(timeout_seconds: u64, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        anyhow::anyhow!(
+            "vision model pool timed out after {} seconds",
+            timeout.as_secs()
+        )
+    })?
 }
 
 fn vision_client(config: &AppConfig, paths: &MiyuPaths) -> Result<OpenAiCompatibleClient> {
@@ -319,5 +640,152 @@ fn mime_from_path(path: &Path) -> Result<&'static str> {
         value => {
             bail!("unsupported image extension: {value}; supported: jpg, jpeg, png, webp, gif")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platforms::{
+        ConversationKind, OutboundMessage, PlatformAdapter, PlatformConversation, SendReceipt,
+    };
+    use crate::state::StateStore;
+    use futures_util::future::BoxFuture;
+
+    struct ContextImageAdapter {
+        calls: Arc<AtomicUsize>,
+        images: Vec<PlatformImageData>,
+    }
+
+    impl PlatformAdapter for ContextImageAdapter {
+        fn send<'a>(&'a self, _message: OutboundMessage) -> BoxFuture<'a, Result<SendReceipt>> {
+            Box::pin(async { bail!("send is not used in this test") })
+        }
+
+        fn bot_display_name<'a>(&'a self) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("Miyu".to_string()) })
+        }
+
+        fn message_images<'a>(
+            &'a self,
+            _message_id: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<PlatformImageData>>> {
+            let calls = self.calls.clone();
+            let images = self.images.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(images)
+            })
+        }
+    }
+
+    fn test_paths(root: &Path) -> MiyuPaths {
+        MiyuPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.jsonc"),
+            skills_dir: root.join("config/skills"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            pictures_dir: root.join("pictures"),
+            fish_hook_file: root.join("fish"),
+            bash_hook_file: root.join("bash"),
+            zsh_hook_file: root.join("zsh"),
+            scripts_dir: root.join("scripts"),
+            system_scripts_dir: root.join("system-scripts"),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_timeout_cancels_a_stalled_model_pool() {
+        let error = with_image_timeout(1, std::future::pending::<Result<()>>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "vision model pool timed out after 1 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_images_reuse_resolved_ids_and_duplicate_content_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(ContextImageAdapter {
+            calls: calls.clone(),
+            images: vec![PlatformImageData {
+                mime: "image/png".to_string(),
+                data: Arc::from(vec![1_u8, 2, 3]),
+            }],
+        });
+        let context = Arc::new(PlatformTurnContext::new(
+            PlatformConversation {
+                platform: "onebot".to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Group,
+                conversation_id: "20000".to_string(),
+            },
+            "30000".to_string(),
+            "tester".to_string(),
+            false,
+            AppConfig::default(),
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            adapter,
+            Arc::new(crate::platforms::plugins::PlatformPluginRegistry::default()),
+        ));
+        let source = PlatformContextImageRef {
+            id: "context_image_1".to_string(),
+            message_id: "90".to_string(),
+            image_index: 1,
+        };
+        let duplicate_source = PlatformContextImageRef {
+            id: "context_image_2".to_string(),
+            message_id: "91".to_string(),
+            image_index: 1,
+        };
+        let state = ScopedVisionState {
+            allowed_paths: Vec::new(),
+            context_images: [
+                (source.id.clone(), source),
+                (duplicate_source.id.clone(), duplicate_source),
+            ]
+            .into(),
+            platform_context: Some(context),
+            allow_general_access: false,
+            resolve_lock: tokio::sync::Mutex::new(()),
+            resolved: Mutex::new(HashMap::new()),
+            content_images: Mutex::new(HashMap::new()),
+            analyses: Mutex::new(HashMap::new()),
+            calls: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            total_bytes: AtomicUsize::new(0),
+        };
+
+        let (first, second) = tokio::join!(
+            resolve_context_image(&paths, &state, "context_image_1"),
+            resolve_context_image(&paths, &state, "context_image_1")
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let duplicate = resolve_context_image(&paths, &state, "context_image_2")
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.cache_path, second.cache_path);
+        assert_eq!(first.cache_path, duplicate.cache_path);
+        assert_eq!(state.total_bytes.load(Ordering::Acquire), 3);
+        assert!(first.cache_path.is_file());
+        let error = resolve_context_image(&paths, &state, "context_image_999")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("context image ID is not available"));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

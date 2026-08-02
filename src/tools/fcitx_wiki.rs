@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use anyhow::{bail, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -335,16 +335,10 @@ async fn fetch_page_excerpt(url: &str) -> Result<String> {
         .send()
         .await?
         .error_for_status()?;
-    if response.content_length().unwrap_or(0) > MAX_PAGE_BYTES as u64 {
-        bail!("Fcitx Wiki page too large")
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_PAGE_BYTES {
-        bail!("Fcitx Wiki page too large")
-    }
-    let html = String::from_utf8_lossy(&bytes);
+    let html = http_response::read_text(response, MAX_PAGE_BYTES).await?;
     let body = extract_mw_parser_output(&html).unwrap_or(&html);
-    Ok(clip(&html2md::parse_html(body)))
+    let markdown = html_conversion::to_markdown(body.to_string()).await?;
+    Ok(clip(&markdown))
 }
 
 fn extract_mw_parser_output(html: &str) -> Option<&str> {

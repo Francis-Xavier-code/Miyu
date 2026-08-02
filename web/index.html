@@ -7,11 +7,8 @@
   <meta name="theme-color" content="#171821">
   <title>Miyu</title>
   <link rel="stylesheet" href="/styles.css">
-  <!-- matugen 生成的 MD3 token 覆盖;文件不存在时 404,浏览器静默忽略。
-       app.js 依据「配色方案」设置切换 link.disabled:窗边=禁用,Matugen=启用 -->
+  <!-- matugen 生成的 MD3 token 覆盖;app.js 依据「配色方案」切换 link.disabled -->
   <link rel="stylesheet" href="/theme.css" id="matugenThemeLink">
-  <!-- 用户选定「窗边」时在首帧就禁用 matugen 覆盖,避免 defer 的 app.js 生效前闪一下取色主题 -->
-  <script>try { if (localStorage.getItem("miyu.web.colorScheme") === "madobe") document.getElementById("matugenThemeLink").disabled = true; } catch (e) {}</script>
   <script defer src="/app.js"></script>
 </head>
 <body data-theme="graphite">
@@ -29,6 +26,9 @@
         </div>
         <button class="new-chat-button" id="newChatButton" type="button" title="新对话" aria-label="新对话" disabled>
           <span class="icon-slot" data-icon="square-pen" aria-hidden="true"><span class="icon-fallback">＋</span></span>
+        </button>
+        <button class="icon-button sidebar-collapse-button" id="sidebarCollapseButton" type="button" title="收起侧边栏" aria-label="收起侧边栏">
+          <span class="icon-slot" data-icon="panel-left-close" aria-hidden="true"><span class="icon-fallback">◧</span></span>
         </button>
         <button class="icon-button sidebar-close" id="sidebarClose" type="button" title="关闭会话栏" aria-label="关闭会话栏">
           <span class="icon-slot" data-icon="x" aria-hidden="true"><span class="icon-fallback">×</span></span>
@@ -62,6 +62,9 @@
     <main class="main-stage" id="mainStage">
       <header class="topbar">
         <div class="topbar-leading">
+          <button class="icon-button sidebar-expand-button" id="sidebarExpandButton" type="button" title="展开侧边栏" aria-label="展开侧边栏" hidden>
+            <span class="icon-slot" data-icon="panel-left-open" aria-hidden="true"><span class="icon-fallback">▣</span></span>
+          </button>
           <button class="icon-button mobile-menu-button" id="mobileMenuButton" type="button" title="打开会话栏" aria-label="打开会话栏">
             <span class="icon-slot" data-icon="panel-left" aria-hidden="true"><span class="icon-fallback">☰</span></span>
           </button>
@@ -82,6 +85,9 @@
           </div>
           <button class="icon-button" id="themeButton" type="button" title="切换主题" aria-label="切换主题">
             <span class="icon-slot" data-icon="moon" aria-hidden="true"><span class="icon-fallback">◐</span></span>
+          </button>
+          <button class="icon-button artifact-toggle-button" id="artifactToggleButton" type="button" title="打开预览" aria-label="打开预览" hidden>
+            <span class="icon-slot" data-icon="panel-right" aria-hidden="true"><span class="icon-fallback">▥</span></span>
           </button>
           <button class="icon-button" id="topbarSettingsButton" type="button" title="打开设置" aria-label="打开设置">
             <span class="icon-slot" data-icon="sliders-horizontal" aria-hidden="true"><span class="icon-fallback">⚙</span></span>
@@ -160,14 +166,29 @@
           <div class="question-dock" id="questionDock" aria-label="待回答问题" aria-live="polite" hidden></div>
           <form class="composer" id="composerForm">
             <div class="queue-tray" id="queueTray" aria-label="排队中的消息" hidden></div>
+            <div class="attachment-tray" id="attachmentTray" aria-label="待发送附件" hidden></div>
             <textarea id="composerInput" rows="3" placeholder="给 Miyu 发消息" aria-label="消息" disabled></textarea>
+            <input id="attachmentInput" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.markdown,.json,.jsonl,.csv,.tsv,.log,.rs,.js,.jsx,.ts,.tsx,.py,.go,.java,.c,.cc,.cpp,.h,.hpp,.cs,.rb,.php,.swift,.kt,.kts,.sh,.bash,.zsh,.fish,.toml,.yaml,.yml,.xml,.html,.css,.scss,.sql" hidden>
             <div class="composer-footer">
               <div class="composer-controls">
-                <div class="mode-switch" id="modeSwitch" role="group" aria-label="对话模式">
-                  <button class="active" type="button" data-mode="normal" aria-pressed="true">普通</button>
-                  <button type="button" data-mode="plan" aria-pressed="false">计划</button>
-                  <button type="button" data-mode="chat" aria-pressed="false">闲聊</button>
-                </div>
+                <button class="mode-cycle" id="modeCycle" type="button" data-mode="normal" title="当前模式：普通；点击切换到计划" aria-label="当前模式：普通；点击切换到计划">
+                  <span class="mode-option is-active" data-mode-option="normal" aria-hidden="false">
+                    <span class="icon-slot mode-icon" data-icon="message-circle" aria-hidden="true"><span class="icon-fallback">N</span></span>
+                    <span class="mode-label">普通</span>
+                  </span>
+                  <span class="mode-option" data-mode-option="plan" aria-hidden="true">
+                    <span class="icon-slot mode-icon" data-icon="list-todo" aria-hidden="true"><span class="icon-fallback">P</span></span>
+                    <span class="mode-label">计划</span>
+                  </span>
+                  <span class="mode-option" data-mode-option="chat" aria-hidden="true">
+                    <span class="icon-slot mode-icon" data-icon="messages-square" aria-hidden="true"><span class="icon-fallback">C</span></span>
+                    <span class="mode-label">闲聊</span>
+                  </span>
+                </button>
+                <button class="thinking-variant-button" id="thinkingVariantButton" type="button" title="思考程度" aria-label="思考程度" aria-haspopup="dialog" aria-expanded="false" aria-controls="thinkingVariantPopover" disabled>
+                  <span class="icon-slot brain-icon" data-icon="brain" aria-hidden="true"><span class="icon-fallback">B</span></span>
+                  <span class="icon-slot thinking-chevron" data-icon="chevron-down" aria-hidden="true"><span class="icon-fallback">⌄</span></span>
+                </button>
                 <span class="composer-state" id="composerState">正在载入</span>
               </div>
               <div class="composer-submit">
@@ -182,6 +203,9 @@
                   </div>
                 </div>
                 <span class="character-count" id="characterCount" hidden>0 / 20,000</span>
+                <button class="attach-button" id="attachButton" type="button" title="添加附件" aria-label="添加附件" disabled>
+                  <span class="icon-slot" data-icon="paperclip" aria-hidden="true"><span class="icon-fallback">+</span></span>
+                </button>
                 <button class="send-button" id="sendButton" type="submit" title="发送消息" aria-label="发送消息" disabled>
                   <span class="icon-slot" data-icon="arrow-up" aria-hidden="true"><span class="icon-fallback">↑</span></span>
                 </button>
@@ -190,7 +214,72 @@
           </form>
         </footer>
       </section>
+
+      <aside class="artifact-workspace" id="artifactWorkspace" aria-label="预览工作区" aria-hidden="true" hidden>
+        <div class="artifact-resize-handle" id="artifactResizeHandle" aria-hidden="true"></div>
+        <header class="artifact-header">
+          <div class="artifact-leading">
+            <div class="artifact-mode-switch" role="group" aria-label="查看方式">
+              <button id="artifactPreviewButton" type="button" title="预览" aria-label="预览" aria-pressed="true">
+                <span class="icon-slot" data-icon="eye" aria-hidden="true"><span class="icon-fallback">◉</span></span>
+              </button>
+              <button id="artifactSourceButton" type="button" title="查看源码" aria-label="查看源码" aria-pressed="false">
+                <span class="icon-slot" data-icon="code-2" aria-hidden="true"><span class="icon-fallback">&lt;/&gt;</span></span>
+              </button>
+            </div>
+            <div class="artifact-image-actions" id="artifactImageActions" aria-label="图片操作" hidden>
+              <a id="artifactImageExternalButton" title="在新标签页打开原图" aria-label="在新标签页打开原图" target="_blank" rel="noopener noreferrer">
+                <span class="icon-slot" data-icon="external-link" aria-hidden="true"><span class="icon-fallback">↗</span></span>
+              </a>
+              <button id="artifactImageZoomOutButton" type="button" title="缩小" aria-label="缩小">
+                <span class="icon-slot" data-icon="zoom-out" aria-hidden="true"><span class="icon-fallback">−</span></span>
+              </button>
+              <button id="artifactImageZoomInButton" type="button" title="放大" aria-label="放大">
+                <span class="icon-slot" data-icon="zoom-in" aria-hidden="true"><span class="icon-fallback">＋</span></span>
+              </button>
+            </div>
+            <div class="artifact-resource-wrap">
+              <button class="artifact-title-button" id="artifactTitleButton" type="button" aria-haspopup="menu" aria-expanded="false">
+                <strong id="artifactTitle">预览</strong>
+                <small id="artifactTypeLabel"></small>
+                <span class="icon-slot" data-icon="chevron-down" aria-hidden="true"><span class="icon-fallback">⌄</span></span>
+              </button>
+              <div class="artifact-resource-menu" id="artifactResourceMenu" role="menu" hidden></div>
+            </div>
+          </div>
+          <div class="artifact-actions">
+            <button class="icon-button" id="artifactCopyButton" type="button" title="复制" aria-label="复制">
+              <span class="icon-slot" data-icon="copy" aria-hidden="true"><span class="icon-fallback">□</span></span>
+            </button>
+            <a class="artifact-download-button" id="artifactDownloadButton" title="下载" aria-label="下载" download>
+              <span class="icon-slot" data-icon="download" aria-hidden="true"><span class="icon-fallback">↓</span></span>
+            </a>
+            <button class="icon-button" id="artifactMaximizeButton" type="button" title="全屏显示" aria-label="全屏显示">
+              <span class="icon-slot" data-icon="maximize-2" aria-hidden="true"><span class="icon-fallback">□</span></span>
+            </button>
+            <button class="icon-button" id="artifactCloseButton" type="button" title="关闭预览" aria-label="关闭预览">
+              <span class="icon-slot" data-icon="x" aria-hidden="true"><span class="icon-fallback">×</span></span>
+            </button>
+          </div>
+        </header>
+        <div class="artifact-view" id="artifactView"></div>
+      </aside>
     </main>
+
+    <section class="thinking-variant-popover" id="thinkingVariantPopover" role="dialog" aria-modal="false" aria-label="思考程度" hidden>
+      <div class="thinking-variant-layout">
+        <section class="thinking-model-pane" aria-label="模型">
+          <div class="thinking-model-list" id="thinkingModelList" role="listbox" aria-label="选择要设置的模型"></div>
+        </section>
+        <section class="thinking-level-pane" aria-label="档位">
+          <div class="thinking-model-detail">
+            <strong id="thinkingModelName"></strong>
+            <small id="thinkingModelProvider"></small>
+          </div>
+          <div class="thinking-level-list" id="thinkingLevelList" role="radiogroup" aria-label="选择思考程度"></div>
+        </section>
+      </div>
+    </section>
 
     <button class="page-scrim drawer-scrim" id="drawerScrim" type="button" aria-label="关闭设置" tabindex="-1"></button>
     <aside class="settings-drawer" id="settingsDrawer" aria-label="设置" aria-hidden="true" tabindex="-1">
@@ -276,10 +365,21 @@
           <h2>模型池</h2>
           <div class="model-pool-editor" id="modelPoolEditor"></div>
           </section>
-          <section class="settings-section settings-panel" data-settings-panel="plugins" hidden>
-          <h2>插件配置</h2>
-          <div class="plugin-editor" id="pluginEditor"></div>
-          </section>
+           <section class="settings-section settings-panel" data-settings-panel="plugins" hidden>
+           <h2>插件配置</h2>
+           <div class="plugin-editor" id="pluginEditor"></div>
+           <section class="qq-history-tool" aria-labelledby="qqHistoryTitle">
+             <h2 id="qqHistoryTitle">QQ群管理记录</h2>
+             <p class="settings-description">输入 bot QQ 和群号，查看已保存的违规者与踢人记录。</p>
+             <form class="qq-history-form" id="qqHistoryForm">
+               <label>bot QQ<input id="qqHistoryAccount" inputmode="numeric" pattern="[0-9]*" maxlength="12" required></label>
+               <label>群号<input id="qqHistoryGroup" inputmode="numeric" pattern="[0-9]*" maxlength="12" required></label>
+               <button class="secondary-button compact-button" type="submit">加载</button>
+             </form>
+             <div class="qq-history-status" id="qqHistoryStatus" role="status"></div>
+             <div class="qq-history-output" id="qqHistoryOutput" hidden></div>
+           </section>
+           </section>
           <section class="settings-section settings-panel" data-settings-panel="advanced" hidden>
           <h2>完整配置</h2>
           <p class="settings-description">这里包含结构化表单未单独展示的所有配置项。应用到草稿后仍需保存。</p>

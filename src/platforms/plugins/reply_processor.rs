@@ -5,7 +5,7 @@ use crate::platforms::{
     PlatformTurnContext, SendReceipt,
 };
 use crate::state::PlatformPluginScopeKey;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -204,11 +204,7 @@ impl ReplyProcessorPlugin {
     ) -> Result<PreparedSend> {
         let render_config = settings.config.render_config();
         let renderer = self.renderer()?;
-        let markdown = text.clone();
-        let rendered =
-            tokio::task::spawn_blocking(move || renderer.render(&markdown, &render_config))
-                .await
-                .context("the long-image renderer task stopped")??;
+        let rendered = renderer.render(&text, &render_config).await?;
         if rendered.is_empty() {
             return Ok(PreparedSend::unchanged(message));
         }
@@ -224,7 +220,7 @@ impl ReplyProcessorPlugin {
             })
             .collect::<Vec<_>>();
         let mut transformed = replace_text_segments(message.clone(), replacement);
-        transformed.reply_to = message.reply_to.clone();
+        transformed.response_target = message.response_target.clone();
         transformed.metadata.insert(
             IMAGE_METADATA_KEY.to_string(),
             json!({
@@ -237,6 +233,7 @@ impl ReplyProcessorPlugin {
             after_success: Vec::new(),
             fallback: Some(message),
             suppress_final_reply: settings.config.send_tool_intercept,
+            suppress_prior_reply: false,
         })
     }
 
@@ -265,7 +262,7 @@ impl ReplyProcessorPlugin {
                 display_name,
                 segments: segments.clone(),
             }]),
-            reply_to: None,
+            response_target: message.response_target.clone(),
             origin: message.origin,
             metadata: message.metadata.clone(),
         };
@@ -273,7 +270,9 @@ impl ReplyProcessorPlugin {
             .metadata
             .insert("reply_processor.forward".to_string(), Value::Bool(true));
         let mut after_success = Vec::new();
-        if settings.config.followup_mention && context.conversation.kind == ConversationKind::Group
+        if message.response_target.is_none()
+            && settings.config.followup_mention
+            && context.conversation.kind == ConversationKind::Group
         {
             after_success.push(OutboundMessage::segments(
                 OutboundOrigin::Plugin,
@@ -288,6 +287,7 @@ impl ReplyProcessorPlugin {
             after_success,
             fallback: Some(message),
             suppress_final_reply: false,
+            suppress_prior_reply: false,
         })
     }
 
@@ -423,7 +423,15 @@ impl PlatformPlugin for ReplyProcessorPlugin {
                     {
                         Ok(prepared) => Ok(prepared),
                         Err(error) => {
-                            tracing::warn!(error = %error, "long-reply image rendering failed; keeping text output");
+                            tracing::warn!(
+                                target: "miyu::qq",
+                                error = %error,
+                                "{}",
+                                crate::i18n::text(
+                                    "long-reply image rendering failed; keeping text output",
+                                    "长回复图片渲染失败；保留文本输出"
+                                )
+                            );
                             Ok(PreparedSend::unchanged(message))
                         }
                     }
@@ -521,7 +529,7 @@ impl Default for ReplyProcessorConfig {
     fn default() -> Self {
         Self {
             default_enabled: true,
-            threshold: 300,
+            threshold: 200,
             mode: ReplyMode::Image,
             followup_mention: true,
             strip_period: true,
@@ -789,7 +797,7 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::paths::MiyuPaths;
-    use crate::platforms::{PlatformAdapter, PlatformConversation};
+    use crate::platforms::{PlatformAdapter, PlatformConversation, ResponseTarget};
     use crate::state::StateStore;
     use futures_util::future::BoxFuture;
     use std::path::PathBuf;
@@ -834,6 +842,7 @@ mod tests {
             "tester".to_string(),
             is_admin,
             AppConfig::default(),
+            paths.clone(),
             StateStore::new(&paths).unwrap(),
             Arc::new(NoopAdapter),
             Arc::new(super::super::PlatformPluginRegistry::default()),
@@ -949,7 +958,7 @@ mod tests {
         ReplyProcessorPlugin::handle_admin_command(&context, "恢复默认").unwrap();
         let defaults = ReplyProcessorPlugin::effective_settings(&context).unwrap();
         assert!(defaults.enabled);
-        assert_eq!(defaults.threshold, 300);
+        assert_eq!(defaults.threshold, 200);
         assert_eq!(defaults.mode, ReplyMode::Image);
         assert!(!defaults.custom);
     }
@@ -1093,17 +1102,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_threshold_converts_only_after_three_hundred_characters() {
+    async fn default_threshold_converts_only_after_two_hundred_characters() {
         let (_temp, mut context) = test_context(true);
         set_plugin_setting(&mut context, "mode", json!("forward"));
         let plugin = ReplyProcessorPlugin::new().unwrap();
 
-        let boundary = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(300));
+        let boundary = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(200));
         let unchanged = plugin.before_send(&context, boundary).await.unwrap();
         assert!(unchanged.fallback.is_none());
         assert!(matches!(unchanged.primary.body, OutboundBody::Segments(_)));
 
-        let over = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(301));
+        let over = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(201));
         let converted = plugin.before_send(&context, over).await.unwrap();
         assert!(converted.fallback.is_some());
         assert!(matches!(converted.primary.body, OutboundBody::Forward(_)));
@@ -1118,17 +1127,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_mode_builds_one_node_and_mentions_group_sender_after_success() {
+    async fn forward_mode_preserves_the_selected_response_target_without_guessing_sender() {
         let (_temp, mut context) = test_context(true);
         set_plugin_setting(&mut context, "threshold", json!(1));
         set_plugin_setting(&mut context, "mode", json!("forward"));
         let plugin = ReplyProcessorPlugin::new().unwrap();
         let mut message = OutboundMessage::markdown(OutboundOrigin::FinalReply, "long。");
-        message.reply_to = Some("9".to_string());
+        message.response_target = Some(ResponseTarget {
+            message_id: "9".to_string(),
+            user_id: "40000".to_string(),
+            quote: true,
+            mention: true,
+        });
 
         let prepared = plugin.before_send(&context, message).await.unwrap();
         assert!(prepared.fallback.is_some());
-        assert_eq!(prepared.primary.reply_to, None);
+        assert_eq!(
+            prepared.primary.response_target,
+            Some(ResponseTarget {
+                message_id: "9".to_string(),
+                user_id: "40000".to_string(),
+                quote: true,
+                mention: true,
+            })
+        );
         let OutboundBody::Forward(nodes) = prepared.primary.body else {
             panic!("expected a forward message");
         };
@@ -1137,14 +1159,7 @@ mod tests {
             &nodes[0].segments[0],
             OutboundSegment::Markdown(text) if text == "long"
         ));
-        assert_eq!(prepared.after_success.len(), 1);
-        let OutboundBody::Segments(followup) = &prepared.after_success[0].body else {
-            panic!("expected mention follow-up");
-        };
-        assert!(matches!(
-            &followup[0],
-            OutboundSegment::Mention(user_id) if user_id == "30000"
-        ));
+        assert!(prepared.after_success.is_empty());
     }
 
     #[tokio::test]
@@ -1235,6 +1250,9 @@ mod tests {
                 &prepared.primary,
                 &SendReceipt {
                     message_ids: vec!["sent-1".to_string()],
+                    image_message_ids: Vec::new(),
+                    delivered_parts: 1,
+                    image_digests: Vec::new(),
                 },
             )
             .await
@@ -1250,6 +1268,7 @@ mod tests {
         let mut input = PlatformTurnInput {
             content: "next".to_string(),
             system_context: Vec::new(),
+            context_images: Vec::new(),
         };
         plugin.before_turn(&context, &mut input).await.unwrap();
         assert_eq!(input.content, "next");

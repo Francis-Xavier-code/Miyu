@@ -66,11 +66,9 @@ mod tests {
         let seen = with_workspace(workspace.clone(), async {
             let work = async { effective_workdir() };
             tokio::pin!(work);
-            loop {
-                tokio::select! {
-                    result = &mut work => break result,
-                    _ = std::future::ready(()) , if false => unreachable!(),
-                }
+            tokio::select! {
+                result = &mut work => result,
+                _ = std::future::ready(()) , if false => unreachable!(),
             }
         })
         .await;

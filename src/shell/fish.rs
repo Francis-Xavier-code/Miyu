@@ -11,8 +11,8 @@ fn completion_entries() -> [(&'static str, &'static str); 15] {
         (
             "init",
             t(
-                "Create default configuration and state files",
-                "创建默认配置和状态文件",
+                "Create default configuration and state files; use <shell>-init for shell hooks",
+                "创建默认配置和状态文件；Shell 集成请使用对应的 <shell>-init 命令",
             ),
         ),
         (

@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -310,12 +310,14 @@ async fn fetch_archwiki_page(title: &str) -> Result<String> {
         "https://wiki.archlinux.org/api.php?action=parse&page={}&prop=text&format=json",
         urlencoding::encode(title)
     );
-    let data: Value = reqwest::get(url).await?.error_for_status()?.json().await?;
+    let response = reqwest::get(url).await?.error_for_status()?;
+    let data: Value =
+        http_response::read_json(response, http_response::MAX_HTML_RESPONSE_BYTES).await?;
     let html = data
         .pointer("/parse/text/*")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    Ok(html2md::parse_html(html))
+    html_conversion::to_markdown(html.to_string()).await
 }
 
 fn required(args: &Value, key: &str) -> Result<String> {
@@ -689,7 +691,7 @@ fn parse_rss_feed(xml: &str, limit: usize) -> Vec<NewsArticle> {
                     }
                     "description" => {
                         if article.description.is_empty() {
-                            let stripped = html2text::from_read(text.as_bytes(), 2000);
+                            let stripped = html_conversion::to_text_lossy(&text, 2000);
                             article.description = clip_string(&stripped, 500);
                         }
                     }

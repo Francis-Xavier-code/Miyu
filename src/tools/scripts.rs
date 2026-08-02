@@ -77,9 +77,16 @@ pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
         paths.system_scripts_dir.as_path(),
         paths.scripts_dir.as_path(),
     ];
-    if let Ok(scan) = scan_scripts(&dirs) {
-        let specs = script_specs(&scan.entries, &paths.scripts_dir);
-        let _ = registry.replace_script_tools(specs, scan.unregistered);
+    match scan_scripts(&dirs) {
+        Ok(scan) => {
+            let specs = script_specs(&scan.entries, &paths.scripts_dir);
+            if let Err(error) = registry.replace_script_tools(specs, scan.unregistered) {
+                tracing::warn!(error = %error, "failed to register Miyu script tools");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to scan Miyu script directories during tool registration");
+        }
     }
     register_script_tools(registry, paths.scripts_dir.clone());
 }
@@ -91,10 +98,15 @@ pub fn rescan_scripts(registry: &mut ToolRegistry, paths: &MiyuPaths) {
     ];
     let scan = match scan_scripts(&dirs) {
         Ok(scan) => scan,
-        Err(_) => return,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to rescan Miyu script directories");
+            return;
+        }
     };
     let specs = script_specs(&scan.entries, &paths.scripts_dir);
-    let _ = registry.replace_script_tools(specs, scan.unregistered);
+    if let Err(error) = registry.replace_script_tools(specs, scan.unregistered) {
+        tracing::warn!(error = %error, "failed to replace Miyu script tools");
+    }
 }
 
 fn script_specs(entries: &[ScriptEntry], scripts_dir: &Path) -> Vec<ToolSpec> {
@@ -238,6 +250,25 @@ fn canonicalize_key(path: &Path) -> PathBuf {
 fn resolve_script_path(path_str: &str, scripts_dir: &Path) -> PathBuf {
     let p = Path::new(path_str);
     if p.is_absolute() {
+        if p.starts_with(scripts_dir) {
+            return p.to_path_buf();
+        }
+        if let Some(root) = scripts_dir
+            .parent()
+            .filter(|parent| parent.file_name().and_then(|name| name.to_str()) == Some("data"))
+            .and_then(Path::parent)
+        {
+            let legacy = root.join("config/scripts");
+            if let Ok(relative) = p.strip_prefix(&legacy) {
+                return scripts_dir.join(relative);
+            }
+        }
+        if let Some(base) = directories::BaseDirs::new() {
+            let legacy = base.config_dir().join("miyu/scripts");
+            if let Ok(relative) = p.strip_prefix(&legacy) {
+                return scripts_dir.join(relative);
+            }
+        }
         p.to_path_buf()
     } else {
         scripts_dir.join(p)
@@ -1003,6 +1034,17 @@ fn find_auto_detected_path(scripts_dir: &Path, id: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_script_index_absolute_paths_follow_the_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path().join("data/scripts");
+        let legacy = temp.path().join("config/scripts/tool.sh");
+        assert_eq!(
+            resolve_script_path(&legacy.display().to_string(), &scripts_dir),
+            scripts_dir.join("tool.sh")
+        );
+    }
 
     #[test]
     fn extracts_description_from_shebang_script() {
