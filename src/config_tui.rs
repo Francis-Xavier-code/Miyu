@@ -2951,11 +2951,6 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
             ),
             format!(
                 "{}: {}",
-                t("Administrator QQ ids", "管理员 QQ 号"),
-                qq.admin_users.len()
-            ),
-            format!(
-                "{}: {}",
                 t("User identification", "用户识别"),
                 enabled_label(qq.user_identification)
             ),
@@ -2972,6 +2967,14 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
             format!(
                 "{}: {}",
                 t(
+                    "Administrator QQ ids allowed to use the terminal",
+                    "允许使用终端的管理员 QQ 号"
+                ),
+                qq.admin_users.len()
+            ),
+            format!(
+                "{}: {}",
+                t(
                     "Allow non-admin computer access",
                     "是否允许非管理员使用电脑"
                 ),
@@ -2984,9 +2987,17 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
             ),
             format!(
                 "{}: {}",
+                t("Non-whitelist model pool", "非白名单模型池"),
+                route_pool_summary(
+                    qq.non_whitelist_text_models.as_deref(),
+                    PlatformModelPoolInheritance::Platform,
+                )
+            ),
+            format!(
+                "{}: {}",
                 t(
                     "Only private whitelist can add friends",
-                    "只有私聊白名单里的人允许加好友"
+                    "仅私聊白名单能加好友"
                 ),
                 enabled_label(qq.private_chats.friend_requests_require_private_whitelist)
             ),
@@ -3074,21 +3085,24 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                     }
                 }
                 4 if matches!(key, KeyCode::Enter) => edit_qq_token(stdout, config)?,
-                5 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
-                    stdout,
-                    t(" ADMINISTRATORS ", " 管理员 QQ 号 "),
-                    t("QQ id", "QQ 号"),
-                    &mut config.platforms.qq.admin_users,
-                )?,
-                6 => {
+                5 => {
                     config.platforms.qq.user_identification =
                         !config.platforms.qq.user_identification
                 }
-                7 => config.platforms.qq.show_group_name = !config.platforms.qq.show_group_name,
-                8 => {
+                6 => config.platforms.qq.show_group_name = !config.platforms.qq.show_group_name,
+                7 => {
                     config.platforms.qq.memory.write_enabled =
                         !config.platforms.qq.memory.write_enabled
                 }
+                8 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                    stdout,
+                    t(
+                        " TERMINAL-ENABLED ADMINISTRATORS ",
+                        " 允许使用终端的管理员 QQ 号 ",
+                    ),
+                    t("QQ id", "QQ 号"),
+                    &mut config.platforms.qq.admin_users,
+                )?,
                 9 => {
                     config.platforms.qq.allow_non_admin_host_tools =
                         !config.platforms.qq.allow_non_admin_host_tools
@@ -3099,7 +3113,10 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                     t("QQ id", "QQ 号"),
                     &mut config.platforms.qq.private_chats.whitelist,
                 )?,
-                11 => {
+                11 if matches!(key, KeyCode::Enter) => {
+                    select_non_whitelist_model_pool(stdout, config)?
+                }
+                12 => {
                     config
                         .platforms
                         .qq
@@ -3110,50 +3127,50 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                         .private_chats
                         .friend_requests_require_private_whitelist
                 }
-                12 => {
+                13 => {
                     config.platforms.qq.private_chats.allow_non_whitelist =
                         !config.platforms.qq.private_chats.allow_non_whitelist
                 }
-                13 if matches!(key, KeyCode::Enter) => {
+                14 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.private_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                14 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                15 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
                     stdout,
                     t(" GROUP WHITELIST ", " 群聊白名单 "),
                     t("Group id", "群号"),
                     &mut config.platforms.qq.group_chats.whitelist,
                 )?,
-                15 if matches!(key, KeyCode::Enter) => edit_keyword_list(
+                16 if matches!(key, KeyCode::Enter) => edit_keyword_list(
                     stdout,
                     &mut config.platforms.qq.group_chats.trigger_keywords,
                 )?,
-                16 if matches!(key, KeyCode::Enter) => {
+                17 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.whitelist_rate_limit,
                     )?;
                 }
-                17 => {
+                18 => {
                     config.platforms.qq.group_chats.allow_non_whitelist =
                         !config.platforms.qq.group_chats.allow_non_whitelist
                 }
-                18 if matches!(key, KeyCode::Enter) => {
+                19 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                19 if matches!(key, KeyCode::Enter) => {
+                20 if matches!(key, KeyCode::Enter) => {
                     edit_platform_session_limits(stdout, &mut config.platforms.qq.session_limits)?
                 }
-                20 if matches!(key, KeyCode::Enter) => {
+                21 if matches!(key, KeyCode::Enter) => {
                     select_platform_model_routes(stdout, paths, config)?
                 }
-                21 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
-                22 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
+                22 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
+                23 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
                 _ => {}
             },
             _ => {}
@@ -4082,6 +4099,18 @@ fn select_qq_model_pool(
     )
 }
 
+fn select_non_whitelist_model_pool(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let choices = config.text_provider_model_choices();
+    select_model_pool(
+        stdout,
+        choices,
+        &mut config.platforms.qq.non_whitelist_text_models,
+        false,
+        t(" NON-WHITELIST TEXT MODELS ", " 非白名单模型池 "),
+        t("Inherit QQ platform model pool", "继承 QQ 平台模型池"),
+    )
+}
+
 fn select_model_pool(
     stdout: &mut io::Stdout,
     choices: Vec<ProviderModelChoice>,
@@ -4935,8 +4964,12 @@ fn edit_real_context_reply_target(
             ),
             format!(
                 "{}: {}",
-                t("Active-reply reaction ids", "主动回复表情 ID"),
-                settings.active_reply_reaction_emoji_ids.len()
+                t("Active-reply reaction id", "主动回复贴的表情ID"),
+                settings
+                    .active_reply_reaction_emoji_ids
+                    .first()
+                    .copied()
+                    .unwrap_or_default()
             ),
             format!(
                 "{}: {}",
@@ -5004,7 +5037,20 @@ fn edit_real_context_reply_target(
                         settings.active_reply_reaction_enable,
                     )?
                 }
-                6 => edit_real_context_emoji_ids(stdout, settings)?,
+                6 => {
+                    let current = settings
+                        .active_reply_reaction_emoji_ids
+                        .first()
+                        .copied()
+                        .unwrap_or_default();
+                    edit_real_context_number(
+                        stdout,
+                        t("Active-reply reaction id", "主动回复贴的表情ID"),
+                        current,
+                        settings,
+                        |candidate, value| candidate.active_reply_reaction_emoji_ids = vec![value],
+                    )?;
+                }
                 7 => edit_real_context_number(
                     stdout,
                     t("Reaction cleanup timeout (seconds)", "表情清理超时（秒）"),
@@ -5015,35 +5061,6 @@ fn edit_real_context_reply_target(
                 _ => {}
             },
             _ => {}
-        }
-    }
-}
-
-fn edit_real_context_emoji_ids(
-    stdout: &mut io::Stdout,
-    settings: &mut RealContextPluginSettings,
-) -> Result<()> {
-    let mut raw = settings
-        .active_reply_reaction_emoji_ids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    loop {
-        edit_textarea(stdout, &mut raw)?;
-        match parse_real_context_u32_lines(&raw) {
-            Ok(ids) if !ids.is_empty() && ids.len() <= 100 => {
-                settings.active_reply_reaction_emoji_ids = ids;
-                return Ok(());
-            }
-            Ok(_) => message(
-                stdout,
-                t(
-                    "Configure between 1 and 100 reaction ids.",
-                    "请配置 1 到 100 个表情 ID。",
-                ),
-            )?,
-            Err(error) => message(stdout, &error)?,
         }
     }
 }
@@ -5680,29 +5697,6 @@ fn parse_real_context_string_lines(
     Ok(values)
 }
 
-fn parse_real_context_u32_lines(raw: &str) -> std::result::Result<Vec<u32>, String> {
-    let mut values = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value = line.parse::<u32>().ok().filter(|id| *id > 0);
-        let Some(value) = value else {
-            return Err(format!(
-                "{} {}: {}",
-                t("Line", "第"),
-                index + 1,
-                t("id must be a positive integer", "ID 必须是正整数")
-            ));
-        };
-        if !values.contains(&value) {
-            values.push(value);
-        }
-    }
-    Ok(values)
-}
-
 fn real_context_bool(fields: &[Field], index: usize) -> std::result::Result<bool, String> {
     parse_bool_field(&fields[index].value).map_err(|error| error.to_string())
 }
@@ -5840,6 +5834,10 @@ fn apply_reply_processor_values(
 fn edit_reply_processor(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
     let (mut plugin_enabled, mut settings) = reply_processor_values(config)?;
     loop {
+        let mode_choices = vec![
+            reply_processor_mode_label("image"),
+            reply_processor_mode_label("forward"),
+        ];
         let mut fields = vec![
             Field::boolean(t("Plugin enabled", "启用插件"), plugin_enabled),
             Field::boolean(
@@ -5850,8 +5848,12 @@ fn edit_reply_processor(stdout: &mut io::Stdout, config: &mut AppConfig) -> Resu
                 t("Long reply threshold (characters)", "长回复阈值（字符）"),
                 settings.threshold.to_string(),
             ),
-            Field::new(t("Long reply mode", "长回复模式"), settings.mode.clone())
-                .choices(&["image", "forward"]),
+            Field::new(
+                t("Long reply processing mode", "长回复处理模式"),
+                reply_processor_mode_label(&settings.mode),
+            )
+            .choices_owned(mode_choices)
+            .raw_choice_labels(),
             Field::boolean(
                 t("Mention sender after forwarding", "转发后艾特发起者"),
                 settings.followup_mention,
@@ -5939,10 +5941,13 @@ fn parse_reply_processor_fields(
 ) -> std::result::Result<ReplyProcessorSettingsForm, String> {
     let bool_at =
         |index: usize| parse_bool_field(&fields[index].value).map_err(|error| error.to_string());
+    let mode = reply_processor_mode_value(&fields[3].value)
+        .map(str::to_string)
+        .unwrap_or_else(|| fields[3].value.trim().to_string());
     let settings = ReplyProcessorSettingsForm {
         default_enabled: bool_at(1)?,
         threshold: parse_reply_processor_value(fields, 2, t("threshold", "阈值"))?,
-        mode: fields[3].value.trim().to_string(),
+        mode,
         followup_mention: bool_at(4)?,
         strip_period: bool_at(5)?,
         theme: fields[6].value.trim().to_string(),
@@ -5961,6 +5966,23 @@ fn parse_reply_processor_fields(
     };
     validate_reply_processor_settings(&settings)?;
     Ok(settings)
+}
+
+fn reply_processor_mode_label(value: &str) -> String {
+    match value.trim() {
+        "image" => t("Convert to image", "转图片"),
+        "forward" => t("Merged forward", "合并转发"),
+        value => value,
+    }
+    .to_string()
+}
+
+fn reply_processor_mode_value(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "image" | "Convert to image" | "转图片" => Some("image"),
+        "forward" | "Merged forward" | "合并转发" => Some("forward"),
+        _ => None,
+    }
 }
 
 fn parse_reply_processor_value<T>(
@@ -5990,8 +6012,8 @@ fn validate_reply_processor_settings(
     }
     if !matches!(settings.mode.as_str(), "image" | "forward") {
         return Err(t(
-            "Mode must be image or forward.",
-            "模式必须是 image 或 forward。",
+            "Mode must be Convert to image or Merged forward.",
+            "模式必须是转图片或合并转发。",
         )
         .to_string());
     }
@@ -7658,11 +7680,12 @@ mod tests {
         apply_real_context_values, apply_reply_processor_values, choice_display_label,
         field_display_value, language_choice_label, language_choice_value, parse_extra_body,
         parse_id_lines, parse_id_list, parse_keyword_lines, parse_real_context_identity_lines,
-        parse_real_context_string_lines, parse_real_context_u32_lines,
-        platform_conversation_id_label, platform_conversation_kind_label, platform_persona_summary,
-        real_context_values, reply_processor_values, route_pool_summary, t, thinking_variant_field,
-        validate_reply_processor_settings, vision_provider_model_choice_values, Field,
-        PersonaMenuTarget, ReplyProcessorSettingsForm, REPLY_PROCESSOR_PLUGIN_ID,
+        parse_real_context_string_lines, platform_conversation_id_label,
+        platform_conversation_kind_label, platform_persona_summary, real_context_values,
+        reply_processor_mode_label, reply_processor_mode_value, reply_processor_values,
+        route_pool_summary, t, thinking_variant_field, validate_reply_processor_settings,
+        vision_provider_model_choice_values, Field, PersonaMenuTarget, ReplyProcessorSettingsForm,
+        REPLY_PROCESSOR_PLUGIN_ID,
     };
     use crate::config::{
         AppConfig, PlatformConversationKind, PlatformModelPoolInheritance, PlatformPersonaOverride,
@@ -7817,6 +7840,24 @@ mod tests {
     }
 
     #[test]
+    fn reply_processor_mode_labels_preserve_config_values() {
+        assert_eq!(
+            reply_processor_mode_label("image"),
+            t("Convert to image", "转图片")
+        );
+        assert_eq!(
+            reply_processor_mode_label("forward"),
+            t("Merged forward", "合并转发")
+        );
+        assert_eq!(reply_processor_mode_value("转图片"), Some("image"));
+        assert_eq!(
+            reply_processor_mode_value("Merged forward"),
+            Some("forward")
+        );
+        assert_eq!(reply_processor_mode_value("unsupported"), None);
+    }
+
+    #[test]
     fn reply_processor_settings_use_generic_map_and_preserve_unknown_keys() {
         let mut config = AppConfig::default();
         let mut instance = PlatformPluginInstanceConfig {
@@ -7919,11 +7960,6 @@ mod tests {
             parse_real_context_string_lines("晚安\n 晚安 \nMiyu", 128).unwrap(),
             vec!["晚安", "Miyu"]
         );
-        assert_eq!(
-            parse_real_context_u32_lines("289\n\n289\n123").unwrap(),
-            vec![289, 123]
-        );
-        assert!(parse_real_context_u32_lines("0").is_err());
     }
 
     #[test]

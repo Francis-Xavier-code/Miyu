@@ -228,6 +228,7 @@ impl PlatformsConfig {
             .to_string();
         normalize_route_pool(&mut self.qq.text_models);
         normalize_route_pool(&mut self.qq.multimodal_models);
+        normalize_route_pool(&mut self.qq.non_whitelist_text_models);
         for route in &mut self.qq.conversations {
             route.normalize();
         }
@@ -242,6 +243,7 @@ impl PlatformsConfig {
     pub fn prune_model_references(&mut self, providers: &[ProviderConfig]) {
         prune_pool(&mut self.qq.text_models, providers, false);
         prune_pool(&mut self.qq.multimodal_models, providers, true);
+        prune_pool(&mut self.qq.non_whitelist_text_models, providers, false);
         for route in &mut self.qq.conversations {
             route.prune_model_references(providers);
         }
@@ -257,7 +259,11 @@ impl PlatformsConfig {
     }
 
     pub fn remove_model_references(&mut self, provider_id: &str, model: &str) {
-        for pool in [&mut self.qq.text_models, &mut self.qq.multimodal_models] {
+        for pool in [
+            &mut self.qq.text_models,
+            &mut self.qq.multimodal_models,
+            &mut self.qq.non_whitelist_text_models,
+        ] {
             if let Some(entries) = pool {
                 entries.retain(|entry| !(entry.provider_id == provider_id && entry.model == model));
             }
@@ -280,7 +286,11 @@ impl PlatformsConfig {
     }
 
     pub fn remove_provider_references(&mut self, provider_id: &str) {
-        for pool in [&mut self.qq.text_models, &mut self.qq.multimodal_models] {
+        for pool in [
+            &mut self.qq.text_models,
+            &mut self.qq.multimodal_models,
+            &mut self.qq.non_whitelist_text_models,
+        ] {
             if let Some(entries) = pool {
                 entries.retain(|entry| entry.provider_id != provider_id);
             }
@@ -306,7 +316,11 @@ impl PlatformsConfig {
     }
 
     pub fn rename_provider_references(&mut self, old_id: &str, new_id: &str) {
-        for pool in [&mut self.qq.text_models, &mut self.qq.multimodal_models] {
+        for pool in [
+            &mut self.qq.text_models,
+            &mut self.qq.multimodal_models,
+            &mut self.qq.non_whitelist_text_models,
+        ] {
             if let Some(entries) = pool {
                 rename_provider_in_pool(entries, old_id, new_id);
             }
@@ -326,7 +340,11 @@ impl PlatformsConfig {
     }
 
     pub fn rename_model_references(&mut self, provider_id: &str, old: &str, new: &str) {
-        for pool in [&mut self.qq.text_models, &mut self.qq.multimodal_models] {
+        for pool in [
+            &mut self.qq.text_models,
+            &mut self.qq.multimodal_models,
+            &mut self.qq.non_whitelist_text_models,
+        ] {
             if let Some(entries) = pool {
                 for entry in entries {
                     if entry.provider_id == provider_id && entry.model == old {
@@ -1796,6 +1814,10 @@ pub struct OneBotConfig {
     /// QQ-wide multimodal model pool. None inherits the global pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_models: Option<Vec<ActiveProviderModelConfig>>,
+    /// Text model pool for non-whitelisted private chats and groups.
+    /// None inherits the QQ-wide text model pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_whitelist_text_models: Option<Vec<ActiveProviderModelConfig>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversations: Vec<PlatformModelRoute>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1829,8 +1851,8 @@ impl Default for QqPrivateChatsConfig {
             friend_requests_require_private_whitelist: true,
             allow_non_whitelist: true,
             non_whitelist_rate_limit: PlatformRateLimit {
-                max_messages: 1,
-                window_seconds: 120,
+                max_messages: 2,
+                window_seconds: 600,
             },
             session_limits: None,
             legacy_non_whitelist_rate_per_minute: None,
@@ -1907,8 +1929,8 @@ impl Default for QqGroupChatsConfig {
             },
             allow_non_whitelist: true,
             non_whitelist_rate_limit: PlatformRateLimit {
-                max_messages: 5,
-                window_seconds: 60,
+                max_messages: 2,
+                window_seconds: 600,
             },
             session_limits: None,
             legacy_whitelist_rate_per_minute: None,
@@ -1950,6 +1972,7 @@ impl Default for OneBotConfig {
             session_limits: PlatformSessionLimits::default(),
             text_models: None,
             multimodal_models: None,
+            non_whitelist_text_models: None,
             conversations: Vec::new(),
             plugins: PlatformPluginsConfig::new(),
             asset_base_url: String::new(),
@@ -3805,6 +3828,12 @@ impl AppConfig {
             qq.multimodal_models.as_deref().unwrap_or_default(),
             true,
         )?;
+        validate_unique_existing_pool(
+            &self.providers,
+            "QQ non-whitelist text",
+            qq.non_whitelist_text_models.as_deref().unwrap_or_default(),
+            false,
+        )?;
         for (field, limit) in [
             (
                 "private_chats.non_whitelist_rate_limit",
@@ -3981,17 +4010,19 @@ impl AppConfig {
         &'a self,
         kind: PlatformConversationKind,
         conversation_id: &str,
-        specialized: Option<&'a [ActiveProviderModelConfig]>,
+        use_non_whitelist_pool: bool,
     ) -> Option<&'a [ActiveProviderModelConfig]> {
-        if specialized.is_some() {
-            return specialized;
-        }
         if let Some(route) = self.platform_model_route(kind, conversation_id) {
             if route.text_models.is_some() {
                 return route.text_models.as_deref();
             }
             if route.text_models_inheritance == PlatformModelPoolInheritance::Global {
                 return self.active_provider_models.as_deref();
+            }
+        }
+        if use_non_whitelist_pool {
+            if let Some(pool) = self.platforms.qq.non_whitelist_text_models.as_deref() {
+                return Some(pool);
             }
         }
         self.platforms
@@ -6034,6 +6065,10 @@ mod tests {
             provider_id: provider_id.clone(),
             model: "text-only".to_string(),
         }]);
+        config.platforms.qq.non_whitelist_text_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "text-only".to_string(),
+        }]);
         config.platforms.qq.multimodal_models = Some(vec![ActiveProviderModelConfig {
             provider_id,
             model: "vision".to_string(),
@@ -6050,9 +6085,54 @@ mod tests {
             reparsed.platforms.qq.multimodal_models,
             config.platforms.qq.multimodal_models
         );
+        assert_eq!(
+            reparsed.platforms.qq.non_whitelist_text_models,
+            config.platforms.qq.non_whitelist_text_models
+        );
 
         config.platforms.qq.multimodal_models.as_mut().unwrap()[0].model = "text-only".to_string();
         assert!(config.validate().is_err());
+        config.platforms.qq.multimodal_models.as_mut().unwrap()[0].model = "vision".to_string();
+        config
+            .platforms
+            .qq
+            .non_whitelist_text_models
+            .as_mut()
+            .unwrap()[0]
+            .model = "missing".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn qq_non_whitelist_model_pool_normalizes_for_dynamic_inheritance() {
+        let mut config = route_test_config();
+        let provider_id = config.providers[0].id.clone();
+        config.platforms.qq.non_whitelist_text_models = Some(vec![
+            ActiveProviderModelConfig {
+                provider_id: format!(" {provider_id} "),
+                model: " text-only ".to_string(),
+            },
+            ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: "text-only".to_string(),
+            },
+        ]);
+
+        config.normalize_platform_model_routes();
+        assert_eq!(
+            config
+                .platforms
+                .qq
+                .non_whitelist_text_models
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        config.platforms.qq.non_whitelist_text_models = Some(Vec::new());
+        config.normalize_platform_model_routes();
+        assert!(config.platforms.qq.non_whitelist_text_models.is_none());
     }
 
     #[test]
@@ -6108,7 +6188,7 @@ mod tests {
     }
 
     #[test]
-    fn qq_model_pool_resolution_follows_specialized_conversation_platform_global_order() {
+    fn qq_text_model_pool_resolution_preserves_conversation_priority() {
         let mut config = route_test_config();
         let provider_id = config.providers[0].id.clone();
         let pool = |model: &str| {
@@ -6121,6 +6201,7 @@ mod tests {
         config.active_multimodal_provider_models = Some(pool("global-media"));
         config.platforms.qq.text_models = Some(pool("platform"));
         config.platforms.qq.multimodal_models = Some(pool("platform-media"));
+        config.platforms.qq.non_whitelist_text_models = Some(pool("non-whitelist"));
         config.platforms.qq.conversations.push(PlatformModelRoute {
             conversation: PlatformConversationConfig {
                 kind: PlatformConversationKind::Group,
@@ -6134,23 +6215,22 @@ mod tests {
             extra_prompt: String::new(),
             session_limits: None,
         });
-        let specialized = pool("specialized");
 
         {
-            let resolved = |conversation_id, specialized| {
+            let resolved = |conversation_id, use_non_whitelist_pool| {
                 config
                     .qq_text_model_pool(
                         PlatformConversationKind::Group,
                         conversation_id,
-                        specialized,
+                        use_non_whitelist_pool,
                     )
                     .unwrap()[0]
                     .model
                     .as_str()
             };
-            assert_eq!(resolved("20002", Some(&specialized)), "specialized");
-            assert_eq!(resolved("20002", None), "conversation");
-            assert_eq!(resolved("30003", None), "platform");
+            assert_eq!(resolved("20002", true), "conversation");
+            assert_eq!(resolved("30003", true), "non-whitelist");
+            assert_eq!(resolved("30003", false), "platform");
         }
         assert_eq!(
             config
@@ -6164,7 +6244,7 @@ mod tests {
         route.text_models_inheritance = PlatformModelPoolInheritance::Global;
         assert_eq!(
             config
-                .qq_text_model_pool(PlatformConversationKind::Group, "20002", None)
+                .qq_text_model_pool(PlatformConversationKind::Group, "20002", true)
                 .unwrap()[0]
                 .model,
             "global"
@@ -6185,17 +6265,18 @@ mod tests {
                 .model,
             "global-media"
         );
+        config.platforms.qq.non_whitelist_text_models = None;
         assert_eq!(
             config
-                .qq_text_model_pool(PlatformConversationKind::Group, "20002", Some(&specialized),)
+                .qq_text_model_pool(PlatformConversationKind::Group, "30003", true)
                 .unwrap()[0]
                 .model,
-            "specialized"
+            "platform"
         );
         config.platforms.qq.text_models = None;
         assert_eq!(
             config
-                .qq_text_model_pool(PlatformConversationKind::Group, "30003", None)
+                .qq_text_model_pool(PlatformConversationKind::Group, "30003", true)
                 .unwrap()[0]
                 .model,
             "global"
@@ -6418,16 +6499,51 @@ mod tests {
         assert_eq!(
             qq.private_chats.non_whitelist_rate_limit,
             PlatformRateLimit {
-                max_messages: 1,
-                window_seconds: 120,
+                max_messages: 2,
+                window_seconds: 600,
             }
         );
         assert_eq!(
             qq.group_chats.non_whitelist_rate_limit,
             PlatformRateLimit {
-                max_messages: 5,
-                window_seconds: 60,
+                max_messages: 2,
+                window_seconds: 600,
             }
+        );
+
+        let explicit: OneBotConfig = serde_json::from_value(serde_json::json!({
+            "private_chats": {
+                "non_whitelist_rate_limit": {
+                    "max_messages": 1,
+                    "window_seconds": 120
+                }
+            },
+            "group_chats": {
+                "non_whitelist_rate_limit": {
+                    "max_messages": 5,
+                    "window_seconds": 60
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit.private_chats.non_whitelist_rate_limit.max_messages,
+            1
+        );
+        assert_eq!(
+            explicit
+                .private_chats
+                .non_whitelist_rate_limit
+                .window_seconds,
+            120
+        );
+        assert_eq!(
+            explicit.group_chats.non_whitelist_rate_limit.max_messages,
+            5
+        );
+        assert_eq!(
+            explicit.group_chats.non_whitelist_rate_limit.window_seconds,
+            60
         );
     }
 
@@ -6682,9 +6798,23 @@ mod tests {
     fn platform_model_references_are_renamed_and_pruned() {
         let mut config = route_test_config();
         let old_provider = config.providers[0].id.clone();
+        config.platforms.qq.non_whitelist_text_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: old_provider.clone(),
+            model: "text-only".to_string(),
+        }]);
         config.platforms.qq.conversations.push(test_route(&config));
 
         config.rename_platform_provider_references(&old_provider, "renamed");
+        assert_eq!(
+            config
+                .platforms
+                .qq
+                .non_whitelist_text_models
+                .as_ref()
+                .unwrap()[0]
+                .provider_id,
+            "renamed"
+        );
         let route = &config.platforms.qq.conversations[0];
         assert_eq!(
             route.text_models.as_ref().unwrap()[0].provider_id,
@@ -6703,6 +6833,7 @@ mod tests {
         config.remove_active_model_references(&old_provider, "text-only");
         assert_eq!(config.platforms.qq.conversations.len(), 1);
         assert!(config.platforms.qq.conversations[0].text_models.is_none());
+        assert!(config.platforms.qq.non_whitelist_text_models.is_none());
     }
 
     #[test]
@@ -6722,6 +6853,10 @@ mod tests {
             provider_id: old_id.clone(),
             model: "text-only".to_string(),
         });
+        config.platforms.qq.non_whitelist_text_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: old_id.clone(),
+            model: "text-only".to_string(),
+        }]);
         config.platforms.qq.conversations.push(test_route(&config));
         config.plugins.vision.vision_provider_id = old_id.clone();
         config.plugins.vision.vision_model = "vision".to_string();
@@ -6742,6 +6877,16 @@ mod tests {
         );
         assert_eq!(config.subagent_tiers.cheap[0].provider_id, "renamed");
         assert_eq!(
+            config
+                .platforms
+                .qq
+                .non_whitelist_text_models
+                .as_ref()
+                .unwrap()[0]
+                .provider_id,
+            "renamed"
+        );
+        assert_eq!(
             config.platforms.qq.conversations[0]
                 .text_models
                 .as_ref()
@@ -6761,6 +6906,7 @@ mod tests {
         assert!(config.active_provider_models.is_none());
         assert!(config.active_multimodal_provider_models.is_none());
         assert!(config.subagent_tiers.cheap.is_empty());
+        assert!(config.platforms.qq.non_whitelist_text_models.is_none());
         assert_eq!(config.platforms.qq.conversations.len(), 1);
         assert!(config.platforms.qq.conversations[0].text_models.is_none());
         assert!(config.plugins.vision.vision_provider_id.is_empty());

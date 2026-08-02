@@ -140,13 +140,17 @@ impl ReplyProcessorPlugin {
             }
             "模式" | "mode" => {
                 let Some(value) = parts.next() else {
-                    return Ok(Self::command_response("用法：/回复处理 模式 <图片|转发>"));
+                    return Ok(Self::command_response(
+                        "用法：/回复处理 模式 <转图片|合并转发>",
+                    ));
                 };
                 if parts.next().is_some() {
-                    return Ok(Self::command_response("用法：/回复处理 模式 <图片|转发>"));
+                    return Ok(Self::command_response(
+                        "用法：/回复处理 模式 <转图片|合并转发>",
+                    ));
                 }
                 let Some(mode) = ReplyMode::parse(value) else {
-                    return Ok(Self::command_response("模式只能是“图片”或“转发”。"));
+                    return Ok(Self::command_response("模式只能是“转图片”或“合并转发”。"));
                 };
                 let mut overrides = Self::overrides(context)?.unwrap_or_default();
                 overrides.enabled = Some(true);
@@ -171,7 +175,7 @@ impl ReplyProcessorPlugin {
                 )))
             }
             _ => Ok(Self::command_response(
-                "用法：/回复处理 状态｜阈值 <数值|开|关>｜模式 <图片|转发>｜恢复默认",
+                "用法：/回复处理 状态｜阈值 <数值|开|关>｜模式 <转图片|合并转发>｜恢复默认",
             )),
         }
     }

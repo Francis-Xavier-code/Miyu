@@ -364,6 +364,14 @@ fn retain_configured_models(
         .chain(config.active_multimodal_provider_models.iter().flatten())
         .chain(config.platforms.qq.text_models.iter().flatten())
         .chain(config.platforms.qq.multimodal_models.iter().flatten())
+        .chain(
+            config
+                .platforms
+                .qq
+                .non_whitelist_text_models
+                .iter()
+                .flatten(),
+        )
         .chain(conversation_models)
         .chain(real_context_models.iter())
     {
@@ -752,12 +760,18 @@ mod tests {
             "route-text".to_string(),
             "route-vision".to_string(),
             "platform-text".to_string(),
+            "non-whitelist-text".to_string(),
             "context-text".to_string(),
         ]);
         config.platforms.qq.text_models = Some(vec![crate::config::ActiveProviderModelConfig {
             provider_id: provider_id.clone(),
             model: "platform-text".to_string(),
         }]);
+        config.platforms.qq.non_whitelist_text_models =
+            Some(vec![crate::config::ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: "non-whitelist-text".to_string(),
+            }]);
         let mut real_context = crate::config::PlatformPluginInstanceConfig::default();
         crate::config::merge_real_context_settings(
             &mut real_context,
@@ -804,6 +818,7 @@ mod tests {
                 ("route-text".to_string(), model(64_000)),
                 ("route-vision".to_string(), model(96_000)),
                 ("platform-text".to_string(), model(64_000)),
+                ("non-whitelist-text".to_string(), model(64_000)),
                 ("context-text".to_string(), model(64_000)),
                 ("unused-model".to_string(), model(32_000)),
             ]),
@@ -815,6 +830,7 @@ mod tests {
         assert!(retained.contains_key("route-text"));
         assert!(retained.contains_key("route-vision"));
         assert!(retained.contains_key("platform-text"));
+        assert!(retained.contains_key("non-whitelist-text"));
         assert!(retained.contains_key("context-text"));
         assert!(!retained.contains_key("unused-model"));
     }

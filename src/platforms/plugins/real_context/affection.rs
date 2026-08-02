@@ -1,7 +1,5 @@
 use super::store::{GroupKey, HistoryStore, RecentQuery};
-use crate::config::{
-    AppConfig, PlatformConversationKind, RealContextPluginSettings, REAL_CONTEXT_PLUGIN_ID,
-};
+use crate::config::{AppConfig, RealContextPluginSettings, REAL_CONTEXT_PLUGIN_ID};
 use crate::i18n::{agent_text as t, text_for, Locale};
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
@@ -188,7 +186,6 @@ pub(super) struct AffectionUpdateJob {
     group: GroupKey,
     scope: PlatformPluginScopeKey,
     profile_key: String,
-    conversation_id: String,
     sender_id: String,
     sender_name: String,
     current_text: String,
@@ -232,7 +229,6 @@ pub(super) fn update_job(
         group,
         scope,
         profile_key,
-        conversation_id: context.conversation.conversation_id.clone(),
         sender_id: context.sender_id.clone(),
         sender_name: bounded_single_line(&context.sender_display_name, MAX_NAME_CHARS),
         current_text: bounded_text(&event.text, MAX_UPDATE_TEXT_CHARS),
@@ -585,12 +581,7 @@ async fn run_update(job: AffectionUpdateJob) -> Result<()> {
     };
     let prompt = build_update_prompt(&job, &profile, level, &tags, &history);
     let mut config = job.config.clone();
-    let models = job.config.qq_text_model_pool(
-        PlatformConversationKind::Group,
-        &job.conversation_id,
-        job.settings.text_models.as_deref(),
-    );
-    if let Some(models) = models {
+    if let Some(models) = job.settings.text_models.as_deref() {
         config.active_provider_models = Some(models.to_vec());
     }
     let client = OpenAiCompatibleClient::from_config(&config, &job.paths)

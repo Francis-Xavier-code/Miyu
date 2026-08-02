@@ -1419,12 +1419,19 @@
     };
   }
 
-  const PLATFORM_MODEL_POOL_NAMES = ["text_models", "multimodal_models"];
+  const PLATFORM_MODEL_POOL_NAMES = ["text_models", "multimodal_models", "non_whitelist_text_models"];
 
   function forEachPlatformModelPool(callback) {
-    const routes = state.configDraft?.platforms?.qq?.conversations;
-    if (!Array.isArray(routes)) return;
-    for (const route of routes) {
+    const qq = state.configDraft?.platforms?.qq;
+    if (!qq || typeof qq !== "object") return;
+    for (const poolName of PLATFORM_MODEL_POOL_NAMES) {
+      if (Array.isArray(qq[poolName])) callback(qq, poolName, qq[poolName]);
+    }
+    const realContext = qq.plugins?.real_context?.settings;
+    if (Array.isArray(realContext?.text_models)) {
+      callback(realContext, "text_models", realContext.text_models);
+    }
+    for (const route of Array.isArray(qq.conversations) ? qq.conversations : []) {
       if (!route || typeof route !== "object") continue;
       for (const poolName of PLATFORM_MODEL_POOL_NAMES) {
         if (Array.isArray(route[poolName])) callback(route, poolName, route[poolName]);
@@ -1433,14 +1440,9 @@
   }
 
   function normalizePlatformModelRoutes() {
-    const qq = state.configDraft?.platforms?.qq;
-    if (!Array.isArray(qq?.conversations)) return;
-    for (const route of qq.conversations) {
-      if (!route || typeof route !== "object") continue;
-      for (const poolName of PLATFORM_MODEL_POOL_NAMES) {
-        if (Array.isArray(route[poolName]) && route[poolName].length === 0) delete route[poolName];
-      }
-    }
+    forEachPlatformModelPool((owner, poolName, pool) => {
+      if (pool.length === 0) delete owner[poolName];
+    });
   }
 
   function replacePlatformProviderReferences(previousId, nextId) {
@@ -2321,14 +2323,14 @@
     qq.private_chats = Object.assign({
       whitelist: [],
       allow_non_whitelist: true,
-      non_whitelist_rate_limit: { max_messages: 1, window_seconds: 180 }
+      non_whitelist_rate_limit: { max_messages: 2, window_seconds: 600 }
     }, qq.private_chats);
     qq.group_chats = Object.assign({
       whitelist: [],
       trigger_keywords: [],
       whitelist_rate_limit: { max_messages: 30, window_seconds: 60 },
       allow_non_whitelist: true,
-      non_whitelist_rate_limit: { max_messages: 10, window_seconds: 60 }
+      non_whitelist_rate_limit: { max_messages: 2, window_seconds: 600 }
     }, qq.group_chats);
     draft.platforms.qq = qq;
   }

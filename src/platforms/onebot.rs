@@ -1051,6 +1051,7 @@ struct Admission {
     allowed: bool,
     rate_key: Option<String>,
     rate_limit: PlatformRateLimit,
+    use_non_whitelist_text_models: bool,
 }
 
 fn admission_for(config: &OneBotConfig, target: Target, self_id: i64, user_id: i64) -> Admission {
@@ -1088,15 +1089,16 @@ fn admission_for_access(
                 )
         },
     );
-    if is_admin {
-        return Admission {
-            allowed: true,
-            rate_key: None,
-            rate_limit: PlatformRateLimit::default(),
-        };
-    }
     match target {
         Target::Private { user_id } => {
+            if is_admin {
+                return Admission {
+                    allowed: true,
+                    rate_key: None,
+                    rate_limit: PlatformRateLimit::default(),
+                    use_non_whitelist_text_models: false,
+                };
+            }
             let whitelisted = state.map_or_else(
                 || config.private_chats.whitelist.contains(&user_id),
                 |state| {
@@ -1114,12 +1116,14 @@ fn admission_for_access(
                     allowed: true,
                     rate_key: None,
                     rate_limit: PlatformRateLimit::default(),
+                    use_non_whitelist_text_models: false,
                 }
             } else {
                 Admission {
                     allowed: config.private_chats.allow_non_whitelist,
                     rate_key: Some(format!("qq:{self_id}:private:{user_id}")),
                     rate_limit: config.private_chats.non_whitelist_rate_limit,
+                    use_non_whitelist_text_models: true,
                 }
             }
         }
@@ -1137,6 +1141,14 @@ fn admission_for_access(
                         )
                 },
             );
+            if is_admin {
+                return Admission {
+                    allowed: true,
+                    rate_key: None,
+                    rate_limit: PlatformRateLimit::default(),
+                    use_non_whitelist_text_models: !whitelisted,
+                };
+            }
             let privileged = state.map_or_else(
                 || config.private_chats.whitelist.contains(&user_id),
                 |state| {
@@ -1157,9 +1169,30 @@ fn admission_for_access(
                 } else {
                     config.group_chats.non_whitelist_rate_limit
                 },
+                use_non_whitelist_text_models: !whitelisted,
             }
         }
     }
+}
+
+fn apply_admission_text_model_pool(
+    config: &mut crate::config::AppConfig,
+    target: Target,
+    admission: &Admission,
+) {
+    let kind = match target {
+        Target::Private { .. } => PlatformConversationKind::Private,
+        Target::Group { .. } => PlatformConversationKind::Group,
+    };
+    let conversation_id = target.conversation_id().to_string();
+    let models = config
+        .qq_text_model_pool(
+            kind,
+            &conversation_id,
+            admission.use_non_whitelist_text_models,
+        )
+        .map(<[_]>::to_vec);
+    config.active_provider_models = models;
 }
 
 #[derive(Default)]
@@ -1957,7 +1990,7 @@ async fn handle_message_with_activity(
     ingress_order: i64,
     activity: Option<InboundMessageActivity>,
 ) {
-    let app_config = state.manager.lock().unwrap().config.clone();
+    let mut app_config = state.manager.lock().unwrap().config.clone();
     let config = app_config.platforms.qq.clone();
     if !config.enabled {
         return;
@@ -1986,6 +2019,7 @@ async fn handle_message_with_activity(
     if !admission.allowed {
         return;
     }
+    apply_admission_text_model_pool(&mut app_config, target, &admission);
 
     let mut parsed = parse_message(event.get("message"), event.get("raw_message"), self_id);
     if let Some(reason) = parsed.rejected_reason {
@@ -3317,14 +3351,7 @@ async fn build_and_run_turn(
     system_context.extend(prepared.system_context);
     let profile = TurnProfile {
         active_persona: Some(context.config.prompt.active_persona.clone()),
-        text_models: context
-            .config
-            .qq_text_model_pool(
-                conversation_kind,
-                &context.conversation.conversation_id,
-                None,
-            )
-            .map(<[_]>::to_vec),
+        text_models: context.config.active_provider_models.clone(),
         multimodal_models: context
             .config
             .qq_multimodal_model_pool(conversation_kind, &context.conversation.conversation_id)
@@ -6718,28 +6745,42 @@ mod tests {
         let admin = admission_for(&config, Target::Group { group_id: 99 }, 100, 1);
         assert!(admin.allowed);
         assert!(admin.rate_key.is_none());
+        assert!(admin.use_non_whitelist_text_models);
+
+        let private_admin = admission_for(&config, Target::Private { user_id: 1 }, 100, 1);
+        assert!(private_admin.allowed);
+        assert!(!private_admin.use_non_whitelist_text_models);
 
         let private_whitelist = admission_for(&config, Target::Private { user_id: 2 }, 100, 2);
         assert!(private_whitelist.allowed);
         assert!(private_whitelist.rate_key.is_none());
+        assert!(!private_whitelist.use_non_whitelist_text_models);
 
         let private_guest = admission_for(&config, Target::Private { user_id: 3 }, 100, 3);
         assert!(private_guest.allowed);
-        assert_eq!(private_guest.rate_limit.max_messages, 1);
-        assert_eq!(private_guest.rate_limit.window_seconds, 120);
+        assert_eq!(private_guest.rate_limit.max_messages, 2);
+        assert_eq!(private_guest.rate_limit.window_seconds, 600);
         assert_eq!(private_guest.rate_key.as_deref(), Some("qq:100:private:3"));
+        assert!(private_guest.use_non_whitelist_text_models);
 
         let group_whitelist = admission_for(&config, Target::Group { group_id: 10 }, 100, 2);
         assert!(group_whitelist.allowed);
         assert_eq!(group_whitelist.rate_limit.max_messages, 30);
         assert_eq!(group_whitelist.rate_limit.window_seconds, 60);
         assert!(group_whitelist.rate_key.is_none());
+        assert!(!group_whitelist.use_non_whitelist_text_models);
 
         let group_guest = admission_for(&config, Target::Group { group_id: 11 }, 100, 3);
         assert!(group_guest.allowed);
-        assert_eq!(group_guest.rate_limit.max_messages, 5);
-        assert_eq!(group_guest.rate_limit.window_seconds, 60);
+        assert_eq!(group_guest.rate_limit.max_messages, 2);
+        assert_eq!(group_guest.rate_limit.window_seconds, 600);
         assert_eq!(group_guest.rate_key.as_deref(), Some("qq:100:group:11"));
+        assert!(group_guest.use_non_whitelist_text_models);
+
+        let privileged_group_guest = admission_for(&config, Target::Group { group_id: 11 }, 100, 2);
+        assert!(privileged_group_guest.allowed);
+        assert!(privileged_group_guest.rate_key.is_none());
+        assert!(privileged_group_guest.use_non_whitelist_text_models);
 
         config.private_chats.allow_non_whitelist = false;
         config.group_chats.allow_non_whitelist = false;
@@ -6749,6 +6790,41 @@ mod tests {
             admission_for(&config, Target::Group { group_id: 11 }, 100, 2);
         assert!(!privileged_disallowed_group.allowed);
         assert!(privileged_disallowed_group.rate_key.is_none());
+        assert!(privileged_disallowed_group.use_non_whitelist_text_models);
+    }
+
+    #[test]
+    fn admission_materializes_the_effective_text_model_pool() {
+        let mut base = crate::config::AppConfig::default();
+        let provider_id = base.providers[0].id.clone();
+        let pool = |model: &str| {
+            vec![crate::config::ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: model.to_string(),
+            }]
+        };
+        base.active_provider_models = Some(pool("global"));
+        base.platforms.qq.text_models = Some(pool("platform"));
+        base.platforms.qq.non_whitelist_text_models = Some(pool("non-whitelist"));
+        base.platforms.qq.admin_users.push(1);
+        base.platforms.qq.private_chats.whitelist.push(2);
+        base.platforms.qq.group_chats.whitelist.push(10);
+
+        for (target, user_id, expected) in [
+            (Target::Private { user_id: 1 }, 1, "platform"),
+            (Target::Private { user_id: 2 }, 2, "platform"),
+            (Target::Private { user_id: 3 }, 3, "non-whitelist"),
+            (Target::Group { group_id: 10 }, 3, "platform"),
+            (Target::Group { group_id: 11 }, 1, "non-whitelist"),
+        ] {
+            let mut config = base.clone();
+            let admission = admission_for(&config.platforms.qq, target, 100, user_id);
+            apply_admission_text_model_pool(&mut config, target, &admission);
+            assert_eq!(
+                config.active_provider_models.as_ref().unwrap()[0].model,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -6796,11 +6872,18 @@ mod tests {
             admission_for_with_state(&config, &state, Target::Group { group_id: 99 }, 999, 1);
         assert!(admin.allowed);
         assert!(admin.rate_key.is_none());
+        assert!(admin.use_non_whitelist_text_models);
+
+        let private_admin =
+            admission_for_with_state(&config, &state, Target::Private { user_id: 1 }, 999, 1);
+        assert!(private_admin.allowed);
+        assert!(!private_admin.use_non_whitelist_text_models);
 
         let private_whitelist =
             admission_for_with_state(&config, &state, Target::Private { user_id: 2 }, 999, 2);
         assert!(private_whitelist.allowed);
         assert!(private_whitelist.rate_key.is_none());
+        assert!(!private_whitelist.use_non_whitelist_text_models);
 
         let group_whitelist =
             admission_for_with_state(&config, &state, Target::Group { group_id: 10 }, 999, 3);
@@ -6810,6 +6893,7 @@ mod tests {
             config.group_chats.whitelist_rate_limit
         );
         assert_eq!(group_whitelist.rate_key.as_deref(), Some("qq:999:group:10"));
+        assert!(!group_whitelist.use_non_whitelist_text_models);
     }
 
     #[test]

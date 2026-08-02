@@ -1,5 +1,5 @@
 use super::store::HistoryMessage;
-use crate::config::{PlatformConversationKind, RealContextPluginSettings};
+use crate::config::RealContextPluginSettings;
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::platforms::PlatformTurnContext;
 use anyhow::{bail, Context, Result};
@@ -68,12 +68,7 @@ pub(super) async fn run(
     request: JudgeRequest<'_>,
 ) -> Result<JudgeResult> {
     let mut config = context.config.clone();
-    let models = context.config.qq_text_model_pool(
-        PlatformConversationKind::Group,
-        &context.conversation.conversation_id,
-        settings.text_models.as_deref(),
-    );
-    if let Some(models) = models {
+    if let Some(models) = settings.text_models.as_deref() {
         config.active_provider_models = Some(models.to_vec());
     }
     let timeout = if request.moderation_only {
