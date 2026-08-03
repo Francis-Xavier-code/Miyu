@@ -1826,10 +1826,8 @@ pub(crate) async fn run_platform_turn(
                 let suppression_start = platform_context
                     .as_ref()
                     .and_then(|context| context.take_final_reply_suppression_start(text.len()));
-                if data.get("ok").and_then(Value::as_bool) == Some(true) {
-                    if let Some(start) = suppression_start {
-                        reply_suppression.direct_send_succeeded(start);
-                    }
+                if let Some(start) = suppression_start {
+                    reply_suppression.direct_send_succeeded(start);
                 }
             }
             "queue.consumed" => reply_suppression.queued_prompt_consumed(),

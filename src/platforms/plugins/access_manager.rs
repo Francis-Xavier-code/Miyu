@@ -1,17 +1,12 @@
-use super::{
-    PlatformPlugin, PluginDescriptor, FIXED_OUTPUT_METADATA_KEY, SUPPRESS_FINAL_REPLY_METADATA_KEY,
-    SUPPRESS_PRIOR_REPLY_METADATA_KEY,
-};
+use super::{send_fixed_tool_output, PlatformPlugin, PluginDescriptor};
 use crate::platforms::access_control::{
-    global_grant_key, has_dynamic_access, AccessPermission, ONEBOT_PLATFORM,
+    administrator_authorization, global_grant_key, is_effective_admin, AccessPermission,
+    ONEBOT_PLATFORM,
 };
-use crate::platforms::{
-    ConversationKind, OutboundMessage, OutboundOrigin, PlatformInboundEventKind,
-    PlatformTurnContext,
-};
+use crate::platforms::{ConversationKind, PlatformInboundEventKind, PlatformTurnContext};
 use crate::state::{
-    PlatformAccessActor, PlatformAccessAuthorization, PlatformAccessGrant, PlatformAccessGrantKey,
-    PlatformAccessMutation, PlatformAccessMutationResult, GLOBAL_PLATFORM_ACCOUNT_SCOPE,
+    PlatformAccessActor, PlatformAccessGrant, PlatformAccessMutation, PlatformAccessMutationResult,
+    GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
@@ -102,7 +97,7 @@ async fn manage_access(arguments: Value, context: Arc<PlatformTurnContext>) -> R
             "操作失败".to_string()
         }
     };
-    send_access_output(&context, &response).await?;
+    send_fixed_tool_output(&context, &response).await?;
     Ok(json!({
         "ok": response != "操作失败",
         "message_sent": true,
@@ -182,7 +177,11 @@ fn apply_change(
                 &global_grant_key(permission, target_id_text),
                 actor,
                 operation,
-                &access_authorization(context, qq),
+                &administrator_authorization(
+                    qq,
+                    &context.conversation.account_id,
+                    &context.sender_id,
+                ),
             )?;
         match result {
             PlatformAccessMutationResult::Unauthorized => {
@@ -209,36 +208,13 @@ fn apply_change(
 
 fn effective_admin(context: &PlatformTurnContext) -> bool {
     context.with_current_config(|config| {
-        context.sender_id.parse::<i64>().ok().is_some_and(|sender| {
-            config.platforms.qq.admin_users.contains(&sender)
-                || has_dynamic_access(
-                    &context.state_store,
-                    &context.conversation.account_id,
-                    AccessPermission::Administrator,
-                    &context.sender_id,
-                )
-        })
+        is_effective_admin(
+            &config.platforms.qq,
+            &context.state_store,
+            &context.conversation.account_id,
+            &context.sender_id,
+        )
     })
-}
-
-fn access_authorization(
-    context: &PlatformTurnContext,
-    config: &crate::config::OneBotConfig,
-) -> PlatformAccessAuthorization {
-    PlatformAccessAuthorization {
-        statically_authorized: context
-            .sender_id
-            .parse::<i64>()
-            .ok()
-            .is_some_and(|sender| config.admin_users.contains(&sender)),
-        dynamic_key: PlatformAccessGrantKey {
-            platform: ONEBOT_PLATFORM.to_string(),
-            account_scope: context.conversation.account_id.clone(),
-            permission: AccessPermission::Administrator.as_str().to_string(),
-            subject_kind: AccessPermission::Administrator.subject_kind().to_string(),
-            subject_id: context.sender_id.clone(),
-        },
-    }
 }
 
 fn access_actor(context: &PlatformTurnContext) -> Result<PlatformAccessActor> {
@@ -395,7 +371,11 @@ fn format_access_list(
             .state_store
             .platform_access_grants_if_authorized(
                 ONEBOT_PLATFORM,
-                &access_authorization(context, qq),
+                &administrator_authorization(
+                    qq,
+                    &context.conversation.account_id,
+                    &context.sender_id,
+                ),
             )?
             .context("the requesting user is no longer a Miyu administrator")?;
         Ok((qq.clone(), grants))
@@ -490,23 +470,6 @@ fn join_ids(ids: &[i64]) -> String {
         .join("、")
 }
 
-async fn send_access_output(context: &PlatformTurnContext, text: &str) -> Result<()> {
-    let mut message = OutboundMessage::text(OutboundOrigin::Tool, text);
-    message
-        .metadata
-        .insert(FIXED_OUTPUT_METADATA_KEY.to_string(), Value::Bool(true));
-    message.metadata.insert(
-        SUPPRESS_FINAL_REPLY_METADATA_KEY.to_string(),
-        Value::Bool(true),
-    );
-    message.metadata.insert(
-        SUPPRESS_PRIOR_REPLY_METADATA_KEY.to_string(),
-        Value::Bool(true),
-    );
-    context.send(message).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,8 +477,8 @@ mod tests {
     use crate::paths::MiyuPaths;
     use crate::platforms::plugins::PlatformPluginRegistry;
     use crate::platforms::{
-        OutboundBody, OutboundSegment, PlatformAdapter, PlatformConversation, PlatformInboundEvent,
-        SendReceipt,
+        OutboundBody, OutboundMessage, OutboundSegment, PlatformAdapter, PlatformConversation,
+        PlatformInboundEvent, SendReceipt,
     };
     use crate::state::StateStore;
     use futures_util::future::BoxFuture;

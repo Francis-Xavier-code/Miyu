@@ -15,6 +15,10 @@ use crate::llm::{
 };
 use crate::paths::MiyuPaths;
 use crate::platforms::commands::{self, PlatformCommandDescriptor};
+use crate::platforms::plugins::{
+    active_judgement_skip_ids, apply_active_judgement_skip_editor_changes,
+};
+use crate::state::StateStore;
 use anyhow::{bail, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
@@ -3169,7 +3173,9 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                 21 if matches!(key, KeyCode::Enter) => {
                     select_platform_model_routes(stdout, paths, config)?
                 }
-                22 if matches!(key, KeyCode::Enter) => select_platform_plugins(stdout, config)?,
+                22 if matches!(key, KeyCode::Enter) => {
+                    select_platform_plugins(stdout, paths, config)?
+                }
                 23 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
                 _ => {}
             },
@@ -4223,7 +4229,11 @@ impl Default for ReplyProcessorSettingsForm {
     }
 }
 
-fn select_platform_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+fn select_platform_plugins(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let reply_enabled = config
@@ -4289,7 +4299,7 @@ fn select_platform_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> R
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
             KeyCode::Enter => match selected {
                 0 => edit_reply_processor(stdout, config)?,
-                1 => edit_real_context(stdout, config)?,
+                1 => edit_real_context(stdout, paths, config)?,
                 2 => edit_meme_collector(stdout, config)?,
                 _ => {}
             },
@@ -4383,7 +4393,11 @@ fn apply_real_context_values(
     merge_real_context_settings(instance, settings);
 }
 
-fn edit_real_context(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+fn edit_real_context(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &mut AppConfig,
+) -> Result<()> {
     let (mut enabled, mut settings) = real_context_values(config)?;
     let mut selected = 0usize;
     loop {
@@ -4447,7 +4461,16 @@ fn edit_real_context(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<
                     |candidate, value| candidate.context_messages = value,
                 )?,
                 3 => edit_real_context_history(stdout, &mut settings)?,
-                4 => edit_real_context_active_reply(stdout, config, &mut settings)?,
+                4 => match StateStore::new(paths) {
+                    Ok(state) => edit_real_context_active_reply(stdout, &state, &mut settings)?,
+                    Err(error) => message(
+                        stdout,
+                        &format!(
+                            "{}: {error}",
+                            t("Unable to open persistent state", "无法打开持久状态数据库")
+                        ),
+                    )?,
+                },
                 5 => edit_real_context_reply_target(stdout, &mut settings)?,
                 6 => edit_real_context_moderation(stdout, &mut settings)?,
                 7 => edit_real_context_affection(stdout, config, &mut settings)?,
@@ -4538,11 +4561,14 @@ fn edit_real_context_history(
 
 fn edit_real_context_active_reply(
     stdout: &mut io::Stdout,
-    _config: &AppConfig,
+    state: &StateStore,
     settings: &mut RealContextPluginSettings,
 ) -> Result<()> {
     let mut selected = 0usize;
     loop {
+        let skip_list_summary = active_judgement_skip_ids(state)
+            .map(|ids| ids.len().to_string())
+            .unwrap_or_else(|_| t("unavailable", "不可用").to_string());
         let options = vec![
             format!(
                 "{}: {}",
@@ -4577,6 +4603,11 @@ fn edit_real_context_active_reply(
                 "{}: {}",
                 t("Skip image-only messages", "跳过纯图片消息"),
                 boolean_label(settings.skip_pure_image_active_judge)
+            ),
+            format!(
+                "{}: {}",
+                t("QQ ids that skip active judgement", "跳过主动判断的 QQ 号"),
+                skip_list_summary
             ),
             format!(
                 "{}: {}",
@@ -4664,6 +4695,9 @@ fn edit_real_context_active_reply(
                     )?
                 }
                 6 => {
+                    edit_active_judgement_skip_ids(stdout, state)?;
+                }
+                7 => {
                     settings.active_reply_supersede_enable = select_bool(
                         stdout,
                         t(
@@ -4673,43 +4707,82 @@ fn edit_real_context_active_reply(
                         settings.active_reply_supersede_enable,
                     )?
                 }
-                7 => edit_real_context_number(
+                8 => edit_real_context_number(
                     stdout,
                     t("Supersede window (seconds)", "覆盖窗口（秒）"),
                     settings.active_reply_supersede_window_seconds,
                     settings,
                     |candidate, value| candidate.active_reply_supersede_window_seconds = value,
                 )?,
-                8 => {
+                9 => {
                     settings.reply_restraint_enable = select_bool(
                         stdout,
                         t("Reply restraint", "回复克制"),
                         settings.reply_restraint_enable,
                     )?
                 }
-                9 => edit_real_context_number(
+                10 => edit_real_context_number(
                     stdout,
                     t("Restraint recovery (minutes)", "克制恢复时间（分钟）"),
                     settings.reply_restraint_recover_minutes,
                     settings,
                     |candidate, value| candidate.reply_restraint_recover_minutes = value,
                 )?,
-                10 => edit_real_context_restraint_strength(stdout, settings)?,
-                11 => edit_real_context_number(
+                11 => edit_real_context_restraint_strength(stdout, settings)?,
+                12 => edit_real_context_number(
                     stdout,
                     t("Restraint multiplier", "克制倍率"),
                     settings.reply_restraint_multiplier,
                     settings,
                     |candidate, value| candidate.reply_restraint_multiplier = value,
                 )?,
-                12 => edit_real_context_continuation(stdout, settings)?,
-                13 => edit_real_context_triggers(stdout, settings)?,
-                14 => edit_real_context_judge_advanced(stdout, settings)?,
+                13 => edit_real_context_continuation(stdout, settings)?,
+                14 => edit_real_context_triggers(stdout, settings)?,
+                15 => edit_real_context_judge_advanced(stdout, settings)?,
                 _ => {}
             },
             _ => {}
         }
     }
+}
+
+fn edit_active_judgement_skip_ids(stdout: &mut io::Stdout, state: &StateStore) -> Result<()> {
+    let original = match active_judgement_skip_ids(state) {
+        Ok(ids) => ids,
+        Err(error) => {
+            message(
+                stdout,
+                &format!(
+                    "{}: {error}",
+                    t(
+                        "Unable to read the active judgement skip list",
+                        "无法读取主动判断跳过名单"
+                    )
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let mut edited = original.clone();
+    edit_qq_id_list(
+        stdout,
+        t(" ACTIVE JUDGEMENT SKIP QQ IDS ", " 跳过主动判断的 QQ 号 "),
+        t("QQ id", "QQ 号"),
+        &mut edited,
+    )?;
+    if let Err(error) = apply_active_judgement_skip_editor_changes(state, &original, &edited) {
+        message(
+            stdout,
+            &format!(
+                "{}: {error}",
+                t(
+                    "Unable to update the active judgement skip list",
+                    "无法更新主动判断跳过名单"
+                )
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn edit_real_context_restraint_strength(
@@ -7141,6 +7214,8 @@ fn draw_menu(
         .max(7);
     let x = cols.saturating_sub(width) / 2;
     let y = rows.saturating_sub(height) / 2;
+    let visible_rows = height.saturating_sub(4).max(1) as usize;
+    let window = menu_window(options.len(), selected, visible_rows);
 
     queue!(stdout, Clear(ClearType::All))?;
     draw_box(stdout, x, y, width, height, title)?;
@@ -7154,8 +7229,9 @@ fn draw_menu(
         )),
         SetAttribute(Attribute::Reset)
     )?;
-    for (index, option) in options.iter().enumerate() {
-        queue!(stdout, MoveTo(x + 2, y + index as u16 + 2))?;
+    for (row, index) in window.enumerate() {
+        let option = &options[index];
+        queue!(stdout, MoveTo(x + 2, y + row as u16 + 2))?;
         if index == selected {
             queue!(
                 stdout,
@@ -7169,6 +7245,18 @@ fn draw_menu(
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn menu_window(item_count: usize, selected: usize, visible_rows: usize) -> std::ops::Range<usize> {
+    if item_count == 0 || visible_rows == 0 {
+        return 0..0;
+    }
+    let visible_rows = visible_rows.min(item_count);
+    let selected = selected.min(item_count - 1);
+    let start = selected
+        .saturating_sub(visible_rows / 2)
+        .min(item_count - visible_rows);
+    start..start + visible_rows
 }
 
 fn menu_help(status: &str) -> &str {
@@ -7688,14 +7776,14 @@ impl Field {
 mod tests {
     use super::{
         apply_real_context_values, apply_reply_processor_values, choice_display_label,
-        field_display_value, language_choice_label, language_choice_value, parse_extra_body,
-        parse_id_lines, parse_id_list, parse_keyword_lines, parse_real_context_identity_lines,
-        parse_real_context_string_lines, platform_conversation_id_label,
-        platform_conversation_kind_label, platform_persona_summary, real_context_values,
-        reply_processor_mode_label, reply_processor_mode_value, reply_processor_values,
-        route_pool_summary, t, thinking_variant_field, validate_reply_processor_settings,
-        vision_provider_model_choice_values, Field, PersonaMenuTarget, ReplyProcessorSettingsForm,
-        REPLY_PROCESSOR_PLUGIN_ID,
+        field_display_value, language_choice_label, language_choice_value, menu_window,
+        parse_extra_body, parse_id_lines, parse_id_list, parse_keyword_lines,
+        parse_real_context_identity_lines, parse_real_context_string_lines,
+        platform_conversation_id_label, platform_conversation_kind_label, platform_persona_summary,
+        real_context_values, reply_processor_mode_label, reply_processor_mode_value,
+        reply_processor_values, route_pool_summary, t, thinking_variant_field,
+        validate_reply_processor_settings, vision_provider_model_choice_values, Field,
+        PersonaMenuTarget, ReplyProcessorSettingsForm, REPLY_PROCESSOR_PLUGIN_ID,
     };
     use crate::config::{
         AppConfig, PlatformConversationKind, PlatformModelPoolInheritance, PlatformPersonaOverride,
@@ -7808,6 +7896,15 @@ mod tests {
             assert_eq!(language_choice_value(value), Some("zh"));
         }
         assert_eq!(language_choice_value("unsupported"), None);
+    }
+
+    #[test]
+    fn menu_window_keeps_selection_visible_for_long_lists() {
+        assert_eq!(menu_window(100, 0, 5), 0..5);
+        assert_eq!(menu_window(100, 50, 5), 48..53);
+        assert_eq!(menu_window(100, 99, 5), 95..100);
+        assert_eq!(menu_window(3, 2, 10), 0..3);
+        assert_eq!(menu_window(0, 0, 5), 0..0);
     }
 
     #[test]

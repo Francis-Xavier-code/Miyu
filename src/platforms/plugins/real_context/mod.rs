@@ -1,3 +1,4 @@
+pub(super) mod active_judgement_skip;
 mod affection;
 mod judge;
 mod store;
@@ -225,8 +226,26 @@ impl RealContextPlugin {
                         .whitelist
                         .contains(&sender_id)
                 });
-        let active_judgement_allowed =
-            active_judgement_allowed(settings, system_triggered, privileged_sender);
+        let active_judgement_without_skip =
+            active_judgement_allowed(settings, system_triggered, privileged_sender, false);
+        let skip_active_judgement = active_judgement_without_skip
+            && match active_judgement_skip::contains(&context.state_store, &event.sender_id) {
+                Ok(skip) => skip,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "miyu::qq",
+                        error = %error,
+                        sender_id = %event.sender_id,
+                        "{}",
+                        crate::i18n::text(
+                            "failed to read active judgement skip list; skipping social judgement",
+                            "读取主动判断跳过名单失败；跳过社交主动判断"
+                        )
+                    );
+                    true
+                }
+            };
+        let active_judgement_allowed = active_judgement_without_skip && !skip_active_judgement;
         if !active_judgement_allowed && !moderation_candidate {
             if system_triggered
                 && context.bot_send_availability().await == BotSendAvailability::Muted
@@ -323,17 +342,14 @@ impl RealContextPlugin {
         // still restores the original core trigger below, but the safety
         // check should not spend a full social-reply score or accidentally
         // turn a keyword hit into an unsolicited response.
-        let trigger = if moderation_candidate && !active_judgement_allowed {
-            Some(TriggerKind::Moderation)
-        } else {
-            select_trigger(
-                system_triggered,
-                moderation_candidate,
-                inherited,
-                continuation,
-                probabilistic,
-            )
-        };
+        let trigger = select_trigger_for_policy(
+            active_judgement_allowed,
+            system_triggered,
+            moderation_candidate,
+            inherited,
+            continuation,
+            probabilistic,
+        );
         decision.should_reply = false;
         let Some(trigger) = trigger else {
             return Ok(());
@@ -1004,20 +1020,54 @@ impl PlatformPlugin for RealContextPlugin {
             return Ok(false);
         }
         let now = Instant::now();
-        let runtime = self.runtime.lock().unwrap();
-        let pending = runtime
-            .sessions
-            .get(&runtime_session_key(context))
-            .and_then(|session| session.pending.get(&event.sender_id));
-        let Some(pending) = pending else {
+        let session_key = runtime_session_key(context);
+        let supersede_window = Duration::from_secs(settings.active_reply_supersede_window_seconds);
+        let generation = {
+            let runtime = self.runtime.lock().unwrap();
+            let pending = runtime
+                .sessions
+                .get(&session_key)
+                .and_then(|session| session.pending.get(&event.sender_id));
+            let Some(pending) =
+                pending.filter(|pending| now.duration_since(pending.started) <= supersede_window)
+            else {
+                return Ok(false);
+            };
+            pending.generation
+        };
+        match active_judgement_skip::contains(&context.state_store, &event.sender_id) {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "miyu::qq",
+                    error = %error,
+                    sender_id = %event.sender_id,
+                    "{}",
+                    crate::i18n::text(
+                        "failed to read active judgement skip list; skipping supersede",
+                        "读取主动判断跳过名单失败；跳过接管当前生成"
+                    )
+                );
+                return Ok(false);
+            }
+        }
+        let targets = {
+            let runtime = self.runtime.lock().unwrap();
+            runtime
+                .sessions
+                .get(&session_key)
+                .and_then(|session| session.pending.get(&event.sender_id))
+                .filter(|pending| {
+                    pending.generation == generation
+                        && Instant::now().duration_since(pending.started) <= supersede_window
+                })
+                .map(|pending| pending.targets.clone())
+        };
+        let Some(targets) = targets else {
             return Ok(false);
         };
-        if now.duration_since(pending.started)
-            > Duration::from_secs(settings.active_reply_supersede_window_seconds)
-        {
-            return Ok(false);
-        }
-        set_active_targets(context, &pending.targets);
+        set_active_targets(context, &targets);
         Ok(true)
     }
 
@@ -1086,6 +1136,7 @@ impl PlatformPlugin for RealContextPlugin {
         context: Arc<PlatformTurnContext>,
     ) -> Result<()> {
         let settings = self.settings(&context)?;
+        active_judgement_skip::register_tools(registry, context.clone());
         tools::register(
             registry,
             context.clone(),
@@ -1720,12 +1771,35 @@ fn select_trigger(
     }
 }
 
+fn select_trigger_for_policy(
+    active_judgement_allowed: bool,
+    system_triggered: bool,
+    moderation_candidate: bool,
+    inherited: bool,
+    continuation: bool,
+    probabilistic: bool,
+) -> Option<TriggerKind> {
+    if moderation_candidate && !active_judgement_allowed {
+        Some(TriggerKind::Moderation)
+    } else {
+        select_trigger(
+            system_triggered,
+            moderation_candidate,
+            inherited,
+            continuation,
+            probabilistic,
+        )
+    }
+}
+
 fn active_judgement_allowed(
     settings: &RealContextPluginSettings,
     direct_triggered: bool,
     privileged_sender: bool,
+    skip_active_judgement: bool,
 ) -> bool {
     settings.active_reply_enable
+        && !skip_active_judgement
         && (!direct_triggered
             || settings.takeover_direct_trigger_enable
                 && !(privileged_sender && settings.privileged_direct_trigger_skip_active_judgement))
@@ -2843,15 +2917,29 @@ mod tests {
     #[test]
     fn direct_trigger_judgement_respects_takeover_and_privileged_bypass() {
         let mut settings = RealContextPluginSettings::default();
-        assert!(!active_judgement_allowed(&settings, true, false));
-        assert!(active_judgement_allowed(&settings, false, false));
+        assert!(!active_judgement_allowed(&settings, true, false, false));
+        assert!(active_judgement_allowed(&settings, false, false, false));
 
         settings.takeover_direct_trigger_enable = true;
-        assert!(active_judgement_allowed(&settings, true, false));
-        assert!(!active_judgement_allowed(&settings, true, true));
+        assert!(active_judgement_allowed(&settings, true, false, false));
+        assert!(!active_judgement_allowed(&settings, true, true, false));
 
         settings.privileged_direct_trigger_skip_active_judgement = false;
-        assert!(active_judgement_allowed(&settings, true, true));
+        assert!(active_judgement_allowed(&settings, true, true, false));
+        assert!(!active_judgement_allowed(&settings, false, false, true));
+        assert!(!active_judgement_allowed(&settings, true, true, true));
+    }
+
+    #[test]
+    fn skipped_social_judgement_preserves_moderation_only_trigger() {
+        assert_eq!(
+            select_trigger_for_policy(false, true, true, true, true, true),
+            Some(TriggerKind::Moderation)
+        );
+        assert_eq!(
+            select_trigger_for_policy(true, true, true, true, true, true),
+            Some(TriggerKind::Direct)
+        );
     }
 
     #[test]
@@ -3329,6 +3417,14 @@ mod tests {
         let inherited = active_targets_from_context(&context);
         assert_eq!(inherited.len(), 1);
         assert_eq!(inherited[0].sender_id, event.sender_id);
+
+        active_judgement_skip::apply_active_judgement_skip_editor_changes(
+            &context.state_store,
+            &[],
+            &[event.sender_id.parse().unwrap()],
+        )
+        .unwrap();
+        assert!(!plugin.preempt_inbound(&context, &event).unwrap());
 
         let mut other = event.clone();
         other.sender_id = "other-user".to_string();

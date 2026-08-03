@@ -1268,6 +1268,61 @@ impl ConversationDb {
             .transpose()
     }
 
+    pub fn plugin_json_revision(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT updated_at FROM platform_plugin_kv
+             WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+               AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+            params![
+                scope.plugin_id,
+                scope.platform,
+                scope.account_id,
+                scope.conversation_kind,
+                scope.conversation_id,
+                key,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn plugin_get_json_with_revision<T: DeserializeOwned>(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+    ) -> Result<Option<(T, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT value_json, updated_at FROM platform_plugin_kv
+                 WHERE plugin_id = ?1 AND platform = ?2 AND account_id = ?3
+                   AND conversation_kind = ?4 AND conversation_id = ?5 AND key = ?6",
+                params![
+                    scope.plugin_id,
+                    scope.platform,
+                    scope.account_id,
+                    scope.conversation_kind,
+                    scope.conversation_id,
+                    key,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        drop(conn);
+        row.map(|(value, revision)| {
+            serde_json::from_str(&value)
+                .context("invalid platform plugin JSON state")
+                .map(|value| (value, revision))
+        })
+        .transpose()
+    }
+
     pub fn plugin_put_json<T: Serialize + ?Sized>(
         &self,
         scope: &PlatformPluginScopeKey,

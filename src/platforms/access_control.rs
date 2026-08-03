@@ -1,5 +1,7 @@
 use crate::config::OneBotConfig;
-use crate::state::{StateStore, GLOBAL_PLATFORM_ACCOUNT_SCOPE};
+use crate::state::{
+    PlatformAccessAuthorization, PlatformAccessGrantKey, StateStore, GLOBAL_PLATFORM_ACCOUNT_SCOPE,
+};
 
 pub(crate) const ONEBOT_PLATFORM: &str = "onebot";
 pub(crate) const USER_SUBJECT: &str = "user";
@@ -67,6 +69,38 @@ pub(crate) fn has_dynamic_access(
         permission.subject_kind(),
         target_id,
     )
+}
+
+pub(crate) fn is_effective_admin(
+    config: &OneBotConfig,
+    state: &StateStore,
+    account_id: &str,
+    user_id: &str,
+) -> bool {
+    user_id.parse::<i64>().ok().is_some_and(|numeric_user_id| {
+        config.admin_users.contains(&numeric_user_id)
+            || has_dynamic_access(state, account_id, AccessPermission::Administrator, user_id)
+    })
+}
+
+pub(crate) fn administrator_authorization(
+    config: &OneBotConfig,
+    account_id: &str,
+    user_id: &str,
+) -> PlatformAccessAuthorization {
+    PlatformAccessAuthorization {
+        statically_authorized: user_id
+            .parse::<i64>()
+            .ok()
+            .is_some_and(|user_id| config.admin_users.contains(&user_id)),
+        dynamic_key: PlatformAccessGrantKey {
+            platform: ONEBOT_PLATFORM.to_string(),
+            account_scope: account_id.to_string(),
+            permission: AccessPermission::Administrator.as_str().to_string(),
+            subject_kind: AccessPermission::Administrator.subject_kind().to_string(),
+            subject_id: user_id.to_string(),
+        },
+    }
 }
 
 pub(crate) fn global_grant_key(

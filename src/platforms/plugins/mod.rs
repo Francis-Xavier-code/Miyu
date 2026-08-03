@@ -1,6 +1,6 @@
 use super::types::{
-    OutboundMessage, PlatformContextImageRef, PlatformConversation, PlatformInboundEvent,
-    SendReceipt, TriggerDecision,
+    OutboundMessage, OutboundOrigin, PlatformContextImageRef, PlatformConversation,
+    PlatformInboundEvent, SendReceipt, TriggerDecision,
 };
 use super::PlatformTurnContext;
 use crate::config::AppConfig;
@@ -16,6 +16,23 @@ pub(super) const FIXED_OUTPUT_METADATA_KEY: &str = "platform.fixed_output";
 pub(super) const SUPPRESS_FINAL_REPLY_METADATA_KEY: &str = "platform.suppress_final_reply";
 pub(super) const SUPPRESS_PRIOR_REPLY_METADATA_KEY: &str = "platform.suppress_prior_reply";
 
+async fn send_fixed_tool_output(context: &PlatformTurnContext, text: &str) -> Result<()> {
+    let mut message = OutboundMessage::text(OutboundOrigin::Tool, text);
+    message
+        .metadata
+        .insert(FIXED_OUTPUT_METADATA_KEY.to_string(), Value::Bool(true));
+    message.metadata.insert(
+        SUPPRESS_FINAL_REPLY_METADATA_KEY.to_string(),
+        Value::Bool(true),
+    );
+    message.metadata.insert(
+        SUPPRESS_PRIOR_REPLY_METADATA_KEY.to_string(),
+        Value::Bool(true),
+    );
+    context.send(message).await?;
+    Ok(())
+}
+
 mod access_manager;
 mod group_management;
 mod meme_collector;
@@ -24,6 +41,9 @@ mod real_context;
 mod renderer;
 mod reply_processor;
 
+pub(crate) use real_context::active_judgement_skip::{
+    active_judgement_skip_ids, apply_active_judgement_skip_editor_changes,
+};
 pub(crate) use renderer::{renderer_worker_requested, run_renderer_worker};
 
 #[derive(Clone, Copy, Debug)]

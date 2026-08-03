@@ -194,6 +194,10 @@ impl StateStore {
         self.session_id.read().unwrap().clone()
     }
 
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     fn session(&self) -> Arc<str> {
         self.session_id.read().unwrap().clone()
     }
@@ -332,6 +336,20 @@ impl StateStore {
                 }
             }
         }
+    }
+
+    /// Runs an operation while holding the platform-access mutation lock.
+    /// The callback must not call another access-control mutation method.
+    pub(crate) fn with_platform_access_authorization<T>(
+        &self,
+        authorization: &PlatformAccessAuthorization,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let _mutation = self.platform_access.mutations.lock().unwrap();
+        if !self.platform_access_authorized(authorization) {
+            return Ok(None);
+        }
+        operation().map(Some)
     }
 
     pub fn add_platform_access_grant(
@@ -539,6 +557,22 @@ impl StateStore {
         key: &str,
     ) -> Result<Option<T>> {
         self.conv_db.plugin_get_json(scope, key)
+    }
+
+    pub(crate) fn plugin_json_revision(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+    ) -> Result<Option<String>> {
+        self.conv_db.plugin_json_revision(scope, key)
+    }
+
+    pub(crate) fn plugin_get_json_with_revision<T: serde::de::DeserializeOwned>(
+        &self,
+        scope: &PlatformPluginScopeKey,
+        key: &str,
+    ) -> Result<Option<(T, String)>> {
+        self.conv_db.plugin_get_json_with_revision(scope, key)
     }
 
     pub fn plugin_put_json<T: Serialize + ?Sized>(
