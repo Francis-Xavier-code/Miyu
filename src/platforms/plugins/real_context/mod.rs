@@ -1,9 +1,8 @@
 pub(super) mod active_judgement_skip;
 mod affection;
 mod judge;
-mod store;
-mod tools;
 
+use super::message_history::{self, store, ORIGINAL_TEXT_KEY};
 use super::{
     PlatformPersonaResetContext, PlatformPlugin, PlatformTurnInput, PluginDescriptor, PreparedSend,
 };
@@ -23,22 +22,20 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::{
-    AccountKey, GroupKey, HistoryMessage, HistoryStore, MediaKind, MediaPlaceholder,
-    NewHistoryMessage, NewRecall, RecentQuery, SanitizedContent,
+    AccountKey, GroupKey, HistoryMessage, HistoryStore, MediaKind, MediaPlaceholder, RecentQuery,
 };
+#[cfg(test)]
+use store::{NewHistoryMessage, SanitizedContent};
 use tokio::sync::Notify;
 
-const ORIGINAL_TEXT_KEY: &str = "real_context.original_text";
 const TRIGGER_KEY: &str = "real_context.trigger";
 const MODERATION_NOTICE_KEY: &str = "real_context.moderation_notice";
 const REPLY_MARKED_KEY: &str = "real_context.reply_marked";
 const ACTIVE_TARGETS_KEY: &str = "real_context.active_targets";
-const HISTORY_DB: &str = "platforms/onebot/real_context/history.sqlite3";
 const SESSION_STATE_SOFT_LIMIT: usize = 512;
 const SESSION_STATE_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const PENDING_REPLY_TTL: Duration = Duration::from_secs(31 * 60);
@@ -50,7 +47,6 @@ const MAX_CONTEXT_IMAGE_REFS: usize = 8;
 const MAX_CONTEXT_IMAGES_PER_MESSAGE: usize = 4;
 
 pub(super) struct RealContextPlugin {
-    stores: Mutex<HashMap<PathBuf, HistoryStore>>,
     settings_cache: Mutex<
         Option<(
             Option<PlatformPluginInstanceConfig>,
@@ -59,7 +55,6 @@ pub(super) struct RealContextPlugin {
     >,
     runtime: Mutex<RuntimeState>,
     global_judge_gate: DynamicGate,
-    delete_confirmations: tools::DeleteConfirmations,
     reaction_expirations: Mutex<HashMap<(String, String, String), tokio::task::AbortHandle>>,
     affection_updates: affection::AffectionUpdateQueue,
 }
@@ -67,11 +62,9 @@ pub(super) struct RealContextPlugin {
 impl RealContextPlugin {
     pub(super) fn new() -> Self {
         Self {
-            stores: Mutex::new(HashMap::new()),
             settings_cache: Mutex::new(None),
             runtime: Mutex::new(RuntimeState::default()),
             global_judge_gate: DynamicGate::default(),
-            delete_confirmations: tools::DeleteConfirmations::default(),
             reaction_expirations: Mutex::new(HashMap::new()),
             affection_updates: affection::AffectionUpdateQueue::default(),
         }
@@ -101,78 +94,7 @@ impl RealContextPlugin {
     }
 
     fn store(&self, context: &PlatformTurnContext) -> HistoryStore {
-        self.store_for_paths(&context.paths)
-    }
-
-    fn store_for_paths(&self, paths: &crate::paths::MiyuPaths) -> HistoryStore {
-        let path = paths.data_dir.join(HISTORY_DB);
-        let mut stores = self.stores.lock().unwrap();
-        stores
-            .entry(path.clone())
-            .or_insert_with(|| HistoryStore::new(path))
-            .clone()
-    }
-
-    async fn record_inbound(
-        &self,
-        context: &PlatformTurnContext,
-        event: &PlatformInboundEvent,
-        settings: &RealContextPluginSettings,
-    ) -> Result<()> {
-        if !settings.record_enable || event.conversation.kind != ConversationKind::Group {
-            return Ok(());
-        }
-        let group = group_key(context)?;
-        let store = self.store(context);
-        match event.kind {
-            PlatformInboundEventKind::Message => {
-                let media = if settings.record_media_mode == "off" {
-                    Vec::new()
-                } else {
-                    event
-                        .media
-                        .iter()
-                        .map(|media| {
-                            MediaPlaceholder::new(
-                                media_kind(media.kind),
-                                (settings.record_media_mode == "metadata")
-                                    .then(|| media.name.clone().or_else(|| media.id.clone()))
-                                    .flatten(),
-                                None::<String>,
-                            )
-                        })
-                        .collect()
-                };
-                let mut content = SanitizedContent::new(event.text.clone(), media);
-                content.mentioned_user_ids = event.mentioned_user_ids.clone();
-                content.mentioned_users = event.mentioned_users.clone();
-                store
-                    .record_message(NewHistoryMessage {
-                        group,
-                        message_id: event.message_id.clone(),
-                        sender_id: event.sender_id.clone(),
-                        sender_name: event.sender_display_name.clone(),
-                        content,
-                        reply_to_message_id: event.reply_to_message_id.clone(),
-                        is_bot: false,
-                        sent_at: normalized_timestamp(event.timestamp),
-                        ingress_order: event.ingress_order,
-                    })
-                    .await?;
-            }
-            PlatformInboundEventKind::MessageRecall => {
-                store
-                    .record_recall(NewRecall {
-                        group,
-                        message_id: event.message_id.clone(),
-                        operator_id: event.operator_id.clone(),
-                        recalled_at: normalized_timestamp(event.timestamp),
-                    })
-                    .await?;
-            }
-            PlatformInboundEventKind::GroupBan | PlatformInboundEventKind::GroupDecrease => {}
-        }
-        Ok(())
+        message_history::store_for_paths(&context.paths)
     }
 
     async fn decide_group_trigger(
@@ -892,74 +814,6 @@ impl RealContextPlugin {
         Ok(())
     }
 
-    async fn record_bot_message(
-        &self,
-        context: &PlatformTurnContext,
-        message: &OutboundMessage,
-        receipt: &SendReceipt,
-        settings: &RealContextPluginSettings,
-    ) -> Result<()> {
-        if !settings.record_enable || context.conversation.kind != ConversationKind::Group {
-            return Ok(());
-        }
-        let text = message
-            .metadata
-            .get(ORIGINAL_TEXT_KEY)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| outbound_text(message));
-        let media = outbound_media(message);
-        if text.trim().is_empty() && media.is_empty() {
-            return Ok(());
-        }
-        let timestamp = now_unix();
-        let message_id = receipt
-            .message_ids
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("miyu-{timestamp}-{:08x}", rand::random::<u32>()));
-        let sender_name = context
-            .bot_display_name()
-            .await
-            .unwrap_or_else(|_| "Miyu".to_string());
-        let mut content = SanitizedContent::new(text, media);
-        if let Some(target) = message.response_target.as_ref() {
-            if target.mention && !target.user_id.is_empty() {
-                content.mentioned_user_ids.push(target.user_id.clone());
-            }
-            for user_id in &target.explicit_mention_user_ids {
-                if let Ok(Some(member)) = context.group_member(user_id).await {
-                    content.mentioned_users.push(PlatformMention {
-                        user_id: user_id.clone(),
-                        display_name: Some(member.display_name().to_string()),
-                    });
-                } else {
-                    content.mentioned_user_ids.push(user_id.clone());
-                }
-            }
-        }
-        self.store(context)
-            .record_message(NewHistoryMessage {
-                group: group_key(context)?,
-                message_id,
-                sender_id: context.conversation.account_id.clone(),
-                sender_name,
-                content,
-                reply_to_message_id: message
-                    .response_target
-                    .as_ref()
-                    .filter(|target| target.quote)
-                    .map(|target| target.message_id.clone()),
-                is_bot: true,
-                sent_at: timestamp,
-                ingress_order: context
-                    .inbound_event()
-                    .and_then(|event| event.ingress_order),
-            })
-            .await?;
-        Ok(())
-    }
-
     async fn finish_reply(
         &self,
         context: &PlatformTurnContext,
@@ -1156,26 +1010,15 @@ impl PlatformPlugin for RealContextPlugin {
     ) -> Result<()> {
         let settings = self.settings(&context)?;
         active_judgement_skip::register_tools(registry, context.clone());
-        tools::register(
-            registry,
-            context.clone(),
-            self.store(&context),
-            settings.clone(),
-            self.delete_confirmations.clone(),
-        );
+        if context.conversation.kind == ConversationKind::Group {
+            message_history::register_group_member_tool(
+                registry,
+                context.clone(),
+                settings.group_member_search_max_results,
+            );
+        }
         affection::register_query_tool(registry, context.clone(), settings);
         Ok(())
-    }
-
-    fn observe_inbound<'a>(
-        &'a self,
-        context: &'a PlatformTurnContext,
-        event: &'a PlatformInboundEvent,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let settings = self.settings(context)?;
-            self.record_inbound(context, event, &settings).await
-        })
     }
 
     fn accept_followup(
@@ -1236,12 +1079,10 @@ impl PlatformPlugin for RealContextPlugin {
     ) -> BoxFuture<'a, Result<PreparedSend>> {
         Box::pin(async move {
             if !message.metadata.contains_key(ORIGINAL_TEXT_KEY) {
-                let text = outbound_text(&message);
-                if !text.trim().is_empty() {
-                    message
-                        .metadata
-                        .insert(ORIGINAL_TEXT_KEY.to_string(), Value::String(text));
-                }
+                message.metadata.insert(
+                    ORIGINAL_TEXT_KEY.to_string(),
+                    Value::String(outbound_text(&message)),
+                );
             }
             Ok(PreparedSend::unchanged(message))
         })
@@ -1251,12 +1092,10 @@ impl PlatformPlugin for RealContextPlugin {
         &'a self,
         context: &'a PlatformTurnContext,
         message: &'a OutboundMessage,
-        receipt: &'a SendReceipt,
+        _receipt: &'a SendReceipt,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let settings = self.settings(context)?;
-            self.record_bot_message(context, message, receipt, &settings)
-                .await?;
             if matches!(
                 message.origin,
                 OutboundOrigin::FinalReply | OutboundOrigin::Tool
@@ -1327,7 +1166,7 @@ impl PlatformPlugin for RealContextPlugin {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let persona = context.config.active_persona_scope();
-            let store = self.store_for_paths(context.paths);
+            let store = message_history::store_for_paths(context.paths);
             for binding in context
                 .bindings
                 .iter()
@@ -1359,43 +1198,6 @@ impl PlatformPlugin for RealContextPlugin {
                     }
                 }
             }
-            Ok(())
-        })
-    }
-
-    fn record_external_bot_message<'a>(
-        &'a self,
-        context: &'a PlatformTurnContext,
-        message_id: &'a str,
-        text: &'a str,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let settings = self.settings(context)?;
-            if !settings.record_enable || context.conversation.kind != ConversationKind::Group {
-                return Ok(());
-            }
-            let timestamp = now_unix();
-            let sender_name = context
-                .bot_display_name()
-                .await
-                .unwrap_or_else(|_| "Miyu".to_string());
-            self.store(context)
-                .record_message(NewHistoryMessage {
-                    group: group_key(context)?,
-                    message_id: message_id.to_string(),
-                    sender_id: context.conversation.account_id.clone(),
-                    sender_name,
-                    content: SanitizedContent::new(text, Vec::new()),
-                    reply_to_message_id: context
-                        .inbound_event()
-                        .map(|event| event.message_id.clone()),
-                    is_bot: true,
-                    sent_at: timestamp,
-                    ingress_order: context
-                        .inbound_event()
-                        .and_then(|event| event.ingress_order),
-                })
-                .await?;
             Ok(())
         })
     }
@@ -2496,17 +2298,6 @@ fn short_message_boost(
     }
 }
 
-fn media_kind(kind: PlatformMediaKind) -> MediaKind {
-    match kind {
-        PlatformMediaKind::Image => MediaKind::Image,
-        PlatformMediaKind::Emoji => MediaKind::Sticker,
-        PlatformMediaKind::File => MediaKind::File,
-        PlatformMediaKind::Audio => MediaKind::Audio,
-        PlatformMediaKind::Video => MediaKind::Video,
-        PlatformMediaKind::Other => MediaKind::Other,
-    }
-}
-
 pub(super) fn format_history(
     messages: &[HistoryMessage],
     maximum_bytes: usize,
@@ -2697,42 +2488,6 @@ fn append_segment_text(parts: &mut Vec<String>, segments: &[OutboundSegment]) {
             _ => {}
         }
     }
-}
-
-fn outbound_media(message: &OutboundMessage) -> Vec<MediaPlaceholder> {
-    let segments = match &message.body {
-        OutboundBody::Segments(segments) => segments.iter().collect::<Vec<_>>(),
-        OutboundBody::Forward(nodes) => {
-            nodes.iter().flat_map(|node| node.segments.iter()).collect()
-        }
-    };
-    segments
-        .into_iter()
-        .filter_map(|segment| match segment {
-            OutboundSegment::ImageBytes { alt, mime, .. } => Some(MediaPlaceholder::new(
-                MediaKind::Image,
-                (!alt.trim().is_empty()).then(|| alt.clone()),
-                Some(mime.clone()),
-            )),
-            OutboundSegment::ImagePath { path, alt } => Some(MediaPlaceholder::new(
-                MediaKind::Image,
-                (!alt.trim().is_empty()).then(|| alt.clone()).or_else(|| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                }),
-                None::<String>,
-            )),
-            OutboundSegment::FilePath { path, name } => Some(MediaPlaceholder::new(
-                MediaKind::File,
-                name.clone().or_else(|| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                }),
-                None::<String>,
-            )),
-            _ => None,
-        })
-        .collect()
 }
 
 fn truncate_utf8(value: &str, maximum_bytes: usize) -> &str {

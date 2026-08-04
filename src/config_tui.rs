@@ -3,10 +3,10 @@ use crate::config::{
     ApiQuotaProviderConfig, AppConfig, PlatformCommandPermission, PlatformConversationConfig,
     PlatformConversationKind, PlatformModelPoolInheritance, PlatformModelRoute,
     PlatformPersonaOverride, PlatformRateLimit, PlatformSessionLimits, ProviderConfig,
-    ProviderModelChoice, QqMemeCollectorPluginSettings, RealContextIdentityMapping,
-    RealContextPluginSettings, MAX_COMMAND_OUTPUT_LINES, MAX_PLATFORM_COMMAND_PREFIX_CHARS,
-    MAX_PLATFORM_SESSION_QUEUED, MAX_PLATFORM_SESSION_RUNNING, QQ_MEME_COLLECTOR_PLUGIN_ID,
-    REAL_CONTEXT_PLUGIN_ID,
+    ProviderModelChoice, QqMemeCollectorPluginSettings, QqMessageHistoryPluginSettings,
+    RealContextIdentityMapping, RealContextPluginSettings, MAX_COMMAND_OUTPUT_LINES,
+    MAX_PLATFORM_COMMAND_PREFIX_CHARS, MAX_PLATFORM_SESSION_QUEUED, MAX_PLATFORM_SESSION_RUNNING,
+    QQ_MEME_COLLECTOR_PLUGIN_ID, QQ_MESSAGE_HISTORY_PLUGIN_ID, REAL_CONTEXT_PLUGIN_ID,
 };
 use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
 use crate::i18n::{is_zh, text as t};
@@ -4260,6 +4260,18 @@ fn select_platform_plugins(
         } else {
             t("disabled", "未启用")
         };
+        let message_history_enabled = config
+            .platforms
+            .qq
+            .plugins
+            .get(QQ_MESSAGE_HISTORY_PLUGIN_ID)
+            .map(|plugin| plugin.enabled_or(true))
+            .unwrap_or(true);
+        let message_history_state = if message_history_enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
         let meme_collector_enabled = config
             .platforms
             .qq
@@ -4277,6 +4289,10 @@ fn select_platform_plugins(
             format!(
                 "{}: {real_context_state}",
                 t("Group real-context replies", "群聊真实上下文回复")
+            ),
+            format!(
+                "{}: {message_history_state}",
+                t("QQ text message history", "QQ 纯文字消息历史")
             ),
             format!(
                 "{}: {meme_collector_state}",
@@ -4300,12 +4316,85 @@ fn select_platform_plugins(
             KeyCode::Enter => match selected {
                 0 => edit_reply_processor(stdout, config)?,
                 1 => edit_real_context(stdout, paths, config)?,
-                2 => edit_meme_collector(stdout, config)?,
+                2 => edit_message_history(stdout, config)?,
+                3 => edit_meme_collector(stdout, config)?,
                 _ => {}
             },
             _ => {}
         }
     }
+}
+
+fn edit_message_history(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let instance = config
+        .platforms
+        .qq
+        .plugins
+        .get(QQ_MESSAGE_HISTORY_PLUGIN_ID);
+    let enabled = instance.map(|value| value.enabled_or(true)).unwrap_or(true);
+    let settings = instance
+        .map(QqMessageHistoryPluginSettings::from_instance)
+        .transpose()?
+        .unwrap_or_default();
+    let mut fields = vec![
+        Field::boolean(t("Plugin", "插件状态"), enabled),
+        Field::new(
+            t(
+                "Maximum query results (0 = safety limit)",
+                "查询工具单次最多返回（0=安全页上限）",
+            ),
+            settings.history_search_max_results.to_string(),
+        ),
+        Field::new(
+            t("Query safety page limit", "查询安全页上限"),
+            settings.history_safe_page_limit.to_string(),
+        ),
+        Field::boolean(
+            t(
+                "Allow administrators to access other conversations",
+                "允许管理员访问其他会话",
+            ),
+            settings.allow_cross_conversation_search,
+        ),
+    ];
+    if !run_form(
+        stdout,
+        t(" QQ TEXT MESSAGE HISTORY ", " QQ 纯文字消息历史 "),
+        &mut fields,
+    )? {
+        return Ok(());
+    }
+    let enabled = fields[0].value.parse::<bool>()?;
+    let settings = QqMessageHistoryPluginSettings {
+        history_search_max_results: fields[1].value.trim().parse()?,
+        history_safe_page_limit: fields[2].value.trim().parse()?,
+        allow_cross_conversation_search: fields[3].value.parse()?,
+    };
+    settings.validate()?;
+    let mut candidate = config.clone();
+    let instance = candidate
+        .platforms
+        .qq
+        .plugins
+        .entry(QQ_MESSAGE_HISTORY_PLUGIN_ID.to_string())
+        .or_default();
+    instance.enabled = (!enabled).then_some(false);
+    instance.settings.insert(
+        "history_search_max_results".to_string(),
+        serde_json::json!(settings.history_search_max_results),
+    );
+    instance.settings.insert(
+        "history_safe_page_limit".to_string(),
+        serde_json::json!(settings.history_safe_page_limit),
+    );
+    instance.settings.insert(
+        "allow_cross_conversation_search".to_string(),
+        serde_json::json!(settings.allow_cross_conversation_search),
+    );
+    candidate.normalize_platform_model_routes();
+    candidate.validate()?;
+    *config = candidate;
+    Ok(())
 }
 
 fn edit_meme_collector(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
@@ -4418,11 +4507,7 @@ fn edit_real_context(
                 t("Context messages", "上下文消息数量"),
                 settings.context_messages
             ),
-            t(
-                "Group history and member information",
-                "记录群聊历史与群成员信息查询",
-            )
-            .to_string(),
+            t("Group member information", "群成员信息查询").to_string(),
             t("Active reply judgement", "主动回复判断").to_string(),
             t("Quote, mention, and reactions", "引用艾特和贴表情").to_string(),
             t("Safety checks", "违规判断").to_string(),
@@ -4487,66 +4572,23 @@ fn edit_real_context_history(
     settings: &mut RealContextPluginSettings,
 ) -> Result<()> {
     loop {
-        let mut fields = vec![
-            Field::boolean(
-                t("Record group history", "记录群聊历史"),
-                settings.record_enable,
+        let mut fields = vec![Field::new(
+            t(
+                "Maximum group member search results",
+                "群成员搜索工具最大返回数量",
             ),
-            Field::new(
-                t("Media history mode", "媒体记录方式"),
-                real_context_media_mode_label(&settings.record_media_mode).to_string(),
-            )
-            .choices(&[
-                t("Off", "不记录"),
-                t("Placeholder", "仅占位"),
-                t("Metadata", "保留元数据"),
-            ]),
-            Field::new(
-                t(
-                    "Maximum history query results (0 = safety limit)",
-                    "历史查询工具单次最多返回（0=安全页上限）",
-                ),
-                settings.history_search_max_results.to_string(),
-            ),
-            Field::new(
-                t("History safety page limit", "安全页上限"),
-                settings.history_safe_page_limit.to_string(),
-            ),
-            Field::boolean(
-                t(
-                    "Allow administrators to search other groups",
-                    "允许管理员跨群搜索",
-                ),
-                settings.allow_cross_group_search,
-            ),
-            Field::new(
-                t(
-                    "Maximum group member search results",
-                    "群成员搜索工具最大返回数量",
-                ),
-                settings.group_member_search_max_results.to_string(),
-            ),
-        ];
+            settings.group_member_search_max_results.to_string(),
+        )];
         if !run_form(
             stdout,
-            t(
-                " GROUP HISTORY AND MEMBER INFORMATION ",
-                " 记录群聊历史与群成员信息查询 ",
-            ),
+            t(" GROUP MEMBER INFORMATION ", " 群成员信息查询 "),
             &mut fields,
         )? {
             return Ok(());
         }
         let mut candidate = settings.clone();
         let parsed = (|| -> std::result::Result<(), String> {
-            candidate.record_enable = real_context_bool(&fields, 0)?;
-            candidate.record_media_mode = real_context_media_mode_value(&fields[1].value)
-                .ok_or_else(|| t("Invalid media history mode.", "媒体记录方式无效。").to_string())?
-                .to_string();
-            candidate.history_search_max_results = real_context_value(&fields, 2)?;
-            candidate.history_safe_page_limit = real_context_value(&fields, 3)?;
-            candidate.allow_cross_group_search = real_context_bool(&fields, 4)?;
-            candidate.group_member_search_max_results = real_context_value(&fields, 5)?;
+            candidate.group_member_search_max_results = real_context_value(&fields, 0)?;
             candidate.validate().map_err(|error| error.to_string())
         })();
         match parsed {

@@ -1,4 +1,4 @@
-use crate::platforms::PlatformMention;
+use crate::platforms::{ConversationKind, PlatformMention};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
 const MAX_QUEUE_CAPACITY: usize = 4_096;
 const MAX_BATCH_MESSAGES: usize = 256;
@@ -27,25 +27,38 @@ const MAX_SEARCH_TERMS: usize = 32;
 const MAX_ACTIVITY_RANKING_LIMIT: usize = 200;
 const SECONDS_PER_DAY: i64 = 86_400;
 
-/// A QQ group history is always isolated by all three components. There is no
-/// private-chat variant, so private messages cannot accidentally enter this DB.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct GroupKey {
+pub(crate) struct ConversationKey {
     platform: String,
     account_id: String,
-    group_id: String,
+    conversation_kind: String,
+    conversation_id: String,
 }
 
-impl GroupKey {
+/// Compatibility name for real-context code that only reads group history.
+pub(crate) type GroupKey = ConversationKey;
+
+impl ConversationKey {
+    /// Constructs a group conversation key for existing real-context callers.
     pub(crate) fn new(
         platform: impl Into<String>,
         account_id: impl Into<String>,
         group_id: impl Into<String>,
     ) -> Result<Self> {
+        Self::for_kind(platform, account_id, ConversationKind::Group, group_id)
+    }
+
+    pub(crate) fn for_kind(
+        platform: impl Into<String>,
+        account_id: impl Into<String>,
+        kind: ConversationKind,
+        conversation_id: impl Into<String>,
+    ) -> Result<Self> {
         Ok(Self {
             platform: validate_identifier("platform", platform.into())?,
             account_id: validate_identifier("account id", account_id.into())?,
-            group_id: validate_identifier("group id", group_id.into())?,
+            conversation_kind: kind.as_str().to_string(),
+            conversation_id: validate_identifier("conversation id", conversation_id.into())?,
         })
     }
 
@@ -58,7 +71,19 @@ impl GroupKey {
     }
 
     pub(crate) fn group_id(&self) -> &str {
-        &self.group_id
+        &self.conversation_id
+    }
+
+    pub(crate) fn conversation_kind(&self) -> &str {
+        &self.conversation_kind
+    }
+
+    pub(crate) fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    pub(crate) fn is_group(&self) -> bool {
+        self.conversation_kind == ConversationKind::Group.as_str()
     }
 
     pub(crate) fn account_scope(&self) -> AccountKey {
@@ -97,6 +122,7 @@ impl AccountKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum HistoryScope {
     Group(GroupKey),
+    Private(ConversationKey),
     Account(AccountKey),
 }
 
@@ -241,6 +267,7 @@ impl NewHistoryMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct HistoryMessage {
     pub(crate) row_id: i64,
+    #[serde(rename = "conversation")]
     pub(crate) group: GroupKey,
     pub(crate) message_id: String,
     pub(crate) sender_id: String,
@@ -399,6 +426,9 @@ pub(crate) enum DeleteMode {
 pub(crate) struct DeleteRequest {
     pub(crate) scope: HistoryScope,
     pub(crate) mode: DeleteMode,
+    pub(crate) sender_id: Option<String>,
+    pub(crate) since: Option<i64>,
+    pub(crate) until: Option<i64>,
     /// Unix timestamp used as a stable reference for `KeepDays`.
     pub(crate) now: i64,
     pub(crate) batch_size: usize,
@@ -409,6 +439,9 @@ impl DeleteRequest {
         Self {
             scope,
             mode: DeleteMode::All,
+            sender_id: None,
+            since: None,
+            until: None,
             now,
             batch_size: DEFAULT_DELETE_BATCH_SIZE,
         }
@@ -421,6 +454,9 @@ impl DeleteRequest {
         Ok(Self {
             scope,
             mode: DeleteMode::KeepDays(days),
+            sender_id: None,
+            since: None,
+            until: None,
             now,
             batch_size: DEFAULT_DELETE_BATCH_SIZE,
         })
@@ -557,9 +593,9 @@ impl HistoryStore {
         if query
             .since
             .zip(query.until)
-            .is_some_and(|(from, to)| from >= to)
+            .is_some_and(|(from, to)| from > to)
         {
-            bail!("history search time range must have since < until");
+            bail!("history search time range must have since <= until");
         }
         self.request(|reply| Command::Search { query, reply }).await
     }
@@ -582,6 +618,17 @@ impl HistoryStore {
         if matches!(request.mode, DeleteMode::KeepDays(0)) {
             bail!("keep_days must be a positive integer");
         }
+        request.sender_id = request
+            .sender_id
+            .map(|value| validate_identifier("sender id", value))
+            .transpose()?;
+        if request
+            .since
+            .zip(request.until)
+            .is_some_and(|(from, to)| from > to)
+        {
+            bail!("history deletion time range must have since <= until");
+        }
         request.batch_size = request.batch_size.clamp(1, MAX_DELETE_BATCH_SIZE);
         self.request(|reply| Command::Delete { request, reply })
             .await
@@ -599,10 +646,10 @@ impl HistoryStore {
         actor
             .send(build(reply))
             .await
-            .map_err(|_| anyhow!("group history actor is unavailable"))?;
+            .map_err(|_| anyhow!("message history actor is unavailable"))?;
         receiver
             .await
-            .map_err(|_| anyhow!("group history actor stopped before replying"))?
+            .map_err(|_| anyhow!("message history actor stopped before replying"))?
     }
 
     fn actor_sender(&self) -> Result<mpsc::Sender<Command>> {
@@ -610,7 +657,7 @@ impl HistoryStore {
             .inner
             .actor
             .lock()
-            .map_err(|_| anyhow!("group history actor lock was poisoned"))?;
+            .map_err(|_| anyhow!("message history actor lock was poisoned"))?;
         if let Some(sender) = guard.as_ref().filter(|sender| !sender.is_closed()) {
             return Ok(sender.clone());
         }
@@ -618,9 +665,9 @@ impl HistoryStore {
         let (sender, receiver) = mpsc::channel(self.inner.queue_capacity);
         let path = self.inner.db_path.clone();
         std::thread::Builder::new()
-            .name("miyu-group-history".to_string())
+            .name("miyu-message-history".to_string())
             .spawn(move || actor_loop(path, receiver))
-            .context("starting group history actor")?;
+            .context("starting message history actor")?;
         *guard = Some(sender.clone());
         Ok(sender)
     }
@@ -730,7 +777,7 @@ fn actor_connection<'a>(
     }
     connection
         .as_mut()
-        .ok_or_else(|| anyhow!("group history connection was not initialized"))
+        .ok_or_else(|| anyhow!("message history connection was not initialized"))
 }
 
 fn open_database(db_path: &Path) -> Result<Connection> {
@@ -739,10 +786,10 @@ fn open_database(db_path: &Path) -> Result<Connection> {
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating group history directory: {}", parent.display()))?;
+            .with_context(|| format!("creating message history directory: {}", parent.display()))?;
     }
     let conn = Connection::open(db_path)
-        .with_context(|| format!("opening group history database: {}", db_path.display()))?;
+        .with_context(|| format!("opening message history database: {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA auto_vacuum = INCREMENTAL;
@@ -765,7 +812,7 @@ fn open_database(db_path: &Path) -> Result<Connection> {
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        bail!("group history database schema {version} is newer than supported {SCHEMA_VERSION}");
+        bail!("message history database schema {version} is newer than supported {SCHEMA_VERSION}");
     }
     if version == SCHEMA_VERSION {
         return Ok(());
@@ -856,7 +903,7 @@ fn migrate(conn: &Connection) -> Result<()> {
          PRAGMA user_version = 1;
          COMMIT;",
     )
-    .context("creating group history schema")?;
+    .context("creating message history schema")?;
     if version < 2 {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
@@ -867,7 +914,7 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 2;
              COMMIT;",
         )
-        .context("migrating group history schema to version 2")?;
+        .context("migrating message history schema to version 2")?;
     }
     if version < 3 {
         conn.execute_batch(
@@ -891,7 +938,169 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 3;
              COMMIT;",
         )
-        .context("migrating group history schema to version 3")?;
+        .context("migrating message history schema to version 3")?;
+    }
+    if version < 4 {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TRIGGER IF EXISTS messages_fts_insert;
+             DROP TRIGGER IF EXISTS messages_fts_delete;
+             DROP TRIGGER IF EXISTS messages_fts_update;
+             DROP TABLE IF EXISTS messages_fts;
+
+             ALTER TABLE messages RENAME TO messages_v3;
+             ALTER TABLE recalls RENAME TO recalls_v3;
+             ALTER TABLE context_boundaries RENAME TO context_boundaries_v3;
+
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 platform TEXT NOT NULL,
+                 account_id TEXT NOT NULL,
+                 conversation_kind TEXT NOT NULL
+                     CHECK (conversation_kind IN ('group', 'private')),
+                 conversation_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 sender_id TEXT NOT NULL,
+                 sender_name TEXT NOT NULL,
+                 text TEXT NOT NULL,
+                 media_json TEXT NOT NULL,
+                 mentions_json TEXT NOT NULL,
+                 reply_to_message_id TEXT,
+                 is_bot INTEGER NOT NULL CHECK (is_bot IN (0, 1)),
+                 sent_at INTEGER NOT NULL,
+                 ingress_order INTEGER,
+                 recalled_at INTEGER,
+                 recorded_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 UNIQUE (
+                     platform, account_id, conversation_kind, conversation_id, message_id
+                 )
+             );
+             INSERT INTO messages (
+                 id, platform, account_id, conversation_kind, conversation_id,
+                 message_id, sender_id, sender_name, text, media_json, mentions_json,
+                 reply_to_message_id, is_bot, sent_at, ingress_order, recalled_at,
+                 recorded_at
+             )
+             SELECT id, platform, account_id, 'group', group_id, message_id, sender_id,
+                    sender_name, text, media_json, mentions_json, reply_to_message_id,
+                    is_bot, sent_at, ingress_order, recalled_at, recorded_at
+             FROM messages_v3;
+
+             CREATE TABLE recalls (
+                 id INTEGER PRIMARY KEY,
+                 platform TEXT NOT NULL,
+                 account_id TEXT NOT NULL,
+                 conversation_kind TEXT NOT NULL
+                     CHECK (conversation_kind IN ('group', 'private')),
+                 conversation_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 operator_id TEXT,
+                 recalled_at INTEGER NOT NULL,
+                 UNIQUE (
+                     platform, account_id, conversation_kind, conversation_id, message_id
+                 )
+             );
+             INSERT INTO recalls (
+                 id, platform, account_id, conversation_kind, conversation_id,
+                 message_id, operator_id, recalled_at
+             )
+             SELECT id, platform, account_id, 'group', group_id, message_id,
+                    operator_id, recalled_at
+             FROM recalls_v3;
+
+             CREATE TABLE context_boundaries (
+                 platform TEXT NOT NULL,
+                 account_id TEXT NOT NULL,
+                 conversation_kind TEXT NOT NULL
+                     CHECK (conversation_kind IN ('group', 'private')),
+                 conversation_id TEXT NOT NULL,
+                 persona_scope TEXT NOT NULL,
+                 after_row_id INTEGER NOT NULL,
+                 reset_at INTEGER NOT NULL,
+                 PRIMARY KEY (
+                     platform, account_id, conversation_kind, conversation_id, persona_scope
+                 )
+             ) WITHOUT ROWID;
+             INSERT INTO context_boundaries (
+                 platform, account_id, conversation_kind, conversation_id,
+                 persona_scope, after_row_id, reset_at
+             )
+             SELECT platform, account_id, 'group', group_id, persona_scope,
+                    after_row_id, reset_at
+             FROM context_boundaries_v3;
+
+             DROP TABLE messages_v3;
+             DROP TABLE recalls_v3;
+             DROP TABLE context_boundaries_v3;
+
+             CREATE INDEX idx_messages_scope_time
+                 ON messages(
+                     platform, account_id, conversation_kind, conversation_id,
+                     sent_at DESC, id DESC
+                 );
+             CREATE INDEX idx_messages_account_time
+                 ON messages(platform, account_id, sent_at DESC, id DESC);
+             CREATE INDEX idx_messages_scope_sender_time
+                 ON messages(
+                     platform, account_id, conversation_kind, conversation_id,
+                     sender_id, sent_at DESC, id DESC
+                 );
+             CREATE INDEX idx_messages_account_sender_time
+                 ON messages(platform, account_id, sender_id, sent_at DESC, id DESC);
+             CREATE INDEX idx_messages_scope_reply
+                 ON messages(
+                     platform, account_id, conversation_kind, conversation_id,
+                     reply_to_message_id
+                 )
+                 WHERE reply_to_message_id IS NOT NULL;
+             CREATE INDEX idx_messages_scope_ingress
+                 ON messages(
+                     platform, account_id, conversation_kind, conversation_id, ingress_order
+                 )
+                 WHERE ingress_order IS NOT NULL;
+
+             CREATE INDEX idx_recalls_scope_time
+                 ON recalls(
+                     platform, account_id, conversation_kind, conversation_id,
+                     recalled_at DESC, id DESC
+                 );
+             CREATE INDEX idx_recalls_account_time
+                 ON recalls(platform, account_id, recalled_at DESC, id DESC);
+             CREATE INDEX idx_recalls_scope_operator_time
+                 ON recalls(
+                     platform, account_id, conversation_kind, conversation_id,
+                     operator_id, recalled_at DESC
+                 )
+                 WHERE operator_id IS NOT NULL;
+
+             CREATE VIRTUAL TABLE messages_fts USING fts5(
+                 text,
+                 sender_name,
+                 content='messages',
+                 content_rowid='id',
+                 tokenize='trigram'
+             );
+             INSERT INTO messages_fts(rowid, text, sender_name)
+                 SELECT id, text, sender_name FROM messages;
+             CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                 INSERT INTO messages_fts(rowid, text, sender_name)
+                 VALUES (new.id, new.text, new.sender_name);
+             END;
+             CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+                 INSERT INTO messages_fts(messages_fts, rowid, text, sender_name)
+                 VALUES ('delete', old.id, old.text, old.sender_name);
+             END;
+             CREATE TRIGGER messages_fts_update
+             AFTER UPDATE OF text, sender_name ON messages BEGIN
+                 INSERT INTO messages_fts(messages_fts, rowid, text, sender_name)
+                 VALUES ('delete', old.id, old.text, old.sender_name);
+                 INSERT INTO messages_fts(rowid, text, sender_name)
+                 VALUES (new.id, new.text, new.sender_name);
+             END;
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )
+        .context("migrating message history schema to version 4")?;
     }
     Ok(())
 }
@@ -911,18 +1120,21 @@ fn insert_messages(
         };
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO messages (
-                 platform, account_id, group_id, message_id, sender_id, sender_name,
-                 text, media_json, mentions_json, reply_to_message_id, is_bot, sent_at,
-                 ingress_order, recalled_at
+                 platform, account_id, conversation_kind, conversation_id, message_id,
+                 sender_id, sender_name, text, media_json, mentions_json,
+                 reply_to_message_id, is_bot, sent_at, ingress_order, recalled_at
              ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  (SELECT recalled_at FROM recalls
-                  WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3 AND message_id = ?4)
+                  WHERE platform = ?1 AND account_id = ?2
+                    AND conversation_kind = ?3 AND conversation_id = ?4
+                    AND message_id = ?5)
              )",
             params![
                 message.group.platform,
                 message.group.account_id,
-                message.group.group_id,
+                message.group.conversation_kind,
+                message.group.conversation_id,
                 message.message_id,
                 message.sender_id,
                 message.sender_name,
@@ -937,11 +1149,13 @@ fn insert_messages(
         )? != 0;
         let row_id = tx.query_row(
             "SELECT id FROM messages
-             WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3 AND message_id = ?4",
+             WHERE platform = ?1 AND account_id = ?2
+               AND conversation_kind = ?3 AND conversation_id = ?4 AND message_id = ?5",
             params![
                 message.group.platform,
                 message.group.account_id,
-                message.group.group_id,
+                message.group.conversation_kind,
+                message.group.conversation_id,
                 message.message_id,
             ],
             |row| row.get(0),
@@ -957,27 +1171,33 @@ fn insert_recall(conn: &mut Connection, recall: NewRecall) -> Result<RecallOutco
     let existed: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM recalls
-             WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3 AND message_id = ?4
+             WHERE platform = ?1 AND account_id = ?2
+               AND conversation_kind = ?3 AND conversation_id = ?4 AND message_id = ?5
          )",
         params![
             recall.group.platform,
             recall.group.account_id,
-            recall.group.group_id,
+            recall.group.conversation_kind,
+            recall.group.conversation_id,
             recall.message_id,
         ],
         |row| row.get(0),
     )?;
     tx.execute(
         "INSERT INTO recalls (
-             platform, account_id, group_id, message_id, operator_id, recalled_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(platform, account_id, group_id, message_id) DO UPDATE SET
+             platform, account_id, conversation_kind, conversation_id,
+             message_id, operator_id, recalled_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(
+             platform, account_id, conversation_kind, conversation_id, message_id
+         ) DO UPDATE SET
              operator_id = COALESCE(recalls.operator_id, excluded.operator_id),
              recalled_at = MIN(recalls.recalled_at, excluded.recalled_at)",
         params![
             recall.group.platform,
             recall.group.account_id,
-            recall.group.group_id,
+            recall.group.conversation_kind,
+            recall.group.conversation_id,
             recall.message_id,
             recall.operator_id,
             recall.recalled_at,
@@ -986,14 +1206,16 @@ fn insert_recall(conn: &mut Connection, recall: NewRecall) -> Result<RecallOutco
     let matched_message = tx.execute(
         "UPDATE messages
          SET recalled_at = CASE
-             WHEN recalled_at IS NULL THEN ?5
-             ELSE MIN(recalled_at, ?5)
+             WHEN recalled_at IS NULL THEN ?6
+             ELSE MIN(recalled_at, ?6)
          END
-         WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3 AND message_id = ?4",
+         WHERE platform = ?1 AND account_id = ?2
+           AND conversation_kind = ?3 AND conversation_id = ?4 AND message_id = ?5",
         params![
             recall.group.platform,
             recall.group.account_id,
-            recall.group.group_id,
+            recall.group.conversation_kind,
+            recall.group.conversation_id,
             recall.message_id,
             recall.recalled_at,
         ],
@@ -1013,21 +1235,31 @@ fn upsert_boundary(
 ) -> Result<ContextBoundary> {
     let after_row_id = conn.query_row(
         "SELECT COALESCE(MAX(id), 0) FROM messages
-         WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3",
-        params![group.platform, group.account_id, group.group_id],
+         WHERE platform = ?1 AND account_id = ?2
+           AND conversation_kind = ?3 AND conversation_id = ?4",
+        params![
+            group.platform,
+            group.account_id,
+            group.conversation_kind,
+            group.conversation_id
+        ],
         |row| row.get(0),
     )?;
     conn.execute(
         "INSERT INTO context_boundaries (
-             platform, account_id, group_id, persona_scope, after_row_id, reset_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(platform, account_id, group_id, persona_scope) DO UPDATE SET
+             platform, account_id, conversation_kind, conversation_id,
+             persona_scope, after_row_id, reset_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(
+             platform, account_id, conversation_kind, conversation_id, persona_scope
+         ) DO UPDATE SET
              after_row_id = excluded.after_row_id,
              reset_at = excluded.reset_at",
         params![
             group.platform,
             group.account_id,
-            group.group_id,
+            group.conversation_kind,
+            group.conversation_id,
             persona_scope,
             after_row_id,
             reset_at,
@@ -1046,11 +1278,13 @@ fn read_boundary(
 ) -> Result<Option<ContextBoundary>> {
     conn.query_row(
         "SELECT after_row_id, reset_at FROM context_boundaries
-         WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3 AND persona_scope = ?4",
+         WHERE platform = ?1 AND account_id = ?2
+           AND conversation_kind = ?3 AND conversation_id = ?4 AND persona_scope = ?5",
         params![
             group.platform,
             group.account_id,
-            group.group_id,
+            group.conversation_kind,
+            group.conversation_id,
             persona_scope
         ],
         |row| {
@@ -1064,9 +1298,9 @@ fn read_boundary(
     .map_err(Into::into)
 }
 
-const MESSAGE_COLUMNS: &str = "m.id, m.platform, m.account_id, m.group_id, m.message_id, \
-    m.sender_id, m.sender_name, m.text, m.media_json, m.mentions_json, m.reply_to_message_id, \
-    m.is_bot, m.sent_at, m.ingress_order, m.recalled_at";
+const MESSAGE_COLUMNS: &str = "m.id, m.platform, m.account_id, m.conversation_kind, \
+    m.conversation_id, m.message_id, m.sender_id, m.sender_name, m.text, m.media_json, \
+    m.mentions_json, m.reply_to_message_id, m.is_bot, m.sent_at, m.ingress_order, m.recalled_at";
 
 fn query_recent(conn: &Connection, query: RecentQuery) -> Result<HistoryPage> {
     let page_size = page_size(query.limit);
@@ -1084,24 +1318,26 @@ fn query_recent(conn: &Connection, query: RecentQuery) -> Result<HistoryPage> {
     };
     let sql = format!(
         "SELECT {MESSAGE_COLUMNS} FROM messages AS m
-         WHERE m.platform = ?1 AND m.account_id = ?2 AND m.group_id = ?3
-           AND m.id > ?4
-           AND (?5 OR m.recalled_at IS NULL)
-           AND (m.sent_at < ?6 OR (m.sent_at = ?6 AND m.id < ?7))
-           AND (?8 IS NULL OR m.ingress_order IS NULL OR m.ingress_order < ?8)
+         WHERE m.platform = ?1 AND m.account_id = ?2
+           AND m.conversation_kind = ?3 AND m.conversation_id = ?4
+           AND m.id > ?5
+           AND (?6 OR m.recalled_at IS NULL)
+           AND (m.sent_at < ?7 OR (m.sent_at = ?7 AND m.id < ?8))
+           AND (?9 IS NULL OR m.ingress_order IS NULL OR m.ingress_order < ?9)
           ORDER BY
-            CASE WHEN ?8 IS NOT NULL AND m.ingress_order IS NOT NULL THEN 0 ELSE 1 END ASC,
-            CASE WHEN ?8 IS NOT NULL THEN m.ingress_order END DESC,
+            CASE WHEN ?9 IS NOT NULL AND m.ingress_order IS NOT NULL THEN 0 ELSE 1 END ASC,
+            CASE WHEN ?9 IS NOT NULL THEN m.ingress_order END DESC,
             m.sent_at DESC,
             m.id DESC
-         LIMIT ?9"
+         LIMIT ?10"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             query.group.platform,
             query.group.account_id,
-            query.group.group_id,
+            query.group.conversation_kind,
+            query.group.conversation_id,
             boundary,
             query.include_recalled,
             before.sent_at,
@@ -1157,15 +1393,18 @@ fn query_search(conn: &Connection, query: SearchQuery) -> Result<HistoryPage> {
     };
 
     match &query.scope {
-        HistoryScope::Group(group) => {
-            arguments.push(SqlValue::Text(group.platform.clone()));
+        HistoryScope::Group(conversation) | HistoryScope::Private(conversation) => {
+            arguments.push(SqlValue::Text(conversation.platform.clone()));
             let platform = arguments.len();
-            arguments.push(SqlValue::Text(group.account_id.clone()));
+            arguments.push(SqlValue::Text(conversation.account_id.clone()));
             let account = arguments.len();
-            arguments.push(SqlValue::Text(group.group_id.clone()));
-            let group = arguments.len();
+            arguments.push(SqlValue::Text(conversation.conversation_kind.clone()));
+            let kind = arguments.len();
+            arguments.push(SqlValue::Text(conversation.conversation_id.clone()));
+            let conversation_id = arguments.len();
             conditions.push(format!(
-                "m.platform = ?{platform} AND m.account_id = ?{account} AND m.group_id = ?{group}"
+                "m.platform = ?{platform} AND m.account_id = ?{account} \
+                 AND m.conversation_kind = ?{kind} AND m.conversation_id = ?{conversation_id}"
             ));
         }
         HistoryScope::Account(account) => {
@@ -1195,7 +1434,7 @@ fn query_search(conn: &Connection, query: SearchQuery) -> Result<HistoryPage> {
     conditions.push(format!("(?{since} IS NULL OR m.sent_at >= ?{since})"));
     arguments.push(query.until.map(SqlValue::Integer).unwrap_or(SqlValue::Null));
     let until = arguments.len();
-    conditions.push(format!("(?{until} IS NULL OR m.sent_at < ?{until})"));
+    conditions.push(format!("(?{until} IS NULL OR m.sent_at <= ?{until})"));
     arguments.push(SqlValue::Integer(before.sent_at));
     let before_at = arguments.len();
     arguments.push(SqlValue::Integer(before.row_id));
@@ -1239,13 +1478,14 @@ fn query_activity_ranking(
     let mut stmt = conn.prepare(
         "WITH scoped AS (
              SELECT id,
-                    CASE WHEN is_bot = 1 THEN ?2 ELSE sender_id END AS effective_sender_id,
+                     CASE WHEN is_bot = 1 THEN ?2 ELSE sender_id END AS effective_sender_id,
                     sender_name,
                     sent_at
-             FROM messages
-             WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3
-               AND sent_at >= ?4 AND sent_at <= ?5
-               AND (?6 OR is_bot = 0)
+              FROM messages
+              WHERE platform = ?1 AND account_id = ?2
+                AND conversation_kind = ?3 AND conversation_id = ?4
+                AND sent_at >= ?5 AND sent_at <= ?6
+                AND (?7 OR is_bot = 0)
          ),
          named AS (
              SELECT effective_sender_id,
@@ -1288,13 +1528,14 @@ fn query_activity_ranking(
                 first_sent_at, last_sent_at, total_messages, participant_count
          FROM ranked
          ORDER BY rank
-         LIMIT ?7",
+         LIMIT ?8",
     )?;
     let rows = stmt.query_map(
         params![
             query.group.platform,
             query.group.account_id,
-            query.group.group_id,
+            query.group.conversation_kind,
+            query.group.conversation_id,
             query.since,
             query.until,
             query.include_bot,
@@ -1346,7 +1587,15 @@ fn delete_history(conn: &mut Connection, request: DeleteRequest) -> Result<Delet
 
     loop {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = delete_message_batch(&tx, &request.scope, cutoff, batch_size)?;
+        let deleted = delete_message_batch(
+            &tx,
+            &request.scope,
+            cutoff,
+            request.sender_id.as_deref(),
+            request.since,
+            request.until,
+            batch_size,
+        )?;
         tx.commit()?;
         if deleted == 0 {
             break;
@@ -1355,21 +1604,25 @@ fn delete_history(conn: &mut Connection, request: DeleteRequest) -> Result<Delet
         report.batches = report.batches.saturating_add(1);
     }
 
-    loop {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = delete_recall_batch(&tx, &request.scope, cutoff, batch_size)?;
-        tx.commit()?;
-        if deleted == 0 {
-            break;
+    let delete_auxiliary =
+        request.sender_id.is_none() && request.since.is_none() && request.until.is_none();
+    if delete_auxiliary {
+        loop {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let deleted = delete_recall_batch(&tx, &request.scope, cutoff, batch_size)?;
+            tx.commit()?;
+            if deleted == 0 {
+                break;
+            }
+            report.recalls_deleted = report.recalls_deleted.saturating_add(deleted as u64);
+            report.batches = report.batches.saturating_add(1);
         }
-        report.recalls_deleted = report.recalls_deleted.saturating_add(deleted as u64);
-        report.batches = report.batches.saturating_add(1);
-    }
 
-    let boundary_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    report.boundaries_deleted = delete_boundaries(&boundary_tx, &request.scope, cutoff)? as u64;
-    clamp_boundaries_to_current_rowid(&boundary_tx)?;
-    boundary_tx.commit()?;
+        let boundary_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        report.boundaries_deleted = delete_boundaries(&boundary_tx, &request.scope, cutoff)? as u64;
+        clamp_boundaries_to_current_rowid(&boundary_tx)?;
+        boundary_tx.commit()?;
+    }
 
     // Never run a full VACUUM in the daemon. Reclaim a bounded number of pages
     // after an explicit admin purge and let later purges continue the work.
@@ -1381,21 +1634,32 @@ fn delete_message_batch(
     tx: &Transaction<'_>,
     scope: &HistoryScope,
     cutoff: Option<i64>,
+    sender_id: Option<&str>,
+    since: Option<i64>,
+    until: Option<i64>,
     batch_size: usize,
 ) -> Result<usize> {
     match scope {
-        HistoryScope::Group(group) => Ok(tx.execute(
+        HistoryScope::Group(conversation) | HistoryScope::Private(conversation) => Ok(tx.execute(
             "DELETE FROM messages WHERE id IN (
                  SELECT id FROM messages
-                 WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3
-                   AND (?4 IS NULL OR sent_at < ?4)
-                 ORDER BY id LIMIT ?5
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND conversation_kind = ?3 AND conversation_id = ?4
+                   AND (?5 IS NULL OR sent_at < ?5)
+                   AND (?6 IS NULL OR sender_id = ?6)
+                   AND (?7 IS NULL OR sent_at >= ?7)
+                   AND (?8 IS NULL OR sent_at <= ?8)
+                 ORDER BY id LIMIT ?9
              )",
             params![
-                group.platform,
-                group.account_id,
-                group.group_id,
+                conversation.platform,
+                conversation.account_id,
+                conversation.conversation_kind,
+                conversation.conversation_id,
                 cutoff,
+                sender_id,
+                since,
+                until,
                 batch_size as i64,
             ],
         )?),
@@ -1404,12 +1668,18 @@ fn delete_message_batch(
                  SELECT id FROM messages
                  WHERE platform = ?1 AND account_id = ?2
                    AND (?3 IS NULL OR sent_at < ?3)
-                 ORDER BY id LIMIT ?4
+                   AND (?4 IS NULL OR sender_id = ?4)
+                   AND (?5 IS NULL OR sent_at >= ?5)
+                   AND (?6 IS NULL OR sent_at <= ?6)
+                 ORDER BY id LIMIT ?7
              )",
             params![
                 account.platform,
                 account.account_id,
                 cutoff,
+                sender_id,
+                since,
+                until,
                 batch_size as i64,
             ],
         )?),
@@ -1423,23 +1693,27 @@ fn delete_recall_batch(
     batch_size: usize,
 ) -> Result<usize> {
     match scope {
-        HistoryScope::Group(group) => Ok(tx.execute(
+        HistoryScope::Group(conversation) | HistoryScope::Private(conversation) => Ok(tx.execute(
             "DELETE FROM recalls WHERE id IN (
                  SELECT r.id FROM recalls AS r
-                 WHERE r.platform = ?1 AND r.account_id = ?2 AND r.group_id = ?3
-                   AND (?4 IS NULL OR (
-                       r.recalled_at < ?4 AND NOT EXISTS (
+                 WHERE r.platform = ?1 AND r.account_id = ?2
+                   AND r.conversation_kind = ?3 AND r.conversation_id = ?4
+                   AND (?5 IS NULL OR (
+                       r.recalled_at < ?5 AND NOT EXISTS (
                            SELECT 1 FROM messages AS m
                            WHERE m.platform = r.platform AND m.account_id = r.account_id
-                             AND m.group_id = r.group_id AND m.message_id = r.message_id
+                             AND m.conversation_kind = r.conversation_kind
+                             AND m.conversation_id = r.conversation_id
+                             AND m.message_id = r.message_id
                        )
                    ))
-                 ORDER BY r.id LIMIT ?5
+                 ORDER BY r.id LIMIT ?6
              )",
             params![
-                group.platform,
-                group.account_id,
-                group.group_id,
+                conversation.platform,
+                conversation.account_id,
+                conversation.conversation_kind,
+                conversation.conversation_id,
                 cutoff,
                 batch_size as i64,
             ],
@@ -1452,7 +1726,9 @@ fn delete_recall_batch(
                        r.recalled_at < ?3 AND NOT EXISTS (
                            SELECT 1 FROM messages AS m
                            WHERE m.platform = r.platform AND m.account_id = r.account_id
-                             AND m.group_id = r.group_id AND m.message_id = r.message_id
+                             AND m.conversation_kind = r.conversation_kind
+                             AND m.conversation_id = r.conversation_id
+                             AND m.message_id = r.message_id
                        )
                    ))
                  ORDER BY r.id LIMIT ?4
@@ -1473,15 +1749,22 @@ fn delete_boundaries(
     cutoff: Option<i64>,
 ) -> Result<usize> {
     match scope {
-        HistoryScope::Group(group) => Ok(tx.execute(
+        HistoryScope::Group(conversation) | HistoryScope::Private(conversation) => Ok(tx.execute(
             "DELETE FROM context_boundaries
-             WHERE platform = ?1 AND account_id = ?2 AND group_id = ?3
-               AND (?4 IS NULL OR reset_at < ?4)",
-            params![group.platform, group.account_id, group.group_id, cutoff],
+             WHERE platform = ?1 AND account_id = ?2
+               AND conversation_kind = ?3 AND conversation_id = ?4
+               AND (?5 IS NULL OR reset_at < ?5)",
+            params![
+                conversation.platform,
+                conversation.account_id,
+                conversation.conversation_kind,
+                conversation.conversation_id,
+                cutoff
+            ],
         )?),
         HistoryScope::Account(account) => Ok(tx.execute(
             "DELETE FROM context_boundaries
-             WHERE platform = ?1 AND account_id = ?2
+              WHERE platform = ?1 AND account_id = ?2
                AND (?3 IS NULL OR reset_at < ?3)",
             params![account.platform, account.account_id, cutoff],
         )?),
@@ -1507,11 +1790,11 @@ fn clamp_boundaries_to_current_rowid(conn: &Connection) -> Result<()> {
 }
 
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryMessage> {
-    let media_json: String = row.get(8)?;
+    let media_json: String = row.get(9)?;
     let media = serde_json::from_str(&media_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let mentions_json: String = row.get(9)?;
+    let mentions_json: String = row.get(10)?;
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StoredMentions {
@@ -1521,7 +1804,7 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryMessage> {
     let (mentioned_user_ids, mentioned_users) =
         match serde_json::from_str(&mentions_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                9,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -1540,22 +1823,23 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryMessage> {
         group: GroupKey {
             platform: row.get(1)?,
             account_id: row.get(2)?,
-            group_id: row.get(3)?,
+            conversation_kind: row.get(3)?,
+            conversation_id: row.get(4)?,
         },
-        message_id: row.get(4)?,
-        sender_id: row.get(5)?,
-        sender_name: row.get(6)?,
+        message_id: row.get(5)?,
+        sender_id: row.get(6)?,
+        sender_name: row.get(7)?,
         content: SanitizedContent {
-            text: row.get(7)?,
+            text: row.get(8)?,
             media,
             mentioned_user_ids,
             mentioned_users,
         },
-        reply_to_message_id: row.get(10)?,
-        is_bot: row.get(11)?,
-        sent_at: row.get(12)?,
-        ingress_order: row.get(13)?,
-        recalled_at: row.get(14)?,
+        reply_to_message_id: row.get(11)?,
+        is_bot: row.get(12)?,
+        sent_at: row.get(13)?,
+        ingress_order: row.get(14)?,
+        recalled_at: row.get(15)?,
     })
 }
 
@@ -1643,6 +1927,10 @@ mod tests {
 
     fn group(account: &str, group_id: &str) -> GroupKey {
         GroupKey::new("onebot", account, group_id).unwrap()
+    }
+
+    fn private(account: &str, user_id: &str) -> ConversationKey {
+        ConversationKey::for_kind("onebot", account, ConversationKind::Private, user_id).unwrap()
     }
 
     fn message(
@@ -1738,8 +2026,110 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .any(|column| column == "ingress_order");
+        let has_conversation_kind = conn
+            .prepare("PRAGMA table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|column| column == "conversation_kind");
         assert_eq!(version, SCHEMA_VERSION);
         assert!(has_ingress_order);
+        assert!(has_conversation_kind);
+    }
+
+    #[tokio::test]
+    async fn private_and_group_conversations_are_isolated_and_filterable() {
+        let (_temp, store) = test_store();
+        let private_key = private("bot", "42");
+        let group_key = group("bot", "42");
+        store
+            .record_message(message(
+                private_key.clone(),
+                "same-id",
+                "42",
+                "Alice",
+                "private first",
+                10,
+            ))
+            .await
+            .unwrap();
+        store
+            .record_message(message(
+                private_key.clone(),
+                "private-2",
+                "7",
+                "Bob",
+                "private second",
+                20,
+            ))
+            .await
+            .unwrap();
+        store
+            .record_message(message(
+                group_key.clone(),
+                "same-id",
+                "42",
+                "Alice",
+                "group message",
+                15,
+            ))
+            .await
+            .unwrap();
+
+        let private_page = store
+            .search(SearchQuery::new(
+                HistoryScope::Private(private_key.clone()),
+                "private",
+                20,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(private_page.messages.len(), 2);
+        assert!(private_page
+            .messages
+            .iter()
+            .all(|message| message.group == private_key));
+
+        let account_page = store
+            .search(SearchQuery::new(
+                HistoryScope::Account(private_key.account_scope()),
+                "",
+                20,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(account_page.messages.len(), 3);
+        assert!(account_page
+            .messages
+            .iter()
+            .any(|message| message.group == group_key));
+        assert!(account_page
+            .messages
+            .iter()
+            .any(|message| message.group == private_key));
+
+        let mut request = DeleteRequest::all(HistoryScope::Private(private_key.clone()), 30);
+        request.sender_id = Some("42".to_string());
+        request.since = Some(10);
+        request.until = Some(10);
+        let report = store.delete_history(request).await.unwrap();
+        assert_eq!(report.messages_deleted, 1);
+        let remaining_private = store
+            .recent(RecentQuery::for_history(private_key, 20))
+            .await
+            .unwrap();
+        assert_eq!(remaining_private.messages.len(), 1);
+        assert_eq!(remaining_private.messages[0].message_id, "private-2");
+        assert_eq!(
+            store
+                .recent(RecentQuery::for_history(group_key, 20))
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2430,9 +2820,15 @@ mod tests {
             let conn = open_database(&path).unwrap();
             conn.execute(
                 "INSERT INTO context_boundaries (
-                     platform, account_id, group_id, persona_scope, after_row_id, reset_at
-                 ) VALUES (?1, ?2, ?3, 'default', 99, 123)",
-                params![key.platform(), key.account_id(), key.group_id()],
+                     platform, account_id, conversation_kind, conversation_id,
+                     persona_scope, after_row_id, reset_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'default', 99, 123)",
+                params![
+                    key.platform(),
+                    key.account_id(),
+                    key.conversation_kind(),
+                    key.conversation_id()
+                ],
             )
             .unwrap();
         }

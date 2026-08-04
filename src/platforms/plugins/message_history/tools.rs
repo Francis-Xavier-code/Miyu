@@ -1,9 +1,10 @@
 use super::store::{
-    ActivityRankingQuery, DeleteMode, DeleteRequest, GroupKey, HistoryScope, HistoryStore,
-    RecentQuery, SearchQuery,
+    ActivityRankingQuery, ConversationKey, DeleteMode, DeleteRequest, GroupKey, HistoryScope,
+    HistoryStore, RecentQuery, SearchQuery,
 };
-use crate::config::RealContextPluginSettings;
+use crate::config::QqMessageHistoryPluginSettings;
 use crate::i18n::agent_text as t;
+use crate::platforms::access_control::{is_effective_admin, ONEBOT_PLATFORM};
 use crate::platforms::{
     ConversationKind, PlatformGroupMember, PlatformInboundEventKind, PlatformTurnContext,
 };
@@ -72,7 +73,7 @@ impl DeleteConfirmations {
     ) -> DeleteChallenge {
         let token = random_confirmation_token();
         let scope = describe_scope(&request.scope);
-        let mode = describe_delete_mode(request.mode);
+        let mode = describe_delete_request(&request);
         let phrase = format!("确认删除 Miyu 历史 范围={scope} 模式={mode} {token}");
         let now = Instant::now();
         let mut pending = self.pending.lock().unwrap();
@@ -147,21 +148,16 @@ pub(super) fn register(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
     delete_confirmations: DeleteConfirmations,
 ) {
     if context.conversation.kind == ConversationKind::Group {
         register_activity_ranking(registry, context.clone(), store.clone());
-        register_group_members(
-            registry,
-            context.clone(),
-            settings.group_member_search_max_results,
-        );
     }
     register_search(registry, context.clone(), store.clone(), settings.clone());
     register_recent(registry, context.clone(), store.clone(), settings.clone());
     register_user_history(registry, context.clone(), store.clone(), settings.clone());
-    if !context.is_admin {
+    if !effective_admin(&context) {
         return;
     }
     register_delete(registry, context, store, settings, delete_confirmations);
@@ -337,24 +333,29 @@ fn register_search(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) {
     let maximum = history_limit_ceiling(&settings);
     registry.register(
         ToolSpec::new(
             "search_real_chat_history",
             t(
-                "Search persisted QQ group chat history when needed. In a group it defaults to the current group; in private chat, specify group_id or all_groups=true.",
-                "按需搜索持久化的 QQ 群聊真实历史。群聊默认当前群，私聊必须指定 group_id 或 all_groups=true。",
+                "Search persisted QQ text history. It defaults to the current conversation. Administrators may select another group/private QQ conversation or all conversations.",
+                "搜索持久化的 QQ 纯文字历史。默认当前会话；管理员可指定其他群聊/私聊 QQ 会话或全部会话。",
             ),
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "minLength": 1 },
                     "sender_id": { "type": "string" },
+                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
+                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
                     "group_id": { "type": "string" },
+                    "all_conversations": { "type": "boolean", "default": false },
                     "all_groups": { "type": "boolean", "default": false },
                     "days": { "type": "integer", "minimum": 1 },
+                    "start_time": { "type": "string", "description": "Unix 时间戳、RFC 3339、YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]" },
+                    "end_time": { "type": "string", "description": "格式同 start_time；仅日期时包含当天" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
                 },
                 "required": ["query"],
@@ -375,10 +376,14 @@ async fn search(
     arguments: Value,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) -> Result<String> {
     let query_text = required_string(&arguments, "query")?;
-    let scope = history_scope(&arguments, &context, settings.allow_cross_group_search)?;
+    let scope = history_scope(
+        &arguments,
+        &context,
+        settings.allow_cross_conversation_search,
+    )?;
     let limit = limit(
         &arguments,
         settings.history_search_max_results,
@@ -386,9 +391,7 @@ async fn search(
     );
     let mut query = SearchQuery::new(scope, query_text, limit);
     query.sender_id = optional_id(&arguments, "sender_id")?;
-    if let Some(days) = positive_u32(&arguments, "days")? {
-        query.since = Some(now_unix().saturating_sub(i64::from(days) * 86_400));
-    }
+    apply_time_filter(&arguments, &mut query)?;
     let page = store.search(query).await?;
     Ok(json!({
         "ok": true,
@@ -404,22 +407,27 @@ fn register_recent(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) {
     let maximum = history_limit_ceiling(&settings);
     registry.register(
         ToolSpec::new(
             "get_recent_real_chat_history",
             t(
-                "Read recent persisted QQ group messages without requiring a keyword. In private chat, specify group_id or all_groups=true.",
-                "读取无需关键词的近期 QQ 群聊真实历史。私聊中必须指定 group_id 或 all_groups=true。",
+                "Read recent persisted QQ text messages without a keyword. It defaults to the current conversation; administrators may choose another conversation.",
+                "读取无需关键词的近期 QQ 纯文字历史。默认当前会话；管理员可选择其他会话。",
             ),
             json!({
                 "type": "object",
                 "properties": {
+                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
+                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
                     "group_id": { "type": "string" },
+                    "all_conversations": { "type": "boolean", "default": false },
                     "all_groups": { "type": "boolean", "default": false },
                     "days": { "type": "integer", "minimum": 1 },
+                    "start_time": { "type": "string" },
+                    "end_time": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
                 },
                 "additionalProperties": false
@@ -439,23 +447,28 @@ fn register_user_history(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) {
     let maximum = history_limit_ceiling(&settings);
     registry.register(
         ToolSpec::new(
             "get_user_real_chat_history",
             t(
-                "Read recent persisted QQ chat messages from a specific user. Use user_id to select the sender; in a group it defaults to the current group, while private chat requires group_id or all_groups=true.",
-                "读取指定 QQ 用户的近期持久化聊天消息。必须使用 user_id 指定发送者；群聊默认当前群，私聊必须指定 group_id 或 all_groups=true。",
+                "Read persisted QQ text messages from a specific sender. It defaults to the current conversation; administrators may choose another conversation.",
+                "读取指定发送者的 QQ 纯文字历史。默认当前会话；管理员可选择其他会话。",
             ),
             json!({
                 "type": "object",
                 "properties": {
                     "user_id": { "type": "string", "description": "要查询的 QQ 号" },
+                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
+                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
                     "group_id": { "type": "string" },
+                    "all_conversations": { "type": "boolean", "default": false },
                     "all_groups": { "type": "boolean", "default": false },
                     "days": { "type": "integer", "minimum": 1 },
+                    "start_time": { "type": "string" },
+                    "end_time": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
                 },
                 "required": ["user_id"],
@@ -476,10 +489,14 @@ async fn user_history(
     arguments: Value,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) -> Result<String> {
     let user_id = required_id(&arguments, "user_id")?;
-    let scope = history_scope(&arguments, &context, settings.allow_cross_group_search)?;
+    let scope = history_scope(
+        &arguments,
+        &context,
+        settings.allow_cross_conversation_search,
+    )?;
     let page_limit = limit(
         &arguments,
         settings.history_search_max_results,
@@ -487,9 +504,7 @@ async fn user_history(
     );
     let mut query = SearchQuery::new(scope, "", page_limit);
     query.sender_id = Some(user_id.clone());
-    if let Some(days) = positive_u32(&arguments, "days")? {
-        query.since = Some(now_unix().saturating_sub(i64::from(days) * 86_400));
-    }
+    apply_time_filter(&arguments, &mut query)?;
     let mut page = store.search(query).await?;
     page.messages.reverse();
     Ok(json!({
@@ -507,24 +522,30 @@ async fn recent(
     arguments: Value,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
 ) -> Result<String> {
-    let scope = history_scope(&arguments, &context, settings.allow_cross_group_search)?;
+    let scope = history_scope(
+        &arguments,
+        &context,
+        settings.allow_cross_conversation_search,
+    )?;
     let page_limit = limit(
         &arguments,
         settings.history_search_max_results,
         settings.history_safe_page_limit,
     );
-    let days = positive_u32(&arguments, "days")?;
+    let has_time_filter = optional_string(&arguments, "start_time")?.is_some()
+        || optional_string(&arguments, "end_time")?.is_some()
+        || positive_u32(&arguments, "days")?.is_some();
     let page = match scope {
-        HistoryScope::Group(group) if days.is_none() => {
+        HistoryScope::Group(group) if !has_time_filter => {
             store
                 .recent(RecentQuery::for_history(group, page_limit))
                 .await?
         }
         scope => {
             let mut query = SearchQuery::new(scope, "", page_limit);
-            query.since = days.map(|days| now_unix().saturating_sub(i64::from(days) * 86_400));
+            apply_time_filter(&arguments, &mut query)?;
             store.search(query).await?
         }
     };
@@ -542,7 +563,7 @@ fn register_delete(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
     confirmations: DeleteConfirmations,
 ) {
     registry.register(
@@ -558,8 +579,14 @@ fn register_delete(
                     "action": { "type": "string", "enum": ["request", "confirm"] },
                     "mode": { "type": "string", "enum": ["all", "keep_days"] },
                     "keep_days": { "type": "integer", "minimum": 1 },
+                    "sender_id": { "type": "string", "description": "仅删除此发送者 QQ 的消息" },
+                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
+                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
                     "group_id": { "type": "string" },
+                    "all_conversations": { "type": "boolean", "default": false },
                     "all_groups": { "type": "boolean", "default": false },
+                    "start_time": { "type": "string" },
+                    "end_time": { "type": "string" },
                     "confirmation_token": { "type": "string", "description": "For action=confirm, use the opaque token returned by action=request. The current administrator message must also exactly equal the returned confirmation phrase." }
                 },
                 "required": ["action"],
@@ -584,18 +611,22 @@ async fn delete(
     arguments: Value,
     context: Arc<PlatformTurnContext>,
     store: HistoryStore,
-    settings: Arc<RealContextPluginSettings>,
+    settings: Arc<QqMessageHistoryPluginSettings>,
     confirmations: DeleteConfirmations,
 ) -> Result<String> {
-    if !context.is_admin {
+    if !effective_admin(&context) {
         bail!("only a configured Miyu platform administrator may delete history");
     }
     let principal = DeletePrincipal::from_context(&context);
     match required_string(&arguments, "action")?.as_str() {
         "request" => {
             let event = live_admin_message(&context)?;
-            let scope = history_scope(&arguments, &context, settings.allow_cross_group_search)?;
-            let request = match required_string(&arguments, "mode")?.as_str() {
+            let scope = history_scope(
+                &arguments,
+                &context,
+                settings.allow_cross_conversation_search,
+            )?;
+            let mut request = match required_string(&arguments, "mode")?.as_str() {
                 "all" => DeleteRequest::all(scope, now_unix()),
                 "keep_days" => DeleteRequest::keep_days(
                     scope,
@@ -605,6 +636,10 @@ async fn delete(
                 )?,
                 _ => bail!("mode must be all or keep_days"),
             };
+            request.sender_id = optional_id(&arguments, "sender_id")?;
+            let (since, until) = parsed_time_range(&arguments)?;
+            request.since = since;
+            request.until = until;
             let challenge = confirmations.issue(principal, request, event.message_id.clone());
             Ok(json!({
                 "ok": false,
@@ -656,8 +691,18 @@ fn describe_scope(scope: &HistoryScope) -> String {
             group.account_id(),
             group.group_id()
         ),
+        HistoryScope::Private(conversation) => format!(
+            "{}:{}:private:{}",
+            conversation.platform(),
+            conversation.account_id(),
+            conversation.conversation_id()
+        ),
         HistoryScope::Account(account) => {
-            format!("{}:{}:all_groups", account.platform(), account.account_id())
+            format!(
+                "{}:{}:all_conversations",
+                account.platform(),
+                account.account_id()
+            )
         }
     }
 }
@@ -669,7 +714,21 @@ fn describe_delete_mode(mode: DeleteMode) -> String {
     }
 }
 
-fn register_group_members(
+fn describe_delete_request(request: &DeleteRequest) -> String {
+    let mut description = describe_delete_mode(request.mode);
+    if let Some(sender_id) = request.sender_id.as_deref() {
+        description.push_str(&format!(":sender={sender_id}"));
+    }
+    if let Some(since) = request.since {
+        description.push_str(&format!(":from={since}"));
+    }
+    if let Some(until) = request.until {
+        description.push_str(&format!(":to={until}"));
+    }
+    description
+}
+
+pub(super) fn register_group_members(
     registry: &mut ToolRegistry,
     context: Arc<PlatformTurnContext>,
     max_results: usize,
@@ -838,20 +897,102 @@ fn history_scope(
     allow_cross_group: bool,
 ) -> Result<HistoryScope> {
     let all = arguments
-        .get("all_groups")
+        .get("all_conversations")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || arguments
+            .get("all_groups")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     if all {
-        if !allow_cross_group {
-            bail!("cross-group history access is disabled");
-        }
+        require_cross_conversation_access(context, allow_cross_group)?;
         return Ok(HistoryScope::Account(super::account_key(context)?));
     }
-    Ok(HistoryScope::Group(explicit_or_current_group(
-        arguments,
-        context,
-        allow_cross_group,
-    )?))
+
+    let conversation_id = optional_id(arguments, "conversation_id")?;
+    let group_id = optional_id(arguments, "group_id")?;
+    if conversation_id.is_some() && group_id.is_some() {
+        bail!("use conversation_id or group_id, not both");
+    }
+    let explicit_id = conversation_id.or(group_id.clone());
+    let kind = match optional_string(arguments, "conversation_kind")?.as_deref() {
+        Some("group") => ConversationKind::Group,
+        Some("private") => ConversationKind::Private,
+        Some(_) => bail!("conversation_kind must be group or private"),
+        None if group_id.is_some() => ConversationKind::Group,
+        None => context.conversation.kind,
+    };
+    let current = super::conversation_key(context)?;
+    let Some(conversation_id) = explicit_id else {
+        return Ok(match context.conversation.kind {
+            ConversationKind::Group => HistoryScope::Group(current),
+            ConversationKind::Private => HistoryScope::Private(current),
+        });
+    };
+    let selected = ConversationKey::for_kind(
+        context.conversation.platform.clone(),
+        context.conversation.account_id.clone(),
+        kind,
+        conversation_id,
+    )?;
+    if selected != current {
+        require_cross_conversation_access(context, allow_cross_group)?;
+    }
+    Ok(match kind {
+        ConversationKind::Group => HistoryScope::Group(selected),
+        ConversationKind::Private => HistoryScope::Private(selected),
+    })
+}
+
+fn require_cross_conversation_access(
+    context: &PlatformTurnContext,
+    allow_cross_conversation: bool,
+) -> Result<()> {
+    if !allow_cross_conversation {
+        bail!("cross-conversation history access is disabled");
+    }
+    if !effective_admin(context) {
+        bail!("only a Miyu platform administrator may access another conversation's history");
+    }
+    Ok(())
+}
+
+fn effective_admin(context: &PlatformTurnContext) -> bool {
+    context.conversation.platform == ONEBOT_PLATFORM
+        && context.with_current_config(|config| {
+            is_effective_admin(
+                &config.platforms.qq,
+                &context.state_store,
+                &context.conversation.account_id,
+                &context.sender_id,
+            )
+        })
+}
+
+fn parsed_time_range(arguments: &Value) -> Result<(Option<i64>, Option<i64>)> {
+    let since = optional_string(arguments, "start_time")?
+        .as_deref()
+        .map(|value| parse_time(value, false))
+        .transpose()?;
+    let until = optional_string(arguments, "end_time")?
+        .as_deref()
+        .map(|value| parse_time(value, true))
+        .transpose()?;
+    if since.zip(until).is_some_and(|(since, until)| since > until) {
+        bail!("start_time must not be later than end_time");
+    }
+    Ok((since, until))
+}
+
+fn apply_time_filter(arguments: &Value, query: &mut SearchQuery) -> Result<()> {
+    let (since, until) = parsed_time_range(arguments)?;
+    if since.is_some() || until.is_some() {
+        query.since = since;
+        query.until = until;
+    } else if let Some(days) = positive_u32(arguments, "days")? {
+        query.since = Some(now_unix().saturating_sub(i64::from(days) * 86_400));
+    }
+    Ok(())
 }
 
 fn explicit_or_current_group(
@@ -859,19 +1000,11 @@ fn explicit_or_current_group(
     context: &PlatformTurnContext,
     allow_cross_group: bool,
 ) -> Result<GroupKey> {
-    if let Some(group_id) = optional_id(arguments, "group_id")? {
-        if context.conversation.kind == ConversationKind::Group
-            && group_id != context.conversation.conversation_id
-            && !allow_cross_group
-        {
-            bail!("cross-group history access is disabled");
-        }
-        return super::group_key_for(context, &group_id);
+    match history_scope(arguments, context, allow_cross_group)? {
+        HistoryScope::Group(group) => Ok(group),
+        HistoryScope::Private(_) => bail!("this operation requires a group conversation"),
+        HistoryScope::Account(_) => bail!("this operation requires one group conversation"),
     }
-    if context.conversation.kind == ConversationKind::Group {
-        return super::group_key(context);
-    }
-    bail!("private-chat history requests must specify group_id or all_groups=true")
 }
 
 fn required_string(arguments: &Value, key: &str) -> Result<String> {
@@ -987,7 +1120,7 @@ fn positive_u32(arguments: &Value, key: &str) -> Result<Option<u32>> {
     }
 }
 
-fn history_limit_ceiling(settings: &RealContextPluginSettings) -> usize {
+fn history_limit_ceiling(settings: &QqMessageHistoryPluginSettings) -> usize {
     if settings.history_search_max_results == 0 {
         settings.history_safe_page_limit
     } else {
@@ -1023,6 +1156,66 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
+    use crate::paths::MiyuPaths;
+    use crate::platforms::plugins::PlatformPluginRegistry;
+    use crate::platforms::{OutboundMessage, PlatformAdapter, PlatformConversation, SendReceipt};
+    use crate::state::StateStore;
+    use futures_util::future::BoxFuture;
+    use std::path::PathBuf;
+
+    struct NullAdapter;
+
+    impl PlatformAdapter for NullAdapter {
+        fn send<'a>(&'a self, _message: OutboundMessage) -> BoxFuture<'a, Result<SendReceipt>> {
+            Box::pin(async { Ok(SendReceipt::default()) })
+        }
+
+        fn bot_display_name<'a>(&'a self) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("Miyu".to_string()) })
+        }
+    }
+
+    fn test_paths(root: &std::path::Path) -> MiyuPaths {
+        MiyuPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.jsonc"),
+            skills_dir: root.join("config/skills"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            pictures_dir: root.join("pictures"),
+            fish_hook_file: root.join("fish"),
+            bash_hook_file: root.join("bash"),
+            zsh_hook_file: root.join("zsh"),
+            scripts_dir: root.join("scripts"),
+            system_scripts_dir: PathBuf::new(),
+        }
+    }
+
+    fn test_context(root: &std::path::Path, is_admin: bool) -> PlatformTurnContext {
+        let paths = test_paths(root);
+        let mut config = AppConfig::default();
+        if is_admin {
+            config.platforms.qq.admin_users.push(42);
+        }
+        PlatformTurnContext::new(
+            PlatformConversation {
+                platform: ONEBOT_PLATFORM.to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Private,
+                conversation_id: "42".to_string(),
+            },
+            "42".to_string(),
+            "Alice".to_string(),
+            is_admin,
+            config,
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            Arc::new(NullAdapter),
+            Arc::new(PlatformPluginRegistry::new(Vec::new())),
+        )
+    }
 
     fn principal(sender_id: &str) -> DeletePrincipal {
         DeletePrincipal {
@@ -1031,6 +1224,38 @@ mod tests {
             sender_id: sender_id.to_string(),
             conversation_scope: "onebot:10000:group:42".to_string(),
         }
+    }
+
+    #[test]
+    fn ordinary_users_are_limited_to_the_current_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let ordinary = test_context(temp.path(), false);
+        assert!(matches!(
+            history_scope(&json!({}), &ordinary, true).unwrap(),
+            HistoryScope::Private(_)
+        ));
+        assert!(history_scope(
+            &json!({ "conversation_kind": "group", "conversation_id": "99" }),
+            &ordinary,
+            true,
+        )
+        .is_err());
+        assert!(history_scope(&json!({ "all_conversations": true }), &ordinary, true).is_err());
+
+        let admin = test_context(temp.path(), true);
+        assert!(matches!(
+            history_scope(
+                &json!({ "conversation_kind": "group", "conversation_id": "99" }),
+                &admin,
+                true,
+            )
+            .unwrap(),
+            HistoryScope::Group(_)
+        ));
+        assert!(matches!(
+            history_scope(&json!({ "all_conversations": true }), &admin, true).unwrap(),
+            HistoryScope::Account(_)
+        ));
     }
 
     #[test]

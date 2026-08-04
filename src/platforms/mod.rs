@@ -919,8 +919,19 @@ impl PlatformTurnContext {
             .after_send(self, &delivered_message, &receipt)
             .await;
         for message in prepared.after_success {
+            let history_text = outbound_text_for_history(&message);
             match self.adapter.send(message).await {
-                Ok(receipt) => self.record_delivered_images(&receipt),
+                Ok(receipt) => {
+                    self.record_delivered_images(&receipt);
+                    let message_id = receipt
+                        .message_ids
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    self.plugins
+                        .record_external_bot_message(self, message_id, &history_text)
+                        .await;
+                }
                 Err(error) => {
                     let _ = self.record_partial_delivery(&error);
                     tracing::warn!(error = %error, "{}", crate::i18n::text("platform plugin follow-up send failed", "平台插件后续消息发送失败"));
@@ -945,9 +956,18 @@ impl PlatformTurnContext {
         &self,
         message: OutboundMessage,
     ) -> Result<SendReceipt> {
+        let history_text = outbound_text_for_history(&message);
         match self.adapter.send(message).await {
             Ok(receipt) => {
                 self.record_delivered_images(&receipt);
+                let message_id = receipt
+                    .message_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("");
+                self.plugins
+                    .record_external_bot_message(self, message_id, &history_text)
+                    .await;
                 Ok(receipt)
             }
             Err(error) => {
@@ -1208,6 +1228,35 @@ fn message_is_parenthetical_only(message: &OutboundMessage) -> bool {
         }
     }
     depth == 0
+}
+
+fn outbound_text_for_history(message: &OutboundMessage) -> String {
+    fn append(parts: &mut Vec<String>, segments: &[OutboundSegment]) {
+        for segment in segments {
+            match segment {
+                OutboundSegment::Markdown(text) | OutboundSegment::Text(text) => {
+                    if !text.trim().is_empty() {
+                        parts.push(text.clone());
+                    }
+                }
+                OutboundSegment::Mention(user_id) => parts.push(format!("@{user_id}")),
+                OutboundSegment::ImageBytes { .. }
+                | OutboundSegment::ImagePath { .. }
+                | OutboundSegment::FilePath { .. } => {}
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    match &message.body {
+        OutboundBody::Segments(segments) => append(&mut parts, segments),
+        OutboundBody::Forward(nodes) => {
+            for node in nodes {
+                append(&mut parts, &node.segments);
+            }
+        }
+    }
+    parts.join("\n").trim().to_string()
 }
 
 pub(crate) fn register_platform_tools(

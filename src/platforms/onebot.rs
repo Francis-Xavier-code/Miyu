@@ -863,7 +863,31 @@ async fn connection_loop(
             continue;
         }
         if frame.get("post_type").and_then(Value::as_str) == Some("message") {
+            let ingress_order = next_ingress_order();
             let activity = observe_message_activity(&state, &frame, bound_self_id, Instant::now());
+            let config = state.manager.lock().unwrap().config.clone();
+            if config.platforms.qq.enabled {
+                if let Some(inbound) =
+                    ingress_message_event(&frame, bound_self_id, ingress_order, activity.as_ref())
+                {
+                    match state.platforms.plugins() {
+                        Ok(plugins) => {
+                            plugins
+                                .observe_ingress(&state.paths, &config, &inbound)
+                                .await;
+                        }
+                        Err(error) => tracing::warn!(
+                            target: "miyu::qq",
+                            error = %error,
+                            "{}",
+                            t(
+                                "OneBot message history initialization failed",
+                                "OneBot 消息历史初始化失败"
+                            )
+                        ),
+                    }
+                }
+            }
             let connection_permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -877,7 +901,6 @@ async fn connection_loop(
             };
             let state = state.clone();
             let handle = handle.clone();
-            let ingress_order = next_ingress_order();
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
                 handle_message_with_activity(state, handle, frame, ingress_order, activity).await;
@@ -1041,6 +1064,51 @@ fn observe_message_activity(
         position,
         received_at,
     })
+}
+
+fn ingress_message_event(
+    event: &Value,
+    fallback_self_id: i64,
+    ingress_order: i64,
+    activity: Option<&InboundMessageActivity>,
+) -> Option<PlatformInboundEvent> {
+    let self_id = event
+        .get("self_id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id != 0)
+        .unwrap_or(fallback_self_id);
+    let user_id = event.get("user_id").and_then(Value::as_i64)?;
+    if self_id == 0 || user_id == 0 || user_id == self_id {
+        return None;
+    }
+    let target = match event.get("message_type").and_then(Value::as_str) {
+        Some("private") => Target::Private { user_id },
+        Some("group") => Target::Group {
+            group_id: event
+                .get("group_id")
+                .and_then(Value::as_i64)
+                .filter(|group_id| *group_id != 0)?,
+        },
+        _ => return None,
+    };
+    let mut normalized_event = event.clone();
+    normalized_event["self_id"] = Value::from(self_id);
+    let parsed = parse_message(
+        normalized_event.get("message"),
+        normalized_event.get("raw_message"),
+        self_id,
+    );
+    let mut inbound = message_event_at(
+        target,
+        &normalized_event,
+        &parsed,
+        activity
+            .map(|activity| activity.received_at)
+            .unwrap_or_else(Instant::now),
+        activity.map(|activity| activity.position),
+    );
+    inbound.ingress_order = Some(ingress_order);
+    Some(inbound)
 }
 
 fn sends_rate_limit_notice(target: Target) -> bool {
@@ -5863,6 +5931,39 @@ mod tests {
     }
 
     #[test]
+    fn ingress_history_event_uses_bound_account_and_supports_private_messages() {
+        let frame = json!({
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 42,
+            "message_id": 90,
+            "time": 123,
+            "sender": { "nickname": "Alice" },
+            "message": [
+                { "type": "text", "data": { "text": "hello" } },
+                { "type": "image", "data": { "file": "photo.jpg" } }
+            ]
+        });
+
+        let inbound = ingress_message_event(&frame, 10001, 7, None).unwrap();
+        assert_eq!(inbound.conversation.account_id, "10001");
+        assert_eq!(inbound.conversation.kind, ConversationKind::Private);
+        assert_eq!(inbound.conversation.conversation_id, "42");
+        assert_eq!(inbound.ingress_order, Some(7));
+        assert_eq!(inbound.text, "hello");
+        assert_eq!(inbound.media.len(), 1);
+
+        let bot_echo = json!({
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 10001,
+            "message_id": 91,
+            "message": "echo"
+        });
+        assert!(ingress_message_event(&bot_echo, 10001, 8, None).is_none());
+    }
+
+    #[test]
     fn cq_string_images_use_the_same_model_input_parser_as_segment_arrays() {
         let message = json!(
             "说明[CQ:image,file=https://img.example/a.png,url=https://img.example/a&#44;b.png][CQ:image,file=base64://aGk=]"
@@ -7350,7 +7451,7 @@ mod tests {
         assert!(store.load_turns().unwrap().is_empty());
         assert!(temp
             .path()
-            .join("data/platforms/onebot/real_context/history.sqlite3")
+            .join("data/platforms/onebot/message_history/history.sqlite3")
             .is_file());
         assert_eq!(
             resolve_onebot_session(&state, &context, target, &event).unwrap(),

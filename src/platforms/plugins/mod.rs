@@ -36,6 +36,7 @@ async fn send_fixed_tool_output(context: &PlatformTurnContext, text: &str) -> Re
 mod access_manager;
 mod group_management;
 mod meme_collector;
+mod message_history;
 mod message_recall;
 mod real_context;
 mod renderer;
@@ -241,6 +242,17 @@ impl PreparedSend {
 pub(crate) trait PlatformPlugin: Send + Sync {
     fn descriptor(&self) -> PluginDescriptor;
 
+    /// Archives a transport message before admission, command handling, and
+    /// reply-queue limits. Implementations must keep this hook lightweight.
+    fn observe_ingress<'a>(
+        &'a self,
+        _paths: &'a MiyuPaths,
+        _config: &'a AppConfig,
+        _event: &'a PlatformInboundEvent,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn handle_command<'a>(
         &'a self,
         _context: &'a PlatformTurnContext,
@@ -287,8 +299,8 @@ pub(crate) trait PlatformPlugin: Send + Sync {
     }
 
     /// Observe every admitted platform event, including group messages that
-    /// remain silent and message recalls. Commands are handled before this
-    /// hook and are intentionally not included.
+    /// remain silent and message recalls. Full transport archiving belongs to
+    /// `observe_ingress`; this hook is for state that needs admission context.
     fn observe_inbound<'a>(
         &'a self,
         _context: &'a PlatformTurnContext,
@@ -377,6 +389,7 @@ impl PlatformPluginRegistry {
     pub(crate) fn built_in() -> Result<Self> {
         Ok(Self::new(vec![
             Arc::new(access_manager::AccessManagerPlugin::new()),
+            Arc::new(message_history::MessageHistoryPlugin::new()),
             Arc::new(real_context::RealContextPlugin::new()),
             Arc::new(message_recall::MessageRecallPlugin::new()),
             Arc::new(meme_collector::MemeCollectorPlugin::new()),
@@ -414,6 +427,36 @@ impl PlatformPluginRegistry {
             }
         }
         None
+    }
+
+    pub(crate) async fn observe_ingress(
+        &self,
+        paths: &MiyuPaths,
+        config: &AppConfig,
+        event: &PlatformInboundEvent,
+    ) {
+        for plugin in self.plugins.iter().filter(|plugin| {
+            let descriptor = plugin.descriptor();
+            config
+                .platforms
+                .qq
+                .plugins
+                .get(descriptor.id)
+                .and_then(|instance| instance.enabled)
+                .unwrap_or(descriptor.default_enabled)
+        }) {
+            if let Err(error) = plugin.observe_ingress(paths, config, event).await {
+                tracing::warn!(
+                    plugin = plugin.descriptor().id,
+                    error = %error,
+                    "{}",
+                    crate::i18n::text(
+                        "platform plugin ingress observer failed",
+                        "平台插件入站归档失败"
+                    )
+                );
+            }
+        }
     }
 
     pub(crate) fn register_tools(

@@ -232,6 +232,7 @@ impl PlatformsConfig {
         for route in &mut self.qq.conversations {
             route.normalize();
         }
+        migrate_message_history_instance(&mut self.qq.plugins);
         if let Some(instance) = self.qq.plugins.get_mut(REAL_CONTEXT_PLUGIN_ID) {
             normalize_real_context_instance(instance);
         }
@@ -413,6 +414,7 @@ pub type PlatformPluginsConfig = BTreeMap<String, PlatformPluginInstanceConfig>;
 type PlatformPluginConfigValidator = fn(&PlatformPluginInstanceConfig) -> Result<()>;
 
 pub const REAL_CONTEXT_PLUGIN_ID: &str = "real_context";
+pub const QQ_MESSAGE_HISTORY_PLUGIN_ID: &str = "qq_message_history";
 pub const QQ_GROUP_MANAGEMENT_PLUGIN_ID: &str = "qq_group_management";
 pub const QQ_MESSAGE_RECALL_PLUGIN_ID: &str = "qq_message_recall";
 pub const QQ_MEME_COLLECTOR_PLUGIN_ID: &str = "qq_meme_collector";
@@ -420,6 +422,10 @@ pub const QQ_MEME_COLLECTOR_PLUGIN_ID: &str = "qq_meme_collector";
 const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValidator)] = &[
     ("reply_processor", validate_reply_processor_plugin_config),
     (REAL_CONTEXT_PLUGIN_ID, validate_real_context_plugin_config),
+    (
+        QQ_MESSAGE_HISTORY_PLUGIN_ID,
+        validate_qq_message_history_plugin_config,
+    ),
     (
         QQ_GROUP_MANAGEMENT_PLUGIN_ID,
         validate_qq_group_management_plugin_config,
@@ -601,6 +607,47 @@ fn validate_qq_meme_collector_plugin_config(instance: &PlatformPluginInstanceCon
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QqMessageHistoryPluginSettings {
+    pub history_search_max_results: usize,
+    pub history_safe_page_limit: usize,
+    pub allow_cross_conversation_search: bool,
+}
+
+impl Default for QqMessageHistoryPluginSettings {
+    fn default() -> Self {
+        Self {
+            history_search_max_results: 0,
+            history_safe_page_limit: 500,
+            allow_cross_conversation_search: true,
+        }
+    }
+}
+
+impl QqMessageHistoryPluginSettings {
+    pub fn from_instance(instance: &PlatformPluginInstanceConfig) -> Result<Self> {
+        serde_json::from_value(serde_json::Value::Object(instance.settings.clone()))
+            .context("invalid qq_message_history plugin settings")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.history_safe_page_limit == 0 || self.history_safe_page_limit > 1_000 {
+            bail!("platform plugin qq_message_history.history_safe_page_limit must be between 1 and 1000");
+        }
+        if self.history_search_max_results > self.history_safe_page_limit {
+            bail!("platform plugin qq_message_history.history_search_max_results must be 0 or no greater than history_safe_page_limit");
+        }
+        Ok(())
+    }
+}
+
+fn validate_qq_message_history_plugin_config(
+    instance: &PlatformPluginInstanceConfig,
+) -> Result<()> {
+    QqMessageHistoryPluginSettings::from_instance(instance)?.validate()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealContextIdentityMapping {
     pub nickname: String,
     pub user_id: i64,
@@ -614,12 +661,7 @@ pub struct RealContextIdentityMapping {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RealContextPluginSettings {
-    pub record_enable: bool,
-    pub record_media_mode: String,
     pub context_messages: usize,
-    pub history_search_max_results: usize,
-    pub history_safe_page_limit: usize,
-    pub allow_cross_group_search: bool,
     #[serde(alias = "group_member_page_size")]
     pub group_member_search_max_results: usize,
 
@@ -712,12 +754,7 @@ pub struct RealContextPluginSettings {
 impl Default for RealContextPluginSettings {
     fn default() -> Self {
         Self {
-            record_enable: true,
-            record_media_mode: "placeholder".to_string(),
             context_messages: 20,
-            history_search_max_results: 0,
-            history_safe_page_limit: 500,
-            allow_cross_group_search: true,
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
@@ -830,30 +867,7 @@ impl RealContextPluginSettings {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(
-            self.record_media_mode.as_str(),
-            "off" | "placeholder" | "metadata"
-        ) {
-            bail!(
-                "platform plugin real_context.record_media_mode must be off, placeholder, or metadata"
-            );
-        }
         validate_real_context_count("context_messages", self.context_messages, 1, 200)?;
-        validate_real_context_count(
-            "history_search_max_results",
-            self.history_search_max_results,
-            0,
-            1_000,
-        )?;
-        validate_real_context_count(
-            "history_safe_page_limit",
-            self.history_safe_page_limit,
-            1,
-            1_000,
-        )?;
-        if self.history_search_max_results > self.history_safe_page_limit {
-            bail!("platform plugin real_context.history_search_max_results must be 0 or no greater than history_safe_page_limit");
-        }
         validate_real_context_count(
             "group_member_search_max_results",
             self.group_member_search_max_results,
@@ -1153,7 +1167,48 @@ fn normalize_real_context_instance(instance: &mut PlatformPluginInstanceConfig) 
     merge_real_context_settings(instance, &settings);
 }
 
+fn migrate_message_history_instance(plugins: &mut PlatformPluginsConfig) {
+    if plugins
+        .get(QQ_MESSAGE_HISTORY_PLUGIN_ID)
+        .is_some_and(|instance| !instance.is_empty())
+    {
+        return;
+    }
+    let Some(real_context) = plugins.get(REAL_CONTEXT_PLUGIN_ID) else {
+        return;
+    };
+    let enabled = (real_context.enabled == Some(false)
+        || real_context.settings.get("record_enable") == Some(&serde_json::Value::Bool(false)))
+    .then_some(false);
+    let mut settings = serde_json::Map::new();
+    for key in [
+        "history_search_max_results",
+        "history_safe_page_limit",
+        "allow_cross_group_search",
+    ] {
+        if let Some(value) = real_context.settings.get(key).cloned() {
+            let target_key = if key == "allow_cross_group_search" {
+                "allow_cross_conversation_search"
+            } else {
+                key
+            };
+            settings.insert(target_key.to_string(), value);
+        }
+    }
+    if enabled.is_some() || !settings.is_empty() {
+        plugins.insert(
+            QQ_MESSAGE_HISTORY_PLUGIN_ID.to_string(),
+            PlatformPluginInstanceConfig { enabled, settings },
+        );
+    }
+}
+
 const DEPRECATED_REAL_CONTEXT_SETTINGS: &[&str] = &[
+    "record_enable",
+    "record_media_mode",
+    "history_search_max_results",
+    "history_safe_page_limit",
+    "allow_cross_group_search",
     "group_member_page_size",
     "reply_context_messages",
     "active_context_messages",
@@ -6456,15 +6511,55 @@ mod tests {
     }
 
     #[test]
+    fn qq_message_history_defaults_to_full_text_recording() {
+        let settings = QqMessageHistoryPluginSettings::default();
+
+        assert_eq!(settings.history_search_max_results, 0);
+        assert_eq!(settings.history_safe_page_limit, 500);
+        assert!(settings.allow_cross_conversation_search);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_real_context_history_limits_move_to_message_history() {
+        let mut config = AppConfig::default();
+        config.platforms.qq.plugins.insert(
+            REAL_CONTEXT_PLUGIN_ID.to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: None,
+                settings: serde_json::json!({
+                    "history_search_max_results": 25,
+                    "history_safe_page_limit": 250,
+                    "allow_cross_group_search": false
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            },
+        );
+
+        config.normalize_platform_model_routes();
+
+        let history = QqMessageHistoryPluginSettings::from_instance(
+            &config.platforms.qq.plugins[QQ_MESSAGE_HISTORY_PLUGIN_ID],
+        )
+        .unwrap();
+        assert_eq!(history.history_search_max_results, 25);
+        assert_eq!(history.history_safe_page_limit, 250);
+        assert!(!history.allow_cross_conversation_search);
+        assert!(config
+            .platforms
+            .qq
+            .plugins
+            .get(REAL_CONTEXT_PLUGIN_ID)
+            .is_none());
+    }
+
+    #[test]
     fn real_context_defaults_match_the_deployed_contract() {
         let settings = RealContextPluginSettings::default();
 
-        assert!(settings.record_enable);
-        assert_eq!(settings.record_media_mode, "placeholder");
         assert_eq!(settings.context_messages, 20);
-        assert_eq!(settings.history_search_max_results, 0);
-        assert_eq!(settings.history_safe_page_limit, 500);
-        assert!(settings.allow_cross_group_search);
         assert_eq!(settings.group_member_search_max_results, 200);
         assert!(settings.active_reply_enable);
         assert!(settings.judge_include_persona);
