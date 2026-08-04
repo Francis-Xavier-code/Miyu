@@ -505,6 +505,10 @@ mod tests {
         assert!(is_shell_command("./target/release/miyu hi", "fish"));
         assert!(is_shell_command("for item in a b", "fish"));
         assert!(is_shell_command("time cargo check", "fish"));
+        assert!(is_shell_command(
+            "sudo pacman -U --noconfirm \\\n  /tmp/package.pkg.tar.zst",
+            "fish"
+        ));
     }
 
     #[test]
@@ -522,5 +526,6 @@ mod tests {
             "GTK_IM_MODULE=fcitx 是什么意思？",
             "fish"
         ));
+        assert!(!is_shell_command(r"A\=是真的\这个短语", "fish"));
     }
 }
