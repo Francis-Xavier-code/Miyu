@@ -81,7 +81,18 @@ fn hidden_renderer_worker_returns_one_unicode_png() {
         .spawn()
         .unwrap();
 
-    let cjk_request = render_request("# Miyu 长图\n\n纯中文、`code`。\n\n- [x] 已完成");
+    let cjk_request = render_request(
+        r#"# Miyu 长图
+
+纯中文、`inline code`。
+
+```kdl
+# ~/.config/kitty/kitty.conf
+background_opacity 0.92
+```
+
+- [x] 已完成"#,
+    );
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     write_request(&mut stdin, &cjk_request);
@@ -91,11 +102,30 @@ fn hidden_renderer_worker_returns_one_unicode_png() {
     assert!((360..=2600).contains(&height));
     assert_eq!(mime, "image/png");
     assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+    let code_surface_pixels = decoded
+        .pixels()
+        .filter(|pixel| **pixel == image::Rgba([225, 219, 208, 255]))
+        .count();
+    assert!(
+        code_surface_pixels > width as usize * 40,
+        "fenced code block did not produce a substantial light surface"
+    );
 
     write_request(&mut stdin, &cjk_request);
     let second = read_image_response(&mut stdout);
     assert_eq!((second.0, second.1, second.2), (width, height, mime));
     assert!(second.3.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let table_request = render_request("| 名称 | 状态 |\n| --- | --- |\n| renderer | ready |");
+    write_request(&mut stdin, &table_request);
+    let table = read_image_response(&mut stdout);
+    let table_image = image::load_from_memory(&table.3).unwrap().to_rgba8();
+    let table_header = table_image.get_pixel(table.0 - 64 - 5, 64 + 5);
+    assert!(
+        table_header[0] > 200 && table_header[1] > 200 && table_header[2] > 200,
+        "paper theme table header should remain light"
+    );
 
     let emoji_request = render_request("# Emoji 按需加载\n\n中文和 Emoji 😀 可以一起渲染。");
     write_request(&mut stdin, &emoji_request);

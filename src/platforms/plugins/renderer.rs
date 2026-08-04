@@ -837,8 +837,10 @@ struct Palette {
     muted: [u8; 4],
     link: [u8; 4],
     code_background: [u8; 4],
+    code_text: [u8; 4],
     quote_background: [u8; 4],
     quote_bar: [u8; 4],
+    table_header_background: [u8; 4],
     table_background: [u8; 4],
     border: [u8; 4],
     rule: [u8; 4],
@@ -853,9 +855,11 @@ impl Palette {
                 heading: [255, 255, 255, 255],
                 muted: [164, 168, 176, 255],
                 link: [104, 179, 255, 255],
-                code_background: [19, 20, 23, 255],
+                code_background: [43, 45, 51, 255],
+                code_text: [239, 240, 244, 255],
                 quote_background: [37, 40, 45, 255],
                 quote_bar: [93, 168, 143, 255],
+                table_header_background: [19, 20, 23, 255],
                 table_background: [34, 36, 40, 255],
                 border: [72, 76, 84, 255],
                 rule: [83, 87, 95, 255],
@@ -866,9 +870,11 @@ impl Palette {
                 heading: [18, 20, 24, 255],
                 muted: [92, 96, 104, 255],
                 link: [48, 101, 190, 255],
-                code_background: [238, 240, 244, 255],
+                code_background: [226, 229, 235, 255],
+                code_text: [34, 38, 45, 255],
                 quote_background: [244, 247, 255, 255],
                 quote_bar: [74, 116, 214, 255],
+                table_header_background: [238, 240, 244, 255],
                 table_background: [246, 247, 249, 255],
                 border: [218, 222, 230, 255],
                 rule: [218, 222, 230, 255],
@@ -879,9 +885,11 @@ impl Palette {
                 heading: [37, 34, 29, 255],
                 muted: [104, 98, 88, 255],
                 link: [112, 82, 43, 255],
-                code_background: [232, 226, 215, 255],
+                code_background: [225, 219, 208, 255],
+                code_text: [42, 39, 34, 255],
                 quote_background: [236, 229, 214, 255],
                 quote_bar: [134, 101, 54, 255],
+                table_header_background: [232, 226, 215, 255],
                 table_background: [239, 233, 222, 255],
                 border: [211, 201, 184, 255],
                 rule: [211, 201, 184, 255],
@@ -1506,6 +1514,11 @@ fn layout_block(
         boundaries.push(total_height);
     }
     let (margin_before, margin_after) = block_margins(block.kind, config.font_size);
+    let default_color = if block.kind == BlockKind::Code {
+        palette.code_text
+    } else {
+        palette.text
+    };
     Ok(LayoutBlock {
         kind: block.kind,
         buffer: Some(buffer),
@@ -1517,7 +1530,7 @@ fn layout_block(
         boundaries,
         margin_before,
         margin_after,
-        default_color: color(palette.text),
+        default_color: color(default_color),
     })
 }
 
@@ -1807,7 +1820,9 @@ fn attrs_for<'a>(
         Family::SansSerif
     };
     let family = named.map(Family::Name).unwrap_or(fallback);
-    let foreground = if style.link {
+    let foreground = if matches!(kind, BlockKind::Code) {
+        palette.code_text
+    } else if style.link {
         palette.link
     } else if style.muted {
         palette.muted
@@ -1853,7 +1868,7 @@ fn metrics_for(kind: BlockKind, style: InlineStyle, config: &NormalizedConfig) -
 
 fn block_insets(kind: BlockKind) -> (u32, u32, u32) {
     match kind {
-        BlockKind::Code => (24, 24, 18),
+        BlockKind::Code => (32, 32, 24),
         BlockKind::Table => (20, 20, 16),
         BlockKind::Quote => (32, 14, 12),
         BlockKind::ListItem { depth } => {
@@ -2208,16 +2223,6 @@ fn draw_decoration(
     match block.kind {
         BlockKind::Code => {
             fill_rect(image, x, y, COLUMN_WIDTH, height, palette.code_background);
-            outline_fragment(
-                image,
-                x,
-                y,
-                COLUMN_WIDTH,
-                height,
-                palette.border,
-                placement.source_start == 0,
-                placement.source_end == block.total_height,
-            );
         }
         BlockKind::Quote => {
             fill_rect(image, x, y, COLUMN_WIDTH, height, palette.quote_background);
@@ -2268,7 +2273,7 @@ fn draw_table_fragment(
             destination_y.saturating_add(row.source_start.saturating_sub(placement.source_start));
         let row_height = row.source_end.saturating_sub(row.source_start);
         let background = if row.header {
-            palette.code_background
+            palette.table_header_background
         } else if row.stripe {
             palette.quote_background
         } else {
@@ -2515,44 +2520,6 @@ fn fill_rect(image: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32, col
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn outline_fragment(
-    image: &mut RgbaImage,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    color: [u8; 4],
-    draw_top: bool,
-    draw_bottom: bool,
-) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    if draw_top {
-        fill_rect(image, x, y, width, 1, color);
-    }
-    if draw_bottom {
-        fill_rect(
-            image,
-            x,
-            y.saturating_add(height.saturating_sub(1)),
-            width,
-            1,
-            color,
-        );
-    }
-    fill_rect(image, x, y, 1, height, color);
-    fill_rect(
-        image,
-        x.saturating_add(width.saturating_sub(1)),
-        y,
-        1,
-        height,
-        color,
-    );
-}
-
 fn color(rgba: [u8; 4]) -> Color {
     Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3])
 }
@@ -2756,6 +2723,126 @@ fn main() {
     }
 
     #[test]
+    fn fenced_configuration_keeps_heading_markers_inside_code() {
+        let markdown = r#"下面是 Niri 配置：
+
+```kdl
+input {
+    focus-follows-mouse
+    keyboard { mod-key "Mod1" }
+}
+```
+
+Kitty 透明度：
+
+```conf
+# ~/.config/kitty/kitty.conf
+background_opacity 0.92
+dynamic_background_opacity yes
+```
+"#;
+        let blocks = collect_blocks(markdown);
+        let code_blocks = blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(code_blocks.len(), 2);
+        let code_text = code_blocks
+            .iter()
+            .flat_map(|block| &block.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(code_text.contains("focus-follows-mouse"));
+        assert!(code_text.contains("# ~/.config/kitty/kitty.conf"));
+        assert!(!blocks.iter().any(|block| {
+            matches!(block.kind, BlockKind::Heading(_))
+                && block
+                    .spans
+                    .iter()
+                    .any(|span| span.text.contains("kitty.conf"))
+        }));
+    }
+
+    #[test]
+    fn code_surface_remains_distinct_after_qq_sized_downscale() {
+        let markdown = r#"正文内容用于对比代码块。
+
+```kdl
+# ~/.config/kitty/kitty.conf
+background_opacity 0.92
+```
+
+代码块之后的正文。"#;
+        let raw_config = RenderConfig::default();
+        let config = NormalizedConfig::new(&raw_config);
+        let palette = Palette::for_theme("paper");
+        let mut renderer = RendererState::new().unwrap();
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
+        let layouts = layout_blocks(
+            &mut renderer.font_system,
+            collect_blocks(markdown),
+            &config,
+            palette,
+            &fonts,
+        )
+        .unwrap();
+        let code_index = layouts
+            .iter()
+            .position(|block| block.kind == BlockKind::Code)
+            .expect("fenced block should use the code layout");
+        let columns = plan_columns(&layouts, &config).unwrap();
+        let placement = columns
+            .iter()
+            .flat_map(|column| &column.placements)
+            .find(|placement| placement.block_index == code_index)
+            .expect("code block placement");
+        let code_y = config.padding + placement.y;
+        let sample_y = code_y + (placement.source_end - placement.source_start) / 2;
+
+        let page = render(markdown, &raw_config).unwrap().remove(0);
+        let image = image::load_from_memory(&page.png).unwrap().to_rgba8();
+        let outside_x = config.padding / 2;
+        let inside_x = config.padding + COLUMN_WIDTH - 12;
+        assert_eq!(
+            *image.get_pixel(outside_x, sample_y),
+            Rgba(palette.background)
+        );
+        assert_eq!(
+            *image.get_pixel(inside_x, sample_y),
+            Rgba(palette.code_background)
+        );
+        assert_eq!(
+            *image.get_pixel(config.padding, sample_y),
+            Rgba(palette.code_background)
+        );
+
+        let scaled_width = 568_u32;
+        let scaled_height = (u64::from(page.height) * u64::from(scaled_width)
+            / u64::from(page.width))
+        .max(1) as u32;
+        let scaled = image::imageops::resize(
+            &image,
+            scaled_width,
+            scaled_height,
+            image::imageops::FilterType::Triangle,
+        );
+        let scale_x =
+            |x: u32| (u64::from(x) * u64::from(scaled_width) / u64::from(page.width)) as u32;
+        let scale_y =
+            |y: u32| (u64::from(y) * u64::from(scaled_height) / u64::from(page.height)) as u32;
+        let outside = scaled.get_pixel(scale_x(outside_x), scale_y(sample_y));
+        let inside = scaled.get_pixel(scale_x(inside_x), scale_y(sample_y));
+        let rgb_distance = (0..3)
+            .map(|channel| u32::from(outside[channel].abs_diff(inside[channel])))
+            .sum::<u32>();
+        assert!(
+            rgb_distance > 50,
+            "downscaled code surface contrast was only {rgb_distance}"
+        );
+    }
+
+    #[test]
     fn extreme_config_values_are_clamped_and_missing_fonts_fall_back() {
         let config = RenderConfig {
             theme: "unknown".to_string(),
@@ -2943,7 +3030,7 @@ fn main() {
         let x = config.padding + COLUMN_WIDTH - 5;
         assert_eq!(
             *image.get_pixel(x, config.padding + 5),
-            Rgba(palette.code_background)
+            Rgba(palette.table_header_background)
         );
         assert_eq!(
             *image.get_pixel(x, config.padding + first.source_start + 5),
