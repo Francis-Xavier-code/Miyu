@@ -548,6 +548,7 @@ pub(crate) struct PlatformTurnContext {
     inbound_event: Option<Arc<PlatformInboundEvent>>,
     message_activity: Option<MessageActivityHandle>,
     response_target: Mutex<Option<PendingResponseTarget>>,
+    group_member_cache: Mutex<HashMap<String, PlatformGroupMember>>,
     plugin_values: Mutex<BTreeMap<String, Value>>,
     delivered_image_digests: Mutex<HashSet<blake3::Hash>>,
     reply_rate_available: AtomicBool,
@@ -582,6 +583,7 @@ impl PlatformTurnContext {
             inbound_event: None,
             message_activity: None,
             response_target: Mutex::new(None),
+            group_member_cache: Mutex::new(HashMap::new()),
             plugin_values: Mutex::new(BTreeMap::new()),
             delivered_image_digests: Mutex::new(HashSet::new()),
             reply_rate_available: AtomicBool::new(true),
@@ -653,13 +655,37 @@ impl PlatformTurnContext {
         target: Option<ResponseTarget>,
         policy: AdaptiveResponseTargetPolicy,
     ) {
-        *self.response_target.lock().unwrap() =
-            target
-                .filter(ResponseTarget::is_effective)
-                .map(|target| PendingResponseTarget {
+        let mut pending = self.response_target.lock().unwrap();
+        let explicit_mentions = pending
+            .as_ref()
+            .map(|pending| pending.target.explicit_mention_user_ids.clone())
+            .filter(|mentions| !mentions.is_empty());
+        let target = target.filter(ResponseTarget::is_effective);
+        *pending = match (target, explicit_mentions) {
+            (Some(mut target), Some(mentions)) => {
+                target.mention = false;
+                target.explicit_mention_user_ids = mentions;
+                Some(PendingResponseTarget {
                     target,
                     policy: Some(policy),
-                });
+                })
+            }
+            (Some(target), None) => Some(PendingResponseTarget {
+                target,
+                policy: Some(policy),
+            }),
+            (None, Some(mentions)) => Some(PendingResponseTarget {
+                target: ResponseTarget {
+                    message_id: String::new(),
+                    user_id: String::new(),
+                    quote: false,
+                    mention: false,
+                    explicit_mention_user_ids: mentions,
+                },
+                policy: None,
+            }),
+            (None, None) => None,
+        };
     }
 
     pub(crate) fn response_target(&self) -> Option<ResponseTarget> {
@@ -668,6 +694,28 @@ impl PlatformTurnContext {
             .unwrap()
             .as_ref()
             .map(|pending| pending.target.clone())
+    }
+
+    pub(crate) fn set_explicit_response_mentions(&self, user_ids: Vec<String>) {
+        if user_ids.is_empty() {
+            return;
+        }
+        let mut pending = self.response_target.lock().unwrap();
+        if let Some(pending) = pending.as_mut() {
+            pending.target.mention = false;
+            pending.target.explicit_mention_user_ids = user_ids;
+        } else {
+            *pending = Some(PendingResponseTarget {
+                target: ResponseTarget {
+                    message_id: String::new(),
+                    user_id: String::new(),
+                    quote: false,
+                    mention: false,
+                    explicit_mention_user_ids: user_ids,
+                },
+                policy: None,
+            });
+        }
     }
 
     pub(crate) fn set_plugin_value(&self, key: impl Into<String>, value: Value) {
@@ -826,7 +874,8 @@ impl PlatformTurnContext {
         let delivered = match self.adapter.send(primary.clone()).await {
             Ok(receipt) => Ok((primary, receipt, true)),
             Err(error) => {
-                let partially_delivered = self.record_partial_delivery(&error);
+                let (partially_delivered, response_target_delivered) =
+                    self.record_partial_delivery(&error);
                 match (partially_delivered, prepared.fallback) {
                     (true, _) => {
                         tracing::warn!(
@@ -837,29 +886,29 @@ impl PlatformTurnContext {
                                 "平台消息部分发送成功；为避免重复投递，已跳过完整回退消息",
                             )
                         );
-                        Err(error)
+                        Err((error, response_target_delivered))
                     }
                     (false, Some(fallback)) => {
                         tracing::warn!(error = %error, "{}", crate::i18n::text("transformed platform message failed; sending fallback", "转换后的平台消息发送失败；正在发送回退消息"));
                         match self.adapter.send(fallback.clone()).await {
                             Ok(receipt) => Ok((fallback, receipt, false)),
                             Err(error) => {
-                                self.record_partial_delivery(&error);
-                                Err(error)
+                                let (_, response_target_delivered) =
+                                    self.record_partial_delivery(&error);
+                                Err((error, response_target_delivered))
                             }
                         }
                     }
-                    (false, None) => Err(error),
+                    (false, None) => Err((error, false)),
                 }
             }
         };
         let (delivered_message, receipt, transformed_primary_succeeded) = match delivered {
             Ok(delivered) => delivered,
-            Err(error) => {
-                if let Some(target) = reserved_target {
-                    let mut available = self.response_target.lock().unwrap();
-                    if available.is_none() {
-                        *available = Some(target);
+            Err((error, response_target_delivered)) => {
+                if !response_target_delivered {
+                    if let Some(target) = reserved_target {
+                        self.restore_response_target(target);
                     }
                 }
                 return Err(error);
@@ -873,7 +922,7 @@ impl PlatformTurnContext {
             match self.adapter.send(message).await {
                 Ok(receipt) => self.record_delivered_images(&receipt),
                 Err(error) => {
-                    self.record_partial_delivery(&error);
+                    let _ = self.record_partial_delivery(&error);
                     tracing::warn!(error = %error, "{}", crate::i18n::text("platform plugin follow-up send failed", "平台插件后续消息发送失败"));
                 }
             }
@@ -902,7 +951,7 @@ impl PlatformTurnContext {
                 Ok(receipt)
             }
             Err(error) => {
-                self.record_partial_delivery(&error);
+                let _ = self.record_partial_delivery(&error);
                 Err(error)
             }
         }
@@ -918,12 +967,30 @@ impl PlatformTurnContext {
             .extend(receipt.image_digests.iter().copied());
     }
 
-    fn record_partial_delivery(&self, error: &anyhow::Error) -> bool {
+    fn record_partial_delivery(&self, error: &anyhow::Error) -> (bool, bool) {
         let Some(partial) = error.downcast_ref::<PartialSendError>() else {
-            return false;
+            return (false, false);
         };
         self.record_delivered_images(partial.receipt());
-        partial.receipt().has_delivery()
+        (
+            partial.receipt().has_delivery(),
+            partial.receipt().response_target_delivered,
+        )
+    }
+
+    fn restore_response_target(&self, target: PendingResponseTarget) {
+        let mut available = self.response_target.lock().unwrap();
+        match available.as_mut() {
+            Some(current)
+                if current.target.explicit_mention_user_ids.is_empty()
+                    && !target.target.explicit_mention_user_ids.is_empty() =>
+            {
+                current.target.mention = false;
+                current.target.explicit_mention_user_ids = target.target.explicit_mention_user_ids;
+            }
+            Some(_) => {}
+            None => *available = Some(target),
+        }
     }
 
     pub(crate) fn delivered_image_digests(&self) -> HashSet<blake3::Hash> {
@@ -999,11 +1066,34 @@ impl PlatformTurnContext {
     }
 
     pub(crate) async fn group_members(&self) -> Result<Vec<PlatformGroupMember>> {
-        self.adapter.group_members().await
+        let members = self.adapter.group_members().await?;
+        self.group_member_cache.lock().unwrap().extend(
+            members
+                .iter()
+                .cloned()
+                .map(|member| (member.user_id.clone(), member)),
+        );
+        Ok(members)
     }
 
     pub(crate) async fn group_member(&self, user_id: &str) -> Result<Option<PlatformGroupMember>> {
-        self.adapter.group_member(user_id).await
+        if let Some(member) = self
+            .group_member_cache
+            .lock()
+            .unwrap()
+            .get(user_id)
+            .cloned()
+        {
+            return Ok(Some(member));
+        }
+        let member = self.adapter.group_member(user_id).await?;
+        if let Some(member) = member.as_ref() {
+            self.group_member_cache
+                .lock()
+                .unwrap()
+                .insert(member.user_id.clone(), member.clone());
+        }
+        Ok(member)
     }
 
     pub(crate) async fn bot_group_role(&self) -> types::BotGroupRole {
@@ -2125,11 +2215,13 @@ mod tests {
         calls: AtomicUsize,
         fail_first: bool,
         messages: Mutex<Vec<OutboundMessage>>,
+        group_members: Vec<PlatformGroupMember>,
     }
 
     struct PartialFailureAdapter {
         calls: AtomicUsize,
         digest: blake3::Hash,
+        response_target_delivered: bool,
     }
 
     impl PlatformAdapter for CountingAdapter {
@@ -2161,6 +2253,11 @@ mod tests {
         fn bot_display_name<'a>(&'a self) -> BoxFuture<'a, Result<String>> {
             Box::pin(async { Ok("Miyu".to_string()) })
         }
+
+        fn group_members<'a>(&'a self) -> BoxFuture<'a, Result<Vec<PlatformGroupMember>>> {
+            let members = self.group_members.clone();
+            Box::pin(async move { Ok(members) })
+        }
     }
 
     impl PlatformAdapter for PartialFailureAdapter {
@@ -2172,6 +2269,7 @@ mod tests {
                     SendReceipt {
                         delivered_parts: 1,
                         image_digests: vec![self.digest],
+                        response_target_delivered: self.response_target_delivered,
                         ..SendReceipt::default()
                     },
                 )))
@@ -2198,6 +2296,22 @@ mod tests {
             scripts_dir: root.join("config/scripts"),
             system_scripts_dir: PathBuf::new(),
         }
+    }
+
+    fn test_group_members() -> Vec<PlatformGroupMember> {
+        ["20000", "30000", "40000", "50000"]
+            .into_iter()
+            .map(|user_id| PlatformGroupMember {
+                group_id: "20000".to_string(),
+                user_id: user_id.to_string(),
+                nickname: format!("member-{user_id}"),
+                card: String::new(),
+                role: "member".to_string(),
+                title: String::new(),
+                joined_at: 0,
+                last_active_at: 0,
+            })
+            .collect()
     }
 
     #[test]
@@ -2265,6 +2379,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_first,
             messages: Mutex::new(Vec::new()),
+            group_members: test_group_members(),
         });
         let context = PlatformTurnContext::new(
             PlatformConversation {
@@ -2480,6 +2595,7 @@ mod tests {
             user_id: "alice".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         };
         let policy = AdaptiveResponseTargetPolicy::new(Some(start), now, 5, 15);
 
@@ -2545,6 +2661,7 @@ mod tests {
             user_id: "alice".to_string(),
             quote: false,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         };
         let policy = AdaptiveResponseTargetPolicy::new(Some(start), now, 5, 15);
         let same_sender_message = PlatformMessagePosition {
@@ -2643,6 +2760,7 @@ mod tests {
         let adapter = Arc::new(PartialFailureAdapter {
             calls: AtomicUsize::new(0),
             digest,
+            response_target_delivered: false,
         });
         let context = PlatformTurnContext::new(
             PlatformConversation {
@@ -2687,6 +2805,7 @@ mod tests {
             user_id: "user-4".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         };
         context.set_response_target(Some(target.clone()));
 
@@ -2705,6 +2824,75 @@ mod tests {
         assert_eq!(messages[1].response_target, Some(target));
         assert_eq!(messages[2].response_target, None);
         assert_eq!(context.response_target(), None);
+    }
+
+    #[tokio::test]
+    async fn partially_delivered_response_target_is_not_restored() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let adapter = Arc::new(PartialFailureAdapter {
+            calls: AtomicUsize::new(0),
+            digest: blake3::hash(&[1_u8]),
+            response_target_delivered: true,
+        });
+        let context = PlatformTurnContext::new(
+            PlatformConversation {
+                platform: "onebot".to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Group,
+                conversation_id: "20000".to_string(),
+            },
+            "20000".to_string(),
+            "tester".to_string(),
+            false,
+            AppConfig::default(),
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            adapter,
+            Arc::new(plugins::PlatformPluginRegistry::default()),
+        );
+        context.set_explicit_response_mentions(vec!["30000".to_string()]);
+
+        assert!(context
+            .send(OutboundMessage::text(OutboundOrigin::FinalReply, "first"))
+            .await
+            .is_err());
+        assert!(context.response_target().is_none());
+    }
+
+    #[test]
+    fn failed_older_send_merges_mentions_into_a_newer_response_target() {
+        let (_temp, context, _adapter) = test_turn_context(false);
+        context.set_explicit_response_mentions(vec!["30000".to_string()]);
+        let reserved = context
+            .response_target
+            .lock()
+            .unwrap()
+            .take()
+            .expect("explicit target exists");
+        context.set_adaptive_response_target(
+            Some(ResponseTarget {
+                message_id: "message-2".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: true,
+                explicit_mention_user_ids: Vec::new(),
+            }),
+            AdaptiveResponseTargetPolicy::new(None, Instant::now(), 1, 1),
+        );
+
+        context.restore_response_target(reserved);
+
+        assert_eq!(
+            context.response_target(),
+            Some(ResponseTarget {
+                message_id: "message-2".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: false,
+                explicit_mention_user_ids: vec!["30000".to_string()],
+            })
+        );
     }
 
     #[tokio::test]
@@ -2727,6 +2915,7 @@ mod tests {
             user_id: "alice".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         };
         context.set_adaptive_response_target(
             Some(target.clone()),
@@ -3215,6 +3404,196 @@ mod tests {
         assert!(parameters["properties"].get("files").is_none());
     }
 
+    #[test]
+    fn multi_mention_tool_is_only_registered_for_group_turns() {
+        let (_private_temp, private, _adapter) = test_turn_context(false);
+        let mut private_tools = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut private_tools, Arc::new(private));
+        assert!(private_tools.get("qq_mention_users").is_none());
+
+        let (_group_temp, mut group, _adapter) = test_turn_context(false);
+        group.conversation.kind = ConversationKind::Group;
+        let mut group_tools = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut group_tools, Arc::new(group));
+        assert!(group_tools.get("qq_mention_user").is_none());
+        let tool = group_tools.get("qq_mention_users").unwrap();
+        assert_eq!(tool.parameters["required"], serde_json::json!(["user_ids"]));
+        assert_eq!(tool.parameters["additionalProperties"], false);
+        assert_eq!(tool.parameters["properties"]["user_ids"]["minItems"], 1);
+        assert_eq!(tool.parameters["properties"]["user_ids"]["maxItems"], 32);
+        assert_eq!(
+            tool.parameters["properties"]["user_ids"]["items"]["pattern"],
+            "^[1-9][0-9]{4,11}$"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_mention_tool_overrides_automatic_mention_without_sending_an_extra_message() {
+        let (_temp, mut context, adapter) = test_turn_context(false);
+        context.conversation.kind = ConversationKind::Group;
+        let context = Arc::new(context);
+        context.set_response_target(Some(ResponseTarget {
+            message_id: "message-1".to_string(),
+            user_id: "20000".to_string(),
+            quote: true,
+            mention: true,
+            explicit_mention_user_ids: Vec::new(),
+        }));
+        let mut registry = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut registry, context.clone());
+
+        registry
+            .call("qq_mention_users", r#"{"user_ids":["50000"]}"#)
+            .await
+            .unwrap();
+        let output = registry
+            .call(
+                "qq_mention_users",
+                r#"{"user_ids":["30000","40000","30000"]}"#,
+            )
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["user_ids"], serde_json::json!(["30000", "40000"]));
+        assert_eq!(adapter.calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(
+            context.response_target(),
+            Some(ResponseTarget {
+                message_id: "message-1".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: false,
+                explicit_mention_user_ids: vec!["30000".to_string(), "40000".to_string()],
+            })
+        );
+
+        context
+            .send(OutboundMessage::text(OutboundOrigin::FinalReply, "你好"))
+            .await
+            .unwrap();
+        assert_eq!(adapter.calls.load(AtomicOrdering::Relaxed), 1);
+        assert!(context.response_target().is_none());
+        let messages = adapter.messages.lock().unwrap();
+        assert_eq!(
+            messages[0].response_target,
+            Some(ResponseTarget {
+                message_id: "message-1".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: false,
+                explicit_mention_user_ids: vec!["30000".to_string(), "40000".to_string()],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_mention_tool_preserves_the_adaptive_quote_policy() {
+        let (_temp, mut context, adapter) = test_turn_context(false);
+        context.conversation.kind = ConversationKind::Group;
+        let context = Arc::new(context);
+        context.set_adaptive_response_target(
+            Some(ResponseTarget {
+                message_id: "message-1".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: true,
+                explicit_mention_user_ids: Vec::new(),
+            }),
+            AdaptiveResponseTargetPolicy::new(None, Instant::now(), 1, 0),
+        );
+        let mut registry = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut registry, context.clone());
+
+        registry
+            .call("qq_mention_users", r#"{"user_ids":["30000"]}"#)
+            .await
+            .unwrap();
+        context.set_adaptive_response_target(
+            Some(ResponseTarget {
+                message_id: "message-2".to_string(),
+                user_id: "20000".to_string(),
+                quote: true,
+                mention: true,
+                explicit_mention_user_ids: Vec::new(),
+            }),
+            AdaptiveResponseTargetPolicy::new(None, Instant::now(), 1, 0),
+        );
+        context
+            .send(OutboundMessage::text(OutboundOrigin::FinalReply, "你好"))
+            .await
+            .unwrap();
+
+        let messages = adapter.messages.lock().unwrap();
+        assert_eq!(
+            messages[0].response_target,
+            Some(ResponseTarget {
+                message_id: "message-2".to_string(),
+                user_id: "20000".to_string(),
+                quote: false,
+                mention: false,
+                explicit_mention_user_ids: vec!["30000".to_string()],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_mention_tool_rejects_invalid_or_excessive_targets() {
+        let (_temp, mut context, adapter) = test_turn_context(false);
+        context.conversation.kind = ConversationKind::Group;
+        let mut registry = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut registry, Arc::new(context));
+
+        let error = registry
+            .call("qq_mention_users", r#"{"user_ids":["all"]}"#)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("5-12 digit QQ ID"));
+
+        let error = registry
+            .call("qq_mention_users", r#"{"user_ids":["+30000"]}"#)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("5-12 digit QQ ID"));
+
+        let error = registry
+            .call("qq_mention_users", r#"{"user_ids":[" 30000 "]}"#)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("5-12 digit QQ ID"));
+
+        let error = registry
+            .call(
+                "qq_mention_users",
+                r#"{"user_ids":["30000"],"group_id":"99999"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only user_ids"));
+
+        let error = registry
+            .call("qq_mention_users", r#"{"user_ids":["60000"]}"#)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not members of the current group"));
+
+        let error = registry
+            .call("qq_mention_users", r#"{"user_ids":[]}"#)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at least one QQ ID"));
+
+        let user_ids = (1..=33).map(|id| id.to_string()).collect::<Vec<_>>();
+        let arguments = serde_json::json!({ "user_ids": user_ids }).to_string();
+        let error = registry
+            .call("qq_mention_users", &arguments)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at most 32 users"));
+        assert_eq!(adapter.calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
     fn built_in_test_context(
         kind: ConversationKind,
     ) -> (tempfile::TempDir, Arc<PlatformTurnContext>) {
@@ -3224,6 +3603,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_first: false,
             messages: Mutex::new(Vec::new()),
+            group_members: test_group_members(),
         });
         let context = PlatformTurnContext::new(
             PlatformConversation {

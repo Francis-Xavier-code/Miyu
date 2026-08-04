@@ -72,15 +72,16 @@ pub(crate) enum OutboundOrigin {
     Plugin,
 }
 
-/// The single reply target selected for one platform turn. Target selection
-/// belongs to the trigger pipeline; output plugins may change presentation but
-/// must preserve this value unchanged.
+/// The reply target selected for one platform turn. Target selection belongs
+/// to the trigger pipeline; explicit mentions may replace its automatic
+/// mention while preserving the quoted message and adaptive policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResponseTarget {
     pub(crate) message_id: String,
     pub(crate) user_id: String,
     pub(crate) quote: bool,
     pub(crate) mention: bool,
+    pub(crate) explicit_mention_user_ids: Vec<String>,
 }
 
 impl ResponseTarget {
@@ -90,11 +91,14 @@ impl ResponseTarget {
             user_id: user_id.into(),
             quote: true,
             mention: false,
+            explicit_mention_user_ids: Vec::new(),
         }
     }
 
     pub(crate) fn is_effective(&self) -> bool {
-        (self.quote && !self.message_id.is_empty()) || (self.mention && !self.user_id.is_empty())
+        (self.quote && !self.message_id.is_empty())
+            || (self.mention && !self.user_id.is_empty())
+            || !self.explicit_mention_user_ids.is_empty()
     }
 }
 
@@ -309,6 +313,9 @@ pub(crate) struct SendReceipt {
     /// Content digests for images confirmed by the platform adapter. Keeping
     /// these in the receipt lets a turn avoid re-sending tool-delivered media.
     pub(crate) image_digests: Vec<blake3::Hash>,
+    /// Whether the platform confirmed the operation carrying the response
+    /// quote and mentions. Partial failures must not re-arm a delivered target.
+    pub(crate) response_target_delivered: bool,
 }
 
 impl SendReceipt {
@@ -317,6 +324,7 @@ impl SendReceipt {
             || !self.message_ids.is_empty()
             || !self.image_message_ids.is_empty()
             || !self.image_digests.is_empty()
+            || self.response_target_delivered
     }
 }
 

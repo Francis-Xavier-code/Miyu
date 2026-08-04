@@ -409,6 +409,14 @@ impl PlatformPlugin for ReplyProcessorPlugin {
             if settings.config.strip_period {
                 strip_trailing_chinese_period(&mut message);
             }
+            if settings.mode == ReplyMode::Forward
+                && message
+                    .response_target
+                    .as_ref()
+                    .is_some_and(|target| !target.explicit_mention_user_ids.is_empty())
+            {
+                return Ok(PreparedSend::unchanged(message));
+            }
             if matches!(message.body, OutboundBody::Forward(_)) {
                 return Ok(PreparedSend::unchanged(message));
             }
@@ -1142,6 +1150,7 @@ mod tests {
             user_id: "40000".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         });
 
         let prepared = plugin.before_send(&context, message).await.unwrap();
@@ -1153,6 +1162,7 @@ mod tests {
                 user_id: "40000".to_string(),
                 quote: true,
                 mention: true,
+                explicit_mention_user_ids: Vec::new(),
             })
         );
         let OutboundBody::Forward(nodes) = prepared.primary.body else {
@@ -1164,6 +1174,35 @@ mod tests {
             OutboundSegment::Markdown(text) if text == "long"
         ));
         assert!(prepared.after_success.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_mode_keeps_explicit_mentions_in_the_regular_message() {
+        let (_temp, mut context) = test_context(true);
+        set_plugin_setting(&mut context, "threshold", json!(1));
+        set_plugin_setting(&mut context, "mode", json!("forward"));
+        let plugin = ReplyProcessorPlugin::new().unwrap();
+        let mut message = OutboundMessage::markdown(OutboundOrigin::FinalReply, "long。");
+        message.response_target = Some(ResponseTarget {
+            message_id: "9".to_string(),
+            user_id: "40000".to_string(),
+            quote: true,
+            mention: false,
+            explicit_mention_user_ids: vec!["50000".to_string(), "60000".to_string()],
+        });
+
+        let prepared = plugin.before_send(&context, message).await.unwrap();
+
+        assert!(matches!(prepared.primary.body, OutboundBody::Segments(_)));
+        assert!(prepared.fallback.is_none());
+        assert_eq!(
+            prepared
+                .primary
+                .response_target
+                .unwrap()
+                .explicit_mention_user_ids,
+            ["50000", "60000"]
+        );
     }
 
     #[tokio::test]
@@ -1257,6 +1296,7 @@ mod tests {
                     image_message_ids: Vec::new(),
                     delivered_parts: 1,
                     image_digests: Vec::new(),
+                    response_target_delivered: false,
                 },
             )
             .await

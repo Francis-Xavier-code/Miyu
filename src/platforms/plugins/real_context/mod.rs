@@ -922,13 +922,29 @@ impl RealContextPlugin {
             .bot_display_name()
             .await
             .unwrap_or_else(|_| "Miyu".to_string());
+        let mut content = SanitizedContent::new(text, media);
+        if let Some(target) = message.response_target.as_ref() {
+            if target.mention && !target.user_id.is_empty() {
+                content.mentioned_user_ids.push(target.user_id.clone());
+            }
+            for user_id in &target.explicit_mention_user_ids {
+                if let Ok(Some(member)) = context.group_member(user_id).await {
+                    content.mentioned_users.push(PlatformMention {
+                        user_id: user_id.clone(),
+                        display_name: Some(member.display_name().to_string()),
+                    });
+                } else {
+                    content.mentioned_user_ids.push(user_id.clone());
+                }
+            }
+        }
         self.store(context)
             .record_message(NewHistoryMessage {
                 group: group_key(context)?,
                 message_id,
                 sender_id: context.conversation.account_id.clone(),
                 sender_name,
-                content: SanitizedContent::new(text, media),
+                content,
                 reply_to_message_id: message
                     .response_target
                     .as_ref()
@@ -954,12 +970,15 @@ impl RealContextPlugin {
             return;
         }
         let target = message.response_target.as_ref();
-        let target_message_id = target.map(|target| target.message_id.as_str()).or_else(|| {
-            context
-                .inbound_event()
-                .map(|event| event.message_id.as_str())
-        });
-        if let Some(message_id) = target_message_id.filter(|id| !id.is_empty()) {
+        let target_message_id = target
+            .map(|target| target.message_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                context
+                    .inbound_event()
+                    .map(|event| event.message_id.as_str())
+            });
+        if let Some(message_id) = target_message_id {
             for reaction in &settings.active_reply_reaction_emoji_ids {
                 let reaction = reaction.to_string();
                 self.cancel_reaction_expiration(context, message_id, &reaction);
@@ -2290,6 +2309,7 @@ fn response_target(
         user_id: event.sender_id.clone(),
         quote: settings.reply_target_quote_enable,
         mention: settings.reply_target_mention_enable,
+        explicit_mention_user_ids: Vec::new(),
     };
     target.is_effective().then_some(target)
 }
@@ -3137,6 +3157,7 @@ mod tests {
                 user_id: "guessed-user".to_string(),
                 quote: true,
                 mention: true,
+                explicit_mention_user_ids: Vec::new(),
             }),
         };
 

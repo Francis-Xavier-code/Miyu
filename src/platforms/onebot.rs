@@ -4391,15 +4391,26 @@ fn prepend_response_target(segments: &mut Vec<Value>, target: &ResponseTarget) {
         );
         index += 1;
     }
+    let mut seen = HashSet::new();
+    let mut mention_user_ids = Vec::new();
     if target.mention && !target.user_id.is_empty() {
-        segments.insert(
-            index,
-            json!({ "type": "at", "data": { "qq": target.user_id } }),
-        );
+        seen.insert(target.user_id.as_str());
+        mention_user_ids.push(target.user_id.as_str());
+    }
+    for user_id in &target.explicit_mention_user_ids {
+        let user_id = user_id.trim();
+        if !user_id.is_empty() && seen.insert(user_id) {
+            mention_user_ids.push(user_id);
+        }
+    }
+    for user_id in mention_user_ids {
+        segments.insert(index, json!({ "type": "at", "data": { "qq": user_id } }));
+        index += 1;
         // OneBot renders an `at` segment adjacent to the following text.
         // Keep the generated target readable on clients that do not add
         // visual separation themselves.
-        segments.insert(index + 1, text_segment(" "));
+        segments.insert(index, text_segment(" "));
+        index += 1;
     }
 }
 
@@ -4788,16 +4799,14 @@ impl OneBotAdapter {
                 let mut receipt = self.send_forward(nodes).await?;
                 if let Some(target) = response_target.filter(ResponseTarget::is_effective) {
                     match self.send_response_marker(&target).await {
-                        Ok(Some(message_id)) => {
+                        Ok(message_id) => {
                             receipt.delivered_parts += 1;
-                            receipt.message_ids.push(message_id);
+                            receipt.response_target_delivered = true;
+                            if let Some(message_id) = message_id {
+                                receipt.message_ids.push(message_id);
+                            }
                         }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "{}",
-                            t("sending OneBot forward response target marker failed", "发送 OneBot 合并转发响应目标标记失败")
-                        ),
+                        Err(error) => return Err(partial_send_error(error, receipt)),
                     }
                 }
                 Ok(receipt)
@@ -4871,6 +4880,9 @@ impl OneBotAdapter {
         push_message_frame(&mut frames, &mut current, &mut current_image_digests);
 
         let has_message_frames = !frames.is_empty();
+        let target_on_first_frame = has_message_frames
+            && matches!(self.target, Target::Group { .. })
+            && response_target.is_some_and(ResponseTarget::is_effective);
         let mut receipt = SendReceipt::default();
         for (index, frame) in frames.into_iter().enumerate() {
             let MessageFrame {
@@ -4878,16 +4890,20 @@ impl OneBotAdapter {
                 image_digests,
             } = frame;
             let has_image = !image_digests.is_empty();
-            if index == 0 {
-                if let (Target::Group { .. }, Some(target)) = (self.target, response_target) {
-                    prepend_response_target(&mut segments, target);
-                }
+            if index == 0 && target_on_first_frame {
+                prepend_response_target(
+                    &mut segments,
+                    response_target.expect("effective response target exists"),
+                );
             }
             let data = match self.send_message_segments(segments).await {
                 Ok(data) => data,
                 Err(error) => return Err(partial_send_error(error, receipt)),
             };
             receipt.delivered_parts += 1;
+            if index == 0 && target_on_first_frame {
+                receipt.response_target_delivered = true;
+            }
             receipt.image_digests.extend(image_digests);
             if let Some(id) = data.get("message_id").and_then(value_id_string) {
                 if has_image {
@@ -4908,17 +4924,14 @@ impl OneBotAdapter {
         }
         if !has_message_frames {
             if let Some(target) = response_target.filter(|target| target.is_effective()) {
-                match self.send_response_marker(target).await {
-                    Ok(Some(message_id)) => {
-                        receipt.delivered_parts += 1;
-                        receipt.message_ids.push(message_id);
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "{}",
-                        t("sending OneBot attachment response target marker failed", "发送 OneBot 附件响应目标标记失败")
-                    ),
+                let message_id = match self.send_response_marker(target).await {
+                    Ok(message_id) => message_id,
+                    Err(error) => return Err(partial_send_error(error, receipt)),
+                };
+                receipt.delivered_parts += 1;
+                receipt.response_target_delivered = true;
+                if let Some(message_id) = message_id {
+                    receipt.message_ids.push(message_id);
                 }
             }
         }
@@ -4991,6 +5004,7 @@ impl OneBotAdapter {
             image_message_ids: Vec::new(),
             delivered_parts: 1,
             image_digests,
+            response_target_delivered: false,
         })
     }
 
@@ -5683,7 +5697,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_mentions_have_ascii_separation_from_body() {
+    fn generated_mentions_are_ordered_deduplicated_and_separated() {
         let mut segments = vec![text_segment("正文")];
         prepend_response_target(
             &mut segments,
@@ -5692,12 +5706,22 @@ mod tests {
                 user_id: "123".to_string(),
                 quote: false,
                 mention: true,
+                explicit_mention_user_ids: vec![
+                    "123".to_string(),
+                    "456".to_string(),
+                    "456".to_string(),
+                ],
             },
         );
         assert_eq!(segments[0]["type"], "at");
+        assert_eq!(segments[0]["data"]["qq"], "123");
         assert_eq!(segments[1]["type"], "text");
         assert_eq!(segments[1]["data"]["text"], " ");
-        assert_eq!(segments[2]["data"]["text"], "正文");
+        assert_eq!(segments[2]["type"], "at");
+        assert_eq!(segments[2]["data"]["qq"], "456");
+        assert_eq!(segments[3]["type"], "text");
+        assert_eq!(segments[3]["data"]["text"], " ");
+        assert_eq!(segments[4]["data"]["text"], "正文");
     }
 
     #[tokio::test]
@@ -8447,6 +8471,7 @@ mod tests {
             user_id: "77".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         });
         let send = {
             let adapter = adapter.clone();
@@ -8490,6 +8515,7 @@ mod tests {
                 user_id: "76".to_string(),
                 quote: true,
                 mention: true,
+                explicit_mention_user_ids: Vec::new(),
             }),
             origin: OutboundOrigin::Plugin,
             metadata: Default::default(),
@@ -8548,6 +8574,7 @@ mod tests {
             user_id: "7".to_string(),
             quote: true,
             mention: true,
+            explicit_mention_user_ids: Vec::new(),
         });
         let send = {
             let adapter = adapter.clone();
@@ -8584,6 +8611,137 @@ mod tests {
                 "echo": second["echo"],
             }),
         );
-        assert_eq!(send.await.unwrap().unwrap().message_ids, vec!["1", "2"]);
+        let receipt = send.await.unwrap().unwrap();
+        assert_eq!(receipt.message_ids, vec!["1", "2"]);
+        assert!(receipt.response_target_delivered);
+    }
+
+    #[tokio::test]
+    async fn split_failure_reports_that_the_response_target_was_delivered() {
+        let (handle, mut frames) = test_connection(None);
+        let mut adapter = test_adapter(handle.clone(), Target::Group { group_id: 42 });
+        adapter.max_reply_chars = 3;
+        let adapter = Arc::new(adapter);
+        let mut message = OutboundMessage::text(OutboundOrigin::FinalReply, "abcdef");
+        message.response_target = Some(ResponseTarget {
+            message_id: String::new(),
+            user_id: String::new(),
+            quote: false,
+            mention: false,
+            explicit_mention_user_ids: vec!["30000".to_string(), "40000".to_string()],
+        });
+        let send = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move { adapter.send_message(message).await })
+        };
+
+        let first: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(first["params"]["message"][0]["data"]["qq"], "30000");
+        assert_eq!(first["params"]["message"][2]["data"]["qq"], "40000");
+        route_api_response(
+            &handle,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": { "message_id": 1 },
+                "echo": first["echo"],
+            }),
+        );
+
+        let second: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        route_api_response(
+            &handle,
+            json!({
+                "status": "failed",
+                "retcode": 100,
+                "data": null,
+                "echo": second["echo"],
+            }),
+        );
+        let error = send.await.unwrap().unwrap_err();
+        let partial = error.downcast_ref::<PartialSendError>().unwrap();
+        assert_eq!(partial.receipt().delivered_parts, 1);
+        assert!(partial.receipt().response_target_delivered);
+    }
+
+    #[tokio::test]
+    async fn forward_marker_failure_is_reported_as_partial_delivery() {
+        let (handle, mut frames) = test_connection(None);
+        let adapter = Arc::new(test_adapter(handle.clone(), Target::Group { group_id: 42 }));
+        let message = OutboundMessage {
+            body: OutboundBody::Forward(vec![ForwardNode {
+                user_id: "10000".to_string(),
+                display_name: "Miyu".to_string(),
+                segments: vec![OutboundSegment::Text("forward".to_string())],
+            }]),
+            response_target: Some(ResponseTarget {
+                message_id: String::new(),
+                user_id: String::new(),
+                quote: false,
+                mention: false,
+                explicit_mention_user_ids: vec!["30000".to_string()],
+            }),
+            origin: OutboundOrigin::FinalReply,
+            metadata: Default::default(),
+        };
+        let send = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move { adapter.send_message(message).await })
+        };
+
+        let forward: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(forward["action"], "send_group_forward_msg");
+        route_api_response(
+            &handle,
+            json!({
+                "status": "ok",
+                "retcode": 0,
+                "data": { "message_id": "forward-1" },
+                "echo": forward["echo"],
+            }),
+        );
+
+        let marker: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+        assert_eq!(marker["action"], "send_group_msg");
+        route_api_response(
+            &handle,
+            json!({
+                "status": "failed",
+                "retcode": 100,
+                "data": null,
+                "echo": marker["echo"],
+            }),
+        );
+
+        let error = send.await.unwrap().unwrap_err();
+        let partial = error.downcast_ref::<PartialSendError>().unwrap();
+        assert_eq!(partial.receipt().delivered_parts, 1);
+        assert!(!partial.receipt().response_target_delivered);
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_does_not_send_a_bare_response_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.txt");
+        let (handle, mut frames) = test_connection(None);
+        let adapter = test_adapter(handle, Target::Group { group_id: 42 });
+        let message = OutboundMessage::segments(
+            OutboundOrigin::FinalReply,
+            vec![OutboundSegment::FilePath {
+                path: missing,
+                name: None,
+            }],
+        );
+        let mut message = message;
+        message.response_target = Some(ResponseTarget {
+            message_id: String::new(),
+            user_id: String::new(),
+            quote: false,
+            mention: false,
+            explicit_mention_user_ids: vec!["30000".to_string()],
+        });
+
+        assert!(adapter.send_message(message).await.is_err());
+        assert!(frames.try_recv().is_err());
     }
 }

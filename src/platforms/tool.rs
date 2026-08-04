@@ -1,16 +1,21 @@
-use super::types::{OutboundMessage, OutboundOrigin, OutboundSegment};
+use super::types::{ConversationKind, OutboundMessage, OutboundOrigin, OutboundSegment};
 use super::PlatformTurnContext;
 use crate::i18n::agent_text as t;
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_TOOL_IMAGES: usize = 4;
 const MAX_TOOL_FILES: usize = 4;
+const MAX_TOOL_MENTIONS: usize = 32;
 
 pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
+    if context.conversation.kind == ConversationKind::Group {
+        register_mention(registry, context.clone());
+    }
     let host_tools_allowed = context.host_tools_allowed();
     let parameters = if host_tools_allowed {
         json!({
@@ -72,6 +77,112 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
         .writes()
         .with_display_name(t("Send message", "发送消息")),
     );
+}
+
+fn register_mention(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
+    registry.register(
+        ToolSpec::new(
+            "qq_mention_users",
+            t(
+                "Make Miyu's next outgoing message in the current QQ group natively @ one or more members. Provide exact QQ IDs; use get_group_members_info first when only names are known. These explicit targets replace the automatic reply mention but preserve its message-quote behavior. This tool does not send a separate message.",
+                "让 Miyu 在当前 QQ 群的下一条消息中原生艾特一名或多名成员。请提供准确 QQ 号；只知道名字时先调用 get_group_members_info。显式目标会覆盖自动回复艾特，但保留消息引用策略。此工具不会单独发送消息。",
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "user_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TOOL_MENTIONS,
+                        "items": {
+                            "type": "string",
+                            "pattern": "^[1-9][0-9]{4,11}$"
+                        },
+                        "description": t("Exact QQ IDs of the members to mention, in display order.", "要艾特的群成员 QQ 号列表，按显示顺序填写。")
+                    }
+                },
+                "required": ["user_ids"],
+                "additionalProperties": false
+            }),
+            move |arguments| {
+                let context = context.clone();
+                async move { mention(arguments, &context).await }
+            },
+        )
+        .writes()
+        .with_display_name(t("Mention group members", "艾特群成员")),
+    );
+}
+
+async fn mention(arguments: Value, context: &PlatformTurnContext) -> Result<String> {
+    if context.conversation.kind != ConversationKind::Group {
+        bail!("mentioning users is only available in a group conversation");
+    }
+    let object = arguments
+        .as_object()
+        .context("arguments must be an object containing only user_ids")?;
+    if object.len() != 1 || !object.contains_key("user_ids") {
+        bail!("only user_ids may be specified");
+    }
+    let raw_user_ids = array(&arguments, "user_ids")?;
+    if raw_user_ids.is_empty() {
+        bail!("user_ids must contain at least one QQ ID");
+    }
+    if raw_user_ids.len() > MAX_TOOL_MENTIONS {
+        bail!("at most {MAX_TOOL_MENTIONS} users may be mentioned at once");
+    }
+
+    let mut seen = HashSet::new();
+    let mut user_ids = Vec::with_capacity(raw_user_ids.len());
+    for (index, value) in raw_user_ids.iter().enumerate() {
+        let user_id = value
+            .as_str()
+            .filter(|user_id| !user_id.is_empty())
+            .with_context(|| format!("user_ids[{index}] must be a QQ ID string"))?;
+        if !(5..=12).contains(&user_id.len())
+            || !user_id
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+            || !user_id.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            bail!("user_ids[{index}] must be a 5-12 digit QQ ID");
+        }
+        let user_id = user_id.to_string();
+        if seen.insert(user_id.clone()) {
+            user_ids.push(user_id);
+        }
+    }
+    let member_ids = context
+        .group_members()
+        .await
+        .context("looking up current group members before mentioning them")?
+        .into_iter()
+        .map(|member| member.user_id)
+        .collect::<HashSet<_>>();
+    let missing = user_ids
+        .iter()
+        .filter(|user_id| !member_ids.contains(*user_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "these QQ IDs are not members of the current group: {}",
+            missing.join(", ")
+        );
+    }
+    context.set_explicit_response_mentions(user_ids.clone());
+
+    Ok(json!({
+        "ok": true,
+        "user_ids": user_ids,
+        "conversation": context.conversation.scope_key(),
+        "message": t(
+            "The next outgoing message will mention these members. Write that message normally.",
+            "下一条发出的消息会艾特这些成员，请正常撰写消息内容。"
+        )
+    })
+    .to_string())
 }
 
 async fn send(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
