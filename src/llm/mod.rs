@@ -149,6 +149,12 @@ impl Usage {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ResponsesContinuation {
+    pub(crate) response_id: String,
+    pub(crate) endpoint_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatResult {
     pub content: String,
     pub reasoning: Option<String>,
@@ -157,6 +163,7 @@ pub struct ChatResult {
     pub tool_calls: Vec<ToolCall>,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    pub(crate) responses_continuation: Option<Box<ResponsesContinuation>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

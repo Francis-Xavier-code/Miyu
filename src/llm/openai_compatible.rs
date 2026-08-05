@@ -1,6 +1,6 @@
 use super::{
-    ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind, ToolCall, ToolCallFunction,
-    ToolDefinition, Usage,
+    ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind, ResponsesContinuation, ToolCall,
+    ToolCallFunction, ToolDefinition, Usage,
 };
 use crate::config::{AppConfig, ProviderConfig};
 use crate::default_models::OPENCODE_ZEN_BASE_URL;
@@ -12,7 +12,7 @@ use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::fd::AsRawFd;
@@ -50,6 +50,7 @@ const RESPONSES_RESERVED_BODY_KEYS: &[&str] = &[
     "model",
     "input",
     "instructions",
+    "previous_response_id",
     "stream",
     "tools",
     "reasoning",
@@ -597,6 +598,11 @@ impl ThinkingVariantPreferences {
         rename_thinking_variant_entries(&mut self.changes, old_id, new_id);
         self.provider_renames
             .push((old_id.to_string(), new_id.to_string()));
+    }
+
+    /// True when `save` would write anything to disk.
+    pub(crate) fn is_dirty(&self) -> bool {
+        !self.changes.is_empty() || !self.provider_renames.is_empty()
     }
 
     pub(crate) fn save(&self, paths: &MiyuPaths) -> Result<()> {
@@ -1304,7 +1310,21 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
-        self.chat_stream_inner(messages, tools, false, &mut on_chunk)
+        self.chat_stream_inner(messages, tools, None, false, &mut on_chunk)
+            .await
+    }
+
+    pub(crate) async fn chat_stream_with_continuation<F>(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        continuation: Option<&ResponsesContinuation>,
+        mut on_chunk: F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
+        self.chat_stream_inner(messages, tools, continuation, false, &mut on_chunk)
             .await
     }
 
@@ -1316,7 +1336,7 @@ impl OpenAiCompatibleClient {
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
     ) -> Result<ChatResult> {
-        self.chat_stream_inner(messages, tools, true, &mut |_| Ok(()))
+        self.chat_stream_inner(messages, tools, None, true, &mut |_| Ok(()))
             .await
     }
 
@@ -1324,6 +1344,7 @@ impl OpenAiCompatibleClient {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
+        continuation: Option<&ResponsesContinuation>,
         buffered: bool,
         on_chunk: &mut F,
     ) -> Result<ChatResult>
@@ -1333,7 +1354,20 @@ impl OpenAiCompatibleClient {
         let request_id = gen_llm_request_id();
         let endpoints = self.endpoints.as_ref();
         let mut errors = Vec::new();
-        let mut order = ordered_endpoint_indices(endpoints);
+        let mut order = if let Some(continuation) = continuation {
+            let index = endpoints
+                .iter()
+                .position(|endpoint| endpoint.id() == continuation.endpoint_id)
+                .with_context(|| {
+                    format!(
+                        "Responses continuation endpoint is no longer available: {}",
+                        continuation.endpoint_id
+                    )
+                })?;
+            vec![index]
+        } else {
+            ordered_endpoint_indices(endpoints)
+        };
         if order.is_empty() {
             tracing::warn!(
                 request_id,
@@ -1352,6 +1386,7 @@ impl OpenAiCompatibleClient {
             endpoint_count = order.len(),
             message_count = messages.len(),
             tool_count = tools.len(),
+            continued = continuation.is_some(),
             "{}",
             t("LLM request started", "LLM 请求已开始")
         );
@@ -1387,6 +1422,7 @@ impl OpenAiCompatibleClient {
                     .chat_stream_single(
                         messages.clone(),
                         tools.clone(),
+                        continuation.map(|continuation| continuation.response_id.as_str()),
                         &request_id,
                         &mut attempt_on_chunk,
                     )
@@ -1396,6 +1432,9 @@ impl OpenAiCompatibleClient {
                 Ok(mut result) => {
                     result.provider_id = Some(endpoint.provider.id.clone());
                     result.model = Some(endpoint.provider.default_model.clone());
+                    if let Some(next) = result.responses_continuation.as_mut() {
+                        next.endpoint_id = endpoint.id();
+                    }
                     mark_endpoint_success(endpoint);
                     tracing::debug!(
                         request_id,
@@ -1488,6 +1527,7 @@ impl OpenAiCompatibleClient {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
+        previous_response_id: Option<&str>,
         request_id: &str,
         on_chunk: &mut F,
     ) -> Result<ChatResult>
@@ -1495,6 +1535,11 @@ impl OpenAiCompatibleClient {
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
         let protocol = ProviderProtocol::from_provider(&self.provider)?;
+        let uses_responses = protocol == ProviderProtocol::OpenAiResponses
+            || (protocol == ProviderProtocol::Auto && self.uses_openai_responses());
+        if previous_response_id.is_some() && !uses_responses {
+            bail!("Responses continuation endpoint no longer uses the Responses protocol");
+        }
         if protocol == ProviderProtocol::Anthropic
             || (protocol == ProviderProtocol::Auto && self.uses_anthropic_messages())
         {
@@ -1502,14 +1547,21 @@ impl OpenAiCompatibleClient {
                 .chat_anthropic_stream(messages, tools, request_id, on_chunk)
                 .await;
         }
-        if protocol == ProviderProtocol::OpenAiResponses
-            || (protocol == ProviderProtocol::Auto && self.uses_openai_responses())
-        {
+        if uses_responses {
             if let Some(result) = self
-                .chat_responses_stream(messages.clone(), tools.clone(), request_id, on_chunk)
+                .chat_responses_stream(
+                    messages.clone(),
+                    tools.clone(),
+                    previous_response_id,
+                    request_id,
+                    on_chunk,
+                )
                 .await?
             {
                 return Ok(result);
+            }
+            if previous_response_id.is_some() {
+                bail!("OpenAI Responses continuation is not supported by this provider");
             }
             if protocol == ProviderProtocol::OpenAiResponses {
                 bail!("OpenAI Responses protocol is not supported by this provider");
@@ -2250,6 +2302,7 @@ impl OpenAiCompatibleClient {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
+        previous_response_id: Option<&str>,
         request_id: &str,
         on_chunk: &mut F,
     ) -> Result<Option<ChatResult>>
@@ -2260,10 +2313,22 @@ impl OpenAiCompatibleClient {
             self.provider.extra_body.clone(),
             RESPONSES_RESERVED_BODY_KEYS,
         );
+        let store_disabled = extra_body
+            .as_ref()
+            .and_then(|body| body.get("store"))
+            .and_then(Value::as_bool)
+            == Some(false);
+        if store_disabled && !tools.is_empty() {
+            bail!("OpenAI Responses tools require response storage; remove store=false or disable tools");
+        }
+        if previous_response_id.is_some() && store_disabled {
+            bail!("OpenAI Responses tool continuation requires response storage; remove store=false or disable tools");
+        }
         let request = ResponsesRequest {
             model: self.provider.default_model.clone(),
             input: lower_responses_messages(messages),
             instructions: None,
+            previous_response_id: previous_response_id.map(str::to_string),
             stream: true,
             tools: (!tools.is_empty()).then(|| lower_responses_tools(tools)),
             reasoning: self.responses_reasoning(),
@@ -2320,6 +2385,9 @@ impl OpenAiCompatibleClient {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = self
@@ -2336,22 +2404,28 @@ impl OpenAiCompatibleClient {
                     &mut reasoning_part_active,
                     &mut usage,
                     &mut content_started,
+                    &mut output_text_delta_parts,
+                    &mut refusal_delta_parts,
+                    &mut response_id,
                     &mut tool_calls,
                     &mut *on_chunk,
                 )? {
-                    return finalize_stream_result(
+                    return finalize_responses_stream_result(
                         content,
                         reasoning,
                         usage,
                         tool_calls.finish(),
                         dsml,
+                        response_id,
+                        store_disabled,
                     )
                     .map(Some);
                 }
             }
         }
+        let mut terminal_event_received = false;
         for line in buffer.finish()? {
-            let _ = handle_responses_sse_line(
+            if handle_responses_sse_line(
                 &line,
                 &mut content,
                 &mut content_emitted,
@@ -2360,32 +2434,29 @@ impl OpenAiCompatibleClient {
                 &mut reasoning_part_active,
                 &mut usage,
                 &mut content_started,
+                &mut output_text_delta_parts,
+                &mut refusal_delta_parts,
+                &mut response_id,
                 &mut tool_calls,
                 &mut *on_chunk,
-            )?;
+            )? {
+                terminal_event_received = true;
+                break;
+            }
         }
-        flush_buffer(
-            &reasoning,
-            &mut reasoning_emitted,
-            ChatStreamKind::Reasoning,
-            &mut *on_chunk,
-            true,
-        )?;
-        flush_buffer(
-            &content,
-            &mut content_emitted,
-            ChatStreamKind::Content,
-            &mut *on_chunk,
-            true,
-        )?;
-        let result = finalize_stream_result(content, reasoning, usage, tool_calls.finish(), dsml)?;
-        if reasoning_part_active {
-            on_chunk(ChatStreamChunk {
-                kind: ChatStreamKind::ReasoningPartEnd,
-                text: String::new(),
-            })?;
+        if !terminal_event_received {
+            bail!("OpenAI Responses stream ended before a terminal event");
         }
-        Ok(Some(result))
+        finalize_responses_stream_result(
+            content,
+            reasoning,
+            usage,
+            tool_calls.finish(),
+            dsml,
+            response_id,
+            store_disabled,
+        )
+        .map(Some)
     }
 
     fn uses_openai_responses(&self) -> bool {
@@ -2555,6 +2626,8 @@ struct ResponsesRequest {
     input: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
@@ -2677,8 +2750,7 @@ fn lower_responses_assistant_message(message: ChatMessage) -> Vec<Value> {
     let mut items = Vec::new();
     let text = chat_content_text(message.content);
     if !text.trim().is_empty() {
-        items
-            .push(json!({"role": "assistant", "content": [{"type": "output_text", "text": text}]}));
+        items.push(json!({"role": "assistant", "content": text}));
     }
     if let Some(tool_calls) = message.tool_calls {
         items.extend(tool_calls.into_iter().map(|call| {
@@ -3063,6 +3135,16 @@ struct ResponsesStreamEvent {
     #[serde(default, deserialize_with = "null_as_default")]
     delta: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
+    arguments: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    refusal: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    text: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    content_index: Option<usize>,
+    #[serde(default, deserialize_with = "null_as_default")]
     item_id: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     item: Option<ResponsesStreamItem>,
@@ -3087,7 +3169,17 @@ struct ResponsesStreamItem {
 #[derive(Debug, Deserialize)]
 struct ResponsesStreamResponse {
     #[serde(default, deserialize_with = "null_as_default")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
     usage: Option<ResponsesUsage>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesIncompleteDetails {
+    #[serde(default, deserialize_with = "null_as_default")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3284,40 +3376,55 @@ impl AnthropicToolAccumulator {
 
 #[derive(Debug, Default)]
 struct ResponsesToolAccumulator {
-    calls: Vec<PartialToolCall>,
+    calls: Vec<PartialResponsesToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct PartialResponsesToolCall {
+    item_id: String,
+    call: PartialToolCall,
 }
 
 impl ResponsesToolAccumulator {
     fn start(&mut self, item: ResponsesStreamItem) -> Option<String> {
-        if item.kind != "function_call" {
+        if item.kind != "function_call" || self.calls.len() >= MAX_STREAM_TOOL_CALLS {
             return None;
         }
+        let item_id = item.id.unwrap_or_default();
         let name = item.name.unwrap_or_default();
-        self.calls.push(PartialToolCall {
-            id: item.call_id.or(item.id).unwrap_or_default(),
-            kind: "function".to_string(),
-            name: name.clone(),
-            arguments: bounded_stream_string(
-                item.arguments.unwrap_or_default(),
-                MAX_STREAM_TOOL_ARGUMENT_BYTES,
-            ),
+        self.calls.push(PartialResponsesToolCall {
+            call: PartialToolCall {
+                id: item.call_id.unwrap_or_else(|| item_id.clone()),
+                kind: "function".to_string(),
+                name: name.clone(),
+                arguments: bounded_stream_string(
+                    item.arguments.unwrap_or_default(),
+                    MAX_STREAM_TOOL_ARGUMENT_BYTES,
+                ),
+            },
+            item_id,
         });
         (!name.is_empty()).then_some(name)
     }
 
     fn append_arguments(&mut self, item_id: Option<String>, delta: String) {
         if let Some(item_id) = item_id {
-            if let Some(call) = self
-                .calls
-                .iter_mut()
-                .find(|call| call.id == item_id || call.id.is_empty())
-            {
-                append_bounded(&mut call.arguments, &delta, MAX_STREAM_TOOL_ARGUMENT_BYTES);
+            if let Some(partial) = self.calls.iter_mut().find(|call| call.item_id == item_id) {
+                append_bounded(
+                    &mut partial.call.arguments,
+                    &delta,
+                    MAX_STREAM_TOOL_ARGUMENT_BYTES,
+                );
                 return;
             }
+            return;
         }
-        if let Some(call) = self.calls.last_mut() {
-            append_bounded(&mut call.arguments, &delta, MAX_STREAM_TOOL_ARGUMENT_BYTES);
+        if let Some(partial) = self.calls.last_mut() {
+            append_bounded(
+                &mut partial.call.arguments,
+                &delta,
+                MAX_STREAM_TOOL_ARGUMENT_BYTES,
+            );
         }
     }
 
@@ -3325,28 +3432,59 @@ impl ResponsesToolAccumulator {
         if item.kind != "function_call" {
             return;
         }
-        let id = item.call_id.or(item.id).unwrap_or_default();
-        if let Some(call) = self.calls.iter_mut().find(|call| call.id == id) {
+        let item_id = item.id.unwrap_or_default();
+        let call_id = item.call_id.unwrap_or_default();
+        let existing = self.calls.iter_mut().find(|partial| {
+            (!item_id.is_empty() && partial.item_id == item_id)
+                || (item_id.is_empty() && !call_id.is_empty() && partial.call.id == call_id)
+        });
+        if let Some(partial) = existing {
+            if !call_id.is_empty() {
+                partial.call.id = call_id;
+            }
             if let Some(name) = item.name {
-                call.name = name;
+                partial.call.name = name;
             }
             if let Some(arguments) = item.arguments {
-                call.arguments = bounded_stream_string(arguments, MAX_STREAM_TOOL_ARGUMENT_BYTES);
+                partial.call.arguments =
+                    bounded_stream_string(arguments, MAX_STREAM_TOOL_ARGUMENT_BYTES);
             }
         } else {
             let _ = self.start(ResponsesStreamItem {
                 kind: "function_call".to_string(),
-                id: None,
-                call_id: Some(id),
+                id: (!item_id.is_empty()).then_some(item_id),
+                call_id: (!call_id.is_empty()).then_some(call_id),
                 name: item.name,
                 arguments: item.arguments,
             });
         }
     }
 
+    fn finish_arguments(
+        &mut self,
+        item_id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    ) {
+        let Some(item_id) = item_id else {
+            return;
+        };
+        let Some(partial) = self.calls.iter_mut().find(|call| call.item_id == item_id) else {
+            return;
+        };
+        if let Some(name) = name {
+            partial.call.name = name;
+        }
+        if let Some(arguments) = arguments {
+            partial.call.arguments =
+                bounded_stream_string(arguments, MAX_STREAM_TOOL_ARGUMENT_BYTES);
+        }
+    }
+
     fn finish(self) -> Vec<ToolCall> {
         self.calls
             .into_iter()
+            .map(|partial| partial.call)
             .filter(|call| !call.name.trim().is_empty())
             .map(|call| {
                 let id = if call.id.is_empty() {
@@ -3744,6 +3882,9 @@ fn handle_responses_sse_line<F>(
     reasoning_part_active: &mut bool,
     usage: &mut Option<Usage>,
     content_started: &mut bool,
+    output_text_delta_parts: &mut HashSet<(String, usize)>,
+    refusal_delta_parts: &mut HashSet<(String, usize)>,
+    response_id: &mut Option<String>,
     tool_calls: &mut ResponsesToolAccumulator,
     on_chunk: &mut F,
 ) -> Result<bool>
@@ -3787,6 +3928,14 @@ where
             clean_plain_text(data.to_string())
         )
     })?;
+    if let Some(id) = event
+        .response
+        .as_ref()
+        .and_then(|response| response.id.as_deref())
+        .filter(|id| !id.trim().is_empty())
+    {
+        *response_id = Some(id.to_string());
+    }
     if event.kind.starts_with("response.reasoning")
         || matches!(
             event.kind.as_str(),
@@ -3810,9 +3959,42 @@ where
             t("Responses stream milestone", "Responses 流关键节点")
         );
     }
+    let content_part_key = (
+        event.item_id.clone().unwrap_or_default(),
+        event.content_index.unwrap_or_default(),
+    );
     match event.kind.as_str() {
-        "response.output_text.delta" => {
-            let text = event.delta.unwrap_or_default();
+        "response.output_text.delta"
+        | "response.output_text.done"
+        | "response.refusal.delta"
+        | "response.refusal.done" => {
+            let text = match event.kind.as_str() {
+                "response.output_text.delta" => {
+                    let text = event.delta.unwrap_or_default();
+                    if !text.is_empty() {
+                        output_text_delta_parts.insert(content_part_key.clone());
+                    }
+                    text
+                }
+                "response.output_text.done"
+                    if !output_text_delta_parts.contains(&content_part_key) =>
+                {
+                    event.text.unwrap_or_default()
+                }
+                "response.output_text.done" => String::new(),
+                "response.refusal.delta" => {
+                    let text = event.delta.unwrap_or_default();
+                    if !text.is_empty() {
+                        refusal_delta_parts.insert(content_part_key.clone());
+                    }
+                    text
+                }
+                "response.refusal.done" if !refusal_delta_parts.contains(&content_part_key) => {
+                    event.refusal.unwrap_or_default()
+                }
+                "response.refusal.done" => String::new(),
+                _ => String::new(),
+            };
             if text.is_empty() {
                 return Ok(false);
             }
@@ -3955,12 +4137,15 @@ where
                 tool_calls.append_arguments(event.item_id, delta);
             }
         }
+        "response.function_call_arguments.done" => {
+            tool_calls.finish_arguments(event.item_id, event.name, event.arguments);
+        }
         "response.output_item.done" => {
             if let Some(item) = event.item {
                 tool_calls.finish_item(item);
             }
         }
-        "response.completed" | "response.incomplete" => {
+        "response.completed" => {
             if let Some(next_usage) = event.response.and_then(|response| response.usage) {
                 let total_tokens = if next_usage.total_tokens > 0 {
                     next_usage.total_tokens
@@ -3997,6 +4182,15 @@ where
                 true,
             )?;
             return Ok(true);
+        }
+        "response.incomplete" => {
+            let reason = event
+                .response
+                .as_ref()
+                .and_then(|response| response.incomplete_details.as_ref())
+                .and_then(|details| details.reason.as_deref())
+                .unwrap_or("unknown");
+            bail!("OpenAI Responses response was incomplete: {reason}");
         }
         "error" | "response.failed" => {
             bail!(
@@ -4354,6 +4548,34 @@ where
     Ok(())
 }
 
+fn finalize_responses_stream_result(
+    content: String,
+    reasoning: String,
+    usage: Option<Usage>,
+    tool_calls: Vec<ToolCall>,
+    dsml_enabled: bool,
+    response_id: Option<String>,
+    store_disabled: bool,
+) -> Result<ChatResult> {
+    let mut result = finalize_stream_result(content, reasoning, usage, tool_calls, dsml_enabled)?;
+    if result.tool_calls.is_empty() {
+        return Ok(result);
+    }
+    if store_disabled {
+        bail!(
+            "OpenAI Responses returned tool calls, but store=false prevents stateful continuation"
+        );
+    }
+    let response_id = response_id
+        .filter(|id| !id.trim().is_empty())
+        .context("OpenAI Responses returned tool calls without a response ID")?;
+    result.responses_continuation = Some(Box::new(ResponsesContinuation {
+        response_id,
+        endpoint_id: String::new(),
+    }));
+    Ok(result)
+}
+
 fn finalize_stream_result(
     content: String,
     reasoning: String,
@@ -4417,6 +4639,7 @@ fn finalize_stream_result(
         tool_calls,
         provider_id: None,
         model: None,
+        responses_continuation: None,
     })
 }
 
@@ -4617,6 +4840,60 @@ mod tests {
     use crate::llm::{ChatContent, ChatContentPart, ImageUrlContent};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[derive(Debug)]
+    struct ResponsesTestOutput {
+        content: String,
+        chunks: Vec<ChatStreamChunk>,
+        response_id: Option<String>,
+        terminal: bool,
+    }
+
+    fn run_responses_test_events(lines: &[&str]) -> Result<ResponsesTestOutput> {
+        let mut content = String::new();
+        let mut content_emitted = 0usize;
+        let mut reasoning = String::new();
+        let mut reasoning_emitted = 0usize;
+        let mut reasoning_part_active = false;
+        let mut usage = None;
+        let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
+        let mut tool_calls = ResponsesToolAccumulator::default();
+        let mut chunks = Vec::new();
+        let mut terminal = false;
+        let mut on_chunk = |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        };
+        for line in lines {
+            terminal = handle_responses_sse_line(
+                line,
+                &mut content,
+                &mut content_emitted,
+                &mut reasoning,
+                &mut reasoning_emitted,
+                &mut reasoning_part_active,
+                &mut usage,
+                &mut content_started,
+                &mut output_text_delta_parts,
+                &mut refusal_delta_parts,
+                &mut response_id,
+                &mut tool_calls,
+                &mut on_chunk,
+            )?;
+            if terminal {
+                break;
+            }
+        }
+        Ok(ResponsesTestOutput {
+            content,
+            chunks,
+            response_id,
+            terminal,
+        })
+    }
 
     #[test]
     fn tool_call_accumulators_drop_out_of_range_indices() {
@@ -4983,6 +5260,16 @@ mod tests {
     }
 
     #[test]
+    fn responses_assistant_history_uses_easy_input_message() {
+        let input = lower_responses_messages(vec![ChatMessage::assistant("prior answer", None)]);
+
+        assert_eq!(
+            input,
+            vec![json!({"role": "assistant", "content": "prior answer"})]
+        );
+    }
+
+    #[test]
     fn responses_stream_emits_reasoning_and_content() {
         let mut content = String::new();
         let mut content_emitted = 0usize;
@@ -4991,6 +5278,9 @@ mod tests {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut chunks = Vec::new();
         let mut on_chunk = |chunk| {
@@ -5007,6 +5297,9 @@ mod tests {
             &mut reasoning_part_active,
             &mut usage,
             &mut content_started,
+            &mut output_text_delta_parts,
+            &mut refusal_delta_parts,
+            &mut response_id,
             &mut tool_calls,
             &mut on_chunk,
         )
@@ -5020,6 +5313,9 @@ mod tests {
             &mut reasoning_part_active,
             &mut usage,
             &mut content_started,
+            &mut output_text_delta_parts,
+            &mut refusal_delta_parts,
+            &mut response_id,
             &mut tool_calls,
             &mut on_chunk,
         )
@@ -5033,6 +5329,9 @@ mod tests {
             &mut reasoning_part_active,
             &mut usage,
             &mut content_started,
+            &mut output_text_delta_parts,
+            &mut refusal_delta_parts,
+            &mut response_id,
             &mut tool_calls,
             &mut on_chunk,
         )
@@ -5056,6 +5355,9 @@ mod tests {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut chunks = Vec::new();
         let mut on_chunk = |chunk| {
@@ -5078,6 +5380,9 @@ mod tests {
                 &mut reasoning_part_active,
                 &mut usage,
                 &mut content_started,
+                &mut output_text_delta_parts,
+                &mut refusal_delta_parts,
+                &mut response_id,
                 &mut tool_calls,
                 &mut on_chunk,
             )
@@ -5108,6 +5413,9 @@ mod tests {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut chunks = Vec::new();
         let mut on_chunk = |chunk| {
@@ -5132,6 +5440,9 @@ mod tests {
                 &mut reasoning_part_active,
                 &mut usage,
                 &mut content_started,
+                &mut output_text_delta_parts,
+                &mut refusal_delta_parts,
+                &mut response_id,
                 &mut tool_calls,
                 &mut on_chunk,
             )
@@ -5218,13 +5529,16 @@ mod tests {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut on_chunk = |_| Ok(());
 
         for line in [
             r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"calc","arguments":""}}"#,
-            r#"data: {"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\"x\":"}"#,
-            r#"data: {"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"1}"}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"x\":"}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"1}"}"#,
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"calc","arguments":"{\"x\":1}"}}"#,
         ] {
             handle_responses_sse_line(
@@ -5236,6 +5550,9 @@ mod tests {
                 &mut reasoning_part_active,
                 &mut usage,
                 &mut content_started,
+                &mut output_text_delta_parts,
+                &mut refusal_delta_parts,
+                &mut response_id,
                 &mut tool_calls,
                 &mut on_chunk,
             )
@@ -5258,6 +5575,9 @@ mod tests {
         let mut reasoning_part_active = false;
         let mut usage = None;
         let mut content_started = false;
+        let mut output_text_delta_parts = HashSet::new();
+        let mut refusal_delta_parts = HashSet::new();
+        let mut response_id = None;
         let mut tool_calls = ResponsesToolAccumulator::default();
         let mut chunks = Vec::new();
         let mut on_chunk = |chunk| {
@@ -5274,6 +5594,9 @@ mod tests {
             &mut reasoning_part_active,
             &mut usage,
             &mut content_started,
+            &mut output_text_delta_parts,
+            &mut refusal_delta_parts,
+            &mut response_id,
             &mut tool_calls,
             &mut on_chunk,
         )
@@ -5282,6 +5605,158 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].kind, ChatStreamKind::ToolCall);
         assert_eq!(chunks[0].text, "ask_question");
+    }
+
+    #[test]
+    fn responses_tool_arguments_follow_output_item_ids() {
+        let mut tool_calls = ResponsesToolAccumulator::default();
+        for (item_id, call_id, name) in [
+            ("item_a", "call_a", "first"),
+            ("item_b", "call_b", "second"),
+        ] {
+            tool_calls.start(ResponsesStreamItem {
+                kind: "function_call".to_string(),
+                id: Some(item_id.to_string()),
+                call_id: Some(call_id.to_string()),
+                name: Some(name.to_string()),
+                arguments: Some(String::new()),
+            });
+        }
+
+        tool_calls.append_arguments(Some("item_a".to_string()), "{\"a\":".to_string());
+        tool_calls.append_arguments(Some("item_b".to_string()), "{\"b\":2}".to_string());
+        tool_calls.append_arguments(Some("item_a".to_string()), "1}".to_string());
+        tool_calls.append_arguments(Some("unknown".to_string()), "ignored".to_string());
+
+        let calls = tool_calls.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].function.arguments, r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn responses_stream_surfaces_refusal_text() {
+        let output = run_responses_test_events(&[
+            r#"data: {"type":"response.created","response":{"id":"resp_refusal"}}"#,
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","delta":"Cannot "}"#,
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","delta":"help"}"#,
+            r#"data: {"type":"response.refusal.done","item_id":"msg_1","refusal":"Cannot help"}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_refusal"}}"#,
+        ])
+        .unwrap();
+
+        assert!(output.terminal);
+        assert_eq!(output.content, "Cannot help");
+        assert_eq!(output.response_id.as_deref(), Some("resp_refusal"));
+        assert_eq!(
+            output
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.kind == ChatStreamKind::Content)
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            "Cannot help"
+        );
+    }
+
+    #[test]
+    fn responses_stream_accepts_done_only_refusal() {
+        let output = run_responses_test_events(&[
+            r#"data: {"type":"response.refusal.done","item_id":"msg_1","refusal":"Cannot help"}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_refusal"}}"#,
+        ])
+        .unwrap();
+
+        assert_eq!(output.content, "Cannot help");
+    }
+
+    #[test]
+    fn responses_stream_accepts_done_only_output_text() {
+        let output = run_responses_test_events(&[
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_1","delta":""}"#,
+            r#"data: {"type":"response.output_text.done","item_id":"msg_1","text":"final text"}"#,
+            r#"data: {"type":"response.output_text.done","item_id":"msg_2","text":" second"}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_text"}}"#,
+        ])
+        .unwrap();
+
+        assert_eq!(output.content, "final text second");
+    }
+
+    #[test]
+    fn responses_incomplete_is_not_a_successful_terminal_event() {
+        let error = run_responses_test_events(&[r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("max_output_tokens"), "{error:#}");
+    }
+
+    #[test]
+    fn responses_tool_calls_require_stateful_continuation() {
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: ToolCallFunction {
+                name: "calc".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let store_error = finalize_responses_stream_result(
+            String::new(),
+            String::new(),
+            None,
+            vec![tool_call.clone()],
+            false,
+            Some("resp_1".to_string()),
+            true,
+        )
+        .unwrap_err();
+        assert!(store_error.to_string().contains("store=false"));
+
+        let id_error = finalize_responses_stream_result(
+            String::new(),
+            String::new(),
+            None,
+            vec![tool_call],
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(id_error.to_string().contains("without a response ID"));
+    }
+
+    #[tokio::test]
+    async fn responses_store_false_rejects_tools_before_sending() {
+        let mut provider = test_provider("responses-store-test", "http://127.0.0.1:1/v1");
+        provider.protocol = "openai-responses".to_string();
+        provider.default_model = "gpt-5".to_string();
+        provider.extra_body = json!({"store": false}).as_object().cloned();
+        let client = test_client(provider);
+        let tools = vec![ToolDefinition {
+            kind: "function",
+            function: crate::llm::FunctionDefinition {
+                name: "calc".to_string(),
+                description: "calculate".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        }];
+
+        let error = client
+            .chat_responses_stream(
+                vec![ChatMessage::plain("user", "hi")],
+                tools,
+                None,
+                "request-test",
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remove store=false"));
     }
 
     #[test]
@@ -5804,6 +6279,154 @@ mod tests {
             ]
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_stream_rejects_eof_without_terminal_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_http_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"partial\"}\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("responses-eof-test", &url);
+        provider.protocol = "openai-responses".to_string();
+        provider.default_model = "gpt-5".to_string();
+        let client = test_client(provider);
+
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("before a terminal event"),
+            "{error:#}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_continuation_is_pinned_to_its_original_endpoint() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_url = format!("http://{}/v1", first_listener.local_addr().unwrap());
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_url = format!("http://{}/v1", second_listener.local_addr().unwrap());
+        let first_server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(200), first_listener.accept())
+                .await
+                .is_ok()
+        });
+        let second_server = tokio::spawn(async move {
+            let (mut first, _) = second_listener.accept().await.unwrap();
+            read_http_headers(&mut first).await;
+            write_http_sse_response(
+                &mut first,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"calc\",\"arguments\":\"{}\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"calc\",\"arguments\":\"{}\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+                ),
+            )
+            .await;
+
+            let (mut second, _) = second_listener.accept().await.unwrap();
+            read_http_headers(&mut second).await;
+            write_http_sse_response(
+                &mut second,
+                concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_2\",\"delta\":\"continued\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\"}}\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut first_provider = test_provider("responses-shared", &first_url);
+        first_provider.protocol = "openai-responses".to_string();
+        first_provider.default_model = "gpt-5".to_string();
+        let mut original_provider = test_provider("responses-shared", &second_url);
+        original_provider.protocol = "openai-responses".to_string();
+        original_provider.default_model = "gpt-5".to_string();
+        let http_client = reqwest::Client::new();
+        let original_endpoint = LlmEndpoint {
+            client: http_client.clone(),
+            provider: original_provider.clone(),
+            api_key: "second".to_string(),
+            key_index: 1,
+        };
+        let initial_client = OpenAiCompatibleClient {
+            client: http_client.clone(),
+            provider: original_provider.clone(),
+            api_key: "second".to_string(),
+            endpoints: Arc::new(vec![original_endpoint.clone()]),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Summary,
+            detailed_reasoning_summary: false,
+            request_timeouts: None,
+        };
+        let initial_result = initial_client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let continuation = initial_result
+            .responses_continuation
+            .as_deref()
+            .unwrap()
+            .clone();
+        assert_eq!(continuation.endpoint_id, original_endpoint.id());
+
+        let endpoints = vec![
+            LlmEndpoint {
+                client: http_client.clone(),
+                provider: first_provider.clone(),
+                api_key: "first".to_string(),
+                key_index: 0,
+            },
+            original_endpoint,
+        ];
+        let client = OpenAiCompatibleClient {
+            client: http_client,
+            provider: first_provider,
+            api_key: "first".to_string(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Summary,
+            detailed_reasoning_summary: false,
+            request_timeouts: None,
+        };
+
+        let result = client
+            .chat_stream_with_continuation(
+                vec![ChatMessage::tool("call_1", "tool result")],
+                Vec::new(),
+                Some(&continuation),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "continued");
+        assert_eq!(result.provider_id.as_deref(), Some("responses-shared"));
+        assert!(
+            !first_server.await.unwrap(),
+            "continuation used another endpoint"
+        );
+        second_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -6858,6 +7481,7 @@ mod tests {
 
         let extra = json!({
             "input": [],
+            "previous_response_id": "wrong",
             "reasoning": {"effort": "high"},
             "reasoning_effort": "high",
             "parallel_tool_calls": false
@@ -6869,6 +7493,7 @@ mod tests {
             model: "gpt-5".to_string(),
             input: vec![json!({"role": "user", "content": "Hello"})],
             instructions: None,
+            previous_response_id: Some("resp_good".to_string()),
             stream: true,
             tools: None,
             reasoning: Some(ResponsesReasoning {
@@ -6885,10 +7510,12 @@ mod tests {
         assert_eq!(value["reasoning_effort"], "high");
         assert_eq!(value["parallel_tool_calls"], false);
         assert_eq!(value["model"], "gpt-5");
+        assert_eq!(value["previous_response_id"], "resp_good");
         assert_eq!(value["reasoning"]["effort"], "medium");
         assert_eq!(value["temperature"], 0.5);
         assert!(value.get("extra_body").is_none());
         assert_eq!(serialized.matches("\"input\":").count(), 1);
+        assert_eq!(serialized.matches("\"previous_response_id\":").count(), 1);
         assert_eq!(serialized.matches("\"reasoning\":").count(), 1);
     }
 

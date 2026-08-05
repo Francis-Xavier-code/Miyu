@@ -31,6 +31,8 @@ const MAX_CACHED_GLYPHS: usize = 2048;
 const MAX_CUSTOM_FONT_FILES: usize = 8;
 const COLUMN_WIDTH: u32 = 960;
 const COLUMN_GAP: u32 = 32;
+const TARGET_ASPECT_RATIO: f32 = 4.0 / 3.0;
+const ASPECT_TIE_EPSILON: f32 = 0.01;
 const TABLE_CELL_PADDING: u32 = 14;
 const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const RENDER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -642,7 +644,7 @@ impl RendererState {
         }
         let fonts = self.resolve_config_fonts(config, needs_emoji)?;
         let layouts = layout_blocks(&mut self.font_system, blocks, config, palette, &fonts)?;
-        let columns = plan_columns(&layouts, config)?;
+        let columns = plan_balanced_columns(&layouts, config)?;
         let rendered = render_pages(
             &mut self.font_system,
             &mut self.swash_cache,
@@ -1908,6 +1910,13 @@ fn plan_columns(layouts: &[LayoutBlock], config: &NormalizedConfig) -> Result<Ve
     let usable_height = config
         .max_height
         .saturating_sub(config.padding.saturating_mul(2));
+    plan_columns_with_height(layouts, usable_height)
+}
+
+fn plan_columns_with_height(
+    layouts: &[LayoutBlock],
+    usable_height: u32,
+) -> Result<Vec<ColumnPlan>> {
     if usable_height < 128 {
         bail!("page height leaves too little room for rendered content");
     }
@@ -2041,6 +2050,105 @@ fn push_column(columns: &mut Vec<ColumnPlan>) -> Result<()> {
         .context("rendered Markdown column count overflowed")?;
     columns.push(ColumnPlan::default());
     Ok(())
+}
+
+/// Plans columns and then rebalances them so multi-column images approach the
+/// target aspect ratio instead of leaving a nearly empty trailing column.
+///
+/// The full-height greedy plan fixes the column-count ceiling `n_max` (and
+/// propagates any planning error unchanged). For every candidate column count
+/// a binary search finds the smallest usable column height that still fits in
+/// that many columns; planner errors or overflowing column counts during the
+/// search are treated as "too short" rather than fatal. The candidate whose
+/// overall image is closest to `TARGET_ASPECT_RATIO` (log-distance, ties going
+/// to fewer columns) wins.
+fn plan_balanced_columns(
+    layouts: &[LayoutBlock],
+    config: &NormalizedConfig,
+) -> Result<Vec<ColumnPlan>> {
+    let max_usable = config
+        .max_height
+        .saturating_sub(config.padding.saturating_mul(2));
+    let full_plan = plan_columns_with_height(layouts, max_usable)?;
+    let column_ceiling = full_plan.len();
+    if column_ceiling <= 1 {
+        return Ok(full_plan);
+    }
+
+    let total_content: u64 = layouts
+        .iter()
+        .map(|block| u64::from(block.total_height))
+        .sum();
+    let height_floor = u64::from(
+        MIN_RENDERED_HEIGHT
+            .saturating_sub(config.padding.saturating_mul(2))
+            .max(128),
+    );
+    let mut best: Option<(Vec<ColumnPlan>, f32)> = None;
+    for candidate in 1..=column_ceiling {
+        let low = total_content
+            .div_ceil(candidate as u64)
+            .max(height_floor)
+            .min(u64::from(max_usable)) as u32;
+        let Some(plan) = balanced_plan_for_count(layouts, candidate, low, max_usable) else {
+            continue;
+        };
+        let distance = aspect_distance(&plan, config);
+        let improves = best
+            .as_ref()
+            .map(|(_, best_distance)| distance + ASPECT_TIE_EPSILON < *best_distance)
+            .unwrap_or(true);
+        if improves {
+            best = Some((plan, distance));
+        }
+    }
+    Ok(best.map(|(plan, _)| plan).unwrap_or(full_plan))
+}
+
+/// Binary-searches the smallest usable height in `[low, high]` whose plan fits
+/// in at most `target_columns` columns. Returns `None` when even the full
+/// height `high` cannot satisfy the target.
+fn balanced_plan_for_count(
+    layouts: &[LayoutBlock],
+    target_columns: usize,
+    low: u32,
+    high: u32,
+) -> Option<Vec<ColumnPlan>> {
+    let mut best = match plan_columns_with_height(layouts, high) {
+        Ok(plan) if plan.len() <= target_columns => plan,
+        _ => return None,
+    };
+    let mut low = low.min(high);
+    let mut high = high;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match plan_columns_with_height(layouts, mid) {
+            Ok(plan) if plan.len() <= target_columns => {
+                best = plan;
+                high = mid;
+            }
+            _ => low = mid.saturating_add(1),
+        }
+    }
+    Some(best)
+}
+
+/// Log-space distance between the finished image's aspect ratio (using the
+/// same width/height rules as `render_pages`) and `TARGET_ASPECT_RATIO`.
+fn aspect_distance(columns: &[ColumnPlan], config: &NormalizedConfig) -> f32 {
+    let count = columns.len() as u64;
+    let width = u64::from(config.padding) * 2
+        + u64::from(COLUMN_WIDTH) * count
+        + u64::from(COLUMN_GAP) * count.saturating_sub(1);
+    let content_height = columns
+        .iter()
+        .map(|column| column.used_height)
+        .max()
+        .unwrap_or(0);
+    let height = content_height
+        .saturating_add(config.padding.saturating_mul(2))
+        .clamp(MIN_RENDERED_HEIGHT, config.max_height);
+    ((width as f32 / height as f32).ln() - TARGET_ASPECT_RATIO.ln()).abs()
 }
 
 fn render_pages(
@@ -2957,7 +3065,7 @@ background_opacity 0.92
         )
         .unwrap();
         assert_eq!(layouts.len(), 2);
-        let columns = plan_columns(&layouts, &config).unwrap();
+        let columns = plan_balanced_columns(&layouts, &config).unwrap();
         let placement = columns[0]
             .placements
             .iter()
@@ -2989,7 +3097,7 @@ background_opacity 0.92
         )
         .unwrap();
         let table = layouts[0].table.as_ref().unwrap();
-        let columns = plan_columns(&layouts, &config).unwrap();
+        let columns = plan_balanced_columns(&layouts, &config).unwrap();
         assert!(columns.len() > 1);
         for column in columns.iter().skip(1) {
             let header = column.placements.first().expect("repeated table header");
@@ -3064,7 +3172,72 @@ background_opacity 0.92
         let old_three_column_width = config.padding * 2 + COLUMN_WIDTH * 3 + COLUMN_GAP * 2;
         assert!(page.width > old_three_column_width);
         assert!((MIN_RENDERED_HEIGHT..=MIN_CONFIGURED_HEIGHT).contains(&page.height));
+        // Balancing shares the trailing partial column across all columns, so
+        // the finished image no longer stays pinned at the full page height.
+        assert!(page.height < NormalizedConfig::new(&config).max_height);
         assert!(u64::from(page.width) * u64::from(page.height) <= MAX_PAGE_PIXELS);
+    }
+
+    fn code_layouts_for_balancing(lines: u32) -> (NormalizedConfig, Vec<LayoutBlock>) {
+        let mut markdown = String::from("```text\n");
+        for line in 0..lines {
+            markdown.push_str(&format!("line {line:02}: rendered column content\n"));
+        }
+        markdown.push_str("```\n");
+        let config = NormalizedConfig::new(&RenderConfig {
+            max_height: MIN_CONFIGURED_HEIGHT,
+            ..RenderConfig::default()
+        });
+        let mut renderer = RendererState::new().unwrap();
+        let fonts = renderer.resolve_config_fonts(&config, false).unwrap();
+        let layouts = layout_blocks(
+            &mut renderer.font_system,
+            collect_blocks(&markdown),
+            &config,
+            Palette::for_theme("paper"),
+            &fonts,
+        )
+        .unwrap();
+        (config, layouts)
+    }
+
+    #[test]
+    fn balanced_columns_have_similar_used_heights() {
+        let (config, layouts) = code_layouts_for_balancing(70);
+        let usable_height = config.max_height - config.padding * 2;
+        let greedy = plan_columns(&layouts, &config).unwrap();
+        let balanced = plan_balanced_columns(&layouts, &config).unwrap();
+        assert!(balanced.len() > 1);
+        let heights = |columns: &[ColumnPlan]| {
+            let min = columns.iter().map(|c| c.used_height).min().unwrap();
+            let max = columns.iter().map(|c| c.used_height).max().unwrap();
+            (min, max)
+        };
+        let (greedy_min, greedy_max) = heights(&greedy);
+        let (balanced_min, balanced_max) = heights(&balanced);
+        assert!(balanced_max - balanced_min < usable_height * 30 / 100);
+        assert!(balanced_max - balanced_min < greedy_max - greedy_min);
+    }
+
+    #[test]
+    fn balancing_removes_trailing_sliver_column_and_shrinks_height() {
+        let (config, layouts) = code_layouts_for_balancing(60);
+        let usable_height = config.max_height - config.padding * 2;
+        let greedy = plan_columns(&layouts, &config).unwrap();
+        let sliver = greedy.last().unwrap().used_height;
+        assert!(
+            sliver < usable_height / 4,
+            "test premise: greedy leaves a nearly empty last column, got {sliver}"
+        );
+        let balanced = plan_balanced_columns(&layouts, &config).unwrap();
+        assert!(balanced.len() > 1);
+        let min = balanced.iter().map(|c| c.used_height).min().unwrap();
+        let max = balanced.iter().map(|c| c.used_height).max().unwrap();
+        assert!(min * 2 >= max, "no column holds under half of the tallest");
+        assert!(
+            max + config.padding * 2 < config.max_height,
+            "balanced image should shrink below the full page height"
+        );
     }
 
     #[test]

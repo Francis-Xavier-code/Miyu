@@ -318,6 +318,15 @@ impl PlatformRuntime {
         ticket.state.preempting.store(true, Ordering::Release);
         ticket
     }
+
+    pub(crate) fn queued_session_turns(&self, session_id: &str) -> usize {
+        let locks = self.session_turn_locks.lock().unwrap();
+        locks
+            .get(session_id)
+            .and_then(Weak::upgrade)
+            .map(|state| state.waiting.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
 }
 
 struct SessionTurnState {
@@ -824,7 +833,7 @@ impl PlatformTurnContext {
     pub(crate) async fn send(&self, mut message: OutboundMessage) -> Result<SendReceipt> {
         if matches!(
             message.origin,
-            OutboundOrigin::FinalReply | OutboundOrigin::Tool
+            OutboundOrigin::FinalReply | OutboundOrigin::IntermediateReply | OutboundOrigin::Tool
         ) && message_is_parenthetical_only(&message)
         {
             tracing::info!(
@@ -1530,11 +1539,89 @@ impl ReplySuppression {
             }
         }
     }
+
+    /// Ranges to cut when the current round's text is flushed mid-turn as an
+    /// intermediate reply. Leaves the state untouched so the `model_started`
+    /// reset that follows keeps its existing semantics.
+    fn round_ranges(&self, text_len: usize) -> Vec<(usize, usize)> {
+        let mut ranges = self.ranges.clone();
+        if let Some(start) = self.open_at {
+            if start < text_len {
+                ranges.push((start, text_len));
+            }
+        }
+        ranges
+    }
+}
+
+pub(crate) fn cut_suppressed_ranges(text: &str, ranges: &[(usize, usize)]) -> String {
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for &(start, end) in ranges {
+        let start = start.clamp(cursor, text.len());
+        let end = end.clamp(start, text.len());
+        let (Some(prefix), Some(_suppressed)) = (text.get(cursor..start), text.get(start..end))
+        else {
+            continue;
+        };
+        result.push_str(prefix);
+        cursor = end;
+    }
+    if let Some(suffix) = text.get(cursor..) {
+        result.push_str(suffix);
+    }
+    result
 }
 
 fn start_model_reply(text: &mut String, suppression: &mut ReplySuppression) {
     text.clear();
     suppression.model_started();
+}
+
+/// Sends the just-finished model round as its own platform message. The
+/// round's direct-send suppression ranges still apply, so text a tool already
+/// delivered is not repeated.
+async fn flush_intermediate_reply(
+    context: &PlatformTurnContext,
+    text: &str,
+    suppression: &ReplySuppression,
+) {
+    if context.turn_is_superseded() {
+        return;
+    }
+    let visible = cut_suppressed_ranges(text, &suppression.round_ranges(text.len()));
+    let visible = visible.trim();
+    if visible.is_empty() {
+        return;
+    }
+    match context
+        .send(OutboundMessage::markdown(
+            OutboundOrigin::IntermediateReply,
+            visible.to_string(),
+        ))
+        .await
+    {
+        Ok(_) => tracing::info!(
+            target: "miyu::qq",
+            chars = visible.chars().count(),
+            "{}",
+            crate::i18n::text(
+                "sent an intermediate platform reply",
+                "已发送平台中间消息",
+            )
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "{}",
+            crate::i18n::text(
+                "sending an intermediate platform reply failed",
+                "发送平台中间消息失败",
+            )
+        ),
+    }
 }
 
 fn format_platform_tool_payload(payload: &str) -> String {
@@ -1824,6 +1911,13 @@ pub(crate) async fn run_platform_turn(
     let run_id = random_id("run", 18);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let platform_context = profile.platform.clone();
+    let intermediate_replies = platform_context.as_ref().is_some_and(|context| {
+        let qq = &context.config.platforms.qq;
+        match context.conversation.kind {
+            ConversationKind::Group => qq.group_intermediate_messages,
+            ConversationKind::Private => qq.private_intermediate_messages,
+        }
+    });
     let platform_followup = platform_context
         .as_ref()
         .map(|context| PlatformFollowupRun::new(context.clone()));
@@ -1935,6 +2029,11 @@ pub(crate) async fn run_platform_turn(
         }
         match record.kind.as_str() {
             "reasoning.start" => {
+                if intermediate_replies {
+                    if let Some(context) = platform_context.as_ref() {
+                        flush_intermediate_reply(context, &text, &reply_suppression).await;
+                    }
+                }
                 start_model_reply(&mut text, &mut reply_suppression);
             }
             "assistant.delta" => {
@@ -1969,7 +2068,18 @@ pub(crate) async fn run_platform_turn(
                     reply_suppression.direct_send_succeeded(start);
                 }
             }
-            "queue.consumed" => reply_suppression.queued_prompt_consumed(),
+            "queue.consumed" => {
+                // Flush before the suppression reset below: the flushed text
+                // still needs the direct-send ranges of the round it came
+                // from, and the next round answers the newly consumed prompt.
+                if intermediate_replies {
+                    if let Some(context) = platform_context.as_ref() {
+                        flush_intermediate_reply(context, &text, &reply_suppression).await;
+                    }
+                    text.clear();
+                }
+                reply_suppression.queued_prompt_consumed();
+            }
             "run.completed" => {
                 run_guard.finish();
                 let (suppressed_reply_ranges, final_reply_already_sent) =
@@ -2449,6 +2559,48 @@ mod tests {
             )])),
         );
         (temp, context, adapter)
+    }
+
+    #[tokio::test]
+    async fn intermediate_flush_sends_round_text_once() {
+        let (_temp, context, adapter) = test_turn_context(false);
+        let suppression = ReplySuppression::default();
+        flush_intermediate_reply(&context, "第一轮的说明。", &suppression).await;
+        let messages = adapter.messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].origin, OutboundOrigin::IntermediateReply);
+        let OutboundBody::Segments(segments) = &messages[0].body else {
+            panic!("intermediate reply must be a normal message");
+        };
+        assert!(matches!(
+            segments.as_slice(),
+            [OutboundSegment::Markdown(text)] if text == "第一轮的说明。"
+        ));
+    }
+
+    #[tokio::test]
+    async fn intermediate_flush_skips_empty_and_cuts_direct_send_ranges() {
+        let (_temp, context, adapter) = test_turn_context(false);
+
+        // Nothing to say: no message goes out.
+        flush_intermediate_reply(&context, "   ", &ReplySuppression::default()).await;
+        assert!(adapter.messages.lock().unwrap().is_empty());
+
+        // The model continuation after a confirmed direct tool send is
+        // suppressed, so only the part before the send is flushed.
+        let text = "前半部分。已被工具直发的确认。";
+        let mut suppression = ReplySuppression::default();
+        suppression.direct_send_succeeded("前半部分。".len());
+        flush_intermediate_reply(&context, text, &suppression).await;
+        let messages = adapter.messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        let OutboundBody::Segments(segments) = &messages[0].body else {
+            panic!("intermediate reply must be a normal message");
+        };
+        assert!(matches!(
+            segments.as_slice(),
+            [OutboundSegment::Markdown(text)] if text == "前半部分。"
+        ));
     }
 
     #[test]

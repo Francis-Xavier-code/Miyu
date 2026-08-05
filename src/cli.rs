@@ -487,7 +487,16 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Reload configuration in the running Miyu daemon",
             "在运行中的 Miyu daemon 内重新加载配置",
         ),
-        ("models", "List or switch models", "列出或切换模型"),
+        (
+            "models",
+            "Switch the current session's model",
+            "切换当前会话使用的模型",
+        ),
+        (
+            "list-models",
+            "List the global model pool with indexes",
+            "列出全局模型池并编号",
+        ),
         (
             "variant",
             "View or switch thinking level",
@@ -591,8 +600,11 @@ fn localize_ask_command(command: clap::Command) -> clap::Command {
 }
 
 fn localize_models_command(command: clap::Command) -> clap::Command {
-    command.mut_arg("index", |arg| {
-        arg.help(t("Model list index to activate", "要激活的模型列表序号"))
+    command.mut_arg("target", |arg| {
+        arg.help(t(
+            "List index, provider/model, or 'default' to follow the global pool",
+            "模型列表序号、供应商/模型名，或 default 恢复跟随全局模型池",
+        ))
     })
 }
 
@@ -832,6 +844,7 @@ pub enum Command {
     Config(ConfigArgs),
     Reload,
     Models(ModelsArgs),
+    ListModels,
     Variant(VariantArgs),
     FishInit,
     BashInit,
@@ -984,7 +997,9 @@ pub struct PopArgs {
 
 #[derive(Debug, Args)]
 pub struct ModelsArgs {
-    pub index: Option<usize>,
+    /// 1-based list index, `provider/model`, a bare model name, or
+    /// `default` to follow the global active pool again.
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1246,8 +1261,11 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::Reload) => run_reload(&paths).await,
         Some(Command::Models(args)) => {
             initialize_models_cache(&paths);
-            run_models(&paths, args)?;
-            reload_daemon_if_running(&paths).await
+            run_models(&paths, args).await
+        }
+        Some(Command::ListModels) => {
+            initialize_models_cache(&paths);
+            run_list_models(&paths)
         }
         Some(Command::Variant(args)) => {
             initialize_models_cache(&paths);
@@ -2154,14 +2172,16 @@ async fn follow_daemon_log(
 
 async fn reload_daemon_if_running(paths: &MiyuPaths) -> Result<()> {
     if ipc::daemon_info(paths).await.is_some() {
-        send_ipc_command(paths, IpcCommand::ReloadConfig)
-            .await
-            .with_context(|| {
-                t(
-                    "configuration was saved, but the running daemon did not reload it",
-                    "配置已保存，但正在运行的 daemon 未能重新加载配置",
-                )
-            })?;
+        retry_config_reload(RELOAD_MAX_ATTEMPTS, RELOAD_RETRY_INTERVAL, || {
+            request_config_reload(paths)
+        })
+        .await
+        .with_context(|| {
+            t(
+                "configuration was saved, but the running daemon did not reload it",
+                "配置已保存，但正在运行的 daemon 未能重新加载配置",
+            )
+        })?;
     }
     Ok(())
 }
@@ -2934,75 +2954,213 @@ fn inline_pop_lines(item_count: usize) -> u16 {
     (visible_items as u16).saturating_mul(3).saturating_add(2)
 }
 
-fn run_models(paths: &MiyuPaths, args: ModelsArgs) -> Result<()> {
-    let mut config = AppConfig::load(paths)?;
+async fn run_models(paths: &MiyuPaths, args: ModelsArgs) -> Result<()> {
+    run_models_for_session(paths, args, None).await
+}
+
+/// Switches the model pool of one session (the current session when
+/// `session_id` is None). The override persists on the session, so reopening
+/// it restores the model; the global pool is managed in `miyu config`.
+async fn run_models_for_session(
+    paths: &MiyuPaths,
+    args: ModelsArgs,
+    session_id: Option<&str>,
+) -> Result<()> {
+    let config = AppConfig::load(paths)?;
     let choices = config.text_provider_model_choices();
     if choices.is_empty() {
         bail!(
             "{}",
             t(
-                "no active provider models; configure or activate a model first",
-                "没有已激活的 provider 模型；请先配置或激活模型",
+                "no configured provider models; configure a model first",
+                "没有已配置的 provider 模型；请先配置模型",
             )
         );
     }
-    if let Some(index) = args.index {
-        if index == 0 || index > choices.len() {
-            bail!(
-                "{}: {index}",
-                t("provider index out of range", "provider 序号超出范围")
+    if let Some(target) = args.target.as_deref() {
+        let target = target.trim();
+        if target.eq_ignore_ascii_case("default") || target.eq_ignore_ascii_case("global") {
+            set_session_models(paths, session_id, Vec::new()).await?;
+            println!(
+                "{}",
+                t(
+                    "this session now follows the global active pool",
+                    "当前会话已恢复跟随全局激活模型池"
+                )
             );
+            return Ok(());
         }
-        let choice = &choices[index - 1];
-        let provider_id = choice.provider_id.clone();
-        let model = choice.model.clone();
+        let choice = crate::config::resolve_provider_model_argument(&choices, target)
+            .map_err(anyhow::Error::msg)?;
         let label = choice.label();
-        config.set_active_provider_model(&provider_id, &model)?;
-        config.save(paths)?;
-        println!(
-            "{}: {index}. {label}",
-            t("active provider", "当前 provider")
-        );
+        let models = vec![ActiveProviderModelConfig {
+            provider_id: choice.provider_id.clone(),
+            model: choice.model.clone(),
+        }];
+        set_session_models(paths, session_id, models).await?;
+        println!("{}: {label}", t("session model", "当前会话模型"));
         return Ok(());
     }
     if io::stdout().is_terminal() && io::stdin().is_terminal() {
-        let active = choices
+        let override_pool = session_model_override_snapshot(paths, session_id)?;
+        let initial = choices
             .iter()
-            .map(|choice| config.is_active_provider_model(&choice.provider_id, &choice.model))
+            .map(|choice| match override_pool.as_deref() {
+                Some(pool) => pool.iter().any(|model| {
+                    model.provider_id == choice.provider_id && model.model == choice.model
+                }),
+                None => config.is_active_provider_model(&choice.provider_id, &choice.model),
+            })
             .collect::<Vec<_>>();
         if let Some(active) = inline_fuzzy_select(
             &choices
                 .iter()
                 .map(|choice| choice.label())
                 .collect::<Vec<_>>(),
-            active,
+            initial.clone(),
         )? {
-            config.active_provider_models = Some(
-                choices
-                    .iter()
-                    .zip(active)
-                    .filter_map(|(choice, active)| {
-                        active.then(|| ActiveProviderModelConfig {
-                            provider_id: choice.provider_id.clone(),
-                            model: choice.model.clone(),
-                        })
+            if active == initial {
+                println!("{}", t("no changes", "未做修改"));
+                return Ok(());
+            }
+            let models = choices
+                .iter()
+                .zip(active)
+                .filter_map(|(choice, active)| {
+                    active.then(|| ActiveProviderModelConfig {
+                        provider_id: choice.provider_id.clone(),
+                        model: choice.model.clone(),
                     })
-                    .collect(),
-            );
-            config.save(paths)?;
-            println!("{}", t("active provider models updated", "已更新激活模型"));
+                })
+                .collect::<Vec<_>>();
+            let cleared = models.is_empty();
+            set_session_models(paths, session_id, models).await?;
+            if cleared {
+                println!(
+                    "{}",
+                    t(
+                        "this session now follows the global active pool",
+                        "当前会话已恢复跟随全局激活模型池"
+                    )
+                );
+            } else {
+                println!("{}", t("session models updated", "已更新当前会话模型"));
+            }
         }
         return Ok(());
     }
+    print_model_choices(&config, &choices, None);
+    Ok(())
+}
+
+fn run_list_models(paths: &MiyuPaths) -> Result<()> {
+    let config = AppConfig::load(paths)?;
+    let choices = config.text_provider_model_choices();
+    if choices.is_empty() {
+        bail!(
+            "{}",
+            t(
+                "no configured provider models; configure a model first",
+                "没有已配置的 provider 模型；请先配置模型",
+            )
+        );
+    }
+    let override_pool = session_model_override_snapshot(paths, None)?;
+    print_model_choices(&config, &choices, override_pool.as_deref());
+    println!(
+        "{}",
+        t(
+            "switch with: miyu models <index|provider/model>; 'miyu models default' follows the global pool",
+            "切换：miyu models <序号|供应商/模型>；miyu models default 恢复跟随全局模型池"
+        )
+    );
+    Ok(())
+}
+
+fn print_model_choices(
+    config: &AppConfig,
+    choices: &[crate::config::ProviderModelChoice],
+    override_pool: Option<&[ActiveProviderModelConfig]>,
+) {
     for (index, choice) in choices.iter().enumerate() {
-        let marker = if config.is_active_provider_model(&choice.provider_id, &choice.model) {
-            "[*]"
-        } else {
-            "[ ]"
+        let active = match override_pool {
+            Some(pool) => pool.iter().any(|model| {
+                model.provider_id == choice.provider_id && model.model == choice.model
+            }),
+            None => config.is_active_provider_model(&choice.provider_id, &choice.model),
         };
+        let marker = if active { "[*]" } else { "[ ]" };
         println!("{marker} {}. {}", index + 1, choice.label());
     }
-    Ok(())
+    match override_pool {
+        Some(_) => println!(
+            "{}",
+            t(
+                "[*] = models pinned to the current session",
+                "[*] = 当前会话固定使用的模型"
+            )
+        ),
+        None => println!(
+            "{}",
+            t(
+                "[*] = global active pool (the current session follows it)",
+                "[*] = 全局激活模型池（当前会话跟随全局）"
+            )
+        ),
+    }
+}
+
+/// Reads a session's model override straight from the shared state database;
+/// works whether or not the daemon is running.
+fn session_model_override_snapshot(
+    paths: &MiyuPaths,
+    session_id: Option<&str>,
+) -> Result<Option<Vec<ActiveProviderModelConfig>>> {
+    let store = StateStore::new(paths)?;
+    let session_id = match session_id {
+        Some(session_id) => session_id.to_string(),
+        None => store.session_id().to_string(),
+    };
+    store.session_model_override(&session_id)
+}
+
+async fn set_session_models(
+    paths: &MiyuPaths,
+    session_id: Option<&str>,
+    models: Vec<ActiveProviderModelConfig>,
+) -> Result<()> {
+    if ipc::daemon_info(paths).await.is_some() {
+        let target = match session_id {
+            Some(id) => ipc::SessionRef::Id { id: id.to_string() },
+            None => ipc::SessionRef::Current,
+        };
+        send_ipc_command(paths, IpcCommand::SetSessionModels { target, models }).await?;
+        return Ok(());
+    }
+    let config = AppConfig::load(paths)?;
+    let choices = config.text_provider_model_choices();
+    for model in &models {
+        if !choices
+            .iter()
+            .any(|choice| choice.provider_id == model.provider_id && choice.model == model.model)
+        {
+            bail!(
+                "{}{}/{}",
+                t("unknown model: ", "未知模型："),
+                model.provider_id,
+                model.model
+            );
+        }
+    }
+    let store = StateStore::new(paths)?;
+    let session_id = match session_id {
+        Some(session_id) => session_id.to_string(),
+        None => store.session_id().to_string(),
+    };
+    store.set_session_model_override(
+        &session_id,
+        (!models.is_empty()).then_some(models.as_slice()),
+    )
 }
 
 fn inline_fuzzy_select(items: &[String], mut active: Vec<bool>) -> Result<Option<Vec<bool>>> {
@@ -4551,6 +4709,7 @@ async fn try_run_remote_chat(
             .get("model")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        responses_continuation: None,
     };
     print_mixed_model_endpoint(show_mixed_model_endpoint(&config, false), &result, None);
     let context_tokens = completion
@@ -5570,7 +5729,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     drop(history_state);
     let mut cumulative_tokens = daemon_state.cumulative_tokens;
     let mut footer = ReplFooterStatus::from_config(
-        &config,
+        &footer_config_for_session(paths, &config, &active_session_id),
         daemon_state.context_tokens,
         (cumulative_tokens > 0).then_some(cumulative_tokens),
     );
@@ -5962,39 +6121,44 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     }
                 }
                 ReplSlashCommand::Models => {
-                    run_models(paths, ModelsArgs { index: None })?;
-                    let Some((_, _)) =
-                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await?
-                    else {
+                    // Switches this session's pinned model; the change takes
+                    // effect from the next turn without a daemon reload.
+                    let argument = command_args.trim();
+                    let result = run_models_for_session(
+                        paths,
+                        ModelsArgs {
+                            target: (!argument.is_empty()).then(|| argument.to_string()),
+                        },
+                        Some(&active_session_id),
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        repl_note(&mut live_repl, &format!("\x1b[31m{error:#}\x1b[0m\n"))?;
                         continue;
-                    };
-                    config = AppConfig::load(paths)?;
-                    let (state, changed) =
-                        repl_active_or_default_state(paths, &active_session_id).await?;
-                    if changed {
-                        apply_repl_session_switch(
-                            paths,
-                            &state,
-                            &mut active_session_id,
-                            &mut history,
-                            &mut live_repl,
-                            &mut footer,
-                            &mut cumulative_tokens,
-                        )?;
                     }
+                    let session_config =
+                        footer_config_for_session(paths, &config, &active_session_id);
+                    let (state, _) =
+                        repl_active_or_default_state(paths, &active_session_id).await?;
                     cumulative_tokens = state.cumulative_tokens;
                     footer = ReplFooterStatus::from_config(
-                        &config,
+                        &session_config,
                         state.context_tokens,
                         (cumulative_tokens > 0).then_some(cumulative_tokens),
                     );
-                    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+                    let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
                     footer.update_context_window(state.context_window);
                     repl_note(
                         &mut live_repl,
-                        &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
+                        &format!(
+                            "\x1b[2m{}\x1b[0m\n",
+                            t(
+                                "session model updated; takes effect from the next turn",
+                                "会话模型已更新，下一轮生效"
+                            )
+                        ),
                     )?;
                 }
                 ReplSlashCommand::Config => {
@@ -6021,7 +6185,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     }
                     cumulative_tokens = state.cumulative_tokens;
                     footer = ReplFooterStatus::from_config(
-                        &config,
+                        &footer_config_for_session(paths, &config, &active_session_id),
                         state.context_tokens,
                         (cumulative_tokens > 0).then_some(cumulative_tokens),
                     );
@@ -6079,7 +6243,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             }
                             cumulative_tokens = state.cumulative_tokens;
                             footer = ReplFooterStatus::from_config(
-                                &config,
+                                &footer_config_for_session(paths, &config, &active_session_id),
                                 state.context_tokens,
                                 (cumulative_tokens > 0).then_some(cumulative_tokens),
                             );
@@ -6238,6 +6402,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             tool_calls: Vec::new(),
                             provider_id: None,
                             model: None,
+                            responses_continuation: None,
                         };
                         print_chat_token_usage(
                             &result,
@@ -6389,6 +6554,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     let mut config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    apply_session_model_override(&state, &mut config);
     let memory_organizer = MemoryOrganizer::spawn()?;
     let memory_organizer_handle = memory_organizer.handle();
     memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
@@ -6458,9 +6624,18 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             print_repl_help();
             continue;
         }
-        if command.eq_ignore_ascii_case("/models") && command_args_empty {
-            run_models(paths, ModelsArgs { index: None })?;
-            reload_repl_config(paths, &mut config, &mut client)?;
+        if command.eq_ignore_ascii_case("/models") {
+            let argument = command_args.trim();
+            let repl_session_id = state.session_id();
+            run_models_for_session(
+                paths,
+                ModelsArgs {
+                    target: (!argument.is_empty()).then(|| argument.to_string()),
+                },
+                Some(&repl_session_id),
+            )
+            .await?;
+            reload_repl_config(paths, &state, &mut config, &mut client)?;
             footer = ReplFooterStatus::from_config(
                 &config,
                 agent.effective_context_tokens()?,
@@ -6479,7 +6654,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/config") && command_args_empty {
             crate::config_tui::run(paths)?;
-            reload_repl_config(paths, &mut config, &mut client)?;
+            reload_repl_config(paths, &state, &mut config, &mut client)?;
             footer = ReplFooterStatus::from_config(
                 &config,
                 agent.effective_context_tokens()?,
@@ -6810,12 +6985,43 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
 
 fn reload_repl_config(
     paths: &MiyuPaths,
+    state: &StateStore,
     config: &mut AppConfig,
     client: &mut OpenAiCompatibleClient,
 ) -> Result<()> {
     *config = AppConfig::load(paths)?;
+    apply_session_model_override(state, config);
     *client = OpenAiCompatibleClient::from_config(config, paths)?;
     Ok(())
+}
+
+/// The footer/status display must reflect the session's pinned model pool,
+/// not just the global config.
+fn footer_config_for_session(paths: &MiyuPaths, config: &AppConfig, session_id: &str) -> AppConfig {
+    let mut config = config.clone();
+    if let Ok(Some(models)) =
+        StateStore::new(paths).and_then(|store| store.session_model_override(session_id))
+    {
+        config.active_provider_models = Some(models);
+    }
+    config
+}
+
+/// Direct (daemon-less) sessions read their pinned model pool straight from
+/// the state store; daemon-run turns get the same treatment in the turn task.
+fn apply_session_model_override(state: &StateStore, config: &mut AppConfig) {
+    match state.session_model_override(&state.session_id()) {
+        Ok(Some(models)) => config.active_provider_models = Some(models),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "{}",
+            t(
+                "loading the session model override failed",
+                "读取会话模型覆盖失败"
+            )
+        ),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10344,9 +10550,9 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
     ReplCommandSpec {
         name: "/models",
         command: ReplSlashCommand::Models,
-        arg_hint: "",
-        help_en: "quickly switch model",
-        help_zh: "快速切换模型",
+        arg_hint: "[index|provider/model|default]",
+        help_en: "switch this session's model",
+        help_zh: "切换当前会话使用的模型",
     },
     ReplCommandSpec {
         name: "/config",
@@ -10627,7 +10833,7 @@ mod repl_input_tests {
 
         assert!(matches!(
             cli.command,
-            Some(Command::Models(ModelsArgs { index: Some(1) }))
+            Some(Command::Models(ModelsArgs { target: Some(ref target) })) if target == "1"
         ));
         let old_matches = localized_command()
             .try_get_matches_from(["miyu", "providers"])
@@ -11506,6 +11712,7 @@ mod repl_input_tests {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            responses_continuation: None,
         };
 
         footer.update_token_usage(&result, 240, Some(200_000), Some(100));
@@ -12374,6 +12581,7 @@ fn run_history_with_state(state: &StateStore, args: HistoryArgs) -> Result<()> {
                 tool_calls: Vec::new(),
                 provider_id: None,
                 model: None,
+                responses_continuation: None,
             };
             render::print_assistant_response(&response, !args.no_thinking)?;
         } else {

@@ -80,6 +80,9 @@ fn run_main_menu(
     config: &mut AppConfig,
     thinking_variants: &mut ThinkingVariantPreferences,
 ) -> Result<bool> {
+    // Detects edits on quit; sub-menus mutate `config` in place without any
+    // dirty flag of their own.
+    let pristine_config = serde_json::to_string(config).ok();
     let mut selected = 0usize;
     loop {
         let active = active_label(config);
@@ -120,7 +123,19 @@ fn run_main_menu(
         )?;
 
         match read_key()? {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                let dirty = thinking_variants.is_dirty()
+                    || serde_json::to_string(config).ok() != pristine_config;
+                if !dirty {
+                    return Ok(false);
+                }
+                if confirm_save_on_exit(stdout)? {
+                    config.save(paths)?;
+                    thinking_variants.save(paths)?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
             KeyCode::Enter => match selected {
@@ -512,6 +527,31 @@ fn edit_api_quota_accounts(
                     selected = config.accounts.len().saturating_sub(1);
                 }
             }
+            _ => {}
+        }
+    }
+}
+
+/// true = save and exit, false = discard and exit. A choice is mandatory:
+/// `q`/`Esc` are ignored so an accidental key press cannot lose edits.
+fn confirm_save_on_exit(stdout: &mut io::Stdout) -> Result<bool> {
+    let options = [
+        t("Save", "保存").to_string(),
+        t("Discard", "不保存").to_string(),
+    ];
+    let mut selected = 0usize;
+    loop {
+        draw_menu(
+            stdout,
+            t(" SAVE EDITED CHANGES? ", " 是否保存已编辑内容 "),
+            &options,
+            selected,
+            t("[j/k]move [Enter]confirm", "[j/k]移动 [Enter]确认"),
+        )?;
+        match read_key()? {
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(1),
+            KeyCode::Enter => return Ok(selected == 0),
             _ => {}
         }
     }
@@ -2986,6 +3026,22 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
             ),
             format!(
                 "{}: {}",
+                t(
+                    "Send intermediate messages in group chats",
+                    "群聊是否输出中间消息"
+                ),
+                enabled_label(qq.group_intermediate_messages)
+            ),
+            format!(
+                "{}: {}",
+                t(
+                    "Send intermediate messages in private chats",
+                    "私聊是否输出中间消息"
+                ),
+                enabled_label(qq.private_intermediate_messages)
+            ),
+            format!(
+                "{}: {}",
                 t("Private whitelist", "私聊白名单"),
                 qq.private_chats.whitelist.len()
             ),
@@ -3111,16 +3167,24 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                     config.platforms.qq.allow_non_admin_host_tools =
                         !config.platforms.qq.allow_non_admin_host_tools
                 }
-                10 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                10 => {
+                    config.platforms.qq.group_intermediate_messages =
+                        !config.platforms.qq.group_intermediate_messages
+                }
+                11 => {
+                    config.platforms.qq.private_intermediate_messages =
+                        !config.platforms.qq.private_intermediate_messages
+                }
+                12 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
                     stdout,
                     t(" PRIVATE WHITELIST ", " 私聊白名单 "),
                     t("QQ id", "QQ 号"),
                     &mut config.platforms.qq.private_chats.whitelist,
                 )?,
-                11 if matches!(key, KeyCode::Enter) => {
+                13 if matches!(key, KeyCode::Enter) => {
                     select_non_whitelist_model_pool(stdout, config)?
                 }
-                12 => {
+                14 => {
                     config
                         .platforms
                         .qq
@@ -3131,52 +3195,52 @@ fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -
                         .private_chats
                         .friend_requests_require_private_whitelist
                 }
-                13 => {
+                15 => {
                     config.platforms.qq.private_chats.allow_non_whitelist =
                         !config.platforms.qq.private_chats.allow_non_whitelist
                 }
-                14 if matches!(key, KeyCode::Enter) => {
+                16 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.private_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                15 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
+                17 if matches!(key, KeyCode::Enter) => edit_qq_id_list(
                     stdout,
                     t(" GROUP WHITELIST ", " 群聊白名单 "),
                     t("Group id", "群号"),
                     &mut config.platforms.qq.group_chats.whitelist,
                 )?,
-                16 if matches!(key, KeyCode::Enter) => edit_keyword_list(
+                18 if matches!(key, KeyCode::Enter) => edit_keyword_list(
                     stdout,
                     &mut config.platforms.qq.group_chats.trigger_keywords,
                 )?,
-                17 if matches!(key, KeyCode::Enter) => {
+                19 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.whitelist_rate_limit,
                     )?;
                 }
-                18 => {
+                20 => {
                     config.platforms.qq.group_chats.allow_non_whitelist =
                         !config.platforms.qq.group_chats.allow_non_whitelist
                 }
-                19 if matches!(key, KeyCode::Enter) => {
+                21 if matches!(key, KeyCode::Enter) => {
                     edit_platform_rate_limit(
                         stdout,
                         &mut config.platforms.qq.group_chats.non_whitelist_rate_limit,
                     )?;
                 }
-                20 if matches!(key, KeyCode::Enter) => {
+                22 if matches!(key, KeyCode::Enter) => {
                     edit_platform_session_limits(stdout, &mut config.platforms.qq.session_limits)?
                 }
-                21 if matches!(key, KeyCode::Enter) => {
+                23 if matches!(key, KeyCode::Enter) => {
                     select_platform_model_routes(stdout, paths, config)?
                 }
-                22 if matches!(key, KeyCode::Enter) => {
+                24 if matches!(key, KeyCode::Enter) => {
                     select_platform_plugins(stdout, paths, config)?
                 }
-                23 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
+                25 if matches!(key, KeyCode::Enter) => edit_qq_advanced(stdout, config)?,
                 _ => {}
             },
             _ => {}

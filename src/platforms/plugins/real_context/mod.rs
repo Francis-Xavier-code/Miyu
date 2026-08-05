@@ -2692,6 +2692,7 @@ mod tests {
     #[test]
     fn direct_trigger_judgement_respects_takeover_and_privileged_bypass() {
         let mut settings = RealContextPluginSettings::default();
+        settings.takeover_direct_trigger_enable = false;
         assert!(!active_judgement_allowed(&settings, true, false, false));
         assert!(active_judgement_allowed(&settings, false, false, false));
 
@@ -2747,7 +2748,9 @@ mod tests {
         }));
         let plugin = RealContextPlugin::new();
         let event = inbound_event();
-        let settings = RealContextPluginSettings::default();
+        // The bypass path under test requires takeover to stay off.
+        let mut settings = RealContextPluginSettings::default();
+        settings.takeover_direct_trigger_enable = false;
         let mut decision = TriggerDecision {
             should_reply: true,
             content: event.text.clone(),

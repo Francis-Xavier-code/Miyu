@@ -871,6 +871,25 @@ impl ConversationDb {
         self.update_session_field(session_id, "workspace", workspace)
     }
 
+    /// JSON-encoded per-session model pool override
+    /// (`[{"provider_id": ..., "model": ...}, ...]`); None follows the global
+    /// active pool.
+    pub fn session_model_override(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT model_override FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    pub fn set_session_model_override(&self, session_id: &str, value: Option<&str>) -> Result<()> {
+        self.update_session_field(session_id, "model_override", value)
+    }
+
     pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(

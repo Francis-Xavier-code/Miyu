@@ -2093,7 +2093,11 @@ async fn handle_ipc_connection(
                     return Ok(());
                 }
             };
-            if let Err(error) = reserve_admin(&state.manager) {
+            // Light reservation: reloading is allowed while turns run. Running
+            // turns keep the config snapshot they started with; new turns pick
+            // up the reloaded config. Persona layout changes interrupt running
+            // turns inside the ApplyConfig handler instead of failing here.
+            if let Err(error) = reserve_admin_light(&state.manager) {
                 ipc::send(
                     &mut stream,
                     &IpcFrame::coded_error(ipc::ErrorCode::Busy, error.message),
@@ -2623,6 +2627,39 @@ async fn handle_session_command(
                 json!({ "session_id": record.session_id, "workspace": workspace }),
             );
             Ok(json!({}))
+        }
+        IpcCommand::SetSessionModels { target, models } => {
+            let record = resolve_local_session_ref(state, &target)?;
+            let models = (!models.is_empty()).then_some(models);
+            if let Some(models) = &models {
+                let choices = {
+                    let manager = state.manager.lock().unwrap();
+                    manager.config.text_provider_model_choices()
+                };
+                for model in models {
+                    if !choices.iter().any(|choice| {
+                        choice.provider_id == model.provider_id && choice.model == model.model
+                    }) {
+                        return Err(format!(
+                            "{}{}/{}",
+                            t("unknown model: ", "未知模型："),
+                            model.provider_id,
+                            model.model
+                        ));
+                    }
+                }
+            }
+            store
+                .set_session_model_override(&record.session_id, models.as_deref())
+                .map_err(|error| safe_error_message(&error))?;
+            state.events.publish(
+                "session.updated",
+                json!({
+                    "session_id": record.session_id,
+                    "model_override": models,
+                }),
+            );
+            Ok(json!({ "session_id": record.session_id }))
         }
         _ => Err("unsupported session command".to_string()),
     }
@@ -3266,6 +3303,10 @@ fn router(state: DaemonState) -> Router {
         )
         .route("/api/sessions/{session_id}/turns", get(session_turns_http))
         .route(
+            "/api/sessions/{session_id}/models",
+            get(get_session_models_http).put(set_session_models_http),
+        )
+        .route(
             "/api/sessions/{session_id}/turns/{turn_id}/redo",
             post(redo_turn),
         )
@@ -3828,7 +3869,6 @@ async fn update_config(
     Json(request): Json<UpdateConfigRequest>,
 ) -> std::result::Result<Json<ConfigResponse>, ApiError> {
     require_mutation(&headers, &state)?;
-    require_no_running_turn(&state.state_store)?;
 
     let current = state.manager.lock().unwrap().config.clone();
     let current_prompts =
@@ -3859,7 +3899,9 @@ async fn update_config(
             )
         })?;
     let requested_prompts = request.prompts.clone();
-    reserve_admin(&state.manager)?;
+    // Allowed while turns run: the ApplyConfig handler interrupts running
+    // turns only for persona layout changes; everything else hot-applies.
+    reserve_admin_light(&state.manager)?;
     let (reply, receiver) = oneshot::channel();
     if state
         .actor_tx
@@ -5082,6 +5124,70 @@ async fn set_thinking_variants(
     Ok(Json(ThinkingVariantsResponse { options }))
 }
 
+#[derive(Deserialize)]
+struct SetSessionModelsRequest {
+    /// Empty clears the override so the session follows the global pool.
+    #[serde(default)]
+    models: Vec<ActiveProviderModelConfig>,
+}
+
+#[derive(Serialize)]
+struct SessionModelsResponse {
+    model_override: Option<Vec<ActiveProviderModelConfig>>,
+}
+
+async fn get_session_models_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Json<SessionModelsResponse>, ApiError> {
+    require_auth(&headers, &state)?;
+    let record = require_local_web_session(&state, &session_id)?;
+    let model_override = state
+        .state_store
+        .session_model_override(&record.session_id)
+        .map_err(ApiError::internal)?;
+    Ok(Json(SessionModelsResponse { model_override }))
+}
+
+async fn set_session_models_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<SetSessionModelsRequest>,
+) -> std::result::Result<Json<SessionModelsResponse>, ApiError> {
+    require_mutation(&headers, &state)?;
+    let record = require_local_web_session(&state, &session_id)?;
+    let models = (!request.models.is_empty()).then(|| request.models);
+    if let Some(models) = &models {
+        let choices = {
+            let manager = state.manager.lock().unwrap();
+            manager.config.text_provider_model_choices()
+        };
+        for model in models {
+            if !choices.iter().any(|choice| {
+                choice.provider_id == model.provider_id && choice.model == model.model
+            }) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown model: {}/{}", model.provider_id, model.model),
+                ));
+            }
+        }
+    }
+    state
+        .state_store
+        .set_session_model_override(&record.session_id, models.as_deref())
+        .map_err(ApiError::internal)?;
+    state.events.publish(
+        "session.updated",
+        json!({ "session_id": record.session_id, "model_override": models }),
+    );
+    Ok(Json(SessionModelsResponse {
+        model_override: models,
+    }))
+}
+
 async fn set_models(
     State(state): State<DaemonState>,
     headers: HeaderMap,
@@ -5385,6 +5491,23 @@ async fn actor_loop(
                 reset_conversation,
                 reply,
             } => {
+                // Persona layout changes migrate or delete session state that
+                // running turns may be standing on, so those interrupt every
+                // running turn before applying ("save after interrupting").
+                // All other changes hot-apply: running turns keep the config
+                // snapshot they cloned at start and later turns use the new
+                // configuration.
+                if config_change_requires_interrupt(&config, &next_config, &paths, &prompts) {
+                    for info in manager.lock().unwrap().active_runs.values() {
+                        info.request_cancel();
+                    }
+                    for _ in 0..100 {
+                        if manager.lock().unwrap().active_runs.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
                 let result = rebuild_for_config(
                     &mut agent,
                     &mut config,
@@ -5403,6 +5526,9 @@ async fn actor_loop(
                     } else {
                         TurnEngineState::COLD
                     });
+                    if let Some(handle) = memory_organizer.as_ref() {
+                        handle.wake(config.clone(), paths.clone(), state_store.clone());
+                    }
                 }
                 release_admin(&manager);
                 let _ = reply.send(result);
@@ -5695,6 +5821,26 @@ async fn run_turn_task(
             // override of the global vision plugin's single-model choice.
             config.plugins.vision.vision_provider_id.clear();
             config.plugins.vision.vision_model.clear();
+        }
+    }
+    // Local sessions (REPL/WebUI/shell hook) may pin their own model pool.
+    // Platform turns were already routed through the platform pools above.
+    if profile
+        .as_ref()
+        .is_none_or(|profile| profile.text_models.is_none())
+    {
+        match base_store.session_model_override(&session_id) {
+            Ok(Some(models)) => config.active_provider_models = Some(models),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                session_id = &*session_id,
+                "{}",
+                t(
+                    "loading the session model override failed",
+                    "读取会话模型覆盖失败"
+                )
+            ),
         }
     }
     let manager = &manager;
@@ -8270,6 +8416,26 @@ fn apply_persona_scope_changes(
     Ok(backups)
 }
 
+/// True when applying `next` cannot safely coexist with running turns:
+/// persona renames/deletions and active-persona switches migrate or delete
+/// the session state those turns are using. Everything else hot-applies.
+fn config_change_requires_interrupt(
+    current: &AppConfig,
+    next: &AppConfig,
+    paths: &MiyuPaths,
+    next_prompts: &PromptDocuments,
+) -> bool {
+    let Ok(previous_prompts) = read_prompt_documents(current, paths) else {
+        // The safe direction: interrupt when the current prompt layout cannot
+        // be read to prove the change is turn-safe.
+        return true;
+    };
+    if !persona_document_changes(&previous_prompts, next_prompts).is_empty() {
+        return true;
+    }
+    current.active_persona_scope() != next.active_persona_scope()
+}
+
 fn persona_document_changes(
     current: &PromptDocuments,
     next: &PromptDocuments,
@@ -9392,9 +9558,48 @@ mod tests {
             .config
             .save(&state.paths)
             .unwrap();
-        let (cancel, _cancel_rx) = tokio::sync::watch::channel(false);
+        // Running turns no longer block a reload (they keep their own config
+        // snapshot); only a concurrent admin operation does.
+        state.manager.lock().unwrap().admin_busy = true;
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let server_state = state.clone();
+        let task = tokio::spawn(async move { handle_ipc_connection(server_state, server).await });
+        ipc::send(&mut client, &IpcRequest::new(IpcCommand::ReloadConfig))
+            .await
+            .unwrap();
+        let response = ipc::receive::<IpcFrame>(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response,
+            IpcFrame::Error {
+                code: Some(ipc::ErrorCode::Busy),
+                message,
+            } if message.contains("busy with another operation")
+        ));
+        task.await.unwrap().unwrap();
+
+        state.manager.lock().unwrap().admin_busy = false;
+        state.actor_tx.send(ActorCommand::Shutdown).unwrap();
+        actor_join.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_reload_succeeds_and_keeps_turns_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, actor_join) = test_daemon_with_actor(temp.path());
+        state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .save(&state.paths)
+            .unwrap();
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
         state.manager.lock().unwrap().active_runs.insert(
-            "busy-run".to_string(),
+            "hot-reload-run".to_string(),
             RunInfo {
                 session_id: state.state_store.session_id().into(),
                 mode: AgentMode::Normal,
@@ -9418,18 +9623,101 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            response,
-            IpcFrame::Error {
-                code: Some(ipc::ErrorCode::Busy),
-                message,
-            } if message.contains("busy with another operation")
-        ));
+        assert!(matches!(response, IpcFrame::AdminResult { .. }));
         task.await.unwrap().unwrap();
+
+        // A turn-safe reload neither cancels nor waits out the running turn.
+        assert!(!*cancel_rx.borrow());
+        {
+            let manager = state.manager.lock().unwrap();
+            assert!(manager.active_runs.contains_key("hot-reload-run"));
+            assert!(!manager.admin_busy);
+        }
 
         state.manager.lock().unwrap().active_runs.clear();
         state.actor_tx.send(ActorCommand::Shutdown).unwrap();
         actor_join.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_session_models_ipc_pins_and_clears_the_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let choice = state
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .text_provider_model_choices()
+            .first()
+            .cloned()
+            .expect("the default config configures at least one model");
+        let persona = active_persona_scope(&state);
+        let record = state
+            .state_store
+            .create_session(&persona, "", "user", None)
+            .unwrap();
+        let target = ipc::SessionRef::Id {
+            id: record.session_id.clone(),
+        };
+
+        handle_session_command(
+            &state,
+            IpcCommand::SetSessionModels {
+                target: target.clone(),
+                models: vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: choice.provider_id.clone(),
+                    model: choice.model.clone(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let session_id = record.session_id.clone();
+        let stored = state
+            .state_store
+            .session_model_override(&session_id)
+            .unwrap()
+            .expect("the override is stored");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].provider_id, choice.provider_id);
+        assert_eq!(stored[0].model, choice.model);
+
+        // Unknown models are rejected and leave the override untouched.
+        let error = handle_session_command(
+            &state,
+            IpcCommand::SetSessionModels {
+                target: target.clone(),
+                models: vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: "no-such-provider".to_string(),
+                    model: "no-such-model".to_string(),
+                }],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no-such-provider"));
+        assert!(state
+            .state_store
+            .session_model_override(&session_id)
+            .unwrap()
+            .is_some());
+
+        // An empty list clears the override (follow the global pool again).
+        handle_session_command(
+            &state,
+            IpcCommand::SetSessionModels {
+                target,
+                models: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .state_store
+            .session_model_override(&session_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

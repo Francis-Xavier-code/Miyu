@@ -1129,6 +1129,20 @@ textarea:disabled {
   opacity: 0.52;
 }
 
+.model-menu-follow {
+  margin-bottom: 5px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  border-radius: 6px 6px 0 0;
+}
+
+.model-menu-item.from-global {
+  color: var(--text-soft);
+}
+
+.model-menu-item.from-global .check-slot {
+  color: var(--text-faint);
+}
+
 .model-menu-copy {
   display: grid;
   min-width: 0;

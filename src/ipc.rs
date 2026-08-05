@@ -288,6 +288,13 @@ pub enum Command {
         #[serde(default)]
         path: Option<std::path::PathBuf>,
     },
+    /// Pins the target session to its own model pool. An empty list clears
+    /// the override so the session follows the global active pool again.
+    SetSessionModels {
+        target: SessionRef,
+        #[serde(default)]
+        models: Vec<crate::config::ActiveProviderModelConfig>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

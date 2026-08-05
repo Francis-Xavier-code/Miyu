@@ -71,10 +71,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_generation_journal",
         apply: apply_v10_turn_generation_journal,
     },
+    Migration {
+        version: 11,
+        name: "session_model_override",
+        apply: apply_v11_session_model_override,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 10;
+pub const LATEST_VERSION: i64 = 11;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -695,6 +700,13 @@ fn create_turn_redo_backup_tables(conn: &Connection) -> Result<()> {
         );",
     )?;
     Ok(())
+}
+
+/// Per-session model pool override: a JSON array of
+/// `{"provider_id": ..., "model": ...}` objects. NULL follows the global
+/// active pool.
+fn apply_v11_session_model_override(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "sessions", "model_override", "TEXT")
 }
 
 fn add_column_if_missing(

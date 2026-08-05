@@ -498,6 +498,33 @@ impl StateStore {
         self.conv_db.set_session_workspace(session_id, workspace)
     }
 
+    /// Per-session model pool override. None follows the global active pool.
+    pub fn session_model_override(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<crate::config::ActiveProviderModelConfig>>> {
+        let Some(encoded) = self.conv_db.session_model_override(session_id)? else {
+            return Ok(None);
+        };
+        let models =
+            serde_json::from_str::<Vec<crate::config::ActiveProviderModelConfig>>(&encoded)
+                .with_context(|| format!("invalid session model override for {session_id}"))?;
+        Ok((!models.is_empty()).then_some(models))
+    }
+
+    pub fn set_session_model_override(
+        &self,
+        session_id: &str,
+        models: Option<&[crate::config::ActiveProviderModelConfig]>,
+    ) -> Result<()> {
+        let encoded = match models {
+            Some(models) if !models.is_empty() => Some(serde_json::to_string(models)?),
+            _ => None,
+        };
+        self.conv_db
+            .set_session_model_override(session_id, encoded.as_deref())
+    }
+
     pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<()> {
         self.conv_db.set_session_archived(session_id, archived)
     }

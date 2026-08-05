@@ -786,7 +786,7 @@ impl Default for RealContextPluginSettings {
             continuation_window_seconds: 12,
             continuation_max_turns: 3,
             continuation_boost_score: 0.1,
-            takeover_direct_trigger_enable: false,
+            takeover_direct_trigger_enable: true,
             takeover_direct_trigger_boost_score: 0.3,
             privileged_direct_trigger_skip_active_judgement: true,
             active_reply_reaction_enable: true,
@@ -794,7 +794,7 @@ impl Default for RealContextPluginSettings {
             active_reply_reaction_timeout_seconds: 600,
             reply_target_enable: true,
             reply_target_quote_enable: true,
-            reply_target_quote_after_other_messages: 7,
+            reply_target_quote_after_other_messages: 4,
             reply_target_mention_enable: true,
             reply_target_mention_after_seconds: 15,
             moderation_enable: true,
@@ -1855,6 +1855,13 @@ pub struct OneBotConfig {
     pub admin_users: Vec<i64>,
     /// Grants full host tools only to non-admin users in `private_chats.whitelist`.
     pub allow_non_admin_host_tools: bool,
+    /// Send each model round's text to group chats as its own message while
+    /// the turn is still running, instead of keeping only the final reply.
+    pub group_intermediate_messages: bool,
+    /// Send each model round's text to private chats as its own message while
+    /// the turn is still running, instead of keeping only the final reply.
+    #[serde(default = "default_true")]
+    pub private_intermediate_messages: bool,
     /// Include the current QQ sender's stable id in the model system context.
     /// Nicknames remain available for display even when this is disabled.
     #[serde(default = "default_true")]
@@ -2023,6 +2030,8 @@ impl Default for OneBotConfig {
             access_token: String::new(),
             admin_users: Vec::new(),
             allow_non_admin_host_tools: false,
+            group_intermediate_messages: false,
+            private_intermediate_messages: true,
             user_identification: true,
             show_group_name: true,
             memory: PlatformMemoryConfig::default(),
@@ -2306,6 +2315,62 @@ impl ProviderModelChoice {
 
     pub fn label(&self) -> String {
         format!("{} / {}", self.provider_name, self.model)
+    }
+}
+
+/// Resolves a user-supplied model argument against `choices`: a 1-based list
+/// index, a fully-qualified `provider_id/model`, or a bare model name when it
+/// is unambiguous. The error is a ready-to-display bilingual message.
+pub fn resolve_provider_model_argument<'a>(
+    choices: &'a [ProviderModelChoice],
+    argument: &str,
+) -> std::result::Result<&'a ProviderModelChoice, String> {
+    use crate::i18n::text as t;
+    let argument = argument.trim();
+    if let Ok(index) = argument.parse::<usize>() {
+        return choices.get(index.wrapping_sub(1)).ok_or_else(|| {
+            format!(
+                "{} 1..={}",
+                t(
+                    "The model index is out of range; valid range:",
+                    "模型序号超出范围，有效范围："
+                ),
+                choices.len()
+            )
+        });
+    }
+    // Fully-qualified "provider_id/model". Model ids may themselves contain
+    // '/', so match by provider prefix instead of splitting at the first '/'.
+    if let Some(choice) = choices.iter().find(|choice| {
+        argument
+            .strip_prefix(choice.provider_id.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|model| model == choice.model)
+    }) {
+        return Ok(choice);
+    }
+    let matches: Vec<&ProviderModelChoice> = choices
+        .iter()
+        .filter(|choice| choice.model == argument)
+        .collect();
+    match matches.as_slice() {
+        [choice] => Ok(choice),
+        [] => Err(format!(
+            "{}{argument}",
+            t("No configured model matches: ", "没有匹配的已配置模型：")
+        )),
+        multiple => Err(format!(
+            "{}\n{}",
+            t(
+                "Multiple providers offer this model; use one of:",
+                "多个供应商都提供该模型，请使用以下之一："
+            ),
+            multiple
+                .iter()
+                .map(|choice| format!("{}/{}", choice.provider_id, choice.model))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
     }
 }
 
@@ -6574,13 +6639,13 @@ mod tests {
         assert_eq!(settings.active_reply_supersede_window_seconds, 5);
         assert_eq!(settings.continuation_window_seconds, 12);
         assert_eq!(settings.continuation_max_turns, 3);
-        assert!(!settings.takeover_direct_trigger_enable);
+        assert!(settings.takeover_direct_trigger_enable);
         assert_eq!(settings.takeover_direct_trigger_boost_score, 0.3);
         assert!(settings.privileged_direct_trigger_skip_active_judgement);
         assert_eq!(settings.active_reply_reaction_emoji_ids, [289]);
         assert_eq!(settings.active_reply_reaction_timeout_seconds, 600);
         assert!(settings.reply_target_quote_enable);
-        assert_eq!(settings.reply_target_quote_after_other_messages, 7);
+        assert_eq!(settings.reply_target_quote_after_other_messages, 4);
         assert!(settings.reply_target_mention_enable);
         assert_eq!(settings.reply_target_mention_after_seconds, 15);
         assert_eq!(settings.moderation_min_severity, 7.0);
@@ -6729,7 +6794,11 @@ mod tests {
 
         merge_real_context_settings(&mut instance, &settings);
         assert_eq!(instance.settings["context_messages"], 37);
-        assert_eq!(instance.settings["takeover_direct_trigger_enable"], true);
+        // Migrated to `true`, which now equals the default and is pruned from
+        // the persisted map; the effective value is asserted above.
+        assert!(!instance
+            .settings
+            .contains_key("takeover_direct_trigger_enable"));
         assert_eq!(instance.settings["text_models"][0]["provider_id"], "judge");
         assert_eq!(instance.settings["future_option"]["value"], 1);
         for key in DEPRECATED_REAL_CONTEXT_SETTINGS {

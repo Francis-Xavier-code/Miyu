@@ -1953,6 +1953,7 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            responses_continuation: None,
         }))
     }
 
@@ -2023,6 +2024,7 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            responses_continuation: None,
         }))
     }
 
@@ -2160,6 +2162,9 @@ impl Agent {
         let mut question_rounds = initial_question_rounds;
         let mut loaded_tools = self.initial_loaded_tools(messages)?;
         let mut usage_accumulator = UsageAccumulator::default();
+        let mut responses_continuation = None;
+        let mut continuation_input_start = messages.len();
+        let mut continuation_context: Option<(usize, Vec<ChatMessage>)> = None;
         let artifact_auto_publish = self.mode == AgentMode::Normal
             && self.prompt_audience == PromptAudience::External
             && artifact_delivery_requested(messages)
@@ -2227,15 +2232,34 @@ impl Agent {
             })?;
             let (chunk_tx, mut chunk_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(ChatStreamChunk, Instant)>();
-            let request_messages = messages.clone();
+            let mut request_messages = if responses_continuation.is_some() {
+                messages
+                    .get(continuation_input_start..)
+                    .context("Responses continuation input cursor is out of bounds")?
+                    .to_vec()
+            } else {
+                messages.clone()
+            };
+            if let Some((context_index, context_messages)) = continuation_context.as_ref() {
+                let offset = context_index
+                    .checked_sub(continuation_input_start)
+                    .context("Responses continuation context cursor is out of bounds")?;
+                if offset > request_messages.len() {
+                    bail!("Responses continuation context cursor is out of bounds");
+                }
+                request_messages.splice(offset..offset, context_messages.clone());
+            }
             let mut reasoning_filter = ReasoningTitleFilter::default();
             let round = {
-                let llm_future =
-                    self.client
-                        .chat_stream(request_messages.clone(), definitions, move |chunk| {
-                            let _ = chunk_tx.send((chunk, Instant::now()));
-                            Ok(())
-                        });
+                let llm_future = self.client.chat_stream_with_continuation(
+                    request_messages.clone(),
+                    definitions,
+                    responses_continuation.as_deref(),
+                    move |chunk| {
+                        let _ = chunk_tx.send((chunk, Instant::now()));
+                        Ok(())
+                    },
+                );
                 tokio::pin!(llm_future);
                 let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
                 spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2295,6 +2319,12 @@ impl Agent {
                     tool_round,
                     question_rounds,
                 );
+                let continuation_context_index = responses_continuation.as_ref().map(|_| {
+                    continuation_context
+                        .as_ref()
+                        .map(|(index, _)| *index)
+                        .unwrap_or(messages.len())
+                });
                 self.consume_queued_prompts(
                     current_turn_id,
                     messages,
@@ -2305,6 +2335,18 @@ impl Agent {
                     on_event,
                 )
                 .await?;
+                if let Some(index) = continuation_context_index {
+                    continuation_context = Some((
+                        index,
+                        vec![
+                            ChatMessage::system(continuation_system_prompt(
+                                &self.system_prompt,
+                                self.mode,
+                            )),
+                            ChatMessage::system(runtime_context(self.mode)),
+                        ],
+                    ));
+                }
                 continue;
             };
             while let Ok((chunk, received_at)) = chunk_rx.try_recv() {
@@ -2320,8 +2362,11 @@ impl Agent {
                     text,
                 }))?;
             }
-            usage_accumulator.add_result(&result, &request_messages);
+            usage_accumulator.add_result(&result, messages);
             if result.tool_calls.is_empty() || !self.tools_enabled {
+                responses_continuation = None;
+                continuation_input_start = messages.len();
+                continuation_context = None;
                 if let Some(control) = control {
                     let queued = self.state.load_queued_prompts()?;
                     if !queued.is_empty() {
@@ -2418,6 +2463,7 @@ impl Agent {
                 return Ok(result);
             }
             tool_round += 1;
+            let next_responses_continuation = result.responses_continuation.clone();
             push_assistant_message_with_reasoning(
                 messages,
                 result.content.clone(),
@@ -2425,6 +2471,11 @@ impl Agent {
                 Some(result.tool_calls.clone()),
                 true,
             );
+            if next_responses_continuation.is_some() {
+                continuation_input_start = messages.len();
+            }
+            responses_continuation = next_responses_continuation;
+            continuation_context = None;
             let ask_question_enabled = self
                 .tools
                 .lock()
@@ -2802,6 +2853,12 @@ impl Agent {
                             result.model.as_deref(),
                         )
                     };
+                    let continuation_context_index = responses_continuation.as_ref().map(|_| {
+                        continuation_context
+                            .as_ref()
+                            .map(|(index, _)| *index)
+                            .unwrap_or(messages.len())
+                    });
                     self.consume_queued_prompts(
                         current_turn_id,
                         messages,
@@ -2812,6 +2869,18 @@ impl Agent {
                         on_event,
                     )
                     .await?;
+                    if let Some(index) = continuation_context_index {
+                        continuation_context = Some((
+                            index,
+                            vec![
+                                ChatMessage::system(continuation_system_prompt(
+                                    &self.system_prompt,
+                                    self.mode,
+                                )),
+                                ChatMessage::system(runtime_context(self.mode)),
+                            ],
+                        ));
+                    }
                     if let Some(generation) = supersede_generation {
                         control.mark_supersede_seen(generation);
                     }
@@ -3311,6 +3380,17 @@ fn replace_request_mode_context(
     }) {
         *runtime = ChatMessage::system(runtime_context(mode));
     }
+}
+
+fn continuation_system_prompt(system_prompt: &str, mode: AgentMode) -> String {
+    let mode = match mode {
+        AgentMode::Normal => "normal",
+        AgentMode::Plan => "plan",
+        AgentMode::Chat => "chat",
+    };
+    format!(
+        "<mode-update active=\"{mode}\">This supersedes all earlier mode-specific instructions.</mode-update>\n\n{system_prompt}"
+    )
 }
 
 fn estimate_result_tokens(result: &ChatResult) -> usize {
@@ -6756,6 +6836,173 @@ mod tests {
         assert_eq!(turns[0].assistant_content, "updated final");
         assert_eq!(turns[0].followups.len(), 1);
         assert!(turns[0].followups[0].preceding_assistant_content.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_tool_round_uses_previous_response_id_and_only_new_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = true;
+        config.tools.loading_mode = "full".to_string();
+        config.skills.enabled = false;
+        config.memory.enabled = false;
+        config.providers[0].protocol = "openai-responses".to_string();
+        config.providers[0].models = vec!["gpt-5".to_string()];
+        config.providers[0].default_model = "gpt-5".to_string();
+
+        let mut tools = ToolRegistry::new();
+        tools.register(ToolSpec::new(
+            "responses_continuation_tool",
+            "returns a fixed result",
+            empty_parameters(),
+            |_| async { Ok("tool finished".to_string()) },
+        ));
+        let control = AgentTurnControl::new(
+            AgentMode::Normal,
+            tools.clone(),
+            tools.clone(),
+            tools.clone(),
+        );
+        let server_control = control.clone();
+
+        let (first_request_tx, first_request_rx) = oneshot::channel();
+        let (second_request_tx, second_request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_test_http_request(&mut first).await;
+            let _ = first_request_tx.send(first_request);
+            server_control.set_mode(AgentMode::Plan);
+            write_test_sse(
+                &mut first,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"responses_continuation_tool\",\"arguments\":\"\"}}\n\n",
+                    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{}\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"responses_continuation_tool\",\"arguments\":\"{}\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
+                ),
+            )
+            .await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_test_http_request(&mut second).await;
+            let _ = second_request_tx.send(second_request);
+            write_test_sse(
+                &mut second,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_2\",\"delta\":\"final answer\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\"}}\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            tools,
+            AgentMode::Normal,
+        )
+        .unwrap();
+        state
+            .enqueue_prompt("q1", "queued followup", "queued followup", &[])
+            .unwrap();
+
+        let result = agent
+            .chat_stream_with_control("initial prompt", &[], &control, |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "final answer");
+        assert_eq!(agent.mode(), AgentMode::Plan);
+        assert!(result.responses_continuation.is_none());
+        assert!(result.usage_estimated);
+        let tool_only_tokens =
+            overflow::estimate_messages_tokens(&[ChatMessage::tool("call_1", "tool finished")])
+                as u64;
+        assert!(result.usage.as_ref().unwrap().prompt_tokens > 5 + tool_only_tokens);
+        let first_request: Value =
+            serde_json::from_slice(&first_request_rx.await.unwrap()).unwrap();
+        assert!(first_request.get("previous_response_id").is_none());
+        assert!(first_request["input"].as_array().is_some_and(|input| {
+            input.iter().any(|item| item["role"] == "user")
+                && input.iter().any(|item| item["role"] == "system")
+        }));
+
+        let second_request: Value =
+            serde_json::from_slice(&second_request_rx.await.unwrap()).unwrap();
+        assert_eq!(second_request["previous_response_id"], "resp_1");
+        let input = second_request["input"].as_array().unwrap();
+        let function_output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(function_output["call_id"], "call_1");
+        assert_eq!(function_output["output"], "tool finished");
+        let function_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .unwrap();
+        let mode_index = input
+            .iter()
+            .position(|item| {
+                item["role"] == "system"
+                    && item["content"].as_str().is_some_and(|content| {
+                        content.contains("<mode-update active=\"plan\">")
+                            && content.contains(crate::prompts::PLAN_REMINDER)
+                    })
+            })
+            .unwrap();
+        assert!(input.iter().any(|item| {
+            item["role"] == "system"
+                && item["content"].as_str().is_some_and(|content| {
+                    content.contains("<mode-update active=\"plan\">")
+                        && content.contains(crate::prompts::PLAN_REMINDER)
+                })
+        }));
+        let queued_index = input
+            .iter()
+            .position(|item| {
+                item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part["type"] == "input_text" && part["text"] == "queued followup"
+                        })
+                    })
+            })
+            .unwrap();
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["type"] == "input_text" && part["text"] == "queued followup"
+                    })
+                })
+        }));
+        assert!(function_index < mode_index && mode_index < queued_index);
+        assert!(!serde_json::to_string(input)
+            .unwrap()
+            .contains("initial prompt"));
+        assert!(second_request["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "responses_continuation_tool")
+        }));
+        assert_eq!(
+            state.load_turns().unwrap()[0].assistant_content,
+            "final answer"
+        );
         server.await.unwrap();
     }
 

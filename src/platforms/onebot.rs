@@ -2237,76 +2237,98 @@ async fn handle_message_with_activity(
             ),
         })
         .flatten();
-    if matches!(target, Target::Group { .. }) {
-        if let Some(session_id) = session_id.as_deref() {
-            if let Some((run_id, turn_id, followup, _reservation)) = reserve_tool_followup(
+    if let Some(session_id) = session_id.as_deref() {
+        // Group chats only accept follow-ups while a tool is executing (the
+        // reservation guarantees same-round consumption); outside that window
+        // group messages go through supersede/new-turn admission because other
+        // people may be talking to each other. Private chats behave like the
+        // REPL/WebUI instead: any message while a turn is active becomes a
+        // follow-up to that turn, with the ingress reservation held when one
+        // is available.
+        let followup_target = if matches!(target, Target::Group { .. }) {
+            reserve_tool_followup(
                 &state,
                 session_id,
                 &context.conversation,
                 &context.sender_id,
-            ) {
-                let _enqueue_order = followup.lock_enqueue().await;
-                let rate_decision =
-                    admission
-                        .rate_key
-                        .as_deref()
-                        .map_or(RateDecision::Allow, |key| {
-                            state
-                                .platforms
-                                .rate
-                                .lock()
-                                .unwrap()
-                                .check(key, admission.rate_limit)
-                        });
-                if rate_decision != RateDecision::Allow {
-                    if rate_decision == RateDecision::DropWithNotice {
-                        let _ = context
-                            .send_bypass_plugins(OutboundMessage::text(
-                                OutboundOrigin::Command,
-                                t(
-                                    "Too many messages — please slow down a little.",
-                                    "消息太频繁了，请稍候再发。",
-                                ),
-                            ))
-                            .await;
-                    }
-                    return;
-                }
-                match enqueue_tool_followup(
-                    &state,
-                    &conn,
-                    target,
-                    &event,
-                    parsed,
-                    &inbound_event,
-                    &context,
-                    &followup,
-                    session_id,
-                    &run_id,
-                    &turn_id,
-                    TurnUpdateMode::Followup,
-                )
-                .await
-                {
-                    Ok(()) => tracing::info!(
-                        target: "miyu::qq",
-                        session_id,
-                        sender_id = user_id,
-                        message_id = %inbound_event.message_id,
-                        "{}",
-                        t("OneBot message queued as a tool-time follow-up", "OneBot 消息已加入工具执行期间的后续队列")
-                    ),
-                    Err(error) => tracing::warn!(
-                        target: "miyu::qq",
-                        session_id,
-                        sender_id = user_id,
-                        error = %error,
-                        "{}",
-                        t("OneBot tool-time follow-up could not be queued", "OneBot 工具执行期间的后续消息无法入队")
-                    ),
+            )
+            .map(|(run_id, turn_id, followup, reservation)| {
+                (run_id, turn_id, followup, Some(reservation))
+            })
+        } else {
+            platform_update_target(
+                &state,
+                session_id,
+                &context.conversation,
+                &context.sender_id,
+            )
+            .map(|(run_id, turn_id, followup)| {
+                let reservation = followup.try_reserve();
+                (run_id, turn_id, followup, reservation)
+            })
+        };
+        if let Some((run_id, turn_id, followup, reservation)) = followup_target {
+            let _ingress_reservation = reservation;
+            let _enqueue_order = followup.lock_enqueue().await;
+            let rate_decision = admission
+                .rate_key
+                .as_deref()
+                .map_or(RateDecision::Allow, |key| {
+                    state
+                        .platforms
+                        .rate
+                        .lock()
+                        .unwrap()
+                        .check(key, admission.rate_limit)
+                });
+            if rate_decision != RateDecision::Allow {
+                if rate_decision == RateDecision::DropWithNotice {
+                    let _ = context
+                        .send_bypass_plugins(OutboundMessage::text(
+                            OutboundOrigin::Command,
+                            t(
+                                "Too many messages — please slow down a little.",
+                                "消息太频繁了，请稍候再发。",
+                            ),
+                        ))
+                        .await;
                 }
                 return;
             }
+            match enqueue_tool_followup(
+                &state,
+                &conn,
+                target,
+                &event,
+                parsed,
+                &inbound_event,
+                &context,
+                &followup,
+                session_id,
+                &run_id,
+                &turn_id,
+                TurnUpdateMode::Followup,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(
+                    target: "miyu::qq",
+                    session_id,
+                    sender_id = user_id,
+                    message_id = %inbound_event.message_id,
+                    "{}",
+                    t("OneBot message queued as a follow-up to the active turn", "OneBot 消息已加入当前回合的后续队列")
+                ),
+                Err(error) => tracing::warn!(
+                    target: "miyu::qq",
+                    session_id,
+                    sender_id = user_id,
+                    error = %error,
+                    "{}",
+                    t("OneBot follow-up could not be queued", "OneBot 后续消息无法入队")
+                ),
+            }
+            return;
         }
     }
     if let Some(session_id) = session_id.as_deref() {
@@ -2727,6 +2749,7 @@ async fn execute_builtin_command(
                         .to_string()
                     }
                     Ok(session_id) => {
+                        let queued = state.platforms.queued_session_turns(&session_id);
                         let ticket = state.platforms.preempt_session_turns(&session_id);
                         let cancelled = cancel_session_runs(state, &session_id);
                         let _session_turn = ticket.acquire().await.ok();
@@ -2735,20 +2758,150 @@ async fn execute_builtin_command(
                             session_id = %session_id,
                             sender_id = %context.sender_id,
                             cancelled,
+                            queued,
                             "{}",
                             t("QQ conversation stopped", "QQ 会话已停止")
                         );
-                        t(
-                            "All tasks in the current conversation have been stopped.",
-                            "当前会话中的所有任务已停止。",
-                        )
-                        .to_string()
+                        stop_response_message(cancelled, queued)
                     }
                 }
             }
         }
+        commands::ParsedPlatformCommand::Models { argument } => {
+            let descriptor = commands::descriptor(commands::MODELS_COMMAND_ID)
+                .expect("the models command descriptor is registered");
+            if !commands::is_allowed(&context.config.platforms, descriptor, context.is_admin) {
+                // Deliberately silent for non-admins, like /reset: no reply
+                // and no log line.
+                return None;
+            }
+            execute_models_command(state, target, argument.as_deref())
+        }
     };
     Some(OutboundMessage::text(OutboundOrigin::Command, response))
+}
+
+/// `/models` lists the globally configured models; `/models <index|provider/model>`
+/// switches this conversation's text model by writing a single-model pool into
+/// its per-conversation route (私聊/群聊专属配置), creating the route if needed.
+fn execute_models_command(state: &DaemonState, target: Target, argument: Option<&str>) -> String {
+    let kind = match target {
+        Target::Private { .. } => PlatformConversationKind::Private,
+        Target::Group { .. } => PlatformConversationKind::Group,
+    };
+    let conversation_id = target.conversation_id().to_string();
+    let mut manager = state.manager.lock().unwrap();
+    let choices = manager.config.text_provider_model_choices();
+    if choices.is_empty() {
+        return t("No models are configured.", "尚未配置任何模型。").to_string();
+    }
+    let Some(argument) = argument else {
+        let effective = manager
+            .config
+            .qq_text_model_pool(kind, &conversation_id, false)
+            .unwrap_or(&[])
+            .to_vec();
+        // Plain numbered lines read best in QQ: no alignment padding (IM
+        // fonts are proportional) and no empty checkbox noise — only the
+        // effective models carry a marker.
+        let mut lines = vec![t("Available models:", "可用模型：").to_string()];
+        for (index, choice) in choices.iter().enumerate() {
+            let active = effective.iter().any(|active| {
+                active.provider_id == choice.provider_id && active.model == choice.model
+            });
+            let marker = if active {
+                t(" ✅current", " ✅当前")
+            } else {
+                ""
+            };
+            lines.push(format!("{}. {}{marker}", index + 1, choice.label()));
+        }
+        lines.push(format!(
+            "{}{}",
+            t("Switch with: ", "切换模型："),
+            commands::models_switch_hint(&manager.config.platforms)
+        ));
+        return lines.join("\n");
+    };
+    let selected = match crate::config::resolve_provider_model_argument(&choices, argument) {
+        Ok(choice) => choice.clone(),
+        Err(message) => return message,
+    };
+    if manager.admin_busy {
+        return t(
+            "Miyu is busy with another admin operation. Try again shortly.",
+            "Miyu 正忙于其他管理操作，请稍后再试。",
+        )
+        .to_string();
+    }
+    let mut next_config = manager.config.clone();
+    let mut route = next_config
+        .platforms
+        .model_route(kind, &conversation_id)
+        .cloned()
+        .unwrap_or_else(|| crate::config::PlatformModelRoute {
+            conversation: crate::config::PlatformConversationConfig {
+                kind,
+                id: conversation_id.clone(),
+            },
+            persona: crate::config::PlatformPersonaOverride::default(),
+            text_models_inheritance: crate::config::PlatformModelPoolInheritance::default(),
+            text_models: None,
+            multimodal_models_inheritance: crate::config::PlatformModelPoolInheritance::default(),
+            multimodal_models: None,
+            extra_prompt: String::new(),
+            session_limits: None,
+        });
+    route.text_models = Some(vec![crate::config::ActiveProviderModelConfig {
+        provider_id: selected.provider_id.clone(),
+        model: selected.model.clone(),
+    }]);
+    next_config.platforms.upsert_model_route(route);
+    if let Err(error) = next_config.save(&state.paths) {
+        tracing::warn!(
+            target: "miyu::qq",
+            error = %error,
+            "{}",
+            t(
+                "saving the conversation model override failed",
+                "保存会话专属模型配置失败"
+            )
+        );
+        return t(
+            "The model could not be saved. Check the daemon logs for details.",
+            "模型切换保存失败，请查看 daemon 日志。",
+        )
+        .to_string();
+    }
+    manager.config = next_config;
+    format!(
+        "{}{}",
+        t(
+            "This conversation now uses (saved to its dedicated settings): ",
+            "本会话已切换模型（已写入私聊/群聊专属配置）："
+        ),
+        selected.label()
+    )
+}
+
+fn stop_response_message(cancelled: usize, queued: usize) -> String {
+    if crate::i18n::is_zh() {
+        match (cancelled, queued) {
+            (0, 0) => "当前会话没有正在运行的任务。".to_string(),
+            (_, 0) => format!("已打断 {cancelled} 个运行中的任务。"),
+            (0, _) => format!("已丢弃 {queued} 个排队中的任务。"),
+            _ => format!("已打断 {cancelled} 个运行中的任务、{queued} 个排队中的任务。"),
+        }
+    } else {
+        match (cancelled, queued) {
+            (0, 0) => "No running tasks to stop in the current conversation.".to_string(),
+            (_, 0) => format!("Interrupted {cancelled} running task(s)."),
+            (0, _) => format!("Discarded {queued} queued task(s)."),
+            _ => format!(
+                "Interrupted {cancelled} running task(s) and discarded {queued} queued task(s)."
+            ),
+        }
+    }
 }
 
 fn cancel_session_runs(state: &DaemonState, session_id: &str) -> usize {
@@ -5353,27 +5506,7 @@ async fn deliver_dispatch(
 }
 
 fn final_reply_text(outcome: &super::TurnOutcome) -> String {
-    if outcome.suppressed_reply_ranges.is_empty() {
-        return outcome.text.clone();
-    }
-    let mut text = String::with_capacity(outcome.text.len());
-    let mut cursor = 0;
-    for &(start, end) in &outcome.suppressed_reply_ranges {
-        let start = start.clamp(cursor, outcome.text.len());
-        let end = end.clamp(start, outcome.text.len());
-        let (Some(prefix), Some(_suppressed)) = (
-            outcome.text.get(cursor..start),
-            outcome.text.get(start..end),
-        ) else {
-            continue;
-        };
-        text.push_str(prefix);
-        cursor = end;
-    }
-    if let Some(suffix) = outcome.text.get(cursor..) {
-        text.push_str(suffix);
-    }
-    text
+    super::cut_suppressed_ranges(&outcome.text, &outcome.suppressed_reply_ranges)
 }
 
 fn text_segment(text: &str) -> Value {
@@ -7628,7 +7761,8 @@ mod tests {
         };
         assert!(matches!(
             segments.as_slice(),
-            [OutboundSegment::Text(text)] if text.contains("停止") || text.contains("stopped")
+            [OutboundSegment::Text(text)]
+                if text.contains("已打断 1 个运行中的任务") || text.contains("Interrupted 1 running task")
         ));
         state
             .manager

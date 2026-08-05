@@ -327,7 +327,12 @@
     loginSubmitting: false,
     modelSelectionSubmitting: false,
     stagedModelKeys: null,
+    stagedFollowGlobal: false,
+    modelMenuTouched: false,
     modelMenuError: "",
+    sessionModelOverride: null,
+    sessionModelOverrideFor: "",
+    sessionModelOverrideToken: 0,
     submitting: false,
     revisionSubmitting: false,
     redoCandidate: null,
@@ -933,11 +938,11 @@
   function openModelMenu() {
     if (elements.modelButton.disabled || state.models.length === 0) return;
     closeThinkingVariantPopover();
-    state.stagedModelKeys = new Set(activeModels().map(modelKey));
-    state.modelMenuError = "";
+    resetModelMenuStaging();
     renderModelMenu();
     elements.modelMenu.hidden = false;
     elements.modelButton.setAttribute("aria-expanded", "true");
+    refreshSessionModelOverride();
     const selected = elements.modelMenu.querySelector(".model-menu-item.selected:not(:disabled)");
     const first = elements.modelMenu.querySelector(".model-menu-item:not(:disabled)");
     window.requestAnimationFrame(() => (selected || first)?.focus());
@@ -949,6 +954,8 @@
     elements.modelButton.setAttribute("aria-expanded", "false");
     if (discard) {
       state.stagedModelKeys = null;
+      state.stagedFollowGlobal = false;
+      state.modelMenuTouched = false;
       state.modelMenuError = "";
     }
     if (restoreFocus) elements.modelButton.focus();
@@ -2770,35 +2777,108 @@
     return state.models.filter((model) => model?.active);
   }
 
-  function updateCurrentModelDisplay() {
-    const active = activeModels();
-    if (active.length === 0) {
-      elements.modelMark.textContent = "--";
-      elements.modelLabel.textContent = state.models.length ? "未选择模型" : "未配置模型";
-      elements.modelLabel.title = elements.modelLabel.textContent;
-      elements.settingsModelMark.textContent = "--";
-      elements.settingsModelName.textContent = elements.modelLabel.textContent;
-      elements.settingsModelProvider.textContent = "--";
+  function normalizeModelOverride(value) {
+    if (!Array.isArray(value)) return null;
+    const models = value
+      .map((item) => ({ provider_id: String(item?.provider_id || ""), model: String(item?.model || "") }))
+      .filter((item) => item.provider_id && item.model);
+    return models.length ? models : null;
+  }
+
+  function viewSessionModelOverride() {
+    return state.viewSessionId && state.sessionModelOverrideFor === state.viewSessionId
+      ? state.sessionModelOverride
+      : null;
+  }
+
+  function describeOverrideModel(entry) {
+    const key = modelKey(entry);
+    return state.models.find((model) => modelKey(model) === key) || entry;
+  }
+
+  function setSessionModelOverride(sessionId, override) {
+    state.sessionModelOverrideFor = String(sessionId || "");
+    state.sessionModelOverride = normalizeModelOverride(override);
+    updateCurrentModelDisplay();
+    if (elements.modelMenu.hidden || state.modelSelectionSubmitting) return;
+    // 菜单开着且用户尚未改动暂存选择时，同步为最新覆盖状态。
+    if (!state.modelMenuTouched && state.stagedModelKeys instanceof Set) {
+      const fresh = viewSessionModelOverride();
+      const freshFollow = !fresh;
+      const freshKeys = new Set((fresh || []).map(modelKey));
+      const unchanged = state.stagedFollowGlobal === freshFollow
+        && state.stagedModelKeys.size === freshKeys.size
+        && [...freshKeys].every((key) => state.stagedModelKeys.has(key));
+      if (!unchanged) {
+        const hadFocus = elements.modelMenu.contains(document.activeElement);
+        resetModelMenuStaging();
+        renderModelMenu();
+        if (hadFocus) {
+          const focusTarget = elements.modelMenu.querySelector(".model-menu-item.selected:not(:disabled)")
+            || elements.modelMenu.querySelector(".model-menu-item:not(:disabled)");
+          focusTarget?.focus();
+        }
+        return;
+      }
+    }
+    updateModelMenuState();
+  }
+
+  async function refreshSessionModelOverride(sessionId = state.viewSessionId) {
+    const target = String(sessionId || "");
+    const token = ++state.sessionModelOverrideToken;
+    if (!target) {
+      setSessionModelOverride("", null);
       return;
     }
-    if (active.length > 1) {
-      const title = active.map((model) => `${model.provider_name || model.provider_id || ""} · ${model.model || ""}`).join("\n");
-      elements.modelMark.textContent = "MX";
-      elements.modelLabel.textContent = `混合模型 · ${active.length}`;
-      elements.modelLabel.title = title;
+    try {
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(target)}/models`);
+      const payload = await response.json();
+      if (token !== state.sessionModelOverrideToken || state.viewSessionId !== target) return;
+      setSessionModelOverride(target, payload?.model_override);
+    } catch (_) {
+      // 静默失败：顶栏回退显示全局池，下次打开菜单会再次刷新。
+    }
+  }
+
+  function updateCurrentModelDisplay() {
+    // 设置页摘要始终反映全局激活池。
+    const active = activeModels();
+    if (active.length === 0) {
+      elements.settingsModelMark.textContent = "--";
+      elements.settingsModelName.textContent = state.models.length ? "未选择模型" : "未配置模型";
+      elements.settingsModelProvider.textContent = "--";
+    } else if (active.length > 1) {
       elements.settingsModelMark.textContent = "MX";
       elements.settingsModelName.textContent = "混合模型";
       elements.settingsModelProvider.textContent = `${active.length} 个活动端点`;
+    } else {
+      elements.settingsModelMark.textContent = modelMark(active[0]);
+      elements.settingsModelName.textContent = String(active[0].model || "");
+      elements.settingsModelProvider.textContent = String(active[0].provider_name || active[0].provider_id || "");
+    }
+
+    // 顶栏反映当前会话生效的模型池：有覆盖显示覆盖，否则跟随全局。
+    const override = viewSessionModelOverride();
+    const pool = override ? override.map(describeOverrideModel) : active;
+    const scope = override ? "本会话固定" : "跟随全局";
+    if (pool.length === 0) {
+      elements.modelMark.textContent = "--";
+      elements.modelLabel.textContent = state.models.length ? "未选择模型" : "未配置模型";
+      elements.modelLabel.title = `${elements.modelLabel.textContent}（${scope}）`;
       return;
     }
-    const selected = active[0];
-    const mark = modelMark(selected);
-    elements.modelMark.textContent = mark;
+    if (pool.length > 1) {
+      const title = pool.map((model) => `${model.provider_name || model.provider_id || ""} · ${model.model || ""}`).join("\n");
+      elements.modelMark.textContent = "MX";
+      elements.modelLabel.textContent = `混合模型 · ${pool.length}`;
+      elements.modelLabel.title = `${scope}\n${title}`;
+      return;
+    }
+    const selected = pool[0];
+    elements.modelMark.textContent = modelMark(selected);
     elements.modelLabel.textContent = String(selected.model || "");
-    elements.modelLabel.title = `${selected.provider_name || selected.provider_id || ""} · ${selected.model || ""}`;
-    elements.settingsModelMark.textContent = mark;
-    elements.settingsModelName.textContent = String(selected.model || "");
-    elements.settingsModelProvider.textContent = String(selected.provider_name || selected.provider_id || "");
+    elements.modelLabel.title = `${selected.provider_name || selected.provider_id || ""} · ${selected.model || ""}（${scope}）`;
   }
 
   function refreshLiveEndpointVisibility() {
@@ -2809,15 +2889,55 @@
     }
   }
 
+  function resetModelMenuStaging() {
+    const override = viewSessionModelOverride();
+    state.stagedFollowGlobal = !override;
+    state.stagedModelKeys = new Set((override || []).map(modelKey));
+    state.modelMenuTouched = false;
+    state.modelMenuError = "";
+  }
+
+  function modelMenuStaging() {
+    if (state.stagedModelKeys instanceof Set) {
+      return { follow: state.stagedFollowGlobal, keys: state.stagedModelKeys };
+    }
+    const override = viewSessionModelOverride();
+    return { follow: !override, keys: new Set((override || []).map(modelKey)) };
+  }
+
   function renderModelMenu() {
     elements.modelMenu.replaceChildren();
-    const staged = state.stagedModelKeys instanceof Set
-      ? state.stagedModelKeys
-      : new Set(activeModels().map(modelKey));
+    const staging = modelMenuStaging();
+    const globalKeys = new Set(activeModels().map(modelKey));
     const list = document.createElement("div");
     list.className = "model-menu-list";
     list.setAttribute("role", "group");
     list.setAttribute("aria-label", "可用模型");
+
+    const follow = document.createElement("button");
+    follow.type = "button";
+    follow.className = "model-menu-item model-menu-follow";
+    follow.setAttribute("role", "menuitemcheckbox");
+    follow.setAttribute("aria-checked", String(staging.follow));
+    follow.classList.toggle("selected", staging.follow);
+    const followMark = document.createElement("span");
+    followMark.className = "model-mark";
+    followMark.textContent = "全";
+    const followCopy = document.createElement("span");
+    followCopy.className = "model-menu-copy";
+    const followName = document.createElement("strong");
+    followName.textContent = "跟随全局";
+    const followHint = document.createElement("small");
+    followHint.textContent = "使用全局激活模型池";
+    followCopy.append(followName, followHint);
+    const followCheck = document.createElement("span");
+    followCheck.className = "icon-slot check-slot";
+    followCheck.setAttribute("aria-hidden", "true");
+    if (staging.follow) followCheck.appendChild(createIcon("check"));
+    follow.append(followMark, followCopy, followCheck);
+    follow.addEventListener("click", chooseFollowGlobal);
+    list.appendChild(follow);
+
     for (const model of state.models) {
       if (!model || typeof model !== "object") continue;
       const button = document.createElement("button");
@@ -2825,9 +2945,11 @@
       button.className = "model-menu-item";
       button.setAttribute("role", "menuitemcheckbox");
       button.dataset.modelKey = modelKey(model);
-      const selected = staged.has(button.dataset.modelKey);
-      button.setAttribute("aria-checked", String(selected));
+      const checked = staging.follow ? globalKeys.has(button.dataset.modelKey) : staging.keys.has(button.dataset.modelKey);
+      const selected = checked && !staging.follow;
+      button.setAttribute("aria-checked", String(checked));
       button.classList.toggle("selected", selected);
+      button.classList.toggle("from-global", checked && staging.follow);
 
       const mark = document.createElement("span");
       mark.className = "model-mark";
@@ -2842,7 +2964,7 @@
       const check = document.createElement("span");
       check.className = "icon-slot check-slot";
       check.setAttribute("aria-hidden", "true");
-      if (selected) check.appendChild(createIcon("check"));
+      if (checked) check.appendChild(createIcon("check"));
       button.append(mark, copy, check);
       button.addEventListener("click", () => toggleStagedModel(button.dataset.modelKey));
       list.appendChild(button);
@@ -2876,36 +2998,57 @@
   }
 
   function updateModelMenuState() {
-    const staged = state.stagedModelKeys instanceof Set
-      ? state.stagedModelKeys
-      : new Set(activeModels().map(modelKey));
+    const staging = modelMenuStaging();
+    const globalKeys = new Set(activeModels().map(modelKey));
     elements.modelMenu.querySelectorAll(".model-menu-item").forEach((button) => {
-      const selected = staged.has(button.dataset.modelKey || "");
-      button.classList.toggle("selected", selected);
-      button.setAttribute("aria-checked", String(selected));
+      const isFollowItem = button.classList.contains("model-menu-follow");
+      const key = button.dataset.modelKey || "";
+      const checked = isFollowItem
+        ? staging.follow
+        : (staging.follow ? globalKeys.has(key) : staging.keys.has(key));
+      button.classList.toggle("selected", checked && (isFollowItem || !staging.follow));
+      button.classList.toggle("from-global", !isFollowItem && checked && staging.follow);
+      button.setAttribute("aria-checked", String(checked));
+      button.disabled = state.blocked || state.modelSelectionSubmitting;
       const check = button.querySelector(".check-slot");
-      if (check) check.replaceChildren(...(selected ? [createIcon("check")] : []));
+      if (check) check.replaceChildren(...(checked ? [createIcon("check")] : []));
     });
     const feedback = elements.modelMenu.querySelector(".model-menu-feedback");
     if (feedback) {
-      const empty = staged.size === 0;
-      feedback.textContent = state.modelMenuError || (empty ? "至少选择一个模型" : `已选择 ${formatInteger(staged.size)} 个模型`);
-      feedback.classList.toggle("is-error", Boolean(state.modelMenuError) || empty);
+      const following = staging.follow || staging.keys.size === 0;
+      feedback.textContent = state.modelMenuError
+        || (following ? "跟随全局激活模型池" : `已选择 ${formatInteger(staging.keys.size)} 个模型（仅本会话）`);
+      feedback.classList.toggle("is-error", Boolean(state.modelMenuError));
     }
     const confirm = elements.modelMenu.querySelector(".model-confirm");
     if (confirm) {
       confirm.textContent = state.modelSelectionSubmitting ? "正在应用" : "确认";
-      confirm.disabled = state.modelSelectionSubmitting || state.adminBusy || state.blocked || conversationRunning() || state.submitting || staged.size === 0;
+      confirm.disabled = state.modelSelectionSubmitting || state.blocked;
     }
     const cancel = elements.modelMenu.querySelector(".model-cancel");
-    if (cancel) cancel.disabled = state.modelSelectionSubmitting || (state.adminBusy && !state.modelSelectionSubmitting);
+    if (cancel) cancel.disabled = state.modelSelectionSubmitting;
+  }
+
+  function chooseFollowGlobal() {
+    if (!(state.stagedModelKeys instanceof Set) || state.modelSelectionSubmitting) return;
+    state.stagedFollowGlobal = true;
+    state.stagedModelKeys = new Set();
+    state.modelMenuTouched = true;
+    state.modelMenuError = "";
+    updateModelMenuState();
   }
 
   function toggleStagedModel(key) {
     if (!(state.stagedModelKeys instanceof Set) || state.modelSelectionSubmitting) return;
+    if (state.stagedFollowGlobal) {
+      // 退出跟随模式：以当前显示的全局激活池为起点继续多选。
+      state.stagedFollowGlobal = false;
+      state.stagedModelKeys = new Set(activeModels().map(modelKey));
+    }
     if (state.stagedModelKeys.has(key)) state.stagedModelKeys.delete(key);
     else state.stagedModelKeys.add(key);
-    state.modelMenuError = state.stagedModelKeys.size === 0 ? "至少选择一个模型" : "";
+    state.modelMenuTouched = true;
+    state.modelMenuError = "";
     updateModelMenuState();
   }
 
@@ -3400,6 +3543,13 @@
     disposeAllLiveRuns();
     clearViewSyncTimer();
     state.viewSessionId = sessionId;
+    if (state.sessionModelOverrideFor !== sessionId) {
+      // 会话切换：先按"跟随全局"显示，再异步取回该会话的覆盖池。
+      state.sessionModelOverride = null;
+      state.sessionModelOverrideFor = "";
+      updateCurrentModelDisplay();
+      refreshSessionModelOverride(sessionId);
+    }
     state.turns = Array.isArray(payload?.turns)
       ? payload.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq))
       : [];
@@ -3597,7 +3747,12 @@
       }
     } else if (name === "session.updated") {
       const target = findSession(sessionId) || findArchivedSession(sessionId);
-      if (target) target.workspace = String(data?.workspace || "");
+      if (target && Object.prototype.hasOwnProperty.call(data || {}, "workspace")) {
+        target.workspace = String(data?.workspace || "");
+      }
+      if (Object.prototype.hasOwnProperty.call(data || {}, "model_override") && sessionId === state.viewSessionId) {
+        setSessionModelOverride(sessionId, data.model_override);
+      }
       renderSessionList();
       if (sessionId === state.viewSessionId) updateConversationChrome();
     } else if (name === "session.current_changed") {
@@ -3918,16 +4073,14 @@
     elements.composerForm.classList.toggle("is-disabled", locked);
     elements.attachButton.disabled = locked || state.submitting || !state.capabilities?.attachments || state.composerAttachments.length >= MAX_ATTACHMENTS;
     elements.newChatButton.disabled = state.blocked || busy || state.sessionBusy || state.viewLoading;
-    elements.modelButton.disabled = state.blocked || running || busy || state.models.length === 0;
+    // 会话级模型覆盖允许在回复进行中调整，下一轮生效。
+    elements.modelButton.disabled = state.blocked || state.models.length === 0;
     elements.modeCycle.disabled = state.blocked || running || busy;
     elements.thinkingVariantButton.disabled = state.blocked || running || busy
       || state.thinkingVariantLoading || state.thinkingVariantModels.length === 0;
     if (elements.thinkingVariantButton.disabled) closeThinkingVariantPopover();
     updateThinkingVariantTrigger();
     elements.promptGrid.querySelectorAll("button").forEach((button) => {
-      button.disabled = state.blocked || running || busy;
-    });
-    elements.modelMenu.querySelectorAll(".model-menu-item").forEach((button) => {
       button.disabled = state.blocked || running || busy;
     });
     updateModelMenuState();
@@ -7675,6 +7828,9 @@
     } else {
       // 单会话兜底：没有会话指针时直接使用 bootstrap 快照。
       state.viewSessionId = null;
+      state.sessionModelOverride = null;
+      state.sessionModelOverrideFor = "";
+      updateCurrentModelDisplay();
       state.viewRunningTurnId = typeof snapshot?.running_turn_id === "string" && snapshot.running_turn_id ? snapshot.running_turn_id : null;
       state.turns = Array.isArray(snapshot?.turns) ? snapshot.turns.sort((a, b) => asFiniteNumber(a?.seq) - asFiniteNumber(b?.seq)) : [];
       state.queuedPrompts = Array.isArray(snapshot?.queued_prompts) ? snapshot.queued_prompts : [];
@@ -7765,21 +7921,27 @@
   }
 
   async function confirmModelSelection() {
-    if (!(state.stagedModelKeys instanceof Set) || conversationRunning() || state.adminBusy || state.submitting) return;
-    const selected = state.models.filter((model) => state.stagedModelKeys.has(modelKey(model)));
-    if (selected.length === 0) {
-      state.modelMenuError = "至少选择一个模型";
+    if (!(state.stagedModelKeys instanceof Set) || state.modelSelectionSubmitting) return;
+    const sessionId = String(state.viewSessionId || state.currentSessionId || "");
+    if (!sessionId) {
+      state.modelMenuError = "当前视图没有可设置的会话";
+      updateModelMenuState();
+      return;
+    }
+    const follow = state.stagedFollowGlobal || state.stagedModelKeys.size === 0;
+    const selected = follow ? [] : state.models.filter((model) => state.stagedModelKeys.has(modelKey(model)));
+    if (!follow && selected.length === 0) {
+      state.modelMenuError = "所选模型已不可用，请重新选择";
       updateModelMenuState();
       return;
     }
     state.modelSelectionSubmitting = true;
-    state.adminBusy = true;
     state.modelMenuError = "";
     clearInlineError();
-    updateControlState();
+    updateModelMenuState();
     let applied = false;
     try {
-      const response = await apiRequest("/api/models/active", {
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/models`, {
         method: "PUT",
         body: JSON.stringify({
           models: selected.map((model) => ({
@@ -7789,24 +7951,17 @@
         })
       });
       const payload = await response.json();
-      state.models = Array.isArray(payload?.models) ? payload.models : state.models;
-      if (payload?.display && typeof payload.display === "object") state.display = payload.display;
-      state.context = payload?.context && typeof payload.context === "object" ? payload.context : state.context;
       applied = true;
+      state.modelSelectionSubmitting = false;
+      closeModelMenu();
+      setSessionModelOverride(sessionId, payload?.model_override);
+      showToast(follow ? "本会话已恢复跟随全局" : "本会话模型已更新（下一轮生效）");
     } catch (error) {
       state.modelMenuError = error.message || "模型设置未保存";
       showInlineError(error.message);
       showToast(error.message, "error");
     } finally {
-      state.adminBusy = false;
       state.modelSelectionSubmitting = false;
-      if (applied) {
-        closeModelMenu();
-        renderModelMenu();
-        updateContext();
-        loadThinkingVariants();
-        showToast("模型设置已更新");
-      }
       updateControlState();
       if (applied) window.requestAnimationFrame(() => elements.modelButton.focus());
       else {

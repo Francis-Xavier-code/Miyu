@@ -67,6 +67,10 @@ impl PlatformPrincipal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutboundOrigin {
     FinalReply,
+    /// A completed model round sent mid-turn while later rounds are still
+    /// running. Unlike `FinalReply` it must not consume the reserved response
+    /// target, and unlike `Tool` it must not suppress the final reply.
+    IntermediateReply,
     Tool,
     Command,
     Plugin,

@@ -3,6 +3,7 @@ use crate::i18n::text as t;
 
 pub(crate) const RESET_COMMAND_ID: &str = "reset";
 pub(crate) const STOP_COMMAND_ID: &str = "stop";
+pub(crate) const MODELS_COMMAND_ID: &str = "models";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlatformCommandDescriptor {
@@ -19,6 +20,10 @@ pub(crate) const BUILTIN_COMMANDS: &[PlatformCommandDescriptor] = &[
         id: STOP_COMMAND_ID,
         default_permission: PlatformCommandPermission::AdminOnly,
     },
+    PlatformCommandDescriptor {
+        id: MODELS_COMMAND_ID,
+        default_permission: PlatformCommandPermission::AdminOnly,
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,10 +32,11 @@ pub(crate) enum ResetScope {
     All,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ParsedPlatformCommand {
     Reset { scope: Option<ResetScope> },
     Stop { has_arguments: bool },
+    Models { argument: Option<String> },
 }
 
 pub(crate) fn descriptor(id: &str) -> Option<&'static PlatformCommandDescriptor> {
@@ -56,6 +62,12 @@ pub(crate) fn parse(config: &PlatformsConfig, text: &str) -> Option<ParsedPlatfo
     } else if command.eq_ignore_ascii_case(STOP_COMMAND_ID) {
         let has_arguments = parts.next().is_some();
         Some(ParsedPlatformCommand::Stop { has_arguments })
+    } else if command.eq_ignore_ascii_case(MODELS_COMMAND_ID) {
+        let argument = rest
+            .split_once(char::is_whitespace)
+            .map(|(_, argument)| argument.trim().to_string())
+            .filter(|argument| !argument.is_empty());
+        Some(ParsedPlatformCommand::Models { argument })
     } else {
         None
     }
@@ -102,6 +114,14 @@ pub(crate) fn reset_usage_message(config: &PlatformsConfig) -> String {
 
 pub(crate) fn stop_usage_message(config: &PlatformsConfig) -> String {
     usage_message(config, STOP_COMMAND_ID)
+}
+
+pub(crate) fn models_switch_hint(config: &PlatformsConfig) -> String {
+    format!(
+        "{} <{}>",
+        command_text(config, MODELS_COMMAND_ID),
+        t("index or provider/model", "序号或 供应商/模型")
+    )
 }
 
 fn usage_message(config: &PlatformsConfig, command: &str) -> String {
@@ -161,6 +181,23 @@ mod tests {
             })
         );
         assert_eq!(parse(&config, "/stopping"), None);
+        assert_eq!(
+            parse(&config, "/models"),
+            Some(ParsedPlatformCommand::Models { argument: None })
+        );
+        assert_eq!(
+            parse(&config, "/MODELS  3 "),
+            Some(ParsedPlatformCommand::Models {
+                argument: Some("3".to_string())
+            })
+        );
+        assert_eq!(
+            parse(&config, "/models openai/gpt-5.2"),
+            Some(ParsedPlatformCommand::Models {
+                argument: Some("openai/gpt-5.2".to_string())
+            })
+        );
+        assert_eq!(parse(&config, "/modelsx"), None);
         assert_eq!(parse(&config, "/missing"), None);
         assert_eq!(parse(&config, "/ reset"), None);
         assert_eq!(parse(&config, "/"), None);
@@ -181,10 +218,13 @@ mod tests {
         let mut config = PlatformsConfig::default();
         let reset = descriptor(RESET_COMMAND_ID).unwrap();
         let stop = descriptor(STOP_COMMAND_ID).unwrap();
+        let models = descriptor(MODELS_COMMAND_ID).unwrap();
         assert!(is_allowed(&config, reset, true));
         assert!(!is_allowed(&config, reset, false));
         assert!(is_allowed(&config, stop, true));
         assert!(!is_allowed(&config, stop, false));
+        assert!(is_allowed(&config, models, true));
+        assert!(!is_allowed(&config, models, false));
 
         config.commands.insert(
             RESET_COMMAND_ID.to_string(),
