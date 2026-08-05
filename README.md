@@ -92,9 +92,7 @@ miyu config
 
 - 供应商和模型
 
-  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的。
-
-  供应商协议可设为 `openai-responses`；`auto` 会为 GPT-5 和 o-series 模型优先尝试 Responses API。Responses 的本地函数工具续接使用 `previous_response_id`，因此上游必须支持响应存储；配置 `extra_body.store=false` 时需要禁用工具。
+  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的 API。
 
 - 自定义提示词
 
