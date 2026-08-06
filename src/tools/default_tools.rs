@@ -244,9 +244,9 @@ pub(crate) fn read_file(args: Value) -> Result<String> {
             "path": path.display().to_string(),
             "offset": offset,
             "limit": limit,
-            "entries": selected,
             "truncated": next.is_some(),
             "next": next,
+            "entries": selected,
         }))?);
     }
     let metadata = std::fs::metadata(&path)?;
@@ -286,14 +286,16 @@ pub(crate) fn read_file(args: Value) -> Result<String> {
     if lines.is_empty() && offset != 1 {
         bail!("offset {offset} is out of range")
     }
+    // Pagination cursor before the bulky content: truncating consumers
+    // (platform tool logs cap at 2400 chars) must still see truncated/next.
     Ok(serde_json::to_string_pretty(&json!({
         "type": "text-page",
         "path": path.display().to_string(),
         "offset": offset,
         "limit": limit,
-        "content": lines.join("\n"),
         "truncated": next.is_some(),
         "next": next,
+        "content": lines.join("\n"),
     }))?)
 }
 
