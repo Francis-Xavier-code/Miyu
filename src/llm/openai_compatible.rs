@@ -707,6 +707,10 @@ pub struct OpenAiCompatibleClient {
     reasoning_visibility: ReasoningVisibility,
     detailed_reasoning_summary: bool,
     request_timeouts: Option<RequestTimeouts>,
+    /// Per-clone completion cap. Auxiliary callers (compaction summaries)
+    /// clone the client and set this so a runaway summary cannot eat the
+    /// window; None leaves the provider default untouched.
+    max_tokens_override: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -899,6 +903,7 @@ impl OpenAiCompatibleClient {
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
+            max_tokens_override: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -957,6 +962,7 @@ impl OpenAiCompatibleClient {
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
+            max_tokens_override: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -994,6 +1000,7 @@ impl OpenAiCompatibleClient {
             reasoning_visibility: reasoning_visibility(config),
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
+            max_tokens_override: None,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1070,7 +1077,15 @@ impl OpenAiCompatibleClient {
             reasoning_visibility: self.reasoning_visibility,
             detailed_reasoning_summary: self.detailed_reasoning_summary,
             request_timeouts: self.request_timeouts,
+            max_tokens_override: self.max_tokens_override,
         }
+    }
+
+    /// Returns a clone whose chat completions are capped at `max_tokens`.
+    pub fn with_max_tokens(&self, max_tokens: u32) -> Self {
+        let mut clone = self.clone();
+        clone.max_tokens_override = Some(max_tokens.max(1));
+        clone
     }
 
     pub fn available_thinking_variants(&self) -> Vec<String> {
@@ -1667,7 +1682,7 @@ impl OpenAiCompatibleClient {
             stream_options: Some(ChatStreamOptions {
                 include_usage: true,
             }),
-            max_tokens: None,
+            max_tokens: self.max_tokens_override,
             tools: (!tools.is_empty()).then_some(tools),
             chat_template_kwargs: taotoken_glm_chat_template_kwargs(&self.provider),
             extra_body,
@@ -2313,7 +2328,10 @@ impl OpenAiCompatibleClient {
             messages: lower_anthropic_messages(messages),
             tools: (!tools.is_empty()).then(|| lower_anthropic_tools(tools)),
             stream: true,
-            max_tokens: self.provider.anthropic_max_tokens,
+            max_tokens: self
+                .max_tokens_override
+                .map(|cap| cap.min(self.provider.anthropic_max_tokens))
+                .unwrap_or(self.provider.anthropic_max_tokens),
             temperature: Some(self.provider.temperature),
             thinking: variant_thinking,
             extra_body,
@@ -6434,6 +6452,7 @@ mod tests {
                 response_header: Duration::from_millis(20),
                 stream_idle: Duration::from_secs(1),
             }),
+            max_tokens_override: None,
         };
 
         let result = client
@@ -6617,6 +6636,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
         let initial_result = initial_client
             .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
@@ -6649,6 +6669,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
 
         let result = client
@@ -6782,6 +6803,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
         let mut chunks = Vec::new();
 
@@ -6864,6 +6886,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
 
         let result = client
@@ -7088,6 +7111,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
 
         let error = client
@@ -7261,6 +7285,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         }
     }
 
@@ -7647,6 +7672,7 @@ mod tests {
             reasoning_visibility: ReasoningVisibility::Summary,
             detailed_reasoning_summary: false,
             request_timeouts: None,
+            max_tokens_override: None,
         };
 
         let first_endpoint = client.with_endpoint(&client.endpoints[0]);

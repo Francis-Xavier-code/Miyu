@@ -3182,6 +3182,38 @@ fn run_persona_picker(paths: &MiyuPaths, argument: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// One line per context watermark: absolute tokens left before each tier
+/// fires (soft notice / mechanical prune / compaction / forced compaction).
+/// Absolute values, not percentages — same reasoning as the cache accounting
+/// log line.
+fn compact_watermark_text(
+    context_tokens: usize,
+    window: usize,
+    context: &crate::config::ContextConfig,
+) -> String {
+    let tier = |label: &str, ratio: f32| -> String {
+        let threshold = (window as f32 * ratio).max(1.0) as usize;
+        if context_tokens >= threshold {
+            format!("{label} {}✓", t("reached", "已达"))
+        } else {
+            format!("{label} -{}", threshold - context_tokens)
+        }
+    };
+    format!(
+        "{}: {} / {} · {}",
+        t("Context watermarks", "上下文水位"),
+        context_tokens,
+        window,
+        [
+            tier(&t("notice", "提示"), context.compact_soft_ratio),
+            tier(&t("prune", "折叠"), context.compact_snip_ratio),
+            tier(&t("compact", "压缩"), context.trim_at_ratio),
+            tier(&t("force", "强制"), context.compact_force_ratio),
+        ]
+        .join(" · ")
+    )
+}
+
 fn usage_overview_text(
     snapshot: &crate::state::UsageSnapshot,
     context: Option<(u64, Option<usize>)>,
@@ -7015,8 +7047,16 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/usage") && command_args_empty {
             let snapshot = state.usage_snapshot()?;
-            let context = Some((agent.effective_context_tokens()?, agent.context_window()));
-            println!("{}\n", usage_overview_text(&snapshot, context));
+            let context_tokens = agent.effective_context_tokens()?;
+            let context = Some((context_tokens, agent.context_window()));
+            println!("{}", usage_overview_text(&snapshot, context));
+            if let Some(window) = agent.context_window() {
+                println!(
+                    "{}",
+                    compact_watermark_text(context_tokens as usize, window, &config.context)
+                );
+            }
+            println!();
             continue;
         }
         if command.eq_ignore_ascii_case("/persona") {

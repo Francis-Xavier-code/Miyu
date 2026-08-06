@@ -1089,6 +1089,7 @@ impl Agent {
                 compatible_previous,
             )?;
             self.state.recover_stale_turns()?;
+            self.maybe_cold_resume_prune()?;
         }
         self.system_prompt = with_runtime_system_context(
             with_mode_reminder(effective_system_prompt, self.mode),
@@ -2198,6 +2199,40 @@ impl Agent {
         }))
     }
 
+    /// Cold-resume prune: after idling past the provider cache TTL the next
+    /// request is a full-price cold start anyway, so a history rewrite right
+    /// now is free cache-wise and only shrinks that first request. Uses a
+    /// minimal harvest gate for the same reason.
+    fn maybe_cold_resume_prune(&self) -> Result<()> {
+        if !self.config.context.prune_stale_tool_reports {
+            return Ok(());
+        }
+        let minutes = self.config.context.cold_prune_after_minutes;
+        if minutes == 0 {
+            return Ok(());
+        }
+        let Some(last) = self.state.session_last_request_at()? else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if now.saturating_sub(last) < (minutes as i64).saturating_mul(60) {
+            return Ok(());
+        }
+        let stats = self.state.prune_stale_tool_reports(2, 1024)?;
+        if stats.turns > 0 {
+            tracing::info!(
+                turns = stats.turns,
+                saved_chars = stats.saved_chars,
+                idle_minutes = now.saturating_sub(last) / 60,
+                "context_rewrite reason=cold_resume_prune"
+            );
+        }
+        Ok(())
+    }
+
     /// Mechanical prune behind the harvest gate: rewriting history is a
     /// prefix-cache reset, so the batch must save at least ~window/64 tokens
     /// (~window/16 chars) to pay for it. Protects the newest 2 turns.
@@ -3273,6 +3308,11 @@ impl Agent {
                 if tool_succeeded {
                     let result_ok = tool_output_succeeded(&output);
                     if result_ok {
+                        if let Some(delta) =
+                            tool_call_footprint(&call.function.name, &call.function.arguments)
+                        {
+                            self.state.merge_turn_footprint(current_turn_id, &delta)?;
+                        }
                         if matches!(
                             call.function.name.as_str(),
                             "create_artifact" | "apply_artifact_patch" | "present_artifact"
@@ -3965,6 +4005,44 @@ fn estimate_tool_definition_tokens(definitions: &[crate::llm::ToolDefinition]) -
         .filter_map(|definition| serde_json::to_string(definition).ok())
         .map(|text| crate::token_estimate::estimate_tokens(&text))
         .sum()
+}
+
+/// Deterministic footprint extraction at tool-execution time: the only point
+/// where tool arguments still exist (completed turns don't persist them).
+/// Stub-mode lazy tools wrap real args in an `arguments` shell — unwrap it.
+fn tool_call_footprint(name: &str, arguments: &str) -> Option<crate::state::ToolFootprint> {
+    let mut args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    if let Some(inner) = args.get("arguments") {
+        if inner.is_object() {
+            args = inner.clone();
+        }
+    }
+    let mut footprint = crate::state::ToolFootprint::default();
+    match name {
+        "read_file" => {
+            footprint
+                .read
+                .insert(args.get("path")?.as_str()?.trim().to_string());
+        }
+        "write_file" | "apply_patch" | "edit_string" => {
+            footprint
+                .modified
+                .insert(args.get("path")?.as_str()?.trim().to_string());
+        }
+        "remember_fact" => {
+            let content = args.get("content")?.as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let mut label: String = content.chars().take(80).collect();
+            if content.chars().count() > 80 {
+                label.push('…');
+            }
+            footprint.memories.insert(label);
+        }
+        _ => return None,
+    }
+    Some(footprint)
 }
 
 fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<String> {
@@ -5549,6 +5627,20 @@ mod tests {
             extract_persistable_tool_report("load_tools", &output).as_deref(),
             Some("<previous_tool_report name=\"load_tools\">\n{\"loaded_tools\":[\"get_weather\",\"todoupdate\"]}\n</previous_tool_report>")
         );
+    }
+
+    #[test]
+    fn tool_footprint_extracts_paths_and_memories() {
+        let fp = tool_call_footprint("read_file", r#"{"path":"/tmp/a.txt"}"#).unwrap();
+        assert!(fp.read.contains("/tmp/a.txt"));
+        let fp = tool_call_footprint("edit_string", r#"{"path":"b.rs","old_string":"x","new_string":"y"}"#).unwrap();
+        assert!(fp.modified.contains("b.rs"));
+        // stub-mode wrapped arguments unwrap
+        let fp = tool_call_footprint("write_file", r#"{"arguments":{"path":"c.md","content":"hi"}}"#).unwrap();
+        assert!(fp.modified.contains("c.md"));
+        let fp = tool_call_footprint("remember_fact", r#"{"content":"用户住在杭州"}"#).unwrap();
+        assert!(fp.memories.contains("用户住在杭州"));
+        assert!(tool_call_footprint("bash", r#"{"command":"ls"}"#).is_none());
     }
 
     #[test]
@@ -7233,6 +7325,7 @@ mod tests {
                 "summary",
                 None,
                 false,
+                None,
             )
             .unwrap();
         let memory = MemoryStore::new(&config, &paths);
@@ -7843,6 +7936,127 @@ mod tests {
             body
         );
         stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    /// v7 byte-prefix guard (compact scenario): request N must be a pure
+    /// element-wise prefix extension of request N-1, except immediately
+    /// after a compaction — and each compaction may reset the prefix at most
+    /// once. Catches any regression that inserts, deletes, or perturbs
+    /// already-sent history bytes (the failure mode is symptomless in
+    /// production: cache hit rate silently degrades).
+    #[tokio::test]
+    async fn compaction_resets_the_byte_prefix_at_most_once_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = false;
+        config.providers[0]
+            .model_context_window
+            .insert("test-model".to_string(), 8000);
+        config.context.compact_tail_tokens = Some(600);
+        // Isolated summary path: its request is identifiable by the compact
+        // system prompt and excluded from the prefix chain.
+        config.context.compact_cache_reuse = false;
+        config.context.prune_stale_tool_reports = false;
+
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_bodies = bodies.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = read_test_http_request(&mut stream).await;
+                let body = String::from_utf8_lossy(&body).to_string();
+                let is_compact = body.contains("context summarization assistant");
+                server_bodies.lock().unwrap().push(body);
+                let sse = if is_compact {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"## Task Goal\\nmock summary\"}}]}\n\n",
+                        "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                } else {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+                        "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                };
+                write_test_sse(&mut stream, sse).await;
+            }
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        let filler = "prefix cache guard filler content 前缀缓存守卫填充 ".repeat(40);
+        for i in 0..6 {
+            agent
+                .chat_stream(&format!("message {i}: {filler}"), |_| Ok(()))
+                .await
+                .unwrap();
+            let tokens = agent.effective_context_tokens().unwrap();
+            agent
+                .handle_overflow_after_turn(tokens, |_| Ok(()))
+                .await
+                .unwrap();
+        }
+        server.abort();
+
+        let bodies = bodies.lock().unwrap().clone();
+        let compact_requests = bodies
+            .iter()
+            .filter(|body| body.contains("context summarization assistant"))
+            .count();
+        assert!(
+            compact_requests >= 1,
+            "the scenario must trigger at least one compaction"
+        );
+        let chat: Vec<serde_json::Value> = bodies
+            .iter()
+            .filter(|body| !body.contains("context summarization assistant"))
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        assert!(chat.len() >= 6);
+        let mut resets = 0usize;
+        for pair in chat.windows(2) {
+            let prev = pair[0]["messages"].as_array().unwrap();
+            let next = pair[1]["messages"].as_array().unwrap();
+            let shared = prev
+                .iter()
+                .zip(next.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if shared == prev.len() {
+                continue; // pure append-only extension
+            }
+            resets += 1;
+            assert!(shared >= 1, "the system prompt must never diverge");
+            let checkpoint = next[1]["content"].as_str().unwrap_or_default();
+            assert!(
+                checkpoint.contains("<conversation-checkpoint>"),
+                "a reset must be a compaction (summary checkpoint in slot 1), got: {}",
+                &checkpoint[..checkpoint.len().min(120)]
+            );
+        }
+        assert_eq!(
+            resets, compact_requests,
+            "each compaction resets the prefix exactly once; nothing else may"
+        );
     }
 
     fn queue_test_config(base_url: String) -> AppConfig {

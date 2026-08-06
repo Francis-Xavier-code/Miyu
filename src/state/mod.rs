@@ -20,7 +20,8 @@ pub use conversation_db::{
     ImageAsset, ImageAssetData, PlatformAccessActor, PlatformAccessGrant, PlatformAccessGrantKey,
     PlatformMemeRefRecord, PlatformPluginScopeKey, PlatformSessionBinding,
     PlatformSessionBindingKey, PruneStats, QueuedPrompt, QueuedPromptAttachment, RedoCandidate,
-    RedoInputKind, RedoStart, SessionOverview, SessionRecord, Turn, TurnFollowup, TurnJournalEvent,
+    RedoInputKind, RedoStart, SessionOverview, SessionRecord, ToolFootprint, Turn, TurnFollowup,
+    TurnJournalEvent,
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
@@ -1428,6 +1429,10 @@ impl StateStore {
             .prune_stale_tool_reports(&self.session(), protect_recent, min_saved_chars)
     }
 
+    pub fn session_last_request_at(&self) -> Result<Option<i64>> {
+        self.conv_db.session_last_request_at(&self.session())
+    }
+
     pub fn replace_visible_with_summary(
         &self,
         fold_turn_ids: &[String],
@@ -1435,6 +1440,7 @@ impl StateStore {
         summary: &str,
         token_total: Option<u64>,
         token_usage_estimated: bool,
+        footprint_json: Option<&str>,
     ) -> Result<()> {
         self.conv_db.replace_visible_with_summary(
             &self.session(),
@@ -1443,7 +1449,23 @@ impl StateStore {
             summary,
             token_total,
             token_usage_estimated,
+            footprint_json,
         )
+    }
+
+    pub fn merge_turn_footprint(
+        &self,
+        turn_id: &str,
+        delta: &crate::state::ToolFootprint,
+    ) -> Result<()> {
+        self.conv_db.merge_turn_footprint(turn_id, delta)
+    }
+
+    pub fn load_merged_footprint(
+        &self,
+        turn_ids: &[String],
+    ) -> Result<crate::state::ToolFootprint> {
+        self.conv_db.load_merged_footprint(&self.session(), turn_ids)
     }
 
     pub fn oldest_evictable_visible_turns(&self, count: usize) -> Result<Vec<Turn>> {
@@ -3953,7 +3975,7 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true, None)
             .unwrap();
 
         let all = store.load_turns().unwrap();
@@ -3993,13 +4015,13 @@ mod tests {
         }
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false, None)
             .unwrap();
         store.start_turn("t3", "third", 999999).unwrap();
         store.complete_turn("t3", "reply", None).unwrap();
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false, None)
             .unwrap();
 
         assert_eq!(
@@ -4043,6 +4065,7 @@ mod tests {
                 "summary",
                 None,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4084,6 +4107,7 @@ mod tests {
                 "summary one",
                 None,
                 false,
+                None,
             )
             .unwrap();
         store.start_turn("t4", "fourth", 999999).unwrap();
@@ -4100,6 +4124,7 @@ mod tests {
                 "summary two",
                 None,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4179,7 +4204,7 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false, None)
             .is_err());
 
         let visible = store.load_visible_turns().unwrap();
@@ -4202,7 +4227,7 @@ mod tests {
         .unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false, None)
             .is_err());
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 1);
@@ -4273,7 +4298,7 @@ mod tests {
         store.undo_last_turn().unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
             .is_err());
         assert!(store.load_visible_turns().unwrap().is_empty());
     }
@@ -4288,7 +4313,7 @@ mod tests {
         store.complete_turn("t2", "reply", None).unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
             .is_err());
         assert_eq!(store.load_visible_turns().unwrap().len(), 2);
     }

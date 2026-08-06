@@ -68,6 +68,10 @@ impl Compactor {
         // Safety cap: on a small window the tail itself must stay well under
         // the trigger watermark or compaction can never win.
         let tail_budget_tokens = tail_budget_tokens.min(context_window / 2).max(1);
+        // Hard cap on the summary completion (pi: 0.8×reserve, opencode: 4k
+        // flat): a runaway summary must not eat the reserved output space.
+        let summary_cap = ((reserved_tokens as f32 * 0.8) as u32).clamp(1024, 8192);
+        let client = client.with_max_tokens(summary_cap);
         Self {
             client,
             state,
@@ -257,9 +261,11 @@ impl Compactor {
         }
 
         let previous_summary = self.state.load_last_summary()?;
+        // The footprint sections are code-owned: strip them from the anchor
+        // so the LLM cannot garble them, then re-append the merged sets.
         let prev_text = previous_summary
             .as_ref()
-            .map(|t| t.assistant_content.clone());
+            .map(|t| strip_footprint_sections(&t.assistant_content).to_string());
 
         let mut compact_usage = Usage::default();
         let mut usage_estimated = false;
@@ -268,6 +274,16 @@ impl Compactor {
             .iter()
             .map(|turn| turn.turn_id.clone())
             .collect::<Vec<_>>();
+
+        // Deterministic footprint: merged from the folded turns plus the
+        // previous summary row (which carries everything it already folded).
+        let mut footprint = self.state.load_merged_footprint(&fold_turn_ids)?;
+        if let Some(prev) = previous_summary.as_ref() {
+            footprint.merge(
+                self.state
+                    .load_merged_footprint(std::slice::from_ref(&prev.turn_id))?,
+            );
+        }
 
         let mut fork_summary = None;
         if let Some(builder) = fork_builder {
@@ -350,6 +366,12 @@ impl Compactor {
             }
             Err(error) => return Err(error),
         };
+        let summary = append_footprint_sections(summary, &footprint);
+        let footprint_json = if footprint.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&footprint)?)
+        };
 
         let visible_turn_ids = turns
             .iter()
@@ -361,6 +383,7 @@ impl Compactor {
             &summary,
             Some(compact_usage.effective_total_tokens()),
             usage_estimated,
+            footprint_json.as_deref(),
         )?;
         tracing::info!(
             folded_turns = fold.len(),
@@ -405,6 +428,52 @@ fn mechanical_fold_digest(folded_turns: usize) -> String {
     format!(
         "{folded_turns} earlier conversation turn(s) were folded here to free context, but the automatic summary was unavailable. The original turns are still archived; ask the user if details from before this point are needed."
     )
+}
+
+const FOOTPRINT_MARKER: &str = "\n\n<read-files>";
+const FOOTPRINT_MARKER_ALT: &str = "\n\n<modified-files>";
+const FOOTPRINT_MARKER_MEM: &str = "\n\n<saved-memories>";
+
+/// Removes the code-appended footprint block from a stored summary so the
+/// anchor sent to the LLM contains only prose it is allowed to rewrite.
+fn strip_footprint_sections(summary: &str) -> &str {
+    let cut = [FOOTPRINT_MARKER, FOOTPRINT_MARKER_ALT, FOOTPRINT_MARKER_MEM]
+        .iter()
+        .filter_map(|marker| summary.find(marker))
+        .min();
+    match cut {
+        Some(index) => summary[..index].trim_end(),
+        None => summary,
+    }
+}
+
+/// Appends the deterministic footprint after the LLM summary (pi's pattern:
+/// enumerable facts never pass through the summarizer, so they cannot be
+/// dropped or hallucinated). BTreeSet iteration keeps the bytes stable.
+fn append_footprint_sections(summary: String, footprint: &crate::state::ToolFootprint) -> String {
+    if footprint.is_empty() {
+        return summary;
+    }
+    let mut output = summary.trim_end().to_string();
+    let mut push_section = |tag: &str, items: &std::collections::BTreeSet<String>| {
+        if items.is_empty() {
+            return;
+        }
+        output.push_str("\n\n<");
+        output.push_str(tag);
+        output.push('>');
+        for item in items {
+            output.push('\n');
+            output.push_str(item);
+        }
+        output.push_str("\n</");
+        output.push_str(tag);
+        output.push('>');
+    };
+    push_section("read-files", &footprint.read);
+    push_section("modified-files", &footprint.modified);
+    push_section("saved-memories", &footprint.memories);
+    output
 }
 
 /// Head-truncate a summarizer input item at a char boundary, marking the cut.
@@ -785,6 +854,25 @@ mod tests {
         let turns: Vec<Turn> = (0..3).map(|i| turn(&format!("t{i}"), i, &body)).collect();
         let refs: Vec<&Turn> = turns.iter().collect();
         assert_eq!(find_cut_index(&refs, 1), 1);
+    }
+
+    #[test]
+    fn footprint_sections_round_trip() {
+        let mut fp = crate::state::ToolFootprint::default();
+        fp.read.insert("src/a.rs".to_string());
+        fp.modified.insert("src/b.rs".to_string());
+        fp.memories.insert("用户喜欢橘猫".to_string());
+        let summary = append_footprint_sections("## Goal\nstuff".to_string(), &fp);
+        assert!(summary.contains("<read-files>\nsrc/a.rs\n</read-files>"));
+        assert!(summary.contains("<modified-files>\nsrc/b.rs\n</modified-files>"));
+        assert!(summary.contains("<saved-memories>\n用户喜欢橘猫\n</saved-memories>"));
+        // Anchor sent back to the LLM must not contain the code-owned block.
+        assert_eq!(strip_footprint_sections(&summary), "## Goal\nstuff");
+        let empty = crate::state::ToolFootprint::default();
+        assert_eq!(
+            append_footprint_sections("x".to_string(), &empty),
+            "x"
+        );
     }
 
     #[test]

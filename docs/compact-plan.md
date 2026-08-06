@@ -164,7 +164,17 @@ QQ 群聊文字历史（独立历史）：**也走 LLM 摘要**（用户已定�
 | 可观测 | ✅ | 压缩/剪枝 `context_rewrite reason=compact|prune` 日志行；压缩后 Notice "折叠 N 轮 → 逐字保留 K 轮"；新 `AgentEvent::Notice` 贯通 CLI/WebUI/IPC |
 | 测试 | ✅ | 切点三测（含 2-turn 地板）、多字节截断、溢出分类三测（含限流排除）、尾巴折叠+undo、二次压缩吞并旧摘要、prune 闸门/保护/单调 |
 
-**遗留（下一批，均已在文档留出接口）**：① 确定性信息提取（`<read-files>/<saved-memories>`）——completed turn 不留 tool 参数，需 journal 或 report 格式化协议先行；② QQ 群聊历史摘要化（real_context 独立子系统）；③ TTL 冷恢复剪枝（依赖 v7 `last_request_at` 迁移）；④ 摘要请求 max_tokens 硬帽（需 chat_stream 全链路加参数）；⑤ byte-prefix mock e2e 与 `/usage` 水位显示（并入 v7 Release 1 门禁批次）。压缩期间新消息安全性由 `replace_visible_with_summary` 的乐观并发检查保证（可见集合变化即整体作废），无需新排队机制。
+**第二批（2026-08-07 全部落地，遗留清零）**：
+
+| 项 | 实现 |
+|---|---|
+| ① 确定性信息提取 | v16 `turns.tool_footprint`：工具执行时捕获（`read_file`→read、`write_file/apply_patch/edit_string`→modified、`remember_fact`→memories，stub 外壳自动解包）；压缩时跨压缩集合累积（摘要行携带合并 footprint），代码追加 `<read-files>/<modified-files>/<saved-memories>` 于摘要尾；锚定 merge 前剥离该块（LLM 无权改写，BTreeSet 保证字节确定性） |
+| ② QQ 群聊历史摘要化 | `real_context/history_summary.rs`：读侧最小侵入（inject_context），platform_plugin_kv 存 `{summary_text, upto_row_id 单调水位线}`，affection 式异步队列（永不阻塞轮次）；旧段积累 ≥`context_summary_trigger_messages`(20) 触发锚定 merge 摘要（上限 `context_summary_max_chars`(2000)）；摘要块渲染在历史块头部+`[以下为逐条原文]`；`/clear`/persona 重置同步清空摘要（防"复活"）；撤回风险：QQ 撤回窗 ~2min << 消息老化出窗时间，实际泄漏面为零（已注释）。默认开（`context_summary`） |
+| ③ TTL 冷恢复剪枝 | v15 `sessions.last_request_at`（complete/interrupt 写点，MAX 防回退，NULL 跳过）；`prepare_for_turn` 检查闲置 > `context.cold_prune_after_minutes`(默认 1440) → 低闸门(1024 字符) prune——"缓存已冷，改写免费，还缩小全价冷启动" |
+| ④ 摘要 max_tokens 硬帽 | `OpenAiCompatibleClient::with_max_tokens` per-clone 覆盖（chat + anthropic 路径）；Compactor 构造时 `clamp(0.8×reserved, 1024, 8192)` |
+| ⑤ byte-prefix e2e + /usage 水位 | `compaction_resets_the_byte_prefix_at_most_once_each`：mock 端点逐元素断言"第 N 轮请求是 N-1 的纯前缀延伸；每次压缩恰好重置一次且重置点必须是 checkpoint"；`/usage` 显示四档水位绝对余量 |
+
+压缩期间新消息安全性由 `replace_visible_with_summary` 的乐观并发检查保证（可见集合变化即整体作废），无需新排队机制。schema v14→v16。
 
 ## 五、决策点（全部已定，2026-08-06）
 
