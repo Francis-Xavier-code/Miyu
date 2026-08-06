@@ -2427,6 +2427,37 @@ pub struct ContextConfig {
     pub on_overflow: String,
     #[serde(default = "default_context_window")]
     pub default_context_window: usize,
+    /// Watermark that forces a compaction even when the fold-economics gate
+    /// would skip it. Must be >= trim_at_ratio.
+    #[serde(default = "default_compact_force_ratio")]
+    pub compact_force_ratio: f32,
+    /// Verbatim tail budget kept outside the summary, in tokens. None derives
+    /// min(16384, window/4) for task modes and 8192 for chat mode; the value
+    /// is always capped at window/2 so a small window still lands below the
+    /// trigger after compaction (re-compaction loop guard).
+    #[serde(default)]
+    pub compact_tail_tokens: Option<usize>,
+    /// Soft watermark: a one-shot "context is getting large" notice, no
+    /// history rewrite (a rewrite here would needlessly crater the cache).
+    #[serde(default = "default_compact_soft_ratio")]
+    pub compact_soft_ratio: f32,
+    /// Mechanical watermark: old turns' tool_reports fold into placeholders
+    /// (no LLM call). Must satisfy soft <= snip <= trim_at_ratio.
+    #[serde(default = "default_compact_snip_ratio")]
+    pub compact_snip_ratio: f32,
+    /// Enables the mechanical prune layer (free: tool output is
+    /// re-derivable). Batched behind a harvest gate so each rewrite pays for
+    /// its one-time prefix-cache reset.
+    #[serde(default = "default_true")]
+    pub prune_stale_tool_reports: bool,
+    /// Summarization requests fork the live conversation (same byte prefix,
+    /// same tools + one appended instruction) so the provider prefix cache
+    /// pays for re-reading the history — roughly a 10x input-cost saving on
+    /// prefix-cached providers (DeepSeek/OpenAI-compatible/Anthropic). Turn
+    /// OFF on per-request-billed gateways where cache hits save nothing: the
+    /// isolated fallback path sends the history as plain text instead.
+    #[serde(default = "default_true")]
+    pub compact_cache_reuse: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3285,6 +3316,12 @@ impl Default for ContextConfig {
             trim_batch_ratio: default_trim_batch_ratio(),
             on_overflow: default_on_overflow(),
             default_context_window: default_context_window(),
+            compact_force_ratio: default_compact_force_ratio(),
+            compact_tail_tokens: None,
+            compact_soft_ratio: default_compact_soft_ratio(),
+            compact_snip_ratio: default_compact_snip_ratio(),
+            prune_stale_tool_reports: true,
+            compact_cache_reuse: true,
         }
     }
 }
@@ -3776,6 +3813,22 @@ impl AppConfig {
         }
         if !(0.1..=1.0).contains(&self.context.trim_at_ratio) {
             bail!("context.trim_at_ratio must be between 0.1 and 1.0");
+        }
+        if !(0.1..=1.0).contains(&self.context.compact_force_ratio) {
+            bail!("context.compact_force_ratio must be between 0.1 and 1.0");
+        }
+        if self.context.compact_force_ratio < self.context.trim_at_ratio {
+            bail!("context.compact_force_ratio must be >= context.trim_at_ratio");
+        }
+        if !(0.05..=1.0).contains(&self.context.compact_soft_ratio)
+            || !(0.05..=1.0).contains(&self.context.compact_snip_ratio)
+        {
+            bail!("context.compact_soft_ratio and compact_snip_ratio must be between 0.05 and 1.0");
+        }
+        if self.context.compact_soft_ratio > self.context.compact_snip_ratio
+            || self.context.compact_snip_ratio > self.context.trim_at_ratio
+        {
+            bail!("context watermarks must be ordered: compact_soft_ratio <= compact_snip_ratio <= trim_at_ratio <= compact_force_ratio");
         }
         if !(0.01..=0.9).contains(&self.context.trim_batch_ratio) {
             bail!("context.trim_batch_ratio must be between 0.01 and 0.9");
@@ -5546,8 +5599,22 @@ fn default_calculator_backend() -> String {
     "rust-simple".to_string()
 }
 
+/// Compact trigger watermark. 0.8 (was 0.9) leaves room between the trigger
+/// and the force watermark for the cheap mechanical layer to act first.
 fn default_trim_at_ratio() -> f32 {
+    0.8
+}
+
+fn default_compact_force_ratio() -> f32 {
     0.9
+}
+
+fn default_compact_soft_ratio() -> f32 {
+    0.5
+}
+
+fn default_compact_snip_ratio() -> f32 {
+    0.6
 }
 
 fn default_trim_batch_ratio() -> f32 {

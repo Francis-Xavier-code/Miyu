@@ -81,10 +81,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_context_messages",
         apply: apply_v12_turn_context_messages,
     },
+    Migration {
+        version: 13,
+        name: "compact_hidden_turns",
+        apply: apply_v13_compact_hidden_turns,
+    },
+    Migration {
+        version: 14,
+        name: "tool_reports_archive",
+        apply: apply_v14_tool_reports_archive,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 12;
+pub const LATEST_VERSION: i64 = 14;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -721,6 +731,22 @@ fn apply_v11_session_model_override(conn: &Connection) -> Result<()> {
 /// cached ("注入了就别删"). JSON array of ChatMessage values; '[]' when none.
 fn apply_v12_turn_context_messages(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "turns", "context_messages", "TEXT NOT NULL DEFAULT '[]'")
+}
+
+/// Compact tail retention: a summary turn no longer swallows every visible
+/// turn, so "hidden = seq <= summary_seq" stops describing the folded set.
+/// The summary row records the exact turn_ids it hid (JSON array) so undo can
+/// restore precisely that set. NULL on legacy rows keeps the old undo path.
+fn apply_v13_compact_hidden_turns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "compact_hidden_json", "TEXT")
+}
+
+/// Mechanical prune (free half of context management): old turns'
+/// tool_reports can be replaced by a placeholder because tool output is
+/// re-derivable. The original JSON is archived here (write-once) before the
+/// first rewrite so the prune is reversible and auditable.
+fn apply_v14_tool_reports_archive(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "tool_reports_archive", "TEXT")
 }
 
 fn add_column_if_missing(

@@ -1,5 +1,7 @@
-use crate::llm::{ChatMessage, ChatResult, ChatStreamChunk, OpenAiCompatibleClient, Usage};
-use crate::prompts::COMPACT_SYSTEM_PROMPT;
+use crate::llm::{
+    ChatMessage, ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ToolDefinition, Usage,
+};
+use crate::prompts::{COMPACT_CHAT_SYSTEM_PROMPT, COMPACT_SYSTEM_PROMPT};
 use crate::state::{StateStore, Turn};
 use anyhow::{bail, Result};
 
@@ -7,17 +9,45 @@ use super::overflow::estimate_tokens;
 
 const COMPACT_PROMPT_OVERHEAD: usize = 2000;
 const MAX_MERGE_ROUNDS: usize = 5;
+/// The newest turns are always kept verbatim, budget notwithstanding, so a
+/// single oversized turn cannot force a zero-tail compaction.
+const MIN_TAIL_TURNS: usize = 2;
+/// Fold-economics gate: a non-forced compaction that would free less than
+/// this is skipped silently — the cache reset would cost more than it buys.
+const MIN_FOLD_TOKENS: usize = 400;
+/// Per-item cap for tool reports and reasoning fed to the summarizer. Long
+/// tool payloads are the largest summary-input cost and a prompt-injection
+/// vector when echoed back into the summary (sub-agent prompts re-entering
+/// the session as history).
+const SUMMARY_ITEM_MAX_CHARS: usize = 2000;
+/// A stalled summarizer stream fails loudly instead of wedging compaction.
+const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// (byte-identical conversation prefix over the fold region, live tools).
+/// Built by the agent because only it owns the request rendering; consumed by
+/// the fork summarization path, which re-reads the history at cached price.
+pub type CompactForkParts = (Vec<ChatMessage>, Vec<ToolDefinition>);
+pub type CompactForkBuilder<'a> = &'a dyn Fn(&[String]) -> Result<CompactForkParts>;
 
 pub struct Compactor {
     client: OpenAiCompatibleClient,
     state: StateStore,
     context_window: usize,
     reserved_tokens: usize,
+    /// Verbatim tail kept outside the summary. A fixed token count rather
+    /// than a window fraction: the trigger grows with the window while the
+    /// tail stays constant, which is what stops the re-compaction loop.
+    tail_budget_tokens: usize,
+    /// Chat mode uses the persona/social summary template instead of the
+    /// coding one.
+    chat_mode: bool,
 }
 
 pub struct CompactResult {
     pub usage: Usage,
     pub usage_estimated: bool,
+    pub folded_turns: usize,
+    pub kept_turns: usize,
 }
 
 struct CompactTextResult {
@@ -32,16 +62,160 @@ impl Compactor {
         state: StateStore,
         context_window: usize,
         reserved_tokens: usize,
+        tail_budget_tokens: usize,
+        chat_mode: bool,
     ) -> Self {
+        // Safety cap: on a small window the tail itself must stay well under
+        // the trigger watermark or compaction can never win.
+        let tail_budget_tokens = tail_budget_tokens.min(context_window / 2).max(1);
         Self {
             client,
             state,
             context_window,
             reserved_tokens,
+            tail_budget_tokens,
+            chat_mode,
         }
     }
 
-    pub async fn perform_compact<F>(&self, on_chunk: &mut F) -> Result<Option<CompactResult>>
+    fn system_prompt(&self) -> &'static str {
+        if self.chat_mode {
+            COMPACT_CHAT_SYSTEM_PROMPT
+        } else {
+            COMPACT_SYSTEM_PROMPT
+        }
+    }
+
+    /// Fork summarization: the live conversation prefix (same bytes, same
+    /// tools the provider already cached) plus one appended user instruction.
+    /// The previous summary is already rendered inside the prefix as the
+    /// <conversation-checkpoint> block, so anchoring is implicit. Tool calls
+    /// in the response invalidate the attempt (prompt-level deny is not a
+    /// guarantee), triggering the isolated fallback.
+    async fn summarize_via_fork<F>(
+        &self,
+        prefix: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        has_previous_summary: bool,
+        compact_usage: &mut Usage,
+        usage_estimated: &mut bool,
+        on_chunk: &mut F,
+    ) -> Result<String>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
+        let mut messages = prefix;
+        let anchor_note = if has_previous_summary {
+            "A <conversation-checkpoint> block near the top of this conversation holds the previous anchored summary: PRESERVE its still-true content item by item (the standing facts / user agreements section must be carried over verbatim) and merge in the new facts from the conversation. "
+        } else {
+            ""
+        };
+        messages.push(ChatMessage::plain(
+            "user",
+            format!(
+                "IMPORTANT: The conversation stops here. Do NOT reply to the messages above and do NOT call any tools — a tool call fails this task. You are now acting under the summarization instructions below.\n\n{}\n\n{}Summarize the entire conversation above now, following the output structure exactly.",
+                self.system_prompt(),
+                anchor_note,
+            ),
+        ));
+        let result = self
+            .client
+            .chat_stream(messages.clone(), tools, on_chunk)
+            .await?;
+        if !result.tool_calls.is_empty() {
+            bail!("fork summarization attempted a tool call");
+        }
+        let outcome = compact_text_result(result, &messages);
+        add_usage(compact_usage, &outcome.usage);
+        *usage_estimated |= outcome.usage_estimated;
+        if outcome.text.trim().is_empty() {
+            bail!("fork summarization returned empty output");
+        }
+        Ok(outcome.text)
+    }
+
+    async fn summarize_fold<F>(
+        &self,
+        fold: &[&Turn],
+        prev_text: Option<&str>,
+        compact_usage: &mut Usage,
+        usage_estimated: &mut bool,
+        on_chunk: &mut F,
+    ) -> Result<String>
+    where
+        F: FnMut(ChatStreamChunk) -> Result<()>,
+    {
+        let usable = self
+            .context_window
+            .saturating_sub(self.reserved_tokens)
+            .saturating_sub(COMPACT_PROMPT_OVERHEAD);
+        let fold_text = turns_to_text(fold);
+        let fold_tokens = estimate_tokens(&fold_text);
+
+        if fold_tokens <= usable {
+            let result = compact_single_pass(
+                &self.client,
+                self.system_prompt(),
+                &fold_text,
+                prev_text,
+                on_chunk,
+            )
+            .await?;
+            add_usage(compact_usage, &result.usage);
+            *usage_estimated |= result.usage_estimated;
+            return Ok(result.text);
+        }
+
+        let segments = split_into_segments(fold, usable);
+        let mut summaries = Vec::new();
+        for segment in &segments {
+            let segment_text = turns_to_text(segment);
+            let result = compact_single_pass(
+                &self.client,
+                self.system_prompt(),
+                &segment_text,
+                None,
+                &mut |_| Ok(()),
+            )
+            .await?;
+            add_usage(compact_usage, &result.usage);
+            *usage_estimated |= result.usage_estimated;
+            summaries.push(result.text);
+        }
+        let result = merge_summaries_tree(
+            &self.client,
+            self.system_prompt(),
+            &summaries,
+            prev_text,
+            usable,
+            on_chunk,
+        )
+        .await?;
+        add_usage(compact_usage, &result.usage);
+        *usage_estimated |= result.usage_estimated;
+        Ok(result.text)
+    }
+
+    /// `mechanical_fallback`: automatic compactions must always free space —
+    /// aborting on a summarizer failure leaves the context full and re-fires
+    /// the same failing compaction every turn. When set, a failed summary
+    /// degrades to a deterministic placeholder (the folded turns stay
+    /// soft-deleted in SQLite, so nothing is lost). Manual /compact keeps
+    /// erroring so the user sees the real failure.
+    /// `fork_builder`: when set (proactive compaction with cache reuse on),
+    /// the summary request is a fork of the live conversation — same bytes,
+    /// same tools, plus one appended instruction — so the provider prefix
+    /// cache pays for reading the history instead of us (Claude Code
+    /// strategy). Must be None on overflow recovery: the fork would overflow
+    /// exactly like the request it is trying to rescue. A fork failure falls
+    /// back to the isolated serialized path.
+    pub async fn perform_compact<F>(
+        &self,
+        force: bool,
+        mechanical_fallback: bool,
+        fork_builder: Option<CompactForkBuilder<'_>>,
+        on_chunk: &mut F,
+    ) -> Result<Option<CompactResult>>
     where
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
@@ -60,70 +234,193 @@ impl Compactor {
         if head.is_empty() {
             return Ok(None);
         }
+
+        // Cut point: walk newest → oldest accumulating the verbatim tail;
+        // everything before the cut folds into the summary. Turn granularity
+        // means the cut can never split a tool call/result pair.
+        let cut = find_cut_index(&head, self.tail_budget_tokens);
+        if cut == 0 {
+            // Everything fits in the tail budget — nothing to fold. This is
+            // the "kept region is still within budget" guard against
+            // re-compacting a freshly compacted session.
+            return Ok(None);
+        }
+        let fold = &head[..cut];
+        if !force {
+            let fold_tokens: usize = fold
+                .iter()
+                .map(|turn| estimate_tokens(&turn_to_text(turn)))
+                .sum();
+            if fold_tokens < MIN_FOLD_TOKENS {
+                return Ok(None);
+            }
+        }
+
         let previous_summary = self.state.load_last_summary()?;
         let prev_text = previous_summary
             .as_ref()
             .map(|t| t.assistant_content.clone());
 
-        let usable = self
-            .context_window
-            .saturating_sub(self.reserved_tokens)
-            .saturating_sub(COMPACT_PROMPT_OVERHEAD);
-
-        let head_text = turns_to_text(&head);
-        let head_tokens = estimate_tokens(&head_text);
-
         let mut compact_usage = Usage::default();
         let mut usage_estimated = false;
 
-        let summary = if head_tokens <= usable {
-            let result =
-                compact_single_pass(&self.client, &head_text, prev_text.as_deref(), on_chunk)
-                    .await?;
-            add_usage(&mut compact_usage, &result.usage);
-            usage_estimated |= result.usage_estimated;
-            result.text
-        } else {
-            let segments = split_into_segments(&head, usable);
-            let mut summaries = Vec::new();
-            for segment in &segments {
-                let segment_text = turns_to_text(segment);
-                let result =
-                    compact_single_pass(&self.client, &segment_text, None, &mut |_| Ok(())).await?;
-                add_usage(&mut compact_usage, &result.usage);
-                usage_estimated |= result.usage_estimated;
-                summaries.push(result.text);
+        let fold_turn_ids = fold
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>();
+
+        let mut fork_summary = None;
+        if let Some(builder) = fork_builder {
+            match builder(&fold_turn_ids) {
+                Ok((prefix, tools)) => {
+                    match tokio::time::timeout(
+                        SUMMARY_TIMEOUT,
+                        self.summarize_via_fork(
+                            prefix,
+                            tools,
+                            prev_text.is_some(),
+                            &mut compact_usage,
+                            &mut usage_estimated,
+                            on_chunk,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(text)) => fork_summary = Some(text),
+                        Ok(Err(error)) => tracing::warn!(
+                            error = %error,
+                            "fork summarization failed; falling back to the isolated path"
+                        ),
+                        Err(_) => tracing::warn!(
+                            "fork summarization timed out; falling back to the isolated path"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "fork prefix build failed; falling back to the isolated path"
+                ),
             }
-            let result = merge_summaries_tree(
-                &self.client,
-                &summaries,
-                prev_text.as_deref(),
-                usable,
-                on_chunk,
+        }
+
+        // Timeout keeps a stalled summarizer stream from wedging the
+        // compaction placeholder forever; one retry absorbs transient
+        // provider failures but a timeout is not retried (the caller should
+        // not wait another 90s on a provider that just proved slow).
+        let summary_outcome = if let Some(text) = fork_summary {
+            Ok(text)
+        } else {
+            let first_attempt = tokio::time::timeout(
+                SUMMARY_TIMEOUT,
+                self.summarize_fold(fold, prev_text.as_deref(), &mut compact_usage, &mut usage_estimated, on_chunk),
             )
-            .await?;
-            add_usage(&mut compact_usage, &result.usage);
-            usage_estimated |= result.usage_estimated;
-            result.text
+            .await;
+            match first_attempt {
+                Ok(Ok(text)) => Ok(text),
+                Ok(Err(first_error)) => {
+                    match tokio::time::timeout(
+                        SUMMARY_TIMEOUT,
+                        self.summarize_fold(fold, prev_text.as_deref(), &mut compact_usage, &mut usage_estimated, on_chunk),
+                    )
+                    .await
+                    {
+                        Ok(Ok(text)) => Ok(text),
+                        Ok(Err(retry_error)) => Err(retry_error.context(first_error)),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "compaction summary timed out after {}s (retry)",
+                            SUMMARY_TIMEOUT.as_secs()
+                        )),
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "compaction summary timed out after {}s",
+                    SUMMARY_TIMEOUT.as_secs()
+                )),
+            }
+        };
+        let summary = match summary_outcome {
+            Ok(text) => text,
+            Err(error) if mechanical_fallback => {
+                tracing::warn!(
+                    error = %error,
+                    folded = fold.len(),
+                    "compaction summary unavailable; folding mechanically"
+                );
+                mechanical_fold_digest(fold.len())
+            }
+            Err(error) => return Err(error),
         };
 
-        let last_seq = turns.last().unwrap().seq;
         let visible_turn_ids = turns
             .iter()
             .map(|turn| turn.turn_id.clone())
             .collect::<Vec<_>>();
         self.state.replace_visible_with_summary(
-            last_seq,
+            &fold_turn_ids,
             &visible_turn_ids,
             &summary,
             Some(compact_usage.effective_total_tokens()),
             usage_estimated,
         )?;
+        tracing::info!(
+            folded_turns = fold.len(),
+            kept_turns = head.len() - cut,
+            summary_chars = summary.len(),
+            "context_rewrite reason=compact"
+        );
         Ok(Some(CompactResult {
             usage: compact_usage,
             usage_estimated,
+            folded_turns: fold.len(),
+            kept_turns: head.len() - cut,
         }))
     }
+}
+
+/// Returns the number of oldest turns to fold (index of the first kept
+/// turn). 0 means everything fits in the tail budget. The newest
+/// MIN_TAIL_TURNS turns are kept unconditionally.
+fn find_cut_index(head: &[&Turn], tail_budget_tokens: usize) -> usize {
+    let mut acc = 0usize;
+    for i in (0..head.len()).rev() {
+        let kept_count = head.len() - i;
+        let turn_tokens = estimate_tokens(&turn_to_text(head[i]));
+        if kept_count <= MIN_TAIL_TURNS {
+            acc = acc.saturating_add(turn_tokens);
+            continue;
+        }
+        if acc.saturating_add(turn_tokens) > tail_budget_tokens {
+            return i + 1;
+        }
+        acc = acc.saturating_add(turn_tokens);
+    }
+    0
+}
+
+/// Deterministic stand-in when the summarizer is unavailable. The folded
+/// turns remain soft-deleted in SQLite (undo can restore them), so degrading
+/// beats aborting: an aborted auto-compaction leaves the context full and
+/// re-fires the same failing call every turn.
+fn mechanical_fold_digest(folded_turns: usize) -> String {
+    format!(
+        "{folded_turns} earlier conversation turn(s) were folded here to free context, but the automatic summary was unavailable. The original turns are still archived; ask the user if details from before this point are needed."
+    )
+}
+
+/// Head-truncate a summarizer input item at a char boundary, marking the cut.
+fn truncate_for_summary(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= SUMMARY_ITEM_MAX_CHARS {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = SUMMARY_ITEM_MAX_CHARS;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}\n[... {} more bytes truncated ...]",
+        &text[..end],
+        text.len() - end
+    ))
 }
 
 fn add_usage(total: &mut Usage, usage: &Usage) {
@@ -173,13 +470,13 @@ fn turns_to_text(turns: &[&Turn]) -> String {
         if let Some(reasoning) = &turn.assistant_reasoning {
             if !reasoning.trim().is_empty() {
                 output.push_str("\n[Reasoning: ");
-                output.push_str(reasoning);
+                output.push_str(&truncate_for_summary(reasoning));
                 output.push(']');
             }
         }
         for report in &turn.tool_reports {
             output.push_str("\n[Tool Report: ");
-            output.push_str(report);
+            output.push_str(&truncate_for_summary(report));
             output.push(']');
         }
         output.push('\n');
@@ -190,20 +487,30 @@ fn turns_to_text(turns: &[&Turn]) -> String {
 fn build_compact_prompt(history: &str, previous_summary: Option<&str>) -> String {
     match previous_summary {
         Some(prev) => format!(
-            "Update the anchored summary below using the conversation history above.\n\
-             Preserve still-true details, remove stale details, and merge in the new facts.\n\
+            "Update the anchored summary in <previous-summary> using the new conversation \
+             history in <conversation>.\n\
+             Rules:\n\
+             - PRESERVE all still-true information from the previous summary; keep exact \
+             file paths, names, identifiers, and user-stated facts verbatim.\n\
+             - The standing facts / user agreements section, if present, must be carried \
+             over item by item; never reworded away.\n\
+             - ADD new facts, decisions, and progress from the new history.\n\
+             - UPDATE status: move finished in-progress items to done; drop resolved \
+             blockers; rewrite next steps to match the current state.\n\
+             - Remove a detail only when the new history explicitly made it stale.\n\n\
              <previous-summary>\n{prev}\n</previous-summary>\n\n\
-             <conversation-history>\n{history}\n</conversation-history>"
+             <conversation>\n{history}\n</conversation>"
         ),
         None => format!(
-            "Create a new anchored summary from the conversation history.\n\n\
-             <conversation-history>\n{history}\n</conversation-history>"
+            "Create a new anchored summary from the conversation history in <conversation>.\n\n\
+             <conversation>\n{history}\n</conversation>"
         ),
     }
 }
 
 async fn compact_single_pass<F>(
     client: &OpenAiCompatibleClient,
+    system_prompt: &str,
     history: &str,
     previous_summary: Option<&str>,
     on_chunk: &mut F,
@@ -213,7 +520,7 @@ where
 {
     let prompt = build_compact_prompt(history, previous_summary);
     let messages = vec![
-        ChatMessage::system(COMPACT_SYSTEM_PROMPT.to_string()),
+        ChatMessage::system(system_prompt.to_string()),
         ChatMessage::plain("user", &prompt),
     ];
     let result = client
@@ -224,6 +531,7 @@ where
 
 async fn compact_single_pass_text<F>(
     client: &OpenAiCompatibleClient,
+    system_prompt: &str,
     text: &str,
     previous_summary: Option<&str>,
     on_chunk: &mut F,
@@ -244,7 +552,7 @@ where
         ),
     };
     let messages = vec![
-        ChatMessage::system(COMPACT_SYSTEM_PROMPT.to_string()),
+        ChatMessage::system(system_prompt.to_string()),
         ChatMessage::plain("user", &prompt),
     ];
     let result = client
@@ -324,6 +632,7 @@ fn turn_to_text(turn: &Turn) -> String {
 
 async fn merge_summaries_tree<F>(
     client: &OpenAiCompatibleClient,
+    system_prompt: &str,
     summaries: &[String],
     previous_summary: Option<&str>,
     usable_tokens: usize,
@@ -350,7 +659,7 @@ where
 
         if combined_tokens <= usable_tokens {
             let result =
-                compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+                compact_single_pass_text(client, system_prompt, &combined, previous_summary, on_chunk).await?;
             add_usage(&mut total_usage, &result.usage);
             usage_estimated |= result.usage_estimated;
             return Ok(CompactTextResult {
@@ -369,7 +678,7 @@ where
             if batch_tokens + s_tokens > usable_tokens && !batch.is_empty() {
                 let batch_text = batch.join("\n\n---\n\n");
                 let merged =
-                    compact_single_pass_text(client, &batch_text, None, &mut |_| Ok(())).await?;
+                    compact_single_pass_text(client, system_prompt, &batch_text, None, &mut |_| Ok(())).await?;
                 add_usage(&mut total_usage, &merged.usage);
                 usage_estimated |= merged.usage_estimated;
                 next.push(merged.text);
@@ -382,7 +691,7 @@ where
         if !batch.is_empty() {
             let batch_text = batch.join("\n\n---\n\n");
             let merged =
-                compact_single_pass_text(client, &batch_text, None, &mut |_| Ok(())).await?;
+                compact_single_pass_text(client, system_prompt, &batch_text, None, &mut |_| Ok(())).await?;
             add_usage(&mut total_usage, &merged.usage);
             usage_estimated |= merged.usage_estimated;
             next.push(merged.text);
@@ -391,7 +700,7 @@ where
         if next.len() >= current.len() {
             let combined = current.join("\n\n---\n\n");
             let result =
-                compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+                compact_single_pass_text(client, system_prompt, &combined, previous_summary, on_chunk).await?;
             add_usage(&mut total_usage, &result.usage);
             usage_estimated |= result.usage_estimated;
             return Ok(CompactTextResult {
@@ -404,7 +713,7 @@ where
     }
 
     let combined = current.join("\n\n---\n\n");
-    let result = compact_single_pass_text(client, &combined, previous_summary, on_chunk).await?;
+    let result = compact_single_pass_text(client, system_prompt, &combined, previous_summary, on_chunk).await?;
     add_usage(&mut total_usage, &result.usage);
     usage_estimated |= result.usage_estimated;
     Ok(CompactTextResult {
@@ -412,4 +721,80 @@ where
         usage: total_usage,
         usage_estimated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::TurnStatus;
+
+    fn turn(id: &str, seq: i64, content: &str) -> Turn {
+        Turn {
+            turn_id: id.to_string(),
+            seq,
+            user_content: content.to_string(),
+            display_content: content.to_string(),
+            user_timestamp: "now".to_string(),
+            assistant_content: String::new(),
+            assistant_reasoning: None,
+            assistant_provider_id: None,
+            assistant_model: None,
+            assistant_timestamp: None,
+            status: TurnStatus::Completed,
+            tool_reports: Vec::new(),
+            question_exchanges: Vec::new(),
+            followups: Vec::new(),
+            attachments: Vec::new(),
+            hidden: false,
+            is_summary: false,
+            owner_pid: None,
+            token_total: 0,
+            token_usage_estimated: false,
+            revision: 0,
+            journal_events: Vec::new(),
+            context_messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cut_index_keeps_everything_when_history_fits_the_tail() {
+        let turns: Vec<Turn> = (0..4).map(|i| turn(&format!("t{i}"), i, "hi")).collect();
+        let refs: Vec<&Turn> = turns.iter().collect();
+        assert_eq!(find_cut_index(&refs, 1_000_000), 0);
+    }
+
+    #[test]
+    fn cut_index_folds_oldest_turns_beyond_the_budget() {
+        let body = "lorem ipsum dolor sit amet ".repeat(40);
+        let turns: Vec<Turn> = (0..5).map(|i| turn(&format!("t{i}"), i, &body)).collect();
+        let refs: Vec<&Turn> = turns.iter().collect();
+        let per_turn = estimate_tokens(&turn_to_text(refs[0]));
+        // Budget covers the 2-turn floor plus half a turn: the floor is
+        // unconditional, the third-newest turn no longer fits, so the two
+        // oldest turns fold.
+        let budget = per_turn * 2 + per_turn / 2;
+        assert_eq!(find_cut_index(&refs, budget), 3);
+    }
+
+    #[test]
+    fn cut_index_keeps_the_two_newest_turns_even_when_oversized() {
+        let body = "lorem ipsum dolor sit amet ".repeat(400);
+        let turns: Vec<Turn> = (0..2).map(|i| turn(&format!("t{i}"), i, &body)).collect();
+        let refs: Vec<&Turn> = turns.iter().collect();
+        assert_eq!(find_cut_index(&refs, 1), 0);
+        let turns: Vec<Turn> = (0..3).map(|i| turn(&format!("t{i}"), i, &body)).collect();
+        let refs: Vec<&Turn> = turns.iter().collect();
+        assert_eq!(find_cut_index(&refs, 1), 1);
+    }
+
+    #[test]
+    fn summary_truncation_respects_multibyte_boundaries() {
+        let text = "汉".repeat(SUMMARY_ITEM_MAX_CHARS);
+        let truncated = truncate_for_summary(&text);
+        assert!(truncated.len() < text.len());
+        assert!(truncated.contains("more bytes truncated"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        let short = "short";
+        assert_eq!(truncate_for_summary(short), short);
+    }
 }

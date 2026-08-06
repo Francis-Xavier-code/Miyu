@@ -440,6 +440,11 @@ pub enum AgentEvent {
     CompactEnd,
     PopStart,
     PopEnd,
+    /// One-shot operational notice shown to the user (e.g. auto-compaction
+    /// paused because the window is too small).
+    Notice {
+        text: String,
+    },
 }
 
 const JOURNAL_FLUSH_BYTES: usize = 16 * 1024;
@@ -720,6 +725,7 @@ impl TurnJournalSink {
             | AgentEvent::CompactEnd
             | AgentEvent::PopStart
             | AgentEvent::PopEnd
+            | AgentEvent::Notice { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::PrepareForExternalOutput { .. } => on_event(event),
             AgentEvent::Chunk(chunk) => on_event(AgentEvent::Chunk(chunk)),
@@ -911,6 +917,20 @@ pub struct Agent {
     last_request_snapshot: Option<(Vec<ChatMessage>, Vec<crate::llm::ToolDefinition>)>,
     /// Cancels the currently running keepalive loop, if any.
     keepalive_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Consecutive auto-compactions that failed to bring the context back
+    /// under the trigger. A healthy compaction lands below the trigger; two
+    /// in a row mean the verbatim floor alone exceeds it (window too small),
+    /// so auto-compaction latches off until the context drops (`compact_stuck`).
+    consecutive_compacts: std::sync::atomic::AtomicU32,
+    compact_stuck: std::sync::atomic::AtomicBool,
+    /// Max turn seq observed right after the previous auto-compaction (-1 =
+    /// none yet). A new compaction firing within a few turns of the last one
+    /// means some single item (a huge paste or tool output) refills the
+    /// window instantly — compacting harder won't help ("thrashing").
+    last_compact_max_seq: std::sync::atomic::AtomicI64,
+    rapid_compacts: std::sync::atomic::AtomicU32,
+    /// One-shot "context is getting large" notice at the soft watermark.
+    soft_notice_sent: std::sync::atomic::AtomicBool,
 }
 
 struct PreparedUserInput {
@@ -998,6 +1018,11 @@ impl Agent {
             context_images: Vec::new(),
             last_request_snapshot: None,
             keepalive_cancel: None,
+            consecutive_compacts: std::sync::atomic::AtomicU32::new(0),
+            compact_stuck: std::sync::atomic::AtomicBool::new(false),
+            last_compact_max_seq: std::sync::atomic::AtomicI64::new(-1),
+            rapid_compacts: std::sync::atomic::AtomicU32::new(0),
+            soft_notice_sent: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2124,9 +2149,27 @@ impl Agent {
             self.state.clone(),
             context_window,
             check.reserved_tokens,
+            self.compact_tail_budget(context_window),
+            matches!(self.mode, AgentMode::Chat),
         );
         let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
-        let compact = match compactor.perform_compact(&mut on_chunk).await {
+        let fork_builder = |fold_ids: &[String]| -> Result<compact::CompactForkParts> {
+            Ok((
+                self.compact_fork_prefix(fold_ids)?,
+                self.live_tool_definitions()?,
+            ))
+        };
+        let fork_builder: Option<compact::CompactForkBuilder<'_>> = self
+            .config
+            .context
+            .compact_cache_reuse
+            .then_some(&fork_builder);
+        // Manual /compact is an explicit user request: bypass the
+        // fold-economics gate (but tail retention still applies).
+        let compact = match compactor
+            .perform_compact(true, false, fork_builder, &mut on_chunk)
+            .await
+        {
             Ok(result) => {
                 on_event(AgentEvent::CompactEnd)?;
                 result
@@ -2155,6 +2198,36 @@ impl Agent {
         }))
     }
 
+    /// Mechanical prune behind the harvest gate: rewriting history is a
+    /// prefix-cache reset, so the batch must save at least ~window/64 tokens
+    /// (~window/16 chars) to pay for it. Protects the newest 2 turns.
+    fn prune_stale_history(&self, context_window: usize) -> Result<crate::state::PruneStats> {
+        let min_saved_chars = (context_window / 16).max(8192);
+        let stats = self.state.prune_stale_tool_reports(2, min_saved_chars)?;
+        if stats.turns > 0 {
+            tracing::info!(
+                turns = stats.turns,
+                saved_chars = stats.saved_chars,
+                "context_rewrite reason=prune"
+            );
+        }
+        Ok(stats)
+    }
+
+    /// Derives the verbatim tail budget for compaction. Fixed token count by
+    /// design (the trigger scales with the window, the tail does not — that
+    /// geometry is what stops the re-compaction loop); chat sessions default
+    /// smaller because casual history has less verbatim value.
+    fn compact_tail_budget(&self, context_window: usize) -> usize {
+        self.config.context.compact_tail_tokens.unwrap_or({
+            if matches!(self.mode, AgentMode::Chat) {
+                8192
+            } else {
+                16384.min(context_window / 4)
+            }
+        })
+    }
+
     async fn handle_overflow<F>(
         &self,
         context_tokens: u64,
@@ -2163,10 +2236,64 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        use std::sync::atomic::Ordering;
         let context_window = self.context_window();
         let check = overflow::OverflowCheck::new(context_window, self.trim_at_ratio, None);
         let context_tokens = usize::try_from(context_tokens).unwrap_or(usize::MAX);
-        if !check.is_enabled() || !check.check_tokens(context_tokens) {
+        if !check.is_enabled() {
+            return Ok(None);
+        }
+        if !check.check_tokens(context_tokens) {
+            // Breathing room below the trigger is what a healthy compaction
+            // buys; clear the stuck latch and the run counters here, before
+            // any other branch can return, so a compaction that settles the
+            // context anywhere under the trigger fully re-arms
+            // auto-compaction (a stale count would latch the next one off).
+            self.consecutive_compacts.store(0, Ordering::Relaxed);
+            self.rapid_compacts.store(0, Ordering::Relaxed);
+            self.compact_stuck.store(false, Ordering::Relaxed);
+            // Below-trigger watermarks: each tier does only the cheapest
+            // thing that helps. snip prunes stale tool reports mechanically
+            // (no LLM call); soft just says the context is growing, once.
+            if let Some(window) = context_window {
+                let snip_threshold = (window as f32
+                    * self.config.context.compact_snip_ratio)
+                    .max(1.0) as usize;
+                let soft_threshold = (window as f32
+                    * self.config.context.compact_soft_ratio)
+                    .max(1.0) as usize;
+                if context_tokens >= snip_threshold {
+                    if self.config.context.prune_stale_tool_reports {
+                        let stats = self.prune_stale_history(window)?;
+                        if stats.turns > 0 {
+                            on_event(AgentEvent::Notice {
+                                text: format!(
+                                    "{} {} · ~{} chars",
+                                    crate::i18n::text(
+                                        "Folded stale tool records from turns:",
+                                        "已机械折叠旧轮次的工具记录："
+                                    ),
+                                    stats.turns,
+                                    stats.saved_chars,
+                                ),
+                            })?;
+                        }
+                    }
+                } else if context_tokens >= soft_threshold
+                    && !self.soft_notice_sent.swap(true, Ordering::Relaxed)
+                {
+                    on_event(AgentEvent::Notice {
+                        text: crate::i18n::text(
+                            "Context is getting large; older tool records will fold first, then the history will be compacted automatically.",
+                            "上下文渐大；将先机械折叠旧工具记录，随后才会自动压缩历史。",
+                        )
+                        .to_string(),
+                    })?;
+                }
+            }
+            return Ok(None);
+        }
+        if self.compact_stuck.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let compact_result = match self.on_overflow.as_str() {
@@ -2175,16 +2302,57 @@ impl Agent {
                 if visible_count == 0 {
                     return Ok(None);
                 }
+                let window = context_window.unwrap();
+                let force_threshold = (window as f32
+                    * self.config.context.compact_force_ratio)
+                    .max(1.0) as usize;
+                let force = context_tokens >= force_threshold;
+                // Prune first: it is free, and when it alone lands the
+                // context back under the trigger the paid summary call (and
+                // its cache reset) is skipped entirely.
+                if self.config.context.prune_stale_tool_reports {
+                    let stats = self.prune_stale_history(window)?;
+                    if stats.turns > 0 && !force {
+                        let post_tokens = usize::try_from(self.effective_context_tokens()?)
+                            .unwrap_or(usize::MAX);
+                        if !check.check_tokens(post_tokens) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Folded stale tool records; context is back under the compaction threshold.",
+                                    "已机械折叠旧工具记录；上下文已回落到压缩阈值之下。",
+                                )
+                                .to_string(),
+                            })?;
+                            return Ok(None);
+                        }
+                    }
+                }
                 on_event(AgentEvent::CompactStart)?;
                 let compactor = compact::Compactor::new(
                     self.client.clone(),
                     self.state.clone(),
-                    context_window.unwrap(),
+                    window,
                     check.reserved_tokens,
+                    self.compact_tail_budget(window),
+                    matches!(self.mode, AgentMode::Chat),
                 );
                 let mut on_chunk =
                     |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
-                match compactor.perform_compact(&mut on_chunk).await {
+                let fork_builder = |fold_ids: &[String]| -> Result<compact::CompactForkParts> {
+                    Ok((
+                        self.compact_fork_prefix(fold_ids)?,
+                        self.live_tool_definitions()?,
+                    ))
+                };
+                let fork_builder: Option<compact::CompactForkBuilder<'_>> = self
+                    .config
+                    .context
+                    .compact_cache_reuse
+                    .then_some(&fork_builder);
+                let result = match compactor
+                    .perform_compact(force, true, fork_builder, &mut on_chunk)
+                    .await
+                {
                     Ok(result) => {
                         on_event(AgentEvent::CompactEnd)?;
                         result
@@ -2193,7 +2361,69 @@ impl Agent {
                         on_event(AgentEvent::CompactEnd)?;
                         return Err(e);
                     }
+                };
+                if let Some(result) = result.as_ref() {
+                    on_event(AgentEvent::Notice {
+                        text: format!(
+                            "{} {} → {} {}",
+                            crate::i18n::text("Compacted: folded turns", "压缩完成：折叠轮次"),
+                            result.folded_turns,
+                            crate::i18n::text("kept verbatim", "逐字保留最近轮次"),
+                            result.kept_turns,
+                        ),
+                    })?;
                 }
+                if result.is_some() {
+                    // Post-compaction check: still over the trigger means the
+                    // verbatim floor plus system prompt alone exceed it.
+                    // Twice in a row would re-fire every turn (cratering the
+                    // prefix cache each time), so latch auto-compaction off
+                    // and say why, once.
+                    let post_tokens =
+                        usize::try_from(self.effective_context_tokens()?).unwrap_or(usize::MAX);
+                    if check.check_tokens(post_tokens) {
+                        let runs = self.consecutive_compacts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if runs >= 2 && !self.compact_stuck.swap(true, Ordering::Relaxed) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Automatic context compaction paused: the context window is too small for compaction to help (the system prompt plus the verbatim tail already exceed the trigger). Raise context window or reduce tool output; compaction resumes once the context drops.",
+                                    "自动上下文压缩已暂停：上下文窗口太小，压缩无法奏效（system prompt 加逐字尾巴已超过触发线）。请调大上下文窗口或减小工具输出；上下文回落后自动恢复。",
+                                )
+                                .to_string(),
+                            })?;
+                        }
+                    } else {
+                        self.consecutive_compacts.store(0, Ordering::Relaxed);
+                    }
+                    // Thrashing check: a healthy compaction buys many turns
+                    // of breathing room. Refilling within ~3 turns, three
+                    // times in a row, means a single oversized item refills
+                    // the window and each compaction only craters the cache.
+                    let max_seq = self
+                        .state
+                        .load_visible_turns()?
+                        .last()
+                        .map(|turn| turn.seq)
+                        .unwrap_or(-1);
+                    let previous = self.last_compact_max_seq.swap(max_seq, Ordering::Relaxed);
+                    // Each turn advances seq by 1 and the compaction summary
+                    // itself takes one, so "within 3 turns" is a delta <= 4.
+                    if previous >= 0 && max_seq.saturating_sub(previous) <= 4 {
+                        let rapid = self.rapid_compacts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if rapid >= 3 && !self.compact_stuck.swap(true, Ordering::Relaxed) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Automatic context compaction paused: the context refills within a few turns of each compaction. A single message or tool output is likely too large for the window — read in smaller chunks, or /clear to start fresh.",
+                                    "自动上下文压缩已暂停：每次压缩后几轮内上下文就再次填满。可能有单条消息或工具输出对窗口而言过大——请分块读取，或使用 /clear 重新开始。",
+                                )
+                                .to_string(),
+                            })?;
+                        }
+                    } else {
+                        self.rapid_compacts.store(0, Ordering::Relaxed);
+                    }
+                }
+                result
             }
             "pop" => {
                 on_event(AgentEvent::PopStart)?;
@@ -2287,6 +2517,11 @@ impl Agent {
     {
         let mut tool_round = initial_tool_rounds;
         let mut question_rounds = initial_question_rounds;
+        let mut replay_start = replay_start;
+        // Passive overflow recovery is a one-shot barrier per turn: the
+        // post-compaction retry must not recover another overflow (pi /
+        // opencode / Claude Code all converge on exactly one attempt).
+        let mut overflow_recovery_attempted = false;
         let mut loaded_tools = self.initial_loaded_tools(messages)?;
         let mut usage_accumulator = UsageAccumulator::default();
         // v7 cache write-grace: provider prefix-cache writes are async, so a
@@ -2396,12 +2631,15 @@ impl Agent {
                 self.last_request_snapshot =
                     Some((request_messages.clone(), definitions.clone()));
             }
+            let round_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let round = {
+                let streamed_flag = round_streamed.clone();
                 let llm_future = self.client.chat_stream_with_continuation(
                     request_messages.clone(),
                     definitions,
                     responses_continuation.as_deref(),
                     move |chunk| {
+                        streamed_flag.store(true, Ordering::Relaxed);
                         let _ = chunk_tx.send((chunk, Instant::now()));
                         Ok(())
                     },
@@ -2426,7 +2664,7 @@ impl Agent {
                             break None;
                         }
                         result = &mut llm_future => {
-                            break Some(result?);
+                            break Some(result);
                         }
                         Some((chunk, received_at)) = chunk_rx.recv() => {
                             emit_model_chunk_at(
@@ -2441,6 +2679,83 @@ impl Agent {
                         }
                     }
                 }
+            };
+            let round = match round {
+                Some(Err(error)) => {
+                    // Passive overflow trigger (compact-and-retry). Only at
+                    // the turn's initial request, before any assistant output
+                    // was streamed: mid-loop the live tool exchange is not
+                    // rebuildable from the DB, and a partially shown answer
+                    // must not be silently retried (opencode's
+                    // hasAssistantStarted guard).
+                    let initial_request = tool_round == initial_tool_rounds
+                        && question_rounds == initial_question_rounds
+                        && responses_continuation.is_none()
+                        && !round_streamed.load(Ordering::Relaxed);
+                    let window = self.context_window();
+                    if initial_request
+                        && !overflow_recovery_attempted
+                        && window.is_some()
+                        && crate::llm::is_context_overflow_error(&error)
+                    {
+                        overflow_recovery_attempted = true;
+                        let window = window.unwrap();
+                        let check = overflow::OverflowCheck::new(
+                            Some(window),
+                            self.trim_at_ratio,
+                            None,
+                        );
+                        on_event(AgentEvent::CompactStart)?;
+                        let compactor = compact::Compactor::new(
+                            self.client.clone(),
+                            self.state.clone(),
+                            window,
+                            check.reserved_tokens,
+                            self.compact_tail_budget(window),
+                            matches!(self.mode, AgentMode::Chat),
+                        );
+                        let mut on_compact_chunk =
+                            |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
+                        // No fork here: a fork of an overflowing conversation
+                        // overflows identically — recovery must use the
+                        // isolated serialized path.
+                        let compacted = compactor
+                            .perform_compact(true, true, None, &mut on_compact_chunk)
+                            .await;
+                        on_event(AgentEvent::CompactEnd)?;
+                        if let Ok(Some(compact_result)) = compacted {
+                            self.state.add_auxiliary_usage(&compact_result.usage)?;
+                            // Splice the rebuilt (compacted) history prefix in
+                            // front of the current turn's user message; the
+                            // live tail (user input, runtime stamp, hints)
+                            // is preserved byte-for-byte.
+                            let user_index = replay_start.saturating_sub(2).min(messages.len());
+                            let rebuilt = self.chat_messages(current_turn_id, "")?;
+                            let prefix_len = rebuilt.len().saturating_sub(2);
+                            let tail = messages.split_off(user_index);
+                            messages.clear();
+                            messages.extend(rebuilt.into_iter().take(prefix_len));
+                            messages.extend(tail);
+                            replay_start = prefix_len + 2;
+                            continuation_input_start = messages.len();
+                            tracing::info!(
+                                folded = compact_result.folded_turns,
+                                kept = compact_result.kept_turns,
+                                "context overflow recovered by compact-and-retry"
+                            );
+                            continue;
+                        }
+                        if let Err(compact_error) = compacted {
+                            tracing::warn!(
+                                error = %compact_error,
+                                "compact-and-retry failed; surfacing the original overflow"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+                Some(Ok(result)) => Some(result),
+                None => None,
             };
             let Some(result) = round else {
                 if let Some(control) = control {
@@ -3106,59 +3421,14 @@ impl Agent {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
         if !self.suppress_session_history {
             if let Some(summary) = self.state.load_last_summary()? {
-                messages.push(ChatMessage::system(format!(
-                    "<conversation-summary>\n{}\n</conversation-summary>",
-                    summary.assistant_content
-                )));
+                messages.push(summary_checkpoint_message(&summary.assistant_content));
             }
             let turns = self.state.load_visible_turns_excluding(current_turn_id)?;
             for turn in &turns {
                 if turn.is_summary {
                     continue;
                 }
-                messages.push(self.turn_user_message(turn));
-                // Fossilized transient tail (v7 append-only): replay the
-                // system messages that followed the user message in the live
-                // request, byte-identical and in order, so this turn renders
-                // as a pure extension of what the provider already cached.
-                messages.extend(turn.context_messages.iter().cloned());
-                if turn.status == crate::state::TurnStatus::Interrupted
-                    && !turn.journal_events.is_empty()
-                {
-                    messages.extend(interrupted_turn_replay_messages(self, turn));
-                } else {
-                    for exchange in &turn.question_exchanges {
-                        messages.push(ChatMessage::plain(
-                            "assistant",
-                            crate::question::assistant_exchange_text(exchange),
-                        ));
-                        messages.push(ChatMessage::plain(
-                            "user",
-                            crate::question::user_exchange_text(exchange),
-                        ));
-                    }
-                    for followup in &turn.followups {
-                        push_assistant_context_messages(
-                            &mut messages,
-                            followup
-                                .preceding_assistant_content
-                                .as_deref()
-                                .unwrap_or_default(),
-                            followup.preceding_assistant_reasoning.as_deref(),
-                            false,
-                        );
-                        messages.push(self.followup_user_message(followup));
-                    }
-                    push_assistant_context_messages(
-                        &mut messages,
-                        &turn.assistant_content,
-                        turn.assistant_reasoning.as_deref(),
-                        true,
-                    );
-                    if !turn.tool_reports.is_empty() {
-                        messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
-                    }
-                }
+                self.push_history_turn(&mut messages, turn);
             }
         }
         // v7 §三: the minute-level runtime stamp is transient tail and must sit
@@ -3170,6 +3440,92 @@ impl Agent {
         messages.push(ChatMessage::plain("user", current_input));
         messages.push(ChatMessage::system(runtime_context(self.mode)));
         Ok(messages)
+    }
+
+    /// Renders one stored turn exactly as the live request rendered it
+    /// (byte-identical replay incl. the fossilized transient tail), shared by
+    /// the main request path and the compaction fork prefix.
+    fn push_history_turn(&self, messages: &mut Vec<ChatMessage>, turn: &crate::state::Turn) {
+        messages.push(self.turn_user_message(turn));
+        // Fossilized transient tail (v7 append-only): replay the
+        // system messages that followed the user message in the live
+        // request, byte-identical and in order, so this turn renders
+        // as a pure extension of what the provider already cached.
+        messages.extend(turn.context_messages.iter().cloned());
+        if turn.status == crate::state::TurnStatus::Interrupted && !turn.journal_events.is_empty()
+        {
+            messages.extend(interrupted_turn_replay_messages(self, turn));
+        } else {
+            for exchange in &turn.question_exchanges {
+                messages.push(ChatMessage::plain(
+                    "assistant",
+                    crate::question::assistant_exchange_text(exchange),
+                ));
+                messages.push(ChatMessage::plain(
+                    "user",
+                    crate::question::user_exchange_text(exchange),
+                ));
+            }
+            for followup in &turn.followups {
+                push_assistant_context_messages(
+                    messages,
+                    followup
+                        .preceding_assistant_content
+                        .as_deref()
+                        .unwrap_or_default(),
+                    followup.preceding_assistant_reasoning.as_deref(),
+                    false,
+                );
+                messages.push(self.followup_user_message(followup));
+            }
+            push_assistant_context_messages(
+                messages,
+                &turn.assistant_content,
+                turn.assistant_reasoning.as_deref(),
+                true,
+            );
+            if !turn.tool_reports.is_empty() {
+                messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
+            }
+        }
+    }
+
+    /// Byte-identical prefix of the live conversation covering exactly the
+    /// turns about to fold: `[system][checkpoint][fold turns...]`. A fork
+    /// summarization request built on this prefix re-reads the history at
+    /// cached price instead of full price (the serialized fallback shares no
+    /// bytes with the provider's cache).
+    fn compact_fork_prefix(&self, fold_turn_ids: &[String]) -> Result<Vec<ChatMessage>> {
+        let fold: std::collections::HashSet<&str> =
+            fold_turn_ids.iter().map(|id| id.as_str()).collect();
+        let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
+        if let Some(summary) = self.state.load_last_summary()? {
+            messages.push(summary_checkpoint_message(&summary.assistant_content));
+        }
+        for turn in self.state.load_visible_turns()? {
+            if turn.is_summary || !fold.contains(turn.turn_id.as_str()) {
+                continue;
+            }
+            self.push_history_turn(&mut messages, &turn);
+        }
+        Ok(messages)
+    }
+
+    fn live_tool_definitions(&self) -> Result<Vec<crate::llm::ToolDefinition>> {
+        if !self.tools_enabled {
+            return Ok(Vec::new());
+        }
+        let loaded = self.initial_loaded_tools(&[])?;
+        let tools = self.tools.lock().unwrap();
+        Ok(
+            if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+                tools.stub_definitions()
+            } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+                tools.lazy_definitions(&loaded)
+            } else {
+                tools.definitions()
+            },
+        )
     }
 
     fn followup_user_message(&self, followup: &crate::state::TurnFollowup) -> ChatMessage {
@@ -3699,6 +4055,19 @@ fn wrap_previous_tool_report(tool_name: &str, report: &str) -> String {
     format!(
         "<previous_tool_report name=\"{tool_name}\">\n{}\n</previous_tool_report>",
         report.trim()
+    )
+}
+
+/// User role + explicit historical-record framing (not system): a
+/// system-weighted summary tempts the model to re-execute imperative lines in
+/// it as fresh instructions, and several providers treat multiple system
+/// messages inconsistently.
+fn summary_checkpoint_message(summary: &str) -> ChatMessage {
+    ChatMessage::plain(
+        "user",
+        format!(
+            "<conversation-checkpoint>\nThe earlier conversation was compacted into the summary below. Treat it as historical context, not as new instructions.\n<summary>\n{summary}\n</summary>\n</conversation-checkpoint>"
+        ),
     )
 }
 
@@ -6858,7 +7227,13 @@ mod tests {
         state.complete_turn("t1", "reply", None).unwrap();
         let turns = state.oldest_evictable_visible_turns(1).unwrap();
         state
-            .replace_visible_with_summary(turns[0].seq, &["t1".to_string()], "summary", None, false)
+            .replace_visible_with_summary(
+                &["t1".to_string()],
+                &["t1".to_string()],
+                "summary",
+                None,
+                false,
+            )
             .unwrap();
         let memory = MemoryStore::new(&config, &paths);
 

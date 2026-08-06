@@ -40,6 +40,12 @@ impl TurnStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PruneStats {
+    pub turns: usize,
+    pub saved_chars: usize,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Turn {
@@ -3761,10 +3767,83 @@ impl ConversationDb {
         operation
     }
 
+    /// Mechanical prune: replaces old visible turns' tool_reports with a
+    /// one-line placeholder (tool output is re-derivable — files can be
+    /// re-read, commands re-run). All-or-nothing behind a harvest gate:
+    /// rewriting history is a prefix-cache reset, so it only happens when the
+    /// batch saves enough to pay for that reset. Write-once archive keeps the
+    /// original JSON; a turn with an archive is never rewritten again, which
+    /// makes the prune monotonic (repeat calls never re-crater the cache).
+    pub fn prune_stale_tool_reports(
+        &self,
+        session_id: &str,
+        protect_recent: usize,
+        min_saved_chars: usize,
+    ) -> Result<PruneStats> {
+        const MIN_PRUNE_BYTES: usize = 1024;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT turn_id, tool_reports, tool_reports_archive FROM turns
+                 WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0
+                   AND status = 'completed'
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let eligible = rows.len().saturating_sub(protect_recent);
+        let mut updates = Vec::new();
+        let mut saved_chars = 0usize;
+        for (turn_id, reports_json, archive) in rows.into_iter().take(eligible) {
+            if archive.is_some() {
+                continue;
+            }
+            let reports: Vec<String> =
+                serde_json::from_str(&reports_json).unwrap_or_default();
+            if reports.is_empty() {
+                continue;
+            }
+            let total: usize = reports.iter().map(|report| report.len()).sum();
+            if total < MIN_PRUNE_BYTES {
+                continue;
+            }
+            let placeholder = format!(
+                "[{} 条旧工具记录已折叠以释放上下文 — 原文已归档；需要该数据时请重新调用工具 / {} old tool report(s) elided to free context — re-run the tool if the data is needed again]",
+                reports.len(),
+                reports.len(),
+            );
+            saved_chars += total.saturating_sub(placeholder.len());
+            let new_json = serde_json::to_string(&vec![placeholder])?;
+            updates.push((turn_id, reports_json, new_json));
+        }
+        if updates.is_empty() || saved_chars < min_saved_chars {
+            tx.rollback()?;
+            return Ok(PruneStats::default());
+        }
+        let turns = updates.len();
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE turns SET tool_reports_archive = ?2, tool_reports = ?3
+                 WHERE turn_id = ?1 AND session_id = ?4",
+            )?;
+            for (turn_id, original, replacement) in &updates {
+                stmt.execute(params![turn_id, original, replacement, session_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(PruneStats { turns, saved_chars })
+    }
+
     pub fn replace_visible_with_summary(
         &self,
         session_id: &str,
-        last_seq: i64,
+        fold_turn_ids: &[String],
         visible_turn_ids: &[String],
         summary: &str,
         token_total: Option<u64>,
@@ -3772,6 +3851,9 @@ impl ConversationDb {
     ) -> Result<()> {
         if summary.trim().is_empty() {
             bail!("compact returned an empty summary");
+        }
+        if fold_turn_ids.is_empty() {
+            bail!("compact selected no turns to fold");
         }
 
         let mut conn = self.conn.lock().unwrap();
@@ -3789,19 +3871,46 @@ impl ConversationDb {
         if current_turn_ids != visible_turn_ids {
             bail!("conversation changed while compact was running");
         }
+        // The previous summary (if any) is superseded by the merged one and
+        // folds together with the selected turns. Tail turns keep lower seqs
+        // than the old summary row, so membership is by explicit id, not by a
+        // seq watermark.
+        let prior_summary_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT turn_id FROM turns
+                 WHERE session_id = ?1 AND hidden = 0 AND is_summary = 1",
+            )?;
+            let ids = stmt
+                .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        };
         let parent_summary_seq: Option<i64> = tx.query_row(
             "SELECT MAX(seq) FROM turns
-                 WHERE session_id = ?1 AND hidden = 0 AND is_summary = 1 AND seq <= ?2",
-            params![session_id, last_seq],
+                 WHERE session_id = ?1 AND hidden = 0 AND is_summary = 1",
+            params![session_id],
             |row| row.get(0),
         )?;
-        let hidden = tx.execute(
-            "UPDATE turns SET hidden = 1 WHERE session_id = ?1 AND hidden = 0 AND seq <= ?2",
-            params![session_id, last_seq],
-        )?;
+        let mut hidden_ids: Vec<String> = fold_turn_ids.to_vec();
+        for id in prior_summary_ids {
+            if !hidden_ids.contains(&id) {
+                hidden_ids.push(id);
+            }
+        }
+        let mut hidden = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE turns SET hidden = 1
+                 WHERE session_id = ?1 AND hidden = 0 AND turn_id = ?2",
+            )?;
+            for id in &hidden_ids {
+                hidden += stmt.execute(params![session_id, id])?;
+            }
+        }
         if hidden == 0 {
             bail!("conversation changed before compact could be saved");
         }
+        let hidden_json = serde_json::to_string(&hidden_ids)?;
 
         let turn_id = format!(
             "summary_{}_{}",
@@ -3820,9 +3929,9 @@ impl ConversationDb {
         let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         tx.execute(
-            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10)",
-            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq, compact_hidden_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10, ?11)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq, hidden_json],
         )?;
         tx.commit()?;
         Ok(())
@@ -3930,10 +4039,10 @@ impl ConversationDb {
             tx.rollback()?;
             return Ok((0, None));
         }
-        let last: Option<(String, i64, String, bool, bool, Option<i64>)> = tx
+        let last: Option<(String, i64, String, bool, bool, Option<i64>, Option<String>)> = tx
             .query_row(
                 "SELECT turn_id, seq, user_content, is_summary,
-                        compact_reversible, compact_parent_summary_seq
+                        compact_reversible, compact_parent_summary_seq, compact_hidden_json
                  FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
                 params![session_id],
                 |row| {
@@ -3944,21 +4053,49 @@ impl ConversationDb {
                         row.get::<_, i64>(3)? != 0,
                         row.get::<_, i64>(4)? != 0,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
         match last {
-            Some((turn_id, _, user_content, false, _, _)) => {
+            Some((turn_id, _, user_content, false, _, _, _)) => {
                 tx.execute("DELETE FROM turns WHERE turn_id = ?1", params![turn_id])?;
                 tx.commit()?;
                 Ok((1, Some(user_content)))
             }
-            Some((_, _, _, true, false, _)) => {
+            Some((_, _, _, true, false, _, _)) => {
                 tx.rollback()?;
                 Ok((0, None))
             }
-            Some((turn_id, summary_seq, _, true, true, parent_summary_seq)) => {
+            Some((turn_id, _summary_seq, _, true, true, _, Some(hidden_json))) => {
+                // Tail-retention era summary: restore exactly the set this
+                // compaction hid (folded turns + the superseded summary row).
+                let hidden_ids: Vec<String> =
+                    serde_json::from_str(&hidden_json).unwrap_or_default();
+                if hidden_ids.is_empty() {
+                    tx.rollback()?;
+                    return Ok((0, None));
+                }
+                let mut restored = 0usize;
+                {
+                    let mut stmt = tx.prepare(
+                        "UPDATE turns SET hidden = 0
+                         WHERE session_id = ?1 AND hidden = 1 AND turn_id = ?2",
+                    )?;
+                    for id in &hidden_ids {
+                        restored += stmt.execute(params![session_id, id])?;
+                    }
+                }
+                if restored == 0 {
+                    tx.rollback()?;
+                    return Ok((0, None));
+                }
+                tx.execute("DELETE FROM turns WHERE turn_id = ?1", params![turn_id])?;
+                tx.commit()?;
+                Ok((1, None))
+            }
+            Some((turn_id, summary_seq, _, true, true, parent_summary_seq, None)) => {
                 let restorable: i64 = match parent_summary_seq {
                     Some(previous_seq) => tx.query_row(
                         "SELECT COUNT(*) FROM turns

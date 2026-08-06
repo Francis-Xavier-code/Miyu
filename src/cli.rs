@@ -4970,6 +4970,12 @@ async fn try_run_remote_chat(
             "context.compact_end" => handle_agent_event(&mut renderer, AgentEvent::CompactEnd)?,
             "context.pop_start" => handle_agent_event(&mut renderer, AgentEvent::PopStart)?,
             "context.pop_end" => handle_agent_event(&mut renderer, AgentEvent::PopEnd)?,
+            "context.notice" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::Notice {
+                    text: ipc_text(&data, "text").to_string(),
+                },
+            )?,
             "run.completed" => break data,
             "run.failed" => {
                 renderer.finish()?;
@@ -13448,6 +13454,10 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
         }
         AgentEvent::PopStart => renderer.tick_spinner(),
         AgentEvent::PopEnd => renderer.tick_spinner(),
+        AgentEvent::Notice { text } => {
+            renderer.write_system_message(&text)?;
+            renderer.tick_spinner()
+        }
     }
 }
 

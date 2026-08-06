@@ -9,6 +9,7 @@ pub const INPUT_METHOD_DIAGNOSIS_PROMPT: &str =
     include_str!("prompts/linux-input-method-diagnose.md");
 pub const GAME_COMPATIBILITY_PROMPT: &str = include_str!("prompts/linux-game-compatibility.md");
 pub const COMPACT_SYSTEM_PROMPT: &str = include_str!("prompts/compact.md");
+pub const COMPACT_CHAT_SYSTEM_PROMPT: &str = include_str!("prompts/compact_chat.md");
 
 pub fn default_system_prompt() -> String {
     let bytes = base64::engine::general_purpose::STANDARD

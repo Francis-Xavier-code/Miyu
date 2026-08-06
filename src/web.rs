@@ -1182,6 +1182,10 @@ impl RunEventMapper {
                 self.publish("context.pop_start", json!({ "run_id": self.run_id }))
             }
             AgentEvent::PopEnd => self.publish("context.pop_end", json!({ "run_id": self.run_id })),
+            AgentEvent::Notice { text } => self.publish(
+                "context.notice",
+                json!({ "run_id": self.run_id, "text": text }),
+            ),
         }
     }
 

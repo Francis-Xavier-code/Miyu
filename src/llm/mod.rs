@@ -298,3 +298,78 @@ pub struct ChatStreamChunk {
     pub kind: ChatStreamKind,
     pub text: String,
 }
+
+/// Provider-agnostic context-overflow classifier (compact-and-retry passive
+/// trigger). Exclusions are checked before matches: Bedrock-style throttling
+/// text ("Too many tokens, please wait") overlaps the overflow wording, and a
+/// rate-limit misread would turn a transient 429 into a destructive
+/// compaction. Patterns are the fixed-substring core of the pi/opencode
+/// regex sets (DeepSeek / OpenAI / Anthropic / gateway variants).
+pub fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    const EXCLUSIONS: &[&str] = &["rate limit", "too many requests", "throttling"];
+    if EXCLUSIONS.iter().any(|pattern| lower.contains(pattern)) {
+        return false;
+    }
+    const PATTERNS: &[&str] = &[
+        "prompt is too long",                     // Anthropic
+        "request_too_large",                      // Anthropic HTTP 413
+        "request entity too large",
+        "input is too long for requested model",  // Bedrock
+        "exceeds the context window",             // OpenAI
+        "maximum context length",                 // OpenAI-compatible / gateways
+        "reduce the length of the messages",      // Groq
+        "context window exceeds limit",           // MiniMax
+        "exceeded model token limit",             // Kimi
+        "but the configured context size",        // DeepSeek
+        "model_context_window_exceeded",          // z.ai
+        "context_length_exceeded",                // OpenAI error code
+        "context length exceeded",
+        "prompt too long",                        // Ollama
+        "greater than the context length",        // LM Studio
+        "exceeds the available context size",     // llama.cpp
+        "too many tokens",                        // generic fallback
+        "token limit exceeded",                   // generic fallback
+    ];
+    PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+pub fn is_context_overflow_error(error: &anyhow::Error) -> bool {
+    is_context_overflow_message(&format!("{error:#}"))
+}
+
+#[cfg(test)]
+mod overflow_classifier_tests {
+    use super::is_context_overflow_message;
+
+    #[test]
+    fn matches_provider_overflow_messages() {
+        for msg in [
+            "400 This model's maximum context length is 65536 tokens",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "The prompt has 131500 tokens, but the configured context size is 131072 tokens",
+            "error code context_length_exceeded",
+            "Input validation error: input is too long for requested model",
+            "Please reduce the length of the messages or completion",
+        ] {
+            assert!(is_context_overflow_message(msg), "should match: {msg}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_wording_is_excluded_before_matching() {
+        for msg in [
+            "ThrottlingException: Too many tokens, please wait before trying again",
+            "429 rate limit exceeded, maximum context length notwithstanding",
+            "Too Many Requests",
+        ] {
+            assert!(!is_context_overflow_message(msg), "must not match: {msg}");
+        }
+    }
+
+    #[test]
+    fn unrelated_errors_do_not_match() {
+        assert!(!is_context_overflow_message("connection reset by peer"));
+        assert!(!is_context_overflow_message("invalid api key"));
+    }
+}

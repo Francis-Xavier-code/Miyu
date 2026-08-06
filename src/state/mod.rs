@@ -19,8 +19,8 @@ pub use conversation_db::{
     interrupted_text, pending_placeholder, ArtifactAsset, ArtifactAssetData, ConversationDb,
     ImageAsset, ImageAssetData, PlatformAccessActor, PlatformAccessGrant, PlatformAccessGrantKey,
     PlatformMemeRefRecord, PlatformPluginScopeKey, PlatformSessionBinding,
-    PlatformSessionBindingKey, QueuedPrompt, QueuedPromptAttachment, RedoCandidate, RedoInputKind,
-    RedoStart, SessionOverview, SessionRecord, Turn, TurnFollowup, TurnJournalEvent,
+    PlatformSessionBindingKey, PruneStats, QueuedPrompt, QueuedPromptAttachment, RedoCandidate,
+    RedoInputKind, RedoStart, SessionOverview, SessionRecord, Turn, TurnFollowup, TurnJournalEvent,
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
@@ -1419,9 +1419,18 @@ impl StateStore {
         self.conv_db.load_last_summary(&self.session())
     }
 
+    pub fn prune_stale_tool_reports(
+        &self,
+        protect_recent: usize,
+        min_saved_chars: usize,
+    ) -> Result<PruneStats> {
+        self.conv_db
+            .prune_stale_tool_reports(&self.session(), protect_recent, min_saved_chars)
+    }
+
     pub fn replace_visible_with_summary(
         &self,
-        last_seq: i64,
+        fold_turn_ids: &[String],
         visible_turn_ids: &[String],
         summary: &str,
         token_total: Option<u64>,
@@ -1429,7 +1438,7 @@ impl StateStore {
     ) -> Result<()> {
         self.conv_db.replace_visible_with_summary(
             &self.session(),
-            last_seq,
+            fold_turn_ids,
             visible_turn_ids,
             summary,
             token_total,
@@ -3436,11 +3445,17 @@ mod tests {
         );
     }
 
-    fn visible_snapshot(store: &StateStore) -> (i64, Vec<String>) {
+    /// Returns (non-summary fold ids, all visible ids) mirroring what the
+    /// compactor passes for a full fold of the current history.
+    fn visible_snapshot(store: &StateStore) -> (Vec<String>, Vec<String>) {
         let turns = store.load_visible_turns().unwrap();
-        let last_seq = turns.last().unwrap().seq;
+        let fold_ids = turns
+            .iter()
+            .filter(|turn| !turn.is_summary)
+            .map(|turn| turn.turn_id.clone())
+            .collect();
         let turn_ids = turns.into_iter().map(|turn| turn.turn_id).collect();
-        (last_seq, turn_ids)
+        (fold_ids, turn_ids)
     }
 
     #[test]
@@ -3935,10 +3950,10 @@ mod tests {
             store.start_turn(id, id, 999999).unwrap();
             store.complete_turn(id, "reply", None).unwrap();
         }
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         store
-            .replace_visible_with_summary(last_seq, &turn_ids, "summary", Some(10), true)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true)
             .unwrap();
 
         let all = store.load_turns().unwrap();
@@ -3976,15 +3991,15 @@ mod tests {
             store.start_turn(id, id, 999999).unwrap();
             store.complete_turn(id, "reply", None).unwrap();
         }
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(last_seq, &turn_ids, "summary one", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false)
             .unwrap();
         store.start_turn("t3", "third", 999999).unwrap();
         store.complete_turn("t3", "reply", None).unwrap();
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(last_seq, &turn_ids, "summary two", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false)
             .unwrap();
 
         assert_eq!(
@@ -4014,14 +4029,157 @@ mod tests {
     }
 
     #[test]
+    fn tail_retention_compact_folds_only_the_selected_turns() {
+        let (_temp, store) = test_store();
+        for id in ["t1", "t2", "t3", "t4"] {
+            store.start_turn(id, id, 999999).unwrap();
+            store.complete_turn(id, "reply", None).unwrap();
+        }
+        let (_, all_ids) = visible_snapshot(&store);
+        store
+            .replace_visible_with_summary(
+                &["t1".to_string(), "t2".to_string()],
+                &all_ids,
+                "summary",
+                None,
+                false,
+            )
+            .unwrap();
+
+        let visible = store.load_visible_turns().unwrap();
+        let ids: Vec<&str> = visible.iter().map(|t| t.turn_id.as_str()).collect();
+        assert_eq!(&ids[..2], &["t3", "t4"]);
+        assert_eq!(visible.len(), 3);
+        assert!(visible[2].is_summary);
+        assert_eq!(
+            store
+                .load_last_summary()
+                .unwrap()
+                .unwrap()
+                .assistant_content,
+            "summary"
+        );
+
+        // Undo restores exactly the folded set and deletes the summary.
+        assert_eq!(store.undo_last_turn().unwrap(), (1, None));
+        let visible = store.load_visible_turns().unwrap();
+        assert_eq!(
+            visible.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(),
+            vec!["t1", "t2", "t3", "t4"]
+        );
+    }
+
+    #[test]
+    fn second_tail_compact_supersedes_the_previous_summary() {
+        let (_temp, store) = test_store();
+        for id in ["t1", "t2", "t3"] {
+            store.start_turn(id, id, 999999).unwrap();
+            store.complete_turn(id, "reply", None).unwrap();
+        }
+        let (_, all_ids) = visible_snapshot(&store);
+        store
+            .replace_visible_with_summary(
+                &["t1".to_string()],
+                &all_ids,
+                "summary one",
+                None,
+                false,
+            )
+            .unwrap();
+        store.start_turn("t4", "fourth", 999999).unwrap();
+        store.complete_turn("t4", "reply", None).unwrap();
+
+        // Second compaction folds t2 (oldest visible non-summary turn); the
+        // superseded summary must be hidden together with it even though its
+        // seq is higher than the tail turns'.
+        let (_, all_ids) = visible_snapshot(&store);
+        store
+            .replace_visible_with_summary(
+                &["t2".to_string()],
+                &all_ids,
+                "summary two",
+                None,
+                false,
+            )
+            .unwrap();
+
+        let visible = store.load_visible_turns().unwrap();
+        let ids: Vec<&str> = visible.iter().map(|t| t.turn_id.as_str()).collect();
+        assert_eq!(&ids[..2], &["t3", "t4"]);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(
+            store
+                .load_last_summary()
+                .unwrap()
+                .unwrap()
+                .assistant_content,
+            "summary two"
+        );
+        assert_eq!(
+            visible.iter().filter(|t| t.is_summary).count(),
+            1,
+            "the superseded summary must not stay visible"
+        );
+
+        // Undo restores t2 and summary one, drops summary two.
+        assert_eq!(store.undo_last_turn().unwrap(), (1, None));
+        assert_eq!(
+            store
+                .load_last_summary()
+                .unwrap()
+                .unwrap()
+                .assistant_content,
+            "summary one"
+        );
+        let visible = store.load_visible_turns().unwrap();
+        assert!(visible.iter().any(|t| t.turn_id == "t2" && !t.hidden));
+    }
+
+    #[test]
+    fn prune_folds_old_tool_reports_behind_the_harvest_gate() {
+        let (_temp, store) = test_store();
+        let big_report = "x".repeat(4096);
+        for id in ["t1", "t2", "t3", "t4"] {
+            store.start_turn(id, id, 999999).unwrap();
+            store
+                .conv_db
+                .append_tool_reports(id, &[big_report.clone()])
+                .unwrap();
+            store.complete_turn(id, "reply", None).unwrap();
+        }
+
+        // Harvest gate: potential savings (~8KB from t1+t2) below the
+        // threshold → nothing is rewritten.
+        let stats = store.prune_stale_tool_reports(2, 1_000_000).unwrap();
+        assert_eq!(stats.turns, 0);
+        let turns = store.load_visible_turns().unwrap();
+        assert_eq!(turns[0].tool_reports[0], big_report);
+
+        // Gate passes: the two oldest turns fold, newest two are protected.
+        let stats = store.prune_stale_tool_reports(2, 1024).unwrap();
+        assert_eq!(stats.turns, 2);
+        assert!(stats.saved_chars > 6000);
+        let turns = store.load_visible_turns().unwrap();
+        assert!(turns[0].tool_reports[0].contains("已折叠"));
+        assert!(turns[1].tool_reports[0].contains("已折叠"));
+        assert_eq!(turns[2].tool_reports[0], big_report);
+        assert_eq!(turns[3].tool_reports[0], big_report);
+
+        // Monotonic: a second pass finds nothing new to rewrite (the
+        // archived turns are never re-pruned, so the cache is not re-hit).
+        let stats = store.prune_stale_tool_reports(2, 1024).unwrap();
+        assert_eq!(stats.turns, 0);
+    }
+
+    #[test]
     fn empty_summary_leaves_visible_turns_unchanged() {
         let (_temp, store) = test_store();
         store.start_turn("t1", "hello", 999999).unwrap();
         store.complete_turn("t1", "reply", None).unwrap();
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         assert!(store
-            .replace_visible_with_summary(last_seq, &turn_ids, "  ", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false)
             .is_err());
 
         let visible = store.load_visible_turns().unwrap();
@@ -4034,7 +4192,7 @@ mod tests {
         let (temp, store) = test_store();
         store.start_turn("t1", "hello", 999999).unwrap();
         store.complete_turn("t1", "reply", None).unwrap();
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
         let conn = rusqlite::Connection::open(temp.path().join("state/conversation.db")).unwrap();
         conn.execute_batch(
             "CREATE TRIGGER fail_summary_insert
@@ -4044,7 +4202,7 @@ mod tests {
         .unwrap();
 
         assert!(store
-            .replace_visible_with_summary(last_seq, &turn_ids, "summary", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false)
             .is_err());
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 1);
@@ -4111,11 +4269,11 @@ mod tests {
         let (_temp, store) = test_store();
         store.start_turn("t1", "first", 999999).unwrap();
         store.complete_turn("t1", "reply", None).unwrap();
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
         store.undo_last_turn().unwrap();
 
         assert!(store
-            .replace_visible_with_summary(last_seq, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
             .is_err());
         assert!(store.load_visible_turns().unwrap().is_empty());
     }
@@ -4125,12 +4283,12 @@ mod tests {
         let (_temp, store) = test_store();
         store.start_turn("t1", "first", 999999).unwrap();
         store.complete_turn("t1", "reply", None).unwrap();
-        let (last_seq, turn_ids) = visible_snapshot(&store);
+        let (fold_ids, turn_ids) = visible_snapshot(&store);
         store.start_turn("t2", "second", 999999).unwrap();
         store.complete_turn("t2", "reply", None).unwrap();
 
         assert!(store
-            .replace_visible_with_summary(last_seq, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
             .is_err());
         assert_eq!(store.load_visible_turns().unwrap().len(), 2);
     }
