@@ -853,6 +853,17 @@ impl StateStore {
         self.conv_db.append_tool_reports(turn_id, reports)
     }
 
+    /// Archives the transient system tail that was sent after the user message
+    /// of this turn (v7 append-only fossilization). Replayed verbatim by
+    /// history rendering so the byte stream stays a pure extension.
+    pub fn set_turn_context_messages(
+        &self,
+        turn_id: &str,
+        messages: &[crate::llm::ChatMessage],
+    ) -> Result<()> {
+        self.conv_db.set_turn_context_messages(turn_id, messages)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn append_turn_journal_event(
         &self,

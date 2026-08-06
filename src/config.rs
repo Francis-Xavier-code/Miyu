@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub context: ContextConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default, skip_serializing_if = "CacheConfig::is_default")]
+    pub cache: CacheConfig,
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
@@ -47,6 +49,47 @@ pub struct AppConfig {
     pub subagent_tiers: SubagentTiersConfig,
     #[serde(default, skip_serializing_if = "PlatformsConfig::is_empty")]
     pub platforms: PlatformsConfig,
+}
+
+/// Provider prompt-cache tuning (v7, DeepSeek 高命中策略实测产物). All
+/// options default to off; they trade a little latency or a few cheap
+/// requests for prefix-cache hits on best-effort provider caches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Idle keepalive: while the agent waits for the next user turn, re-send
+    /// the exact prompt prefix of the last request every N seconds as a
+    /// non-streaming max_tokens=1 completion so hot-tier prefix caches
+    /// (DeepSeek-style) keep the deep prefix alive across turn gaps. The ping
+    /// is billed at the provider's cache-hit input price. 0 disables (the
+    /// default — enable only after measuring your provider: on per-REQUEST
+    /// billed endpoints every ping burns quota for nothing).
+    /// Only effective in long-lived processes (daemon/REPL); one-shot `ask`
+    /// exits before any ping fires.
+    pub keepalive_seconds: u64,
+    /// Stop pinging after this many keepalives per turn (bounds idle cost).
+    pub keepalive_max_pings: u32,
+    /// Provider cache writes are asynchronous (measured: a follow-up within
+    /// ~2s can miss the prefix the previous request just computed). When >0,
+    /// consecutive tool-loop requests wait until at least this many
+    /// milliseconds have passed since the previous round completed.
+    pub write_grace_ms: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            keepalive_seconds: 0,
+            keepalive_max_pings: 20,
+            write_grace_ms: 0,
+        }
+    }
+}
+
+impl CacheConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Messaging-platform settings. Public configuration is named after the
@@ -2877,6 +2920,7 @@ impl Default for AppConfig {
             providers: ProviderConfig::default_templates(),
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
+            cache: CacheConfig::default(),
             mcp: McpConfig::default(),
             skills: SkillsConfig::default(),
             display: DisplayConfig::default(),

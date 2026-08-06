@@ -905,6 +905,12 @@ pub struct Agent {
     image_platform_label: Option<String>,
     platform_context: Option<Arc<PlatformTurnContext>>,
     context_images: Vec<PlatformContextImageRef>,
+    /// Exact (messages, tools) of the most recent live request; feeds the
+    /// idle cache-keepalive pings (v7 DeepSeek 高命中策略). Only populated
+    /// while `cache.keepalive_seconds > 0`.
+    last_request_snapshot: Option<(Vec<ChatMessage>, Vec<crate::llm::ToolDefinition>)>,
+    /// Cancels the currently running keepalive loop, if any.
+    keepalive_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct PreparedUserInput {
@@ -990,7 +996,59 @@ impl Agent {
             image_platform_label: None,
             platform_context: None,
             context_images: Vec::new(),
+            last_request_snapshot: None,
+            keepalive_cancel: None,
         })
+    }
+
+    /// Stops the idle cache-keepalive loop (called whenever a new request is
+    /// about to change the context, and before dropping the agent).
+    pub fn cancel_cache_keepalive(&mut self) {
+        if let Some(cancel) = self.keepalive_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Starts the idle keepalive loop for the last request prefix. No-op when
+    /// disabled or when no snapshot exists.
+    fn start_cache_keepalive(&mut self) {
+        self.cancel_cache_keepalive();
+        let interval = self.config.cache.keepalive_seconds;
+        if interval == 0 {
+            return;
+        }
+        let Some((messages, tools)) = self.last_request_snapshot.clone() else {
+            return;
+        };
+        let max_pings = self.config.cache.keepalive_max_pings;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.keepalive_cancel = Some(cancel.clone());
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            for ping in 0..max_pings {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                match client.cache_keepalive(messages.clone(), tools.clone()).await {
+                    Ok(Some(usage)) => {
+                        tracing::info!(
+                            ping = ping + 1,
+                            prompt_tokens = usage.prompt_tokens,
+                            cache_read = usage.cache_read_tokens,
+                            "cache keepalive ping"
+                        );
+                        let _ = state.add_auxiliary_usage(&usage);
+                    }
+                    Ok(None) => return, // protocol without keepalive support
+                    Err(error) => {
+                        tracing::warn!(error = %error, "cache keepalive ping failed");
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     pub fn prepare_for_turn(&mut self) -> Result<()> {
@@ -1556,6 +1614,7 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        self.cancel_cache_keepalive();
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
         if prompts.is_empty()
@@ -1599,8 +1658,13 @@ impl Agent {
         })?;
 
         let mut messages = self.chat_messages(&candidate.turn_id, "")?;
+        // chat_messages ends with [.., user placeholder, runtime]; drop both
+        // and re-append the runtime right after the real redo input so the
+        // transient tail keeps sitting behind the user message.
+        let runtime_message = messages.pop();
         let _ = messages.pop();
         let replay_start;
+        let fossil_start;
         let base_tool_reports;
         let initial_tool_rounds;
         let initial_question_rounds;
@@ -1608,6 +1672,8 @@ impl Agent {
             RedoInputKind::Initial => {
                 let (_, input) = prepared.pop().context("redo input is empty")?;
                 messages.push(input.message);
+                fossil_start = messages.len();
+                messages.extend(runtime_message);
                 replay_start = messages.len();
                 messages.extend(input.hints);
                 base_tool_reports = Vec::new();
@@ -1617,6 +1683,8 @@ impl Agent {
             RedoInputKind::Followup => {
                 let checkpoint = redo.checkpoint.context("redo checkpoint is unavailable")?;
                 messages.push(self.turn_user_message(&current_turn));
+                fossil_start = messages.len();
+                messages.extend(runtime_message);
                 replay_start = messages.len();
                 messages.extend(checkpoint.replay_messages);
                 for (_, input) in prepared {
@@ -1628,6 +1696,12 @@ impl Agent {
                 initial_question_rounds = checkpoint.question_rounds;
             }
         }
+        // Redo rewrites the turn, so refresh its fossilized tail to match what
+        // this generation actually sends (new runtime stamp + replayed tail).
+        self.state.set_turn_context_messages(
+            &candidate.turn_id,
+            &fossil_context_messages(&messages[fossil_start..]),
+        )?;
 
         let mut used_tools = Vec::new();
         let mut persisted_tool_reports = Vec::new();
@@ -1678,6 +1752,7 @@ impl Agent {
         if let Some(usage) = result.usage.clone() {
             self.state.add_usage(&usage)?;
         }
+        self.start_cache_keepalive();
         Ok(result)
     }
 
@@ -1691,6 +1766,9 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        // A new turn is about to mutate the context; stop pinging the stale
+        // prefix (the turn's own requests refresh the cache anyway).
+        self.cancel_cache_keepalive();
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
         let prepared = self.prepare_user_input(input, images).await?;
@@ -1721,8 +1799,12 @@ impl Agent {
             turn_id: turn_id.clone(),
         })?;
         let mut messages = self.chat_messages(&turn_id, &input)?;
-        if let Some(last) = messages.last_mut() {
-            *last = prepared.message;
+        // chat_messages ends with [.., user, runtime]; swap in the prepared
+        // user message (attachments/images) at its position before the
+        // transient runtime tail.
+        let user_index = messages.len().saturating_sub(2);
+        if let Some(user) = messages.get_mut(user_index) {
+            *user = prepared.message;
         }
         let replay_start = messages.len();
         if !self.turn_system_context.is_empty() {
@@ -1751,6 +1833,15 @@ impl Agent {
                 messages.push(ChatMessage::system(reminder));
             }
         }
+        // v7 append-only fossilization ("注入了就别删"): archive the transient
+        // system tail exactly as sent — runtime stamp, trusted transport
+        // context, hints, associative memory, meme reminder — so future
+        // history replay is a byte-exact extension of this request and the
+        // provider prefix cache never sees a divergence at this turn.
+        self.state.set_turn_context_messages(
+            &turn_id,
+            &fossil_context_messages(&messages[user_index + 1..]),
+        )?;
         let mut used_tools = Vec::new();
         let mut persisted_tool_reports = Vec::new();
         let mut journal = TurnJournalSink::new(self.state.clone(), turn_id.clone(), 0);
@@ -1798,6 +1889,7 @@ impl Agent {
         if let Some(usage) = result.usage.clone() {
             self.state.add_usage(&usage)?;
         }
+        self.start_cache_keepalive();
         Ok(result)
     }
 
@@ -2197,6 +2289,10 @@ impl Agent {
         let mut question_rounds = initial_question_rounds;
         let mut loaded_tools = self.initial_loaded_tools(messages)?;
         let mut usage_accumulator = UsageAccumulator::default();
+        // v7 cache write-grace: provider prefix-cache writes are async, so a
+        // follow-up fired within ~2s can miss the prefix the previous round
+        // just computed (measured on DeepSeek). Track round completion time.
+        let mut last_round_completed_at: Option<Instant> = None;
         let mut responses_continuation = None;
         let mut continuation_input_start = messages.len();
         let mut continuation_context: Option<(usize, Vec<ChatMessage>)> = None;
@@ -2287,6 +2383,19 @@ impl Agent {
                 request_messages.splice(offset..offset, context_messages.clone());
             }
             let mut reasoning_filter = ReasoningTitleFilter::default();
+            if self.config.cache.write_grace_ms > 0 {
+                if let Some(previous) = last_round_completed_at {
+                    let grace = std::time::Duration::from_millis(self.config.cache.write_grace_ms);
+                    let elapsed = previous.elapsed();
+                    if elapsed < grace {
+                        tokio::time::sleep(grace - elapsed).await;
+                    }
+                }
+            }
+            if self.config.cache.keepalive_seconds > 0 && responses_continuation.is_none() {
+                self.last_request_snapshot =
+                    Some((request_messages.clone(), definitions.clone()));
+            }
             let round = {
                 let llm_future = self.client.chat_stream_with_continuation(
                     request_messages.clone(),
@@ -2400,6 +2509,7 @@ impl Agent {
                 }))?;
             }
             usage_accumulator.add_result(&result, messages);
+            last_round_completed_at = Some(Instant::now());
             if result.tool_calls.is_empty() || !self.tools_enabled {
                 responses_continuation = None;
                 continuation_input_start = messages.len();
@@ -3007,6 +3117,11 @@ impl Agent {
                     continue;
                 }
                 messages.push(self.turn_user_message(turn));
+                // Fossilized transient tail (v7 append-only): replay the
+                // system messages that followed the user message in the live
+                // request, byte-identical and in order, so this turn renders
+                // as a pure extension of what the provider already cached.
+                messages.extend(turn.context_messages.iter().cloned());
                 if turn.status == crate::state::TurnStatus::Interrupted
                     && !turn.journal_events.is_empty()
                 {
@@ -3046,8 +3161,14 @@ impl Agent {
                 }
             }
         }
-        messages.push(ChatMessage::system(runtime_context(self.mode)));
+        // v7 §三: the minute-level runtime stamp is transient tail and must sit
+        // AFTER the current user message. When it preceded the user message,
+        // every next turn's replayed history diverged from the provider's
+        // cached prefix exactly at this position, capping cross-turn prefix
+        // cache reuse at the end of the stored history (verified byte-level
+        // against DeepSeek prefix caching).
         messages.push(ChatMessage::plain("user", current_input));
+        messages.push(ChatMessage::system(runtime_context(self.mode)));
         Ok(messages)
     }
 
@@ -3424,6 +3545,20 @@ fn queued_prompt_images(prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>
         .collect()
 }
 
+/// The fossilizable prefix of a transient tail: the contiguous run of
+/// system-role text messages. Stops at the first non-system or non-text
+/// message so redo checkpoints (which append loop messages) never leak
+/// assistant/tool content into the fossil record.
+fn fossil_context_messages(tail: &[ChatMessage]) -> Vec<ChatMessage> {
+    tail.iter()
+        .take_while(|message| {
+            message.role == "system"
+                && matches!(message.content.as_ref(), Some(ChatContent::Text(_)))
+        })
+        .cloned()
+        .collect()
+}
+
 fn replace_request_mode_context(
     messages: &mut [ChatMessage],
     system_prompt: &str,
@@ -3670,6 +3805,8 @@ fn push_assistant_message_with_reasoning(
 
 fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
     let mut messages = vec![ChatMessage::plain("user", &turn.user_content)];
+    // Fossilized transient tail is replayed with the turn, so count it.
+    messages.extend(turn.context_messages.iter().cloned());
     for exchange in &turn.question_exchanges {
         messages.push(ChatMessage::plain(
             "assistant",
@@ -5487,7 +5624,71 @@ mod tests {
         assert!(!messages
             .iter()
             .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
-        assert!(format!("{:?}", messages.last().unwrap().content).contains("new user"));
+        // [.., user, runtime tail]: the current user message sits right before
+        // the transient runtime stamp.
+        assert!(format!("{:?}", messages[messages.len() - 2].content).contains("new user"));
+        assert!(format!("{:?}", messages.last().unwrap().content).contains("<runtime now="));
+    }
+
+    #[test]
+    fn fossilized_transient_tail_replays_between_user_and_assistant() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        state.start_turn("old", "old question", 999_999).unwrap();
+        state
+            .set_turn_context_messages(
+                "old",
+                &[
+                    ChatMessage::system("<runtime now=\"frozen stamp\"/>"),
+                    ChatMessage::system("<associative-memory>frozen recall</associative-memory>"),
+                ],
+            )
+            .unwrap();
+        state.complete_turn("old", "old answer", None).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        let messages = agent.chat_messages("current", "next question").unwrap();
+        let text = |message: &ChatMessage| format!("{:?}", message.content);
+        let user = messages
+            .iter()
+            .position(|m| text(m).contains("old question"))
+            .unwrap();
+        let assistant = messages
+            .iter()
+            .position(|m| text(m).contains("old answer"))
+            .unwrap();
+        // The fossils sit, in order, strictly between the user message and the
+        // assistant reply — byte-for-byte what the live request sent.
+        assert_eq!(messages[user + 1].role, "system");
+        assert!(text(&messages[user + 1]).contains("frozen stamp"));
+        assert_eq!(messages[user + 2].role, "system");
+        assert!(text(&messages[user + 2]).contains("frozen recall"));
+        assert!(user + 2 < assistant);
+    }
+
+    #[test]
+    fn fossil_capture_stops_at_first_non_system_message() {
+        let tail = vec![
+            ChatMessage::system("<runtime now=\"x\"/>"),
+            ChatMessage::system("hint"),
+            ChatMessage::plain("assistant", "loop starts here"),
+            ChatMessage::system("after loop — must not be captured"),
+        ];
+        let fossil = fossil_context_messages(&tail);
+        assert_eq!(fossil.len(), 2);
+        assert!(format!("{:?}", fossil[1].content).contains("hint"));
     }
 
     #[test]
@@ -6037,6 +6238,7 @@ mod tests {
             token_usage_estimated: false,
             revision: 0,
             journal_events: Vec::new(),
+            context_messages: Vec::new(),
         };
         let with_reasoning = turn_context_tokens(&turn);
         turn.assistant_reasoning = None;
@@ -6212,6 +6414,7 @@ mod tests {
                     ok: None,
                 },
             ],
+            context_messages: Vec::new(),
         };
 
         let messages = interrupted_turn_replay_messages(&agent, &turn);

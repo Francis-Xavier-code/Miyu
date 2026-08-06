@@ -6472,6 +6472,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             footer
                                 .update_thinking_variant(client.thinking_variant_summary().as_deref());
                             footer.update_context_window(state.context_window);
+                            live_repl.set_footer(footer.clone());
                             repl_note(
                                 &mut live_repl,
                                 &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
@@ -6513,6 +6514,10 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
                     footer.update_context_window(state.context_window);
+                    // Push the rebuilt footer into the live editor now; without
+                    // this the on-screen model label stays stale until the next
+                    // input event redraws the editor.
+                    live_repl.set_footer(footer.clone());
                     repl_note(
                         &mut live_repl,
                         &format!(
@@ -6556,6 +6561,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
                     footer.update_context_window(state.context_window);
+                    live_repl.set_footer(footer.clone());
                     repl_note(
                         &mut live_repl,
                         &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
@@ -6613,6 +6619,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             let thinking_summary = client.thinking_variant_summary();
                             footer.update_thinking_variant(thinking_summary.as_deref());
                             footer.update_context_window(state.context_window);
+                            live_repl.set_footer(footer.clone());
                             repl_note(
                                 &mut live_repl,
                                 &format!("{}\n", t("thinking variants updated", "已更新思考档位")),
@@ -7058,6 +7065,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
             footer.update_context_window(agent.context_window());
+            if let Some(live) = live_repl.as_mut() {
+                live.set_footer(footer.clone());
+            }
             println!("{}", t("configuration reloaded", "配置已重新加载"));
             println!();
             continue;
@@ -7077,6 +7087,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
             footer.update_context_window(agent.context_window());
+            if let Some(live) = live_repl.as_mut() {
+                live.set_footer(footer.clone());
+            }
             println!("{}", t("configuration reloaded", "配置已重新加载"));
             println!();
             continue;
@@ -11191,6 +11204,7 @@ mod repl_input_tests {
             token_usage_estimated: false,
             revision: 0,
             journal_events: Vec::new(),
+            context_messages: Vec::new(),
         }
     }
 

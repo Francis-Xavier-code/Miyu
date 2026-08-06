@@ -76,10 +76,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "session_model_override",
         apply: apply_v11_session_model_override,
     },
+    Migration {
+        version: 12,
+        name: "turn_context_messages",
+        apply: apply_v12_turn_context_messages,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 11;
+pub const LATEST_VERSION: i64 = 12;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -707,6 +712,15 @@ fn create_turn_redo_backup_tables(conn: &Connection) -> Result<()> {
 /// active pool.
 fn apply_v11_session_model_override(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "sessions", "model_override", "TEXT")
+}
+
+/// v7 append-only fossilization: the transient system tail that rode behind
+/// the user message in the live request (runtime stamp, trusted transport
+/// context, hints, associative memory, meme reminder) is archived verbatim so
+/// history replay stays a byte-exact extension of what the provider already
+/// cached ("注入了就别删"). JSON array of ChatMessage values; '[]' when none.
+fn apply_v12_turn_context_messages(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "context_messages", "TEXT NOT NULL DEFAULT '[]'")
 }
 
 fn add_column_if_missing(

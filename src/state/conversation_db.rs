@@ -67,6 +67,10 @@ pub struct Turn {
     /// Semantic events for a non-completed generation. Completed turns keep
     /// this empty so normal history loading does not materialize large logs.
     pub journal_events: Vec<TurnJournalEvent>,
+    /// Fossilized transient tail (v7 append-only): the system messages that
+    /// followed the user message in the live request, replayed verbatim so the
+    /// provider prefix cache sees a pure extension instead of a divergence.
+    pub context_messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2001,6 +2005,20 @@ impl ConversationDb {
         Ok(())
     }
 
+    /// Stores the fossilized transient tail for a turn (v7 append-only).
+    pub fn set_turn_context_messages(
+        &self,
+        turn_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE turns SET context_messages = ?1 WHERE turn_id = ?2",
+            params![serde_json::to_string(messages)?, turn_id],
+        )?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn complete_turn(
         &self,
@@ -3475,7 +3493,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3495,7 +3513,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3515,7 +3533,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3534,7 +3552,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 AND hidden = 0 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3588,7 +3606,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 AND is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
         )?;
         let turn = stmt
@@ -3621,7 +3639,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns WHERE session_id = ?1 AND is_summary = 0 ORDER BY seq ASC LIMIT ?2",
         )?;
         let mut to_remove: Vec<Turn> = stmt
@@ -3647,7 +3665,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision
+                    token_total, token_usage_estimated, revision, context_messages
              FROM turns
              WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0 AND status != 'running'
              ORDER BY seq ASC LIMIT ?2",
@@ -4773,6 +4791,9 @@ pub fn interrupted_text() -> &'static str {
 fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let tool_reports_json: String = row.get(11)?;
     let tool_reports: Vec<String> = serde_json::from_str(&tool_reports_json).unwrap_or_default();
+    let context_messages_json: String = row.get::<_, Option<String>>(18)?.unwrap_or_default();
+    let context_messages: Vec<ChatMessage> =
+        serde_json::from_str(&context_messages_json).unwrap_or_default();
     Ok(Turn {
         turn_id: row.get(0)?,
         seq: row.get(1)?,
@@ -4796,6 +4817,7 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         token_usage_estimated: row.get::<_, i64>(16)? != 0,
         revision: row.get(17)?,
         journal_events: Vec::new(),
+        context_messages,
     })
 }
 

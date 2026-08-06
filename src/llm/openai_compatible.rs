@@ -1340,6 +1340,80 @@ impl OpenAiCompatibleClient {
             .await
     }
 
+    /// Cache keepalive ping (v7 DeepSeek 高命中策略): re-sends the exact
+    /// prompt prefix of the last live request as a non-streaming
+    /// max_tokens=1 completion so best-effort provider caches keep the deep
+    /// prefix alive between user turns. The messages/tools serialization goes
+    /// through the same path as live chat, so the server-rendered prompt is
+    /// byte-identical (measured: extra body params like max_tokens do not
+    /// affect the provider prefix cache key). Returns the reported usage, or
+    /// None when the selected endpoint speaks a protocol where the ping does
+    /// not apply (Anthropic / OpenAI Responses).
+    pub async fn cache_keepalive(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<Option<Usage>> {
+        let endpoints = self.endpoints.as_ref();
+        let order = ordered_endpoint_indices(endpoints);
+        let index = order.first().copied().unwrap_or(0);
+        let endpoint = endpoints
+            .get(index)
+            .context("no LLM endpoint configured for cache keepalive")?;
+        let client = self.with_endpoint(endpoint);
+        if client.uses_openai_responses() || client.uses_anthropic_messages() {
+            return Ok(None);
+        }
+        client.cache_keepalive_single(messages, tools).await
+    }
+
+    async fn cache_keepalive_single(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<Option<Usage>> {
+        let request_id = gen_llm_request_id();
+        let extra_body = merge_extra_body(
+            sanitize_extra_body(self.provider.extra_body.clone(), CHAT_RESERVED_BODY_KEYS),
+            self.chat_variant_extra_body(),
+        );
+        let messages = prepare_chat_messages_for_provider(&self.provider, messages);
+        let request = ChatRequest {
+            model: self.provider.default_model.clone(),
+            messages,
+            temperature: self.provider.temperature,
+            stream: false,
+            stream_options: None,
+            max_tokens: Some(1),
+            tools: (!tools.is_empty()).then_some(tools),
+            chat_template_kwargs: taotoken_glm_chat_template_kwargs(&self.provider),
+            extra_body,
+        };
+        let url = format!(
+            "{}/chat/completions",
+            self.provider.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .send_chat_completion_request(&url, &request, &request_id, "chat.cache_keepalive")
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("cache keepalive ping failed with HTTP {status}: {body}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| "cache keepalive response was not valid JSON")?;
+        let usage = value
+            .get("usage")
+            .cloned()
+            .and_then(|usage| serde_json::from_value::<Usage>(usage).ok())
+            .map(|mut usage| {
+                usage.normalize_cache_fields();
+                usage
+            });
+        Ok(usage)
+    }
+
     async fn chat_stream_inner<F>(
         &self,
         messages: Vec<ChatMessage>,
@@ -1593,6 +1667,7 @@ impl OpenAiCompatibleClient {
             stream_options: Some(ChatStreamOptions {
                 include_usage: true,
             }),
+            max_tokens: None,
             tools: (!tools.is_empty()).then_some(tools),
             chat_template_kwargs: taotoken_glm_chat_template_kwargs(&self.provider),
             extra_body,
@@ -2637,6 +2712,10 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ChatStreamOptions>,
+    /// Only set by cache-keepalive pings; normal chat leaves the provider
+    /// default in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5299,6 +5378,7 @@ mod tests {
             stream_options: Some(ChatStreamOptions {
                 include_usage: true,
             }),
+            max_tokens: None,
             tools: None,
             chat_template_kwargs: None,
             extra_body: None,
@@ -7618,6 +7698,7 @@ mod tests {
             stream_options: Some(ChatStreamOptions {
                 include_usage: true,
             }),
+            max_tokens: None,
             tools: None,
             chat_template_kwargs: None,
             extra_body: sanitize_extra_body(extra, CHAT_RESERVED_BODY_KEYS),
