@@ -5457,7 +5457,7 @@
     }
     if (asFiniteNumber(tokenTotal) > 0) {
       const token = document.createElement("span");
-      token.textContent = `${tokenEstimated ? "约 " : ""}${formatTokens(tokenTotal)} tokens`;
+      token.textContent = `${tokenEstimated ? "约 " : ""}${formatTokens(tokenTotal)} 词元`;
       meta.appendChild(token);
     }
     if (!activeContext) {
@@ -7410,8 +7410,8 @@
       if (live.meta) {
         const total = effectiveUsageTotal(data?.usage);
         const cached = asFiniteNumber(data?.usage?.cache_read_tokens, 0);
-        const cachedSuffix = cached > 0 ? ` · 缓存 ${formatTokens(cached)}` : "";
-        live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} tokens${cachedSuffix}` : "已完成";
+        const cachedSuffix = cached > 0 ? ` · ${formatTokens(cached)} 缓存命中` : "";
+        live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} 词元${cachedSuffix}` : "已完成";
       }
     } else if (kind === "cancelled") {
       markUnfinishedTools(live);
