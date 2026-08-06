@@ -254,7 +254,7 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
 
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    default_tools::register(&mut registry, true);
+    default_tools::register(&mut registry, config.skills.allow_command_execution);
     apply_patch::register(&mut registry);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
