@@ -926,6 +926,10 @@ pub struct WebArgs {
     #[arg(long, default_value_t = ipc::DEFAULT_WEB_PORT)]
     pub port: u16,
 
+    /// WebUI 监听地址；默认 0.0.0.0（所有网卡），127.0.0.1 仅限本机访问。
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<std::net::IpAddr>,
+
     #[arg(short = 'p', long, num_args = 0, default_missing_value = "")]
     pub password: Option<String>,
 
@@ -1385,7 +1389,7 @@ async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
                     )
                 );
             }
-            for url in ipc::web_access_urls(info.web_port) {
+            for url in daemon_web_access_urls(&info) {
                 println!("Miyu WebUI: {url}");
             }
             return Ok(());
@@ -1400,14 +1404,18 @@ async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
     }
     let launch = web_launch_config(paths, &args)?;
     let info = ipc::ensure_daemon(paths, launch.as_ref()).await?;
-    for url in ipc::web_access_urls(info.web_port) {
+    for url in daemon_web_access_urls(&info) {
         println!("Miyu WebUI: {url}");
     }
     Ok(())
 }
 
 fn web_launch_config(paths: &MiyuPaths, args: &WebArgs) -> Result<Option<ipc::DaemonLaunchConfig>> {
-    if !args.port_explicit && args.password.is_none() && args.password_file.is_none() {
+    if !args.port_explicit
+        && args.bind.is_none()
+        && args.password.is_none()
+        && args.password_file.is_none()
+    {
         return Ok(None);
     }
     let password_file = match args.password.as_deref() {
@@ -1432,7 +1440,15 @@ fn web_launch_config(paths: &MiyuPaths, args: &WebArgs) -> Result<Option<ipc::Da
     Ok(Some(ipc::DaemonLaunchConfig {
         port: args.port,
         password_file,
+        bind: args.bind,
     }))
+}
+
+fn daemon_web_access_urls(info: &ipc::DaemonInfo) -> Vec<String> {
+    let bind = info
+        .web_bind
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    ipc::web_access_urls_for(bind, info.web_port)
 }
 
 async fn run_daemon_command(paths: &MiyuPaths, args: DaemonArgs) -> Result<()> {
@@ -1531,7 +1547,7 @@ async fn print_daemon_status(paths: &MiyuPaths) -> Result<()> {
         info.pid,
     );
     for line in
-        daemon_web_status_lines(t("WebUI:", "WebUI："), &ipc::web_access_urls(info.web_port))
+        daemon_web_status_lines(t("WebUI:", "WebUI："), &daemon_web_access_urls(&info))
     {
         println!("{line}");
     }
@@ -11370,6 +11386,7 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 4100,
+                bind: None,
                 password: None,
                 password_file: None,
                 port_explicit: true,
@@ -11385,6 +11402,7 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 8300,
+                bind: None,
                 password: None,
                 password_file: None,
                 port_explicit: false,
@@ -11431,6 +11449,7 @@ mod repl_input_tests {
         let paths = pop_test_paths(temp.path());
         let args = WebArgs {
             port: 9400,
+            bind: None,
             password: Some("very-secret".to_string()),
             password_file: None,
             port_explicit: false,
@@ -11462,6 +11481,7 @@ mod repl_input_tests {
         let paths = pop_test_paths(temp.path());
         let args = WebArgs {
             port: ipc::DEFAULT_WEB_PORT,
+            bind: None,
             password: None,
             password_file: None,
             port_explicit: false,
@@ -11478,6 +11498,7 @@ mod repl_input_tests {
         std::fs::write(&external, "file-secret\n").unwrap();
         let args = WebArgs {
             port: ipc::DEFAULT_WEB_PORT,
+            bind: None,
             password: None,
             password_file: Some(external.clone()),
             port_explicit: false,

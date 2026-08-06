@@ -31,6 +31,19 @@ pub const BUILD_ID: &str = env!("MIYU_BUILD_ID");
 /// Shared between the daemon (startup banner) and the CLI (`miyu web` /
 /// `--status` output).
 pub fn web_access_urls(port: u16) -> Vec<String> {
+    web_access_urls_for(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+}
+
+/// Access URLs honoring the daemon's actual bind address: a loopback bind
+/// yields only the localhost URL, a concrete interface bind yields only
+/// that address, and an unspecified bind enumerates every local IPv4.
+pub fn web_access_urls_for(bind: std::net::IpAddr, port: u16) -> Vec<String> {
+    if bind.is_loopback() {
+        return vec![format!("http://127.0.0.1:{port}")];
+    }
+    if !bind.is_unspecified() {
+        return vec![format!("http://{bind}:{port}")];
+    }
     let mut addresses = std::collections::BTreeSet::new();
     addresses.insert(std::net::Ipv4Addr::LOCALHOST);
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
@@ -53,6 +66,7 @@ pub struct DaemonInfo {
     pub pid: u32,
     pub web_port: u16,
     pub web_public: bool,
+    pub web_bind: Option<std::net::IpAddr>,
     pub build_id: String,
     pub protocol_version: u16,
 }
@@ -62,6 +76,9 @@ pub struct DaemonLaunchConfig {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_file: Option<PathBuf>,
+    /// WebUI bind address; `None` keeps the historical 0.0.0.0 default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<std::net::IpAddr>,
 }
 
 impl Default for DaemonLaunchConfig {
@@ -69,6 +86,7 @@ impl Default for DaemonLaunchConfig {
         Self {
             port: DEFAULT_WEB_PORT,
             password_file: None,
+            bind: None,
         }
     }
 }
@@ -313,6 +331,8 @@ pub enum Frame {
         web_port: u16,
         #[serde(default)]
         web_public: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        web_bind: Option<std::net::IpAddr>,
         #[serde(default)]
         build_id: String,
     },
@@ -381,11 +401,13 @@ pub async fn daemon_info(paths: &MiyuPaths) -> Option<DaemonInfo> {
             pid,
             web_port,
             web_public,
+            web_bind,
             build_id,
         } => Some(DaemonInfo {
             pid,
             web_port,
             web_public,
+            web_bind,
             build_id,
             protocol_version: PROTOCOL_VERSION,
         }),
@@ -395,6 +417,7 @@ pub async fn daemon_info(paths: &MiyuPaths) -> Option<DaemonInfo> {
                 pid,
                 web_port,
                 web_public,
+                web_bind,
                 build_id,
             } = ping_daemon(&socket, protocol_version).await?
             else {
@@ -404,6 +427,7 @@ pub async fn daemon_info(paths: &MiyuPaths) -> Option<DaemonInfo> {
                 pid,
                 web_port,
                 web_public,
+                web_bind,
                 build_id,
                 protocol_version,
             })
@@ -715,6 +739,8 @@ fn recover_legacy_daemon_launch_from_cmdline(
     Ok(DaemonLaunchConfig {
         port: parsed.port,
         password_file,
+        // Legacy daemons predate --bind, so they were listening on 0.0.0.0.
+        bind: None,
     })
 }
 
@@ -1023,6 +1049,9 @@ fn append_daemon_process_args(command: &mut std::process::Command, launch: &Daem
     if let Some(path) = &launch.password_file {
         command.arg("--password-file").arg(path);
     }
+    if let Some(bind) = &launch.bind {
+        command.arg("--bind").arg(bind.to_string());
+    }
 }
 
 pub async fn send<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
@@ -1067,6 +1096,7 @@ mod tests {
             pid: 42,
             web_port: 4096,
             web_public: false,
+            web_bind: None,
             build_id: "test-build".to_string(),
         })
         .unwrap();
@@ -1125,6 +1155,7 @@ mod tests {
         let supplied = DaemonLaunchConfig {
             port: 9400,
             password_file: Some(PathBuf::from("/private/password")),
+            bind: None,
         };
         let mut overridden = std::process::Command::new("miyu");
         append_daemon_process_args(&mut overridden, &supplied);
@@ -1164,6 +1195,7 @@ mod tests {
         let config = DaemonLaunchConfig {
             port: 9400,
             password_file: Some(password_path.clone()),
+            bind: None,
         };
         save_daemon_launch_config(&paths, &config).unwrap();
 
@@ -1203,6 +1235,7 @@ mod tests {
         let saved = DaemonLaunchConfig {
             port: 9412,
             password_file: Some(password.clone()),
+            bind: None,
         };
         save_daemon_launch_config(&paths, &saved).unwrap();
 
@@ -1229,6 +1262,7 @@ mod tests {
         let saved = DaemonLaunchConfig {
             port: 8300,
             password_file: Some(password.clone()),
+            bind: None,
         };
         save_daemon_launch_config(&paths, &saved).unwrap();
 
@@ -1245,6 +1279,7 @@ mod tests {
         let saved = DaemonLaunchConfig {
             port: 9412,
             password_file: None,
+            bind: None,
         };
         save_daemon_launch_config(&paths, &saved).unwrap();
 
@@ -1262,6 +1297,7 @@ mod tests {
         let old_launch = DaemonLaunchConfig {
             port: 8300,
             password_file: Some(old_password.clone()),
+            bind: None,
         };
         commit_daemon_launch_config(&paths, &old_launch).unwrap();
 
@@ -1269,6 +1305,7 @@ mod tests {
         let failed_launch = DaemonLaunchConfig {
             port: 9400,
             password_file: Some(candidate.clone()),
+            bind: None,
         };
         abandon_daemon_launch_candidate(&paths, &failed_launch);
 
@@ -1287,6 +1324,7 @@ mod tests {
             &DaemonLaunchConfig {
                 port: 8300,
                 password_file: Some(old_password.clone()),
+            bind: None,
             },
         )
         .unwrap();
@@ -1294,6 +1332,7 @@ mod tests {
         let new_launch = DaemonLaunchConfig {
             port: 9400,
             password_file: Some(new_password.clone()),
+            bind: None,
         };
 
         commit_daemon_launch_config(&paths, &new_launch).unwrap();

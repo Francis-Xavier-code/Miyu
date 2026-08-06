@@ -95,6 +95,7 @@ pub(crate) struct DaemonState {
     boot_id: Arc<str>,
     pub(crate) web_port: u16,
     web_public: bool,
+    web_bind: IpAddr,
     pub(crate) paths: MiyuPaths,
     pub(crate) manager: Arc<Mutex<ManagerState>>,
     pub(crate) state_store: StateStore,
@@ -126,6 +127,7 @@ impl DaemonState {
             boot_id: Arc::from("boot-test"),
             web_port,
             web_public: false,
+            web_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             paths,
             manager,
             state_store,
@@ -172,6 +174,7 @@ impl DaemonState {
                 boot_id: Arc::from("boot-test"),
                 web_port,
                 web_public: false,
+            web_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 paths,
                 manager,
                 state_store,
@@ -1748,9 +1751,10 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     }
     let context = cold_context(&config, &state_store)?;
 
-    // Listen on all interfaces so the WebUI is reachable from the LAN;
-    // access URLs for every local address are printed below.
-    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    // Default binds all interfaces so the WebUI is reachable from the LAN;
+    // `--bind 127.0.0.1` restricts it to this machine. Access URLs matching
+    // the effective bind are printed below.
+    let bind_ip = args.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let listener = match tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, args.port)).await {
         Ok(listener) => listener,
         Err(error)
@@ -1771,7 +1775,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port));
+                .with_context(|| format!("binding Miyu WebUI to {bind_ip}:{}", args.port));
         }
     };
     let port = listener.local_addr()?.port();
@@ -1807,7 +1811,8 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         auth: WebAuth::new(password.as_deref()),
         boot_id,
         web_port: port,
-        web_public: true,
+        web_public: !bind_ip.is_loopback(),
+        web_bind: bind_ip,
         paths,
         manager,
         state_store,
@@ -1827,7 +1832,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     let app = router(state.clone());
-    let urls = ipc::web_access_urls(port);
+    let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
         println!("Miyu WebUI: {url}");
     }
@@ -2004,6 +2009,7 @@ async fn handle_ipc_connection(
                     pid: std::process::id(),
                     web_port: state.web_port,
                     web_public: state.web_public,
+                    web_bind: Some(state.web_bind),
                     build_id: ipc::BUILD_ID.to_string(),
                 },
             )
