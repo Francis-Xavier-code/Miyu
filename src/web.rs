@@ -1729,6 +1729,11 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let password = resolve_web_password(&args)?;
     AppConfig::init_files(&paths)?;
     let config = AppConfig::load_or_default(&paths)?;
+    tools::jobs::init(
+        &paths,
+        config.tools.background_job_limit,
+        config.tools.background_job_max_minutes,
+    );
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
     let persona = config.active_persona_scope();
@@ -1831,6 +1836,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         .await?
         .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
+    install_background_job_hook(&state);
     let app = router(state.clone());
     let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
@@ -1852,6 +1858,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         }
     };
     let _ = actor_tx.send(ActorCommand::Shutdown);
+    tools::jobs::shutdown_all();
     state.platforms.qq_listener.shutdown(&state).await;
     ipc_task.abort();
     let _ = ipc_task.await;
@@ -6984,6 +6991,206 @@ fn clear_actor_session_content(
         manager.lock().unwrap().context = context;
     }
     Ok(())
+}
+
+/// Background-job completions wake the model so it can follow up on the
+/// result autonomously. Local sessions get a real turn (or a queued
+/// followup when the session is mid-turn); platform-bound sessions get a
+/// plain-text broadcast into the conversation — a self-initiated platform
+/// turn would need synthetic sender semantics the plugins aren't built for.
+fn install_background_job_hook(state: &DaemonState) {
+    let hook_state = state.clone();
+    tools::jobs::set_completion_hook(Arc::new(move |completion| {
+        let state = hook_state.clone();
+        tokio::spawn(async move {
+            handle_job_completion(state, completion).await;
+        });
+    }));
+}
+
+async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobCompletion) {
+    let Some(session_id) = completion.session_id.clone() else {
+        return;
+    };
+    let command_short = completion.command.chars().take(120).collect::<String>();
+    match state.state_store.is_platform_session(&session_id) {
+        Ok(true) => {
+            broadcast_job_completion_to_platform(&state, &session_id, &completion).await;
+        }
+        Ok(false) => {
+            wake_local_session_for_job(&state, session_id, &completion, &command_short);
+        }
+        Err(error) => {
+            tracing::warn!(
+                job_id = %completion.job_id,
+                error = %error,
+                "failed to resolve the session of a finished background job"
+            );
+        }
+    }
+}
+
+fn wake_local_session_for_job(
+    state: &DaemonState,
+    session_id: Arc<str>,
+    completion: &tools::jobs::JobCompletion,
+    command_short: &str,
+) {
+    let content = format!(
+        "<background-job-report>后台任务已结束，请自主跟进：\n\
+         - job_id: {}\n- 命令: {}\n- 状态: {}（运行 {} 秒）\n\
+         先用 job_status 读取输出（必要时用 offset 分页），然后向用户简要汇报结果；\
+         如果任务失败，指出原因并给出建议。这是系统自动触发的跟进，不是用户消息。\
+         </background-job-report>",
+        completion.job_id, command_short, completion.state_label, completion.runtime_seconds
+    );
+    let display_content = format!(
+        "[后台任务完成] {} · {command_short}",
+        completion.state_label
+    );
+
+    // Mid-turn session: ride the queue so the model reacts within the
+    // running reply instead of colliding with it.
+    let queued = {
+        let manager = state.manager.lock().unwrap();
+        manager
+            .active_runs
+            .iter()
+            .find(|(_, info)| &*info.session_id == &*session_id)
+            .map(|(run_id, info)| {
+                (
+                    run_id.clone(),
+                    info.queue_target.clone(),
+                    info.audience,
+                )
+            })
+    };
+    if let Some((run_id, queue_target, audience)) = queued {
+        let Some(target) = queue_target else {
+            // Turn is still starting; report on the next completion poll
+            // rather than racing its queue setup.
+            tracing::debug!(job_id = %completion.job_id, "job wake skipped: turn starting");
+            return;
+        };
+        let request = TurnUpdateRequest {
+            run_id,
+            turn_id: target.turn_id,
+            session_id: Some(session_id.clone()),
+            audience,
+            content,
+            display_content,
+            attachments: Vec::new(),
+            uploaded_attachment_ids: Vec::new(),
+            mode: TurnUpdateMode::Followup,
+        };
+        if let Err(error) = enqueue_turn_update(state, request) {
+            tracing::debug!(
+                job_id = %completion.job_id,
+                error = %error,
+                "job wake could not join the running turn"
+            );
+        }
+        return;
+    }
+
+    let run_id = random_id("run", 18);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut manager = state.manager.lock().unwrap();
+        if manager.admin_busy {
+            tracing::debug!(job_id = %completion.job_id, "job wake skipped: admin busy");
+            return;
+        }
+        manager.active_runs.insert(
+            run_id.clone(),
+            RunInfo {
+                session_id: session_id.clone(),
+                mode: AgentMode::Normal,
+                audience: PromptAudience::Owner,
+                cancel: cancel_tx,
+                turn_id: None,
+                queue_target: None,
+                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
+                platform_followup: None,
+                operation: RunOperation::Create,
+            },
+        );
+    }
+    if state
+        .actor_tx
+        .send(ActorCommand::StartTurn {
+            run_id: run_id.clone(),
+            session_id,
+            content,
+            display_content,
+            attachment_run_id: None,
+            mode: AgentMode::Normal,
+            images: Vec::new(),
+            cwd: Some(completion.workspace.clone()),
+            audience: PromptAudience::Owner,
+            profile: None,
+            cancel: cancel_rx,
+        })
+        .is_err()
+    {
+        finish_run(&state.manager, &run_id, None);
+    }
+}
+
+async fn broadcast_job_completion_to_platform(
+    state: &DaemonState,
+    session_id: &Arc<str>,
+    completion: &tools::jobs::JobCompletion,
+) {
+    let persona = state
+        .manager
+        .lock()
+        .unwrap()
+        .config
+        .active_persona_scope();
+    let binding = state
+        .state_store
+        .platform_session_bindings(&persona, "onebot")
+        .ok()
+        .and_then(|bindings| {
+            bindings
+                .into_iter()
+                .find(|binding| binding.session_id == **session_id)
+        });
+    let Some(binding) = binding else {
+        tracing::debug!(job_id = %completion.job_id, "job broadcast skipped: no platform binding");
+        return;
+    };
+    let log_tail = std::fs::read(&completion.log_path)
+        .ok()
+        .map(|bytes| {
+            let start = bytes.len().saturating_sub(500);
+            String::from_utf8_lossy(&bytes[start..]).into_owned()
+        })
+        .unwrap_or_default();
+    let text = format!(
+        "[后台任务] {} 已结束（{}，{} 秒）\n命令：{}\n输出尾部：\n{}",
+        completion.job_id,
+        completion.state_label,
+        completion.runtime_seconds,
+        completion.command.chars().take(200).collect::<String>(),
+        log_tail.trim()
+    );
+    if let Err(error) = crate::platforms::onebot::send_plain_text(
+        state,
+        &binding.key.account_id,
+        &binding.key.conversation_kind,
+        &binding.key.conversation_id,
+        &text,
+    )
+    .await
+    {
+        tracing::warn!(
+            job_id = %completion.job_id,
+            error = %error,
+            "failed to broadcast a background job result to QQ"
+        );
+    }
 }
 
 /// An explicit cancel withdraws the follow-ups still queued behind the

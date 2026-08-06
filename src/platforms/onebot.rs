@@ -641,6 +641,39 @@ fn api_frame(action: &str, params: Value, echo: &str) -> String {
 // WebSocket endpoint
 // ---------------------------------------------------------------------------
 
+/// Daemon-initiated plain-text delivery into a bound QQ conversation,
+/// bypassing turn and plugin machinery entirely. Used for background-job
+/// completion broadcasts, where a synthetic model turn would need sender
+/// semantics the plugins are not built for.
+pub(crate) async fn send_plain_text(
+    state: &DaemonState,
+    account_id: &str,
+    conversation_kind: &str,
+    conversation_id: &str,
+    text: &str,
+) -> Result<()> {
+    let self_id: i64 = account_id
+        .parse()
+        .context("invalid QQ account id for a plain-text send")?;
+    let handle = state
+        .platforms
+        .onebot
+        .lock()
+        .unwrap()
+        .handle(self_id)
+        .context("the QQ account is not connected")?;
+    let target_id: i64 = conversation_id
+        .parse()
+        .context("invalid QQ conversation id for a plain-text send")?;
+    let message = json!([{ "type": "text", "data": { "text": text } }]);
+    let (action, params) = match conversation_kind {
+        "group" => ("send_group_msg", json!({ "group_id": target_id, "message": message })),
+        "private" => ("send_private_msg", json!({ "user_id": target_id, "message": message })),
+        other => bail!("unsupported QQ conversation kind: {other}"),
+    };
+    handle.call_api(action, params).await.map(|_| ())
+}
+
 pub(crate) async fn onebot_ws(
     State(state): State<DaemonState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

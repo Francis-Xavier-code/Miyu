@@ -19,6 +19,7 @@ mod hash_codec;
 mod html_conversion;
 mod http_response;
 mod image_generation;
+pub mod jobs;
 mod kitty_image;
 pub mod knowledge_base;
 mod linux_game;
@@ -271,6 +272,7 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     default_tools::register(&mut registry, true);
+    jobs::register_management(&mut registry);
     apply_patch::register(&mut registry);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
@@ -418,6 +420,7 @@ pub(crate) fn rescope_platform_memory_tools(
 pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     default_tools::register_readonly(&mut registry);
+    jobs::register_status(&mut registry);
     clipboard::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
     fcitx_wiki::register(&mut registry);

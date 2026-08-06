@@ -21,8 +21,8 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     register_readonly(registry);
     registry.register(ToolSpec::new_with_progress(
         "run_command",
-        t("Run a shell command in the workspace when skills.allow_command_execution is enabled.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds.", "可选超时时间，单位秒。")}},"required":["command"],"additionalProperties":false}),
+        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
+        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background job and return a job_id immediately.", "作为后台任务分离运行，立即返回 job_id。")}},"required":["command"],"additionalProperties":false}),
         move |args, progress| async move {
             run_command(args, allow_command_execution, progress).await
         },
@@ -462,6 +462,13 @@ async fn run_command(args: Value, allowed: bool, progress: ToolProgress) -> Resu
         bail!("{}", t("command execution is disabled; set skills.allow_command_execution=true in config.jsonc to enable run_command", "命令执行已禁用；请在 config.jsonc 中设置 skills.allow_command_execution=true 以启用 run_command"));
     }
     let command = required(&args, "command")?;
+    if args
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return super::jobs::spawn_background(&command).await;
+    }
     let timeout = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)

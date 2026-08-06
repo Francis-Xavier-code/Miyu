@@ -2511,6 +2511,20 @@ pub struct ToolsConfig {
     /// How many `task` subagents from one tool batch may run concurrently.
     #[serde(default = "default_subagent_concurrency")]
     pub subagent_concurrency: usize,
+    /// Concurrent background jobs (run_command background=true) per process.
+    #[serde(default = "default_background_job_limit")]
+    pub background_job_limit: usize,
+    /// Background jobs are terminated after this many minutes.
+    #[serde(default = "default_background_job_max_minutes")]
+    pub background_job_max_minutes: u64,
+}
+
+fn default_background_job_limit() -> usize {
+    8
+}
+
+fn default_background_job_max_minutes() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3306,6 +3320,8 @@ impl Default for ToolsConfig {
             loading_mode: default_tools_loading_mode(),
             persist_loaded_tools: default_true(),
             subagent_concurrency: default_subagent_concurrency(),
+            background_job_limit: default_background_job_limit(),
+            background_job_max_minutes: default_background_job_max_minutes(),
         }
     }
 }

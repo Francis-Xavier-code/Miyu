@@ -6999,6 +6999,11 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     let _cursor_restore = ReplCursorRestore;
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
+    tools::jobs::init(
+        paths,
+        config.tools.background_job_limit,
+        config.tools.background_job_max_minutes,
+    );
     let state = StateStore::new(paths)?;
     state.init_files()?;
     apply_session_model_override(&state, &mut config);
@@ -7486,6 +7491,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
     }
     state.discard_queued_prompts()?;
+    // Background jobs are children of this REPL process; never leave them
+    // running once the host is gone.
+    tools::jobs::shutdown_all();
     Ok(())
 }
 
