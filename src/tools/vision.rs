@@ -169,7 +169,7 @@ fn register_scoped(
         if allow_general_access {
             " 本轮历史图片 ID（context_image_N）会按需获取；也可继续使用普通本地路径或 URL。"
         } else {
-            " 仅可分析当前消息、引用消息中的本轮路径，或此前群聊记录里明确列出的 context_image_N；不得使用其他路径或 URL。"
+            " 仅可分析当前消息、引用消息中的本轮路径，此前群聊记录里明确列出的 context_image_N，或群查询工具返回的 avatar_url 头像链接；不得使用其他路径或 URL。"
         },
     );
 }
@@ -380,6 +380,12 @@ async fn analyze_scoped_image(
         return analyze_image(args, config, paths).await;
     }
     if image.starts_with("http://") || image.starts_with("https://") {
+        // QQ avatar URLs are built by our own tools from numeric IDs
+        // (fixed host, digits-only parameters), so admitting them opens
+        // no injection or exfiltration surface.
+        if crate::platforms::avatar::is_trusted_avatar_url(image) {
+            return analyze_image(args, config, paths).await;
+        }
         bail!("only images attached to the current platform turn are allowed")
     }
     let image = expand_path(image)
