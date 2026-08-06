@@ -3,9 +3,62 @@ use crate::i18n::is_zh;
 use crate::llm::{
     ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind, OpenAiCompatibleClient, Usage,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Checkpoint of an interrupted subagent run: the full live message history
+/// (including every completed tool round) plus the consumed step budget, so a
+/// follow-up `task` call with `resume_id` continues instead of starting over.
+/// Process-local by design — a daemon restart clears them.
+struct SubagentCheckpoint {
+    messages: Vec<ChatMessage>,
+    steps: usize,
+    created: Instant,
+}
+
+const CHECKPOINT_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+const CHECKPOINT_CAP: usize = 32;
+const STREAM_ATTEMPTS: usize = 3;
+
+fn checkpoints() -> &'static Mutex<HashMap<String, SubagentCheckpoint>> {
+    static STORE: OnceLock<Mutex<HashMap<String, SubagentCheckpoint>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_checkpoint(messages: Vec<ChatMessage>, steps: usize) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = format!("subagent-ckpt-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let mut store = checkpoints().lock().unwrap();
+    store.retain(|_, ckpt| ckpt.created.elapsed() < CHECKPOINT_TTL);
+    if store.len() >= CHECKPOINT_CAP {
+        let oldest = store
+            .iter()
+            .min_by_key(|(_, ckpt)| ckpt.created)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            store.remove(&oldest);
+        }
+    }
+    store.insert(
+        id.clone(),
+        SubagentCheckpoint {
+            messages,
+            steps,
+            created: Instant::now(),
+        },
+    );
+    id
+}
+
+fn take_checkpoint(id: &str) -> Option<(Vec<ChatMessage>, usize)> {
+    let mut store = checkpoints().lock().unwrap();
+    store.retain(|_, ckpt| ckpt.created.elapsed() < CHECKPOINT_TTL);
+    store.remove(id).map(|ckpt| (ckpt.messages, ckpt.steps))
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ProgressMode {
@@ -275,14 +328,43 @@ impl SubagentRunner {
     }
 
     pub async fn run(&self, prompt: &str) -> Result<(ChatResult, SubagentStats)> {
+        self.run_with_resume(prompt, None).await
+    }
+
+    pub async fn run_with_resume(
+        &self,
+        prompt: &str,
+        resume_id: Option<&str>,
+    ) -> Result<(ChatResult, SubagentStats)> {
         let mut stats = SubagentStats::default();
-        let messages = vec![
-            ChatMessage::system(self.system_prompt.clone()),
-            ChatMessage::plain("user", prompt.to_string()),
-        ];
+        let (messages, initial_steps) = match resume_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => match take_checkpoint(id) {
+                Some((mut messages, steps)) => {
+                    messages.push(ChatMessage::plain(
+                        "user",
+                        if is_zh() {
+                            "上次连接在此处中断。已完成的工具结果都保留在上文中；请从中断处继续完成原任务，不要重复已经完成的步骤。"
+                        } else {
+                            "The previous connection dropped here. All completed tool results are preserved above; continue the original task from where it stopped without repeating finished steps."
+                        },
+                    ));
+                    (messages, steps)
+                }
+                None => bail!(
+                    "resume_id '{id}' not found or expired (checkpoints are process-local and cleared on restart); re-issue the task without resume_id"
+                ),
+            },
+            None => (
+                vec![
+                    ChatMessage::system(self.system_prompt.clone()),
+                    ChatMessage::plain("user", prompt.to_string()),
+                ],
+                0,
+            ),
+        };
 
         let result = self
-            .chat_with_tools(messages, &mut stats, Instant::now())
+            .chat_with_tools(messages, &mut stats, initial_steps)
             .await?;
 
         stats.add_usage_or_estimate(
@@ -312,38 +394,33 @@ impl SubagentRunner {
         self.progress.phase(format!("__subagent_stats__{text}"));
     }
 
-    async fn chat_with_tools(
+    /// chat_stream with bounded retries: a mid-stream disconnect re-sends the
+    /// same request (cheap thanks to provider prefix caching) instead of
+    /// killing the whole subagent run.
+    async fn chat_stream_with_retry(
         &self,
-        mut messages: Vec<ChatMessage>,
-        stats: &mut SubagentStats,
-        _start: Instant,
+        messages: &[ChatMessage],
+        definitions: &[crate::llm::ToolDefinition],
+        steps: usize,
     ) -> Result<ChatResult> {
-        let excluded: Vec<&str> = self.excluded_tools.iter().map(String::as_str).collect();
-        let definitions = self.tools.definitions_except(&excluded);
-        let mut steps = 0usize;
-
-        loop {
-            if self.max_steps > 0 && steps >= self.max_steps {
-                stats.budget_reached = true;
-                messages.push(ChatMessage::plain("user", finalization_prompt()));
-                let result = self
-                    .client
-                    .chat_stream(messages, Vec::new(), |chunk: ChatStreamChunk| {
-                        if chunk.kind == ChatStreamKind::Reasoning {
-                            self.progress.reasoning(&chunk.text);
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                stats.add_usage_or_estimate(result.usage.as_ref(), &[&result.content]);
-                return Ok(result);
+        let mut last_err = None;
+        for attempt in 0..STREAM_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                self.progress.phase(format!(
+                    "__subagent_stats__{}",
+                    if is_zh() {
+                        format!("连接中断，重试第 {attempt} 次…")
+                    } else {
+                        format!("stream dropped, retry {attempt}…")
+                    }
+                ));
             }
-
-            let result = self
+            match self
                 .client
                 .chat_stream(
-                    messages.clone(),
-                    definitions.clone(),
+                    messages.to_vec(),
+                    definitions.to_vec(),
                     |chunk: ChatStreamChunk| {
                         if chunk.kind == ChatStreamKind::Reasoning {
                             self.progress.reasoning(&chunk.text);
@@ -351,6 +428,42 @@ impl SubagentRunner {
                         Ok(())
                     },
                 )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        let err = last_err.expect("at least one attempt");
+        // All retries failed: freeze the live history so the model can resume
+        // this subagent instead of restarting it from scratch.
+        let resume_id = store_checkpoint(messages.to_vec(), steps);
+        bail!(
+            "subagent stream failed after {STREAM_ATTEMPTS} attempts: {err}; resume_id=\"{resume_id}\" — call the task tool again with this resume_id to continue from the last completed tool round (process-local; lost on restart)"
+        );
+    }
+
+    async fn chat_with_tools(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        stats: &mut SubagentStats,
+        initial_steps: usize,
+    ) -> Result<ChatResult> {
+        let excluded: Vec<&str> = self.excluded_tools.iter().map(String::as_str).collect();
+        let definitions = self.tools.definitions_except(&excluded);
+        let mut steps = initial_steps;
+
+        loop {
+            if self.max_steps > 0 && steps >= self.max_steps {
+                stats.budget_reached = true;
+                messages.push(ChatMessage::plain("user", finalization_prompt()));
+                let result = self.chat_stream_with_retry(&messages, &[], steps).await?;
+                stats.add_usage_or_estimate(result.usage.as_ref(), &[&result.content]);
+                return Ok(result);
+            }
+
+            let result = self
+                .chat_stream_with_retry(&messages, &definitions, steps)
                 .await?;
             stats.add_usage_or_estimate(result.usage.as_ref(), &[]);
 

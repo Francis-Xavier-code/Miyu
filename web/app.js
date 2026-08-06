@@ -7393,7 +7393,9 @@
       if (live.headerStatus) live.headerStatus.textContent = "刚刚";
       if (live.meta) {
         const total = effectiveUsageTotal(data?.usage);
-        live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} tokens` : "已完成";
+        const cached = asFiniteNumber(data?.usage?.cache_read_tokens, 0);
+        const cachedSuffix = cached > 0 ? ` · 缓存 ${formatTokens(cached)}` : "";
+        live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} tokens${cachedSuffix}` : "已完成";
       }
     } else if (kind === "cancelled") {
       markUnfinishedTools(live);
@@ -7411,8 +7413,9 @@
 
     updateLocalTurnFromLive(live, kind, data);
     stashLiveArticle(live, "final");
-    if (kind === "completed") {
+    if (kind === "completed" || kind === "cancelled") {
       // 上下文条展示全局（默认会话）上下文；其他会话的 run 不覆盖它。
+      // cancelled 也要刷新：被中断的轮次已经持久化进上下文。
       const updatesGlobalContext = !data?.session_id || String(data.session_id) === String(state.currentSessionId || "");
       if (updatesGlobalContext) {
         if (data?.context_tokens != null) state.context.tokens = Math.max(0, asFiniteNumber(data.context_tokens));
@@ -7426,6 +7429,8 @@
         state.usage.prompt_tokens = asFiniteNumber(state.usage.prompt_tokens) + asFiniteNumber(usage.prompt_tokens);
         state.usage.completion_tokens = asFiniteNumber(state.usage.completion_tokens) + asFiniteNumber(usage.completion_tokens);
         state.usage.total_tokens = asFiniteNumber(state.usage.total_tokens) + effectiveUsageTotal(usage);
+        state.usage.cache_read_tokens = asFiniteNumber(state.usage.cache_read_tokens) + asFiniteNumber(usage.cache_read_tokens, 0);
+        state.usage.cache_write_tokens = asFiniteNumber(state.usage.cache_write_tokens) + asFiniteNumber(usage.cache_write_tokens, 0);
       }
     }
     state.liveRuns.delete(runId);

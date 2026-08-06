@@ -352,7 +352,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.mcp.enabled {
         mcp::register(&mut registry, config.clone());
     }
-    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+    if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
     registry
@@ -461,7 +461,7 @@ pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry 
     if config.memory_config().enabled {
         memory::register_readonly(&mut registry, config.clone(), paths.clone());
     }
-    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+    if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
     if config.mcp.enabled {
@@ -472,6 +472,20 @@ pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry 
 
 pub fn is_hybrid_loading_mode(mode: &str) -> bool {
     matches!(mode.trim(), "hybrid" | "lazy")
+}
+
+/// Stub loading mode (v7 §八点七): every lazy tool stays registered as a
+/// permanently visible stub (real name + one-line summary + permissive
+/// parameter shell), so the provider-visible tools array is byte-constant for
+/// the whole session; full contracts are fetched on demand through
+/// `load_tools` as a tool result that rides the conversation tail.
+pub fn is_stub_loading_mode(mode: &str) -> bool {
+    mode.trim() == "stub"
+}
+
+/// Modes that need the `load_tools` catalog tool registered.
+pub fn uses_load_tools(mode: &str) -> bool {
+    is_hybrid_loading_mode(mode) || is_stub_loading_mode(mode)
 }
 
 pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
@@ -489,7 +503,7 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.api_quota.enabled {
         api_quota::register(&mut registry, config.plugins.api_quota.clone());
     }
-    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+    if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
     registry
@@ -516,7 +530,7 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
     }
-    if is_hybrid_loading_mode(&config.tools.loading_mode) {
+    if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
     }
     registry

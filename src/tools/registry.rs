@@ -376,14 +376,67 @@ impl ToolRegistry {
             .map(|tool| {
                 let mut definition = tool.definition();
                 if tool.name == "load_tools" {
+                    // v7 Phase 1.3-b: the catalog always lists the full target
+                    // set instead of subtracting `loaded`, so the description
+                    // stays byte-stable across lazy loads within a session and
+                    // the tools array prefix keeps hitting the provider cache.
+                    // Re-loading an already-loaded target is tolerated by
+                    // expand_load_targets with a clear notice.
                     definition.function.description =
-                        super::load_tools::dynamic_description(self, loaded);
+                        super::load_tools::dynamic_description(self, &BTreeSet::new());
                 }
                 definition
             })
             .collect::<Vec<_>>();
         definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         definitions
+    }
+
+    /// Stub loading mode (v7 §八点七): the provider-visible tools array stays
+    /// byte-constant for the whole session. always_loaded tools ship their
+    /// full contract; every lazy tool ships a stub — real name, one-line
+    /// summary, permissive parameter shell — and the full contract is fetched
+    /// on demand through `load_tools`, whose result rides the conversation
+    /// tail without touching the cached prefix.
+    pub fn stub_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = self
+            .tools
+            .values()
+            .map(|tool| {
+                if tool.always_loaded {
+                    let mut definition = tool.definition();
+                    if tool.name == "load_tools" {
+                        definition.function.description =
+                            super::load_tools::stub_mode_description(self);
+                    }
+                    definition
+                } else {
+                    stub_definition(tool)
+                }
+            })
+            .collect::<Vec<_>>();
+        definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        definitions
+    }
+
+    /// Full contracts (name + complete description + JSON Schema) for the
+    /// given tool names; unknown names are silently skipped (the caller
+    /// reports them through `skipped`).
+    pub(super) fn tool_contracts(&self, names: &[String]) -> Vec<serde_json::Value> {
+        let mut seen = BTreeSet::new();
+        names
+            .iter()
+            .filter(|name| seen.insert((*name).clone()))
+            .filter_map(|name| self.tools.get(name))
+            .map(|tool| {
+                let definition = tool.definition();
+                serde_json::json!({
+                    "name": definition.function.name,
+                    "description": definition.function.description,
+                    "parameters": definition.function.parameters,
+                })
+            })
+            .collect()
     }
 
     pub fn requires_lazy_load(&self, name: &str, loaded: &BTreeSet<String>) -> bool {
@@ -401,11 +454,16 @@ impl ToolRegistry {
     }
 
     pub fn definitions_except(&self, excluded: &[&str]) -> Vec<ToolDefinition> {
-        self.tools
+        let mut definitions = self
+            .tools
             .values()
             .filter(|tool| !excluded.iter().any(|name| *name == tool.name))
             .map(|tool| tool.definition())
-            .collect()
+            .collect::<Vec<_>>();
+        // Deterministic order: HashMap iteration order would reshuffle the
+        // subagent tools array between calls and defeat provider prefix caches.
+        definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        definitions
     }
 
     pub fn permission(&self, name: &str) -> Result<ToolPermission> {
@@ -649,8 +707,52 @@ fn load_target_tool_xml(tool: &ToolSpec) -> String {
     format!(
         "  <target>\n    <name>{}</name>\n    <type>{kind}</type>\n    <summary>{}</summary>\n  </target>",
         xml_escape(&tool.name),
-        xml_escape(&tool.description),
+        xml_escape(&load_target_summary(&tool.description)),
     )
+}
+
+fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
+    let summary = load_target_summary(&tool.description);
+    let description = if summary.is_empty() {
+        "（精简条目）先调用 load_tools 获取本工具的完整参数契约，再按契约直接填写参数调用本工具。".to_string()
+    } else {
+        format!(
+            "{summary}（精简条目：先调用 load_tools 获取完整参数契约，再按契约直接填写参数调用本工具。）"
+        )
+    };
+    ToolDefinition {
+        kind: "function",
+        function: crate::llm::FunctionDefinition {
+            name: tool.name.clone(),
+            description,
+            // Permissive shell: real parameters go at the top level exactly as
+            // in a normal call, so execution needs no unwrapping; the actual
+            // contract arrives via the load_tools result.
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }),
+        },
+    }
+}
+
+/// Catalog entries carry a bounded one-line summary instead of the full tool
+/// description. This keeps the loader catalog small and byte-stable: without
+/// the bound, `load_skill`'s description (which embeds the whole skills
+/// catalog) was nested wholesale into the loader XML and re-rendered on every
+/// skills rescan.
+fn load_target_summary(description: &str) -> String {
+    let first_line = description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut summary: String = first_line.chars().take(200).collect();
+    if first_line.chars().count() > 200 {
+        summary.push('…');
+    }
+    summary
 }
 
 fn xml_escape(text: &str) -> String {

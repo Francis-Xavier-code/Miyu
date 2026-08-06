@@ -1584,6 +1584,7 @@ impl OpenAiCompatibleClient {
             sanitize_extra_body(self.provider.extra_body.clone(), CHAT_RESERVED_BODY_KEYS),
             self.chat_variant_extra_body(),
         );
+        let messages = prepare_chat_messages_for_provider(&self.provider, messages);
         let mut request = ChatRequest {
             model: self.provider.default_model.clone(),
             messages,
@@ -2010,7 +2011,9 @@ impl OpenAiCompatibleClient {
             "{}",
             t("Chat completions stream reached EOF", "聊天补全流已到达 EOF")
         );
-        let result = finalize_stream_result(content, reasoning, usage, tool_calls.finish(), dsml)?;
+        let mut result =
+            finalize_stream_result(content, reasoning, usage, tool_calls.finish(), dsml)?;
+        result.finish_reason = finish_reason;
         if reasoning_part_active {
             on_chunk(ChatStreamChunk {
                 kind: ChatStreamKind::ReasoningPartEnd,
@@ -2117,13 +2120,15 @@ impl OpenAiCompatibleClient {
                 "非流式聊天补全响应已处理"
             )
         );
-        finalize_stream_result(
+        let mut result = finalize_stream_result(
             content,
             reasoning,
             response.usage,
             tool_calls.finish(),
             dsml_enabled_for(&self.provider),
-        )
+        )?;
+        result.finish_reason = choice.finish_reason;
+        Ok(result)
     }
 
     fn bail_chat_completion_failure<T>(&self, status: u16, body: &str) -> Result<T> {
@@ -2158,6 +2163,27 @@ impl OpenAiCompatibleClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            let sent_thinking_blocks = messages.iter().any(|message| {
+                message.thinking_signature.is_some()
+                    && message
+                        .reasoning_content
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty())
+            });
+            if sent_thinking_blocks && anthropic_thinking_unsupported(status.as_u16(), &body) {
+                // The request already carried well-formed thinking blocks, so a
+                // thinking-shaped 400 here is a protocol bug on our side, not a
+                // capability gap. Surface it instead of silently downgrading the
+                // whole tool loop (double request per round + split cache).
+                return Err(anyhow::anyhow!(
+                    "{} ({status}): {body}",
+                    t(
+                        "anthropic messages stream rejected replayed thinking blocks",
+                        "Anthropic Messages 拒绝了回传的 thinking 块"
+                    )
+                )
+                .context(HttpStatusFailure::classify(status.as_u16(), &body)));
+            }
             if anthropic_thinking_unsupported(status.as_u16(), &body) {
                 response = self
                     .send_anthropic_request(
@@ -2254,13 +2280,16 @@ impl OpenAiCompatibleClient {
         {
             for data in buffer.push(&chunk)? {
                 if handle_anthropic_sse_data(&data, &mut state, &mut *on_chunk)? {
-                    return finalize_stream_result(
+                    let signature = state.thinking_signature.take();
+                    let mut result = finalize_stream_result(
                         state.content,
                         state.reasoning,
                         state.usage,
                         state.tool_calls.finish(),
                         dsml,
-                    );
+                    )?;
+                    result.thinking_signature = signature;
+                    return Ok(result);
                 }
             }
         }
@@ -2282,13 +2311,15 @@ impl OpenAiCompatibleClient {
             true,
         )?;
         let reasoning_part_active = state.reasoning_part_active;
-        let result = finalize_stream_result(
+        let signature = state.thinking_signature.take();
+        let mut result = finalize_stream_result(
             state.content,
             state.reasoning,
             state.usage,
             state.tool_calls.finish(),
             dsml,
         )?;
+        result.thinking_signature = signature;
         if reasoning_part_active {
             on_chunk(ChatStreamChunk {
                 kind: ChatStreamKind::ReasoningPartEnd,
@@ -2698,6 +2729,10 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: String,
     },
+    /// Extended-thinking block replayed on assistant tool_use turns. Anthropic
+    /// 400s a thinking-enabled tool loop whose assistant turns omit the block.
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -2719,6 +2754,36 @@ struct AnthropicTool {
 #[derive(Debug, Clone, Serialize)]
 struct ChatTemplateKwargs {
     enable_thinking: bool,
+}
+
+/// DeepSeek thinking mode 400s an assistant tool_calls turn whose
+/// `reasoning_content` KEY is absent from the request JSON, while many other
+/// OpenAI-compatible gateways reject the unknown field outright. Send the key
+/// only to providers known to understand it and strip it everywhere else, so
+/// the transport copy stays byte-identical to the pre-A17 shape on unrelated
+/// endpoints (prompt-cache prefix preserved).
+fn provider_accepts_reasoning_content(provider: &ProviderConfig) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        provider.id.to_ascii_lowercase(),
+        provider.base_url.to_ascii_lowercase(),
+        provider.default_model.to_ascii_lowercase()
+    );
+    ["deepseek", "glm-", "zhipu", "bigmodel", "kimi", "moonshot"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+}
+
+fn prepare_chat_messages_for_provider(
+    provider: &ProviderConfig,
+    mut messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    if !provider_accepts_reasoning_content(provider) {
+        for message in &mut messages {
+            message.reasoning_content = None;
+        }
+    }
+    messages
 }
 
 fn taotoken_glm_chat_template_kwargs(provider: &ProviderConfig) -> Option<ChatTemplateKwargs> {
@@ -2905,6 +2970,23 @@ fn lower_anthropic_image_url(url: &str) -> Option<AnthropicContentBlock> {
 
 fn lower_anthropic_assistant_content(message: ChatMessage) -> Vec<AnthropicContentBlock> {
     let mut content = Vec::new();
+    let has_tool_calls = message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if has_tool_calls {
+        if let (Some(signature), Some(thinking)) = (
+            message.thinking_signature.as_ref(),
+            message.reasoning_content.as_ref(),
+        ) {
+            if !thinking.trim().is_empty() && !signature.trim().is_empty() {
+                content.push(AnthropicContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                });
+            }
+        }
+    }
     let text = chat_content_text(message.content);
     if !text.trim().is_empty() {
         content.push(AnthropicContentBlock::Text { text });
@@ -3191,7 +3273,17 @@ struct ResponsesUsage {
     #[serde(default)]
     total_tokens: u64,
     #[serde(default)]
+    input_tokens_details: Option<ResponsesInputTokenDetails>,
+    #[serde(default)]
     output_tokens_details: Option<ResponsesOutputTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3258,6 +3350,10 @@ struct AnthropicUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3535,7 +3631,21 @@ impl ToolCallAccumulator {
             call.kind = kind;
         }
         if let Some(name) = delta.function.name {
-            append_bounded(&mut call.name, &name, 16 * 1024);
+            // Some gateways resend the complete function name on every delta
+            // instead of streaming fragments; blind appending would build
+            // "use_tooluse_tool…". Treat an exact repeat (or a full-name replay
+            // that extends the current prefix) as a replacement, and only
+            // append genuine fragments.
+            if call.name.is_empty() {
+                append_bounded(&mut call.name, &name, 16 * 1024);
+            } else if name == call.name {
+                // full-name replay, ignore
+            } else if name.starts_with(&call.name) {
+                call.name.clear();
+                append_bounded(&mut call.name, &name, 16 * 1024);
+            } else {
+                append_bounded(&mut call.name, &name, 16 * 1024);
+            }
         }
         if let Some(arguments) = delta.function.arguments {
             append_bounded(
@@ -4154,10 +4264,23 @@ where
                         .input_tokens
                         .saturating_add(next_usage.output_tokens)
                 };
+                let input_details = next_usage.input_tokens_details.as_ref();
+                let cache_read = input_details.and_then(|details| details.cached_tokens);
+                let cache_write = input_details.and_then(|details| details.cache_write_tokens);
+                let reasoning_tokens = next_usage
+                    .output_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+                    .unwrap_or(0);
                 *usage = Some(Usage {
                     prompt_tokens: next_usage.input_tokens,
                     completion_tokens: next_usage.output_tokens,
                     total_tokens,
+                    cache_read_tokens: cache_read.unwrap_or(0),
+                    cache_write_tokens: cache_write.unwrap_or(0),
+                    reasoning_tokens,
+                    cache_reported: cache_read.is_some() || cache_write.is_some(),
+                    ..Usage::default()
                 });
             }
             flush_buffer(
@@ -4439,8 +4562,20 @@ where
 
 fn merge_anthropic_usage(current: &mut Option<Usage>, usage: AnthropicUsage) {
     let previous = current.take().unwrap_or_default();
-    let prompt_tokens = if usage.input_tokens > 0 {
-        usage.input_tokens
+    let cache_read = usage
+        .cache_read_input_tokens
+        .unwrap_or(previous.cache_read_tokens);
+    let cache_write = usage
+        .cache_creation_input_tokens
+        .unwrap_or(previous.cache_write_tokens);
+    // Anthropic's `input_tokens` excludes both cache reads and cache writes;
+    // normalize to the cross-provider invariant `prompt = uncached + read + write`
+    // so context accounting does not collapse once cache_control is in play.
+    let prompt_tokens = if usage.input_tokens > 0 || cache_read > 0 || cache_write > 0 {
+        usage
+            .input_tokens
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
     } else {
         previous.prompt_tokens
     };
@@ -4453,6 +4588,13 @@ fn merge_anthropic_usage(current: &mut Option<Usage>, usage: AnthropicUsage) {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cache_reported: previous.cache_reported
+            || usage.cache_read_input_tokens.is_some()
+            || usage.cache_creation_input_tokens.is_some(),
+        reasoning_tokens: previous.reasoning_tokens,
+        ..Usage::default()
     });
 }
 
@@ -4583,6 +4725,22 @@ fn finalize_stream_result(
     tool_calls: Vec<ToolCall>,
     dsml_enabled: bool,
 ) -> Result<ChatResult> {
+    let usage = usage.map(|mut usage| {
+        usage.normalize_cache_fields();
+        if usage.cache_reported {
+            // v7 Release 1 observability: one absolute-value line per request,
+            // à la Reasonix ("in N (M cached / K new)"). Percentages mislead
+            // when a turn adds lots of fresh content, so none are shown.
+            tracing::info!(
+                prompt_tokens = usage.prompt_tokens,
+                cache_read = usage.cache_read_tokens,
+                cache_write = usage.cache_write_tokens,
+                fresh = usage.uncached_prompt_tokens(),
+                "prompt cache accounting"
+            );
+        }
+        usage
+    });
     let content = clean_plain_text(content);
     let (content, mut dsml_tool_calls) = if dsml_enabled {
         extract_dsml_tool_calls(content)
@@ -4639,6 +4797,9 @@ fn finalize_stream_result(
         tool_calls,
         provider_id: None,
         model: None,
+        finish_reason: None,
+        thinking_signature: None,
+        last_request_usage: None,
         responses_continuation: None,
     })
 }

@@ -808,9 +808,13 @@ impl RealContextPlugin {
                 "<qq-moderation-precheck>\n{notice}\n这只是内部初判。结合上下文自行判断如何安全、自然地回应，不得向用户暴露内部评分或判断提示词。\n</qq-moderation-precheck>"
             ));
         }
-        if let Some(snapshot) = affection::snapshot(context, settings, true)? {
-            input.system_context.push(snapshot.prompt().to_string());
-        }
+        // v7 decision 4: the affection snapshot is no longer injected into the
+        // prompt every turn (it changed after almost every reply and was a
+        // permanent prefix-cache churn source). Scores keep updating in the
+        // database — the call below preserves the ensure_profile side effect —
+        // and the model queries relationship state on demand through the
+        // `query_qq_relationship` tool.
+        let _ = affection::snapshot(context, settings, true)?;
         Ok(())
     }
 

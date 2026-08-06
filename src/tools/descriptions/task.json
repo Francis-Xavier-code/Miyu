@@ -34,6 +34,10 @@
           "strong"
         ],
         "description": "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 explore→cheap、general→balanced。未配置的档位回退主模型。"
+      },
+      "resume_id": {
+        "type": "string",
+        "description": "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。"
       }
     },
     "required": [

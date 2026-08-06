@@ -5212,7 +5212,9 @@ fn default_true() -> bool {
 }
 
 fn default_tools_loading_mode() -> String {
-    "hybrid".to_string()
+    // v7 §八点七 stub mode: byte-constant tools array + on-demand contracts.
+    // "hybrid" (grow the tools array on load) and "full" remain available.
+    "stub".to_string()
 }
 
 fn default_subagent_concurrency() -> usize {

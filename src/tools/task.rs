@@ -165,6 +165,10 @@ pub fn register(
                     "type": "integer",
                     "description": t("Optional. Override the subagent's tool call budget. explore defaults to 30, general defaults to 50.", "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。")
                 },
+                "resume_id": {
+                    "type": "string",
+                    "description": t("Optional. When a previous task failed with a resume_id in its error, pass it here to continue that subagent from its last completed tool round instead of starting over (process-local; lost on restart).", "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。")
+                },
                 "tier": {
                     "type": "string",
                     "enum": ["cheap", "balanced", "strong"],
@@ -246,6 +250,12 @@ async fn run_task(
             .and_then(Value::as_str)
             .unwrap_or("general"),
     );
+    let resume_id = args
+        .get("resume_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
     let max_steps = args
         .get("max_steps")
         .and_then(Value::as_u64)
@@ -317,8 +327,12 @@ async fn run_task(
             &[]
         });
 
-    let (result, stats) =
-        match tokio::time::timeout(Duration::from_secs(total_timeout), runner.run(&prompt)).await {
+    let (result, stats) = match tokio::time::timeout(
+        Duration::from_secs(total_timeout),
+        runner.run_with_resume(&prompt, resume_id.as_deref()),
+    )
+    .await
+    {
             Ok(Ok((result, stats))) => (result, stats),
             Ok(Err(err)) => {
                 let output = serde_json::to_string_pretty(&json!({

@@ -702,7 +702,9 @@ impl StateStore {
     pub(crate) fn reset_if_prompt_changed_with_compatible(
         &self,
         system_prompt: &str,
-        compatible_previous_prompt: Option<&str>,
+        // Kept for call-site compatibility; since the v7 no-delete semantics
+        // every previous prompt is effectively compatible.
+        _compatible_previous_prompt: Option<&str>,
     ) -> Result<()> {
         self.init_files()?;
         let fingerprint = prompt_fingerprint(system_prompt);
@@ -716,15 +718,15 @@ impl StateStore {
         }
         let previous = std::fs::read_to_string(&file).unwrap_or_default();
         if previous.trim() != fingerprint {
-            if compatible_previous_prompt
-                .map(prompt_fingerprint)
-                .is_some_and(|compatible| previous.trim() == compatible)
-            {
-                std::fs::write(file, format!("{fingerprint}\n"))?;
-                return Ok(());
-            }
-            self.conv_db.reset_history(&self.session())?;
-            self.remove_artifact_session_dir(&self.session())?;
+            // v7 Release 3: a persona prompt text change is a planned cache
+            // cold start, not a reason to destroy data. Earlier versions
+            // physically deleted every turn and the session's artifacts here,
+            // which meant "upgrade the binary → conversations silently
+            // vanish". History and artifacts are kept; only the fingerprint
+            // advances. Users who want a clean slate still have /clear.
+            tracing::info!(
+                "persona prompt fingerprint changed; keeping session history (cache cold start)"
+            );
             self.clear_last_usage()?;
             std::fs::write(file, format!("{fingerprint}\n"))?;
         }
@@ -1721,6 +1723,12 @@ impl StateStore {
     #[allow(dead_code)]
     pub fn usage_snapshot(&self) -> Result<UsageSnapshot> {
         usage::snapshot(&self.usage_file())
+    }
+
+    /// Lifetime token total of the current session (survives compaction,
+    /// zeroed by /reset). This is the Σ shown in the REPL/WebUI footer.
+    pub fn session_cumulative_tokens(&self) -> Result<u64> {
+        self.conv_db.session_token_total(&self.session())
     }
 
     pub fn clear_last_usage(&self) -> Result<()> {
@@ -3390,6 +3398,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Usage::default()
             })
             .unwrap();
         let usage_before = store.usage_snapshot().unwrap();
@@ -3564,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_prompt_fingerprint_migration_preserves_history() {
+    fn prompt_fingerprint_changes_never_delete_history() {
         let (_temp, store) = test_store();
         store
             .reset_if_prompt_changed("persona plus owner identity")
@@ -3582,8 +3591,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.load_visible_turns().unwrap().len(), 1);
 
+        // v7 Release 3: a prompt text change is a planned cache cold start and
+        // must never destroy conversation data.
         store.reset_if_prompt_changed("different persona").unwrap();
-        assert!(store.load_visible_turns().unwrap().is_empty());
+        assert_eq!(store.load_visible_turns().unwrap().len(), 1);
     }
 
     #[test]

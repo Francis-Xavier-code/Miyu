@@ -472,6 +472,11 @@ pub(crate) struct TurnProfile {
     pub(crate) text_models: Option<Vec<ActiveProviderModelConfig>>,
     pub(crate) multimodal_models: Option<Vec<ActiveProviderModelConfig>>,
     pub(crate) system_context: Vec<String>,
+    /// Per-message transport context (sender identity JSON, message ids, …).
+    /// Rendered as a tail system message after the user turn instead of being
+    /// folded into the system prompt, so the stable prefix stays byte-identical
+    /// across turns (v7 Phase 2.1).
+    pub(crate) turn_system_context: Vec<String>,
     pub(crate) context_images: Vec<PlatformContextImageRef>,
     pub(crate) platform: Option<Arc<PlatformTurnContext>>,
     pub(crate) image_cache_namespace: Option<String>,
@@ -490,6 +495,7 @@ impl Default for TurnProfile {
             text_models: None,
             multimodal_models: None,
             system_context: Vec::new(),
+            turn_system_context: Vec::new(),
             context_images: Vec::new(),
             platform: None,
             image_cache_namespace: None,

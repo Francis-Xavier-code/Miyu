@@ -879,6 +879,10 @@ pub struct Agent {
     /// Per-run system additions supplied by a transport/plugin. They are
     /// intentionally excluded from prompt-change hashing and persistence.
     runtime_system_context: Vec<String>,
+    /// Per-message transport context (sender identity JSON, message ids, …)
+    /// rendered as a tail system message after the user turn. Kept out of the
+    /// system prompt so the stable prefix stays byte-identical across turns.
+    turn_system_context: Vec<String>,
     suppress_session_history: bool,
     trim_at_ratio: f32,
     trim_batch_ratio: f32,
@@ -963,6 +967,7 @@ impl Agent {
             client,
             system_prompt,
             runtime_system_context: Vec::new(),
+            turn_system_context: Vec::new(),
             suppress_session_history: false,
             trim_at_ratio: config.context.trim_at_ratio,
             trim_batch_ratio: config.context.trim_batch_ratio,
@@ -1016,6 +1021,17 @@ impl Agent {
             .filter(|item| !item.is_empty())
             .collect();
         self.refresh_system_prompt()
+    }
+
+    /// Per-message transport blocks that ride the turn tail (after the user
+    /// message) instead of the system prompt. No prompt refresh needed: they
+    /// are consumed at message-assembly time.
+    pub fn set_turn_system_context(&mut self, context: Vec<String>) {
+        self.turn_system_context = context
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
     }
 
     pub(crate) fn set_memory_writes_enabled(&mut self, enabled: bool) {
@@ -1288,13 +1304,18 @@ impl Agent {
         Ok(tokens)
     }
 
+    /// Session-scoped lifetime token total (Σ in the footer): keeps growing
+    /// across compactions, resets to zero with the session history. The old
+    /// global usage.json figure lives on in /usage as the global overview.
     pub fn conversation_usage_tokens(&self) -> Result<u64> {
-        Ok(self.state.usage_snapshot()?.conversation_tokens)
+        self.state.session_cumulative_tokens()
     }
 
     fn tool_definition_tokens(&self, loaded_tools: &BTreeSet<String>) -> usize {
         let tools = self.tools.lock().unwrap();
-        let definitions = if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+        let definitions = if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+            tools.stub_definitions()
+        } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
             tools.lazy_definitions(loaded_tools)
         } else {
             tools.definitions()
@@ -1704,16 +1725,25 @@ impl Agent {
             *last = prepared.message;
         }
         let replay_start = messages.len();
+        if !self.turn_system_context.is_empty() {
+            // Trusted transport/control tail (v7 §三): host-derived per-message
+            // context lands after the user message, before untrusted blocks.
+            messages.push(ChatMessage::system(self.turn_system_context.join("\n\n")));
+        }
         messages.extend(prepared.hints);
         if self.mode != AgentMode::Chat {
             if let Some(association) = self.memory.association(&input)? {
                 if association.organization_due {
                     self.wake_memory_organizer();
                 }
-                messages.insert(
-                    1,
-                    ChatMessage::system(self.memory.format_association(&association)),
-                );
+                // v7 Phase 1.1: the associative-memory block rides the turn
+                // tail instead of `insert(1)`, so the stable history prefix in
+                // front stays byte-identical for provider prefix caches. It
+                // lands after `replay_start`, so redo checkpoints freeze the
+                // recalled snapshot (decision 6).
+                messages.push(ChatMessage::system(
+                    self.memory.format_association(&association),
+                ));
             }
         }
         if self.mode != AgentMode::Plan {
@@ -1808,10 +1838,14 @@ impl Agent {
                     .flatten()
             })
             .collect::<Vec<_>>();
+        // v7 Phase 1.3-b: register the scoped vision tool whenever the platform
+        // path is active, even with no images this turn. A conditional
+        // registration made the tools array appear/disappear between turns,
+        // invalidating the provider prefix cache from token 0; an empty scope
+        // simply rejects analysis requests with a clear message instead.
         if self.tools_enabled
             && self.config.plugins.vision.enabled
             && self.image_platform.is_some()
-            && (!binary_paths.is_empty() || !self.context_images.is_empty())
         {
             let mut tools = self.tools.lock().unwrap();
             if let Some(platform_context) = self.platform_context.clone() {
@@ -1852,12 +1886,7 @@ impl Agent {
                     url: image.data_url().to_string(),
                 },
             }));
-            ChatMessage {
-                role: "user".to_string(),
-                content: Some(ChatContent::Parts(parts)),
-                tool_call_id: None,
-                tool_calls: None,
-            }
+            ChatMessage::user_parts(parts)
         } else {
             ChatMessage::plain("user", &content)
         };
@@ -1953,6 +1982,9 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            finish_reason: None,
+            thinking_signature: None,
+            last_request_usage: None,
             responses_continuation: None,
         }))
     }
@@ -2024,6 +2056,9 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            finish_reason: None,
+            thinking_signature: None,
+            last_request_usage: None,
             responses_continuation: None,
         }))
     }
@@ -2218,7 +2253,9 @@ impl Agent {
 
             let definitions = if self.tools_enabled && !tool_limit_reached {
                 let tools = self.tools.lock().unwrap();
-                if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+                if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+                    tools.stub_definitions()
+                } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
                     tools.lazy_definitions(&loaded_tools)
                 } else {
                     tools.definitions()
@@ -2434,6 +2471,7 @@ impl Agent {
                     publish_auto_artifact_candidates(&artifact_candidates, on_event)?;
                 }
                 if let Some(usage) = usage_accumulator.usage() {
+                    result.last_request_usage = result.usage.take();
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -2457,6 +2495,7 @@ impl Agent {
                 }))?;
                 result.tool_calls.clear();
                 if let Some(usage) = usage_accumulator.usage() {
+                    result.last_request_usage = result.usage.take();
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -2468,9 +2507,28 @@ impl Agent {
                 messages,
                 result.content.clone(),
                 result.reasoning.as_deref(),
+                result.thinking_signature.as_deref(),
                 Some(result.tool_calls.clone()),
                 true,
             );
+            if result
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| reason.eq_ignore_ascii_case("length"))
+                && !result.tool_calls.is_empty()
+            {
+                // A "length" stop means the output hit the token limit, so every
+                // tool call in this message may carry silently truncated
+                // arguments. Refuse to execute any of them and let the model
+                // re-issue the calls with complete arguments.
+                for call in &result.tool_calls {
+                    messages.push(ChatMessage::tool(
+                        call.id.clone(),
+                        "error: 本次回复因输出 token 上限被截断，工具调用参数可能不完整。请重新发起该工具调用并给出完整参数。",
+                    ));
+                }
+                continue;
+            }
             if next_responses_continuation.is_some() {
                 continuation_input_start = messages.len();
             }
@@ -2911,16 +2969,13 @@ impl Agent {
 
     async fn clipboard_image_message(&self, img: ClipboardImage) -> Result<Option<ChatMessage>> {
         if self.current_model_supports_vision() {
-            return Ok(Some(ChatMessage {
-                role: "user".to_string(),
-                content: Some(ChatContent::Parts(vec![ChatContentPart::ImageUrl {
+            return Ok(Some(ChatMessage::user_parts(vec![
+                ChatContentPart::ImageUrl {
                     image_url: ImageUrlContent {
                         url: img.data_url().to_string(),
                     },
-                }])),
-                tool_call_id: None,
-                tool_calls: None,
-            }));
+                },
+            ])));
         }
 
         let images = vec![&img];
@@ -3022,12 +3077,7 @@ impl Agent {
             text: followup.content.clone(),
         }];
         parts.extend(images);
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(ChatContent::Parts(parts)),
-            tool_call_id: None,
-            tool_calls: None,
-        }
+        ChatMessage::user_parts(parts)
     }
 
     fn turn_user_message(&self, turn: &crate::state::Turn) -> ChatMessage {
@@ -3042,12 +3092,7 @@ impl Agent {
             text: turn.user_content.clone(),
         }];
         parts.extend(images);
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(ChatContent::Parts(parts)),
-            tool_call_id: None,
-            tool_calls: None,
-        }
+        ChatMessage::user_parts(parts)
     }
 
     fn uploaded_attachment_image_parts(
@@ -3301,6 +3346,10 @@ struct UsageAccumulator {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cache_reported: bool,
     has_usage: bool,
     estimated: bool,
 }
@@ -3319,6 +3368,7 @@ impl UsageAccumulator {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                ..Usage::default()
             },
             true,
         );
@@ -3331,6 +3381,12 @@ impl UsageAccumulator {
             .saturating_add(usage.completion_tokens);
         let total = usage.effective_total_tokens();
         self.total_tokens = self.total_tokens.saturating_add(total);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(usage.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(usage.reasoning_tokens);
+        self.cache_reported |= usage.cache_reported;
         self.has_usage = true;
         self.estimated |= estimated;
     }
@@ -3340,6 +3396,11 @@ impl UsageAccumulator {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_reported: self.cache_reported,
+            ..Usage::default()
         })
     }
 }
@@ -3511,15 +3572,50 @@ fn private_tool_memory(reports: &[String]) -> String {
         "<system-reminder>\n<private_tool_memory>\n这些是内部工具记忆，仅用于保持对话连续性。不要向用户复述、展示或引用这些标签。\n{}\n</private_tool_memory>\n</system-reminder>",
         reports
             .iter()
-            .map(|report| report.trim())
+            .map(|report| {
+                truncate_middle_chars(
+                    report.trim(),
+                    PRIVATE_TOOL_REPORT_HEAD_CHARS,
+                    PRIVATE_TOOL_REPORT_TAIL_CHARS,
+                )
+            })
             .filter(|report| !report.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
     )
 }
 
+/// A18: bound the per-turn "collapsed body" that re-renders into history. The
+/// truncation depends only on the text itself (never on turn age or position),
+/// so a turn's rendering is frozen once written and the history prefix stays
+/// byte-stable across later requests.
+const PRIVATE_MEMORY_HEAD_CHARS: usize = 800;
+const PRIVATE_MEMORY_TAIL_CHARS: usize = 400;
+const PRIVATE_TOOL_REPORT_HEAD_CHARS: usize = 1600;
+const PRIVATE_TOOL_REPORT_TAIL_CHARS: usize = 400;
+
+fn truncate_middle_chars(text: &str, head: usize, tail: usize) -> String {
+    let total = text.chars().count();
+    // The +64 slack guarantees idempotency: a truncated result is always below
+    // the threshold, so re-applying the function is a no-op.
+    if total <= head + tail + 64 {
+        return text.to_string();
+    }
+    let head_str: String = text.chars().take(head).collect();
+    let tail_str: String = text
+        .chars()
+        .skip(total.saturating_sub(tail))
+        .collect();
+    format!(
+        "{head_str}\n[...省略{}字符...]\n{tail_str}",
+        total - head - tail
+    )
+}
+
 fn private_reasoning_memory(reasoning: &str) -> Option<String> {
     (!reasoning.trim().is_empty()).then(|| {
+        let reasoning =
+            truncate_middle_chars(reasoning, PRIVATE_MEMORY_HEAD_CHARS, PRIVATE_MEMORY_TAIL_CHARS);
         format!(
             "<system-reminder>\n<previous_assistant_reasoning>\n{reasoning}\n</previous_assistant_reasoning>\n这些是上一轮 assistant 已经产生的原始思考内容，用于继续工作；不要向用户复述这些标签。\n</system-reminder>"
         )
@@ -3537,6 +3633,7 @@ fn push_assistant_context_messages(
         content.to_string(),
         reasoning,
         None,
+        None,
         force_assistant_message,
     );
 }
@@ -3545,15 +3642,29 @@ fn push_assistant_message_with_reasoning(
     messages: &mut Vec<ChatMessage>,
     content: String,
     reasoning: Option<&str>,
+    thinking_signature: Option<&str>,
     tool_calls: Option<Vec<ToolCall>>,
     force_assistant_message: bool,
 ) {
+    let has_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+    if has_tool_calls {
+        // A17: DeepSeek thinking mode requires the `reasoning_content` KEY on
+        // assistant tool_calls turns of the live tool loop (an empty string is
+        // accepted, a missing key is a 400). Carry it on the assistant message
+        // itself; the provider adapter strips it for endpoints that do not
+        // understand the field and rebuilds the Anthropic thinking block from
+        // the signature where present.
+        let mut message = ChatMessage::assistant(content, tool_calls);
+        message.reasoning_content = Some(reasoning.unwrap_or_default().to_string());
+        message.thinking_signature = thinking_signature.map(str::to_string);
+        messages.push(message);
+        return;
+    }
     if let Some(reasoning) = reasoning.and_then(private_reasoning_memory) {
         messages.push(ChatMessage::system(reasoning));
     }
-    let has_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
-    if force_assistant_message || !content.trim().is_empty() || has_tool_calls {
-        messages.push(ChatMessage::assistant(content, tool_calls));
+    if force_assistant_message || !content.trim().is_empty() {
+        messages.push(ChatMessage::assistant(content, None));
     }
 }
 

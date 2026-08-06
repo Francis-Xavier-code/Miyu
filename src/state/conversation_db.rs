@@ -3873,6 +3873,20 @@ impl ConversationDb {
         Ok(session_ids)
     }
 
+    /// Lifetime token total of one session, summed over every turn row —
+    /// including hidden (compacted) turns and summary rows, so the counter
+    /// keeps growing across compactions and only /reset (which deletes the
+    /// rows) brings it back to zero.
+    pub fn session_token_total(&self, session_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_total), 0) FROM turns WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as u64)
+    }
+
     pub fn reset_history(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -4834,12 +4848,14 @@ fn attach_turn_children_locked(conn: &Connection, turns: &mut [Turn]) -> Result<
 }
 
 fn attach_turn_journal_events_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+    // BTreeMap keeps the chunking below deterministic; HashMap iteration order
+    // would shuffle turn ids across the 900-id chunks between calls.
     let indexes = turns
         .iter()
         .enumerate()
         .filter(|(_, turn)| turn.status != TurnStatus::Completed)
         .map(|(index, turn)| (turn.turn_id.clone(), index))
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<std::collections::BTreeMap<_, _>>();
     if indexes.is_empty() {
         return Ok(());
     }

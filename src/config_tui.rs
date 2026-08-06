@@ -6490,7 +6490,7 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             t("Tool loading mode", "工具加载模式"),
             config.tools.loading_mode.clone(),
         )
-        .choices(&["full", "hybrid"]),
+        .choices(&["full", "hybrid", "stub"]),
         Field::boolean(
             t("Remember loaded tools", "记住已加载工具"),
             config.tools.persist_loaded_tools,
@@ -7077,6 +7077,8 @@ fn localized_choice_label(value: &str, zh: bool) -> Option<&'static str> {
         ("hidden", true) => Some("隐藏"),
         ("hybrid", false) => Some("Hybrid"),
         ("hybrid", true) => Some("混合"),
+        ("stub", false) => Some("Stub"),
+        ("stub", true) => Some("精简常驻"),
         ("off", false) => Some("Off"),
         ("off", true) => Some("关"),
         ("interactive", false) => Some("Interactive only"),

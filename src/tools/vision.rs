@@ -128,9 +128,10 @@ fn register_scoped(
         .into_iter()
         .map(|image| (image.id.clone(), image))
         .collect::<HashMap<_, _>>();
-    if allowed_paths.is_empty() && context_images.is_empty() {
-        return;
-    }
+    // Register even with an empty scope: keeping the tool pinned keeps the
+    // provider-visible tools array byte-stable across turns (cache prefix).
+    // Analysis calls against an empty scope fail with the existing clear
+    // "not attached to the current platform turn" style errors.
     let state = Arc::new(ScopedVisionState {
         allowed_paths,
         context_images,

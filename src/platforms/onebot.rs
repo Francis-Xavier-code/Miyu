@@ -3553,8 +3553,11 @@ async fn build_and_run_turn(
         .config
         .platforms
         .model_route(conversation_kind, &context.conversation.conversation_id);
-    let mut system_context = Vec::new();
-    system_context.push(qq_turn_system_context(
+    // v7 Phase 2.1: the per-message transport block (sender identity JSON,
+    // message ids, mentions) changes on every inbound message. It rides the
+    // turn tail via `turn_system_context`; only stable policy text stays in the
+    // system prompt so the provider prefix cache survives across messages.
+    let turn_system_context = vec![qq_turn_system_context(
         &context.config.platforms.qq,
         &context.conversation,
         &context.sender_id,
@@ -3562,7 +3565,8 @@ async fn build_and_run_turn(
         context.is_admin,
         context.inbound_event(),
         group_name,
-    ));
+    )];
+    let mut system_context = Vec::new();
     if let Some(prompt) = route
         .map(|route| route.extra_prompt.trim())
         .filter(|prompt| !prompt.is_empty())
@@ -3578,6 +3582,7 @@ async fn build_and_run_turn(
             .qq_multimodal_model_pool(conversation_kind, &context.conversation.conversation_id)
             .map(<[_]>::to_vec),
         system_context,
+        turn_system_context,
         context_images: prepared.context_images,
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),

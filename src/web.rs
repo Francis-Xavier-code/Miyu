@@ -1699,6 +1699,9 @@ struct SafeUsageSnapshot {
     completion_tokens: u64,
     total_tokens: u64,
     conversation_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
     last_usage: Option<Usage>,
     last_conversation_usage: Option<Usage>,
 }
@@ -5958,10 +5961,17 @@ async fn run_turn_task(
             .as_ref()
             .map(|profile| profile.system_context.clone())
             .unwrap_or_default();
+        let mut turn_system_context = profile
+            .as_ref()
+            .map(|profile| profile.turn_system_context.clone())
+            .unwrap_or_default();
         if local_webui && matches!(mode, AgentMode::Normal | AgentMode::Plan) {
             let manifest = tools::webui_artifact_manifest(&paths, &session_id)
                 .unwrap_or_else(|_| "（Artifact 清单暂时不可用）".to_string());
-            runtime_system_context.push(format!(
+            // v7 Phase 2.1: the manifest changes whenever artifacts change, so
+            // it rides the turn tail; only the static policy stays in the
+            // system prompt.
+            turn_system_context.push(format!(
                 "<artifact-workspace>\n{manifest}\n使用 read_artifact 和 apply_artifact_patch 按文件名操作已有 Artifact；不要用 glob 搜索托管目录，也不要猜测 ~/.miyu 路径。\n</artifact-workspace>"
             ));
             runtime_system_context.push(
@@ -5979,6 +5989,9 @@ async fn run_turn_task(
         }
         if !runtime_system_context.is_empty() {
             agent.set_runtime_system_context(runtime_system_context)?;
+        }
+        if !turn_system_context.is_empty() {
+            agent.set_turn_system_context(turn_system_context);
         }
         if let Some(profile) = &profile {
             agent.set_memory_writes_enabled(profile.memory_write_enabled);
@@ -6969,11 +6982,16 @@ fn finish_cancelled_run(
     updates_context: bool,
 ) {
     let context = current_context(agent).ok().filter(|_| updates_context);
+    let mut payload = json!({ "run_id": run_id, "session_id": session_id });
+    if let Some(context) = &context {
+        // The interrupted turn is persisted into the context; keep the client
+        // context meters honest instead of leaving them at the pre-turn value.
+        payload["context_tokens"] = json!(context.tokens);
+        payload["context_window"] = json!(context.window);
+        payload["cumulative_tokens"] = json!(context.cumulative_tokens);
+    }
     finish_run(manager, run_id, context);
-    events.publish(
-        "run.cancelled",
-        json!({ "run_id": run_id, "session_id": session_id }),
-    );
+    events.publish("run.cancelled", payload);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7056,6 +7074,9 @@ fn publish_completed(
     result: &ChatResult,
     context: ContextSnapshot,
 ) {
+    // Prefer the provider-reported context size (final request's prompt +
+    // completion) over the local BPE estimate when real usage is available.
+    let context_tokens = real_context_tokens(result).unwrap_or(context.tokens);
     events.publish(
         "run.completed",
         json!({
@@ -7065,11 +7086,25 @@ fn publish_completed(
             "usage_estimated": result.usage_estimated,
             "provider_id": result.provider_id,
             "model": result.model,
-            "context_tokens": context.tokens,
+            "context_tokens": context_tokens,
             "context_window": context.window,
             "cumulative_tokens": context.cumulative_tokens,
         }),
     );
+}
+
+/// True provider-side context size after a completed turn: the final
+/// request's prompt+completion tokens, when the provider reported real usage.
+pub(crate) fn real_context_tokens(result: &ChatResult) -> Option<u64> {
+    if result.usage_estimated {
+        return None;
+    }
+    let usage = result
+        .last_request_usage
+        .as_ref()
+        .or(result.usage.as_ref())?;
+    let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    (total > 0).then_some(total)
 }
 
 fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
@@ -7137,7 +7172,7 @@ fn cold_context(config: &AppConfig, state_store: &StateStore) -> Result<ContextS
     Ok(ContextSnapshot {
         tokens: 0,
         window: config.active_context_window()?,
-        cumulative_tokens: state_store.usage_snapshot()?.conversation_tokens,
+        cumulative_tokens: state_store.session_cumulative_tokens()?,
     })
 }
 
@@ -8805,6 +8840,9 @@ impl From<UsageSnapshot> for SafeUsageSnapshot {
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             conversation_tokens: usage.conversation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
             last_usage: usage.last_usage,
             last_conversation_usage: usage.last_conversation_usage,
         }

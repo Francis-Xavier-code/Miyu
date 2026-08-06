@@ -59,6 +59,7 @@ struct ReplFooterStatus {
 #[derive(Clone, Copy, Debug)]
 struct ReplTokenUsage {
     turn_tokens: u64,
+    cached_tokens: u64,
     session_tokens: u64,
     context_window: Option<usize>,
     cumulative_tokens: Option<u64>,
@@ -88,6 +89,7 @@ impl ReplFooterStatus {
             thinking: None,
             token_usage: ReplTokenUsage {
                 turn_tokens: 0,
+                cached_tokens: 0,
                 session_tokens,
                 context_window: config.active_context_window().ok().flatten(),
                 cumulative_tokens,
@@ -103,8 +105,9 @@ impl ReplFooterStatus {
         cumulative_tokens: Option<u64>,
     ) {
         if let Some(usage) = &result.usage {
-            self.set_token_usage(
+            self.set_token_usage_with_cache(
                 render::usage_total(usage),
+                usage.cache_read_tokens,
                 session_tokens,
                 context_window,
                 cumulative_tokens,
@@ -119,8 +122,26 @@ impl ReplFooterStatus {
         context_window: Option<usize>,
         cumulative_tokens: Option<u64>,
     ) {
+        self.set_token_usage_with_cache(
+            turn_tokens,
+            0,
+            session_tokens,
+            context_window,
+            cumulative_tokens,
+        );
+    }
+
+    fn set_token_usage_with_cache(
+        &mut self,
+        turn_tokens: u64,
+        cached_tokens: u64,
+        session_tokens: u64,
+        context_window: Option<usize>,
+        cumulative_tokens: Option<u64>,
+    ) {
         self.token_usage = ReplTokenUsage {
             turn_tokens,
+            cached_tokens,
             session_tokens,
             context_window,
             cumulative_tokens,
@@ -142,6 +163,7 @@ impl ReplFooterStatus {
     fn reset_token_usage(&mut self, session_tokens: u64, context_window: Option<usize>) {
         self.token_usage = ReplTokenUsage {
             turn_tokens: 0,
+            cached_tokens: 0,
             session_tokens,
             context_window,
             cumulative_tokens: None,
@@ -174,6 +196,7 @@ fn repl_footer_line(mode: AgentMode, footer: &ReplFooterStatus, cols: usize) -> 
     let usage = footer.token_usage;
     let right_plain = render::format_token_usage_inline(
         usage.turn_tokens,
+        usage.cached_tokens,
         usage.session_tokens,
         usage.context_window,
         usage.cumulative_tokens,
@@ -3053,6 +3076,205 @@ async fn run_models_for_session(
     Ok(())
 }
 
+const DEFAULT_PERSONA_LABEL_ZH: &str = "Miyu（内置默认）";
+const DEFAULT_PERSONA_LABEL_EN: &str = "Miyu (built-in default)";
+
+fn list_persona_files(paths: &MiyuPaths, config: &AppConfig) -> Result<Vec<String>> {
+    let dir = config.prompts_dir_path(paths);
+    let mut names = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".md") && !name.eq_ignore_ascii_case("system-prompt.md") {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Interactive persona picker (single-select). Returns true when the active
+/// persona changed and the config was saved.
+fn run_persona_picker(paths: &MiyuPaths, argument: &str) -> Result<bool> {
+    let mut config = AppConfig::load(paths)?;
+    let personas = list_persona_files(paths, &config)?;
+    let current = config.prompt.active_persona.trim().to_string();
+    let argument = argument.trim();
+    let chosen: Option<String> = if !argument.is_empty() {
+        if argument.eq_ignore_ascii_case("default")
+            || argument.eq_ignore_ascii_case("miyu")
+            || argument == "内置"
+        {
+            Some(String::new())
+        } else {
+            let needle = argument.to_ascii_lowercase();
+            let matched = personas.iter().find(|name| {
+                name.eq_ignore_ascii_case(argument)
+                    || name
+                        .to_ascii_lowercase()
+                        .trim_end_matches(".md")
+                        .contains(needle.trim_end_matches(".md"))
+            });
+            match matched {
+                Some(name) => Some(name.clone()),
+                None => bail!(
+                    "{}: {argument}",
+                    t("no persona file matches", "没有匹配的人格文件")
+                ),
+            }
+        }
+    } else if io::stdout().is_terminal() && io::stdin().is_terminal() {
+        let default_label = t(DEFAULT_PERSONA_LABEL_EN, DEFAULT_PERSONA_LABEL_ZH).to_string();
+        let mut items = vec![default_label];
+        items.extend(personas.iter().cloned());
+        let initial = if current.is_empty() {
+            0
+        } else {
+            personas
+                .iter()
+                .position(|name| *name == current)
+                .map(|index| index + 1)
+                .unwrap_or(0)
+        };
+        match inline_fuzzy_select_single(&items, initial)? {
+            Some(0) => Some(String::new()),
+            Some(index) => personas.get(index - 1).cloned(),
+            None => None,
+        }
+    } else {
+        println!(
+            "{}: {}",
+            t("current persona", "当前人格"),
+            if current.is_empty() {
+                t(DEFAULT_PERSONA_LABEL_EN, DEFAULT_PERSONA_LABEL_ZH).to_string()
+            } else {
+                current.clone()
+            }
+        );
+        for name in &personas {
+            println!("  {name}");
+        }
+        println!("{}", t("switch with: /persona <name>", "切换：/persona <名称>"));
+        return Ok(false);
+    };
+    let Some(target) = chosen else {
+        return Ok(false);
+    };
+    if target == current {
+        println!("{}", t("no changes", "未做修改"));
+        return Ok(false);
+    }
+    config.prompt.active_persona = target.clone();
+    config.save(paths)?;
+    println!(
+        "{}: {}",
+        t("active persona", "当前人格"),
+        if target.is_empty() {
+            t(DEFAULT_PERSONA_LABEL_EN, DEFAULT_PERSONA_LABEL_ZH).to_string()
+        } else {
+            target
+        }
+    );
+    Ok(true)
+}
+
+fn usage_overview_text(
+    snapshot: &crate::state::UsageSnapshot,
+    context: Option<(u64, Option<usize>)>,
+) -> String {
+    let compact = render::format_compact_count;
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
+        t("Token usage", "Token 用量"),
+        t(
+            "(global totals: all sessions + background calls)",
+            "（全局累计：含所有会话与后台调用）"
+        )
+    ));
+    lines.push(format!(
+        "  {:<10} {}",
+        t("requests", "请求次数"),
+        compact(snapshot.requests)
+    ));
+    let cached = snapshot.cache_read_tokens;
+    let fresh = snapshot.prompt_tokens.saturating_sub(cached);
+    let mut input_line = format!(
+        "  {:<10} {}",
+        t("input", "输入"),
+        compact(snapshot.prompt_tokens)
+    );
+    if cached > 0 {
+        input_line.push_str(&format!(
+            "\x1b[2m（{} {} · {} {}",
+            t("cache hits", "缓存命中"),
+            compact(cached),
+            t("billed new", "计费新输入"),
+            compact(fresh)
+        ));
+        if snapshot.cache_write_tokens > 0 {
+            input_line.push_str(&format!(
+                " · {} {}",
+                t("cache writes", "缓存写入"),
+                compact(snapshot.cache_write_tokens)
+            ));
+        }
+        input_line.push_str("）\x1b[0m");
+    }
+    lines.push(input_line);
+    let mut output_line = format!(
+        "  {:<10} {}",
+        t("output", "输出"),
+        compact(snapshot.completion_tokens)
+    );
+    if snapshot.reasoning_tokens > 0 {
+        output_line.push_str(&format!(
+            "\x1b[2m（{} {}）\x1b[0m",
+            t("reasoning", "其中思考"),
+            compact(snapshot.reasoning_tokens)
+        ));
+    }
+    lines.push(output_line);
+    lines.push(format!(
+        "  {:<10} {} \x1b[2m· {} Σ{}\x1b[0m",
+        t("total", "总计"),
+        compact(snapshot.total_tokens),
+        t("conversation", "对话口径"),
+        compact(snapshot.conversation_tokens)
+    ));
+    if let Some(last) = snapshot
+        .last_conversation_usage
+        .as_ref()
+        .or(snapshot.last_usage.as_ref())
+    {
+        let mut line = format!(
+            "  {:<10} in {}",
+            t("last turn", "最近一轮"),
+            compact(last.prompt_tokens)
+        );
+        if last.cache_read_tokens > 0 {
+            line.push_str(&format!("(C{})", compact(last.cache_read_tokens)));
+        }
+        line.push_str(&format!(" · out {}", compact(last.completion_tokens)));
+        lines.push(line);
+    }
+    if let Some((tokens, window)) = context {
+        let window = window
+            .map(|value| render::format_compact_count(value as u64))
+            .unwrap_or_else(|| "?".to_string());
+        lines.push(format!(
+            "  {:<10} {} / {window}",
+            t("context", "会话上下文"),
+            compact(tokens)
+        ));
+    }
+    lines.join("\n")
+}
+
 fn run_list_models(paths: &MiyuPaths) -> Result<()> {
     let config = AppConfig::load(paths)?;
     let choices = config.text_provider_model_choices();
@@ -3219,6 +3441,97 @@ fn inline_fuzzy_select(items: &[String], mut active: Vec<bool>) -> Result<Option
                     if let Some((_, index)) = matches.get(selected) {
                         if let Some(value) = active.get_mut(*index) {
                             *value = !*value;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(matches.len().saturating_sub(1));
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                    scroll = 0;
+                }
+                KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(ch);
+                    selected = 0;
+                    scroll = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Single-select variant of the inline fuzzy menu: Tab marks a row (radio),
+/// Enter confirms the marked row (or the highlighted one when nothing is
+/// marked); Esc / q cancels.
+fn inline_fuzzy_select_single(items: &[String], initial: usize) -> Result<Option<usize>> {
+    let mut active = vec![false; items.len()];
+    if let Some(slot) = active.get_mut(initial) {
+        *slot = true;
+    }
+    let menu_lines = inline_fuzzy_lines(items.len());
+    reserve_inline_fuzzy_space(menu_lines)?;
+    let mut session = InlineRawMode::start()?;
+    let matcher = SkimMatcherV2::default();
+    let mut query = String::new();
+    let mut selected = 0usize;
+    let mut scroll = 0usize;
+    let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
+    let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
+    loop {
+        let matches = fuzzy_matches(&matcher, items, &query);
+        if selected >= matches.len() {
+            selected = matches.len().saturating_sub(1);
+        }
+        let visible = matches.len().min(menu_lines.saturating_sub(2) as usize);
+        scroll = inline_fuzzy_scroll(selected, scroll, visible);
+        draw_inline_fuzzy(
+            &mut session.stdout,
+            anchor_y,
+            menu_lines,
+            &query,
+            items,
+            &matches,
+            selected,
+            scroll,
+            &active,
+        )?;
+        if let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = event::read()?
+        {
+            match code {
+                KeyCode::Char('c')
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Esc => {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Char('q') if query.is_empty() => {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    return Ok(None);
+                }
+                KeyCode::Enter => {
+                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    let marked = active.iter().position(|value| *value);
+                    let fallback = matches.get(selected).map(|(_, index)| *index);
+                    return Ok(marked.or(fallback));
+                }
+                KeyCode::Tab => {
+                    if let Some((_, index)) = matches.get(selected) {
+                        for slot in active.iter_mut() {
+                            *slot = false;
+                        }
+                        if let Some(slot) = active.get_mut(*index) {
+                            *slot = true;
                         }
                     }
                 }
@@ -4709,6 +5022,9 @@ async fn try_run_remote_chat(
             .get("model")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        finish_reason: None,
+        thinking_signature: None,
+        last_request_usage: None,
         responses_continuation: None,
     };
     print_mixed_model_endpoint(show_mixed_model_endpoint(&config, false), &result, None);
@@ -5512,6 +5828,7 @@ fn print_chat_token_usage(
             let turn_tokens = render::usage_total(usage);
             render::print_token_usage(
                 turn_tokens,
+                usage.cache_read_tokens,
                 session_token_total,
                 context_window,
                 cumulative_tokens,
@@ -5592,6 +5909,7 @@ async fn handle_live_post_turn_overflow(
             if let Some(usage) = compact_result.usage.as_ref() {
                 let frame = render::token_usage_output(
                     render::usage_total(usage),
+                    usage.cache_read_tokens,
                     agent.effective_context_tokens()?,
                     agent.context_window(),
                     cumulative_display,
@@ -6120,6 +6438,51 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         )?;
                     }
                 }
+                ReplSlashCommand::Usage => {
+                    let snapshot = StateStore::new(paths)?.usage_snapshot()?;
+                    let usage = footer.token_usage;
+                    let context = Some((usage.session_tokens, usage.context_window));
+                    repl_note(
+                        &mut live_repl,
+                        &format!("{}\n\n", usage_overview_text(&snapshot, context)),
+                    )?;
+                }
+                ReplSlashCommand::Persona => {
+                    match run_persona_picker(paths, command_args) {
+                        Ok(true) => {
+                            let _ = repl_ipc_admin(
+                                paths,
+                                &mut live_repl,
+                                IpcCommand::ReloadConfig,
+                            )
+                            .await;
+                            config = AppConfig::load(paths)?;
+                            let session_config =
+                                footer_config_for_session(paths, &config, &active_session_id);
+                            let (state, _) =
+                                repl_active_or_default_state(paths, &active_session_id).await?;
+                            cumulative_tokens = state.cumulative_tokens;
+                            footer = ReplFooterStatus::from_config(
+                                &session_config,
+                                state.context_tokens,
+                                (cumulative_tokens > 0).then_some(cumulative_tokens),
+                            );
+                            let client =
+                                OpenAiCompatibleClient::from_config(&session_config, paths)?;
+                            footer
+                                .update_thinking_variant(client.thinking_variant_summary().as_deref());
+                            footer.update_context_window(state.context_window);
+                            repl_note(
+                                &mut live_repl,
+                                &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
+                            )?;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            repl_note(&mut live_repl, &format!("\x1b[31m{error:#}\x1b[0m\n"))?
+                        }
+                    }
+                }
                 ReplSlashCommand::Models => {
                     // Switches this session's pinned model; the change takes
                     // effect from the next turn without a daemon reload.
@@ -6402,6 +6765,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             tool_calls: Vec::new(),
                             provider_id: None,
                             model: None,
+                            finish_reason: None,
+                            thinking_signature: None,
+                            last_request_usage: None,
                             responses_continuation: None,
                         };
                         print_chat_token_usage(
@@ -6519,6 +6885,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             {
                 let frame = format!("\x1b[2m{}\x1b[0m\n\n", t("cancelled", "已取消"));
                 live_repl.apply_output_frame(frame.as_bytes())?;
+                // The interrupted turn still entered the context; refresh the
+                // footer from the daemon's post-cancel state.
+                if let Ok((state, _)) =
+                    repl_active_or_default_state(paths, &active_session_id).await
+                {
+                    cumulative_tokens = state.cumulative_tokens;
+                    footer.update_session_tokens(state.context_tokens);
+                    footer.update_cumulative_tokens(state.cumulative_tokens);
+                    footer.update_context_window(state.context_window);
+                }
             }
             Err(err) => {
                 let frame = format!("\x1b[31m{}: {err}\x1b[0m\n\n", t("error", "错误"));
@@ -6568,7 +6944,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
         println!("\x1b[2m{message}\x1b[0m");
     }
-    let mut cumulative_tokens = 0u64;
+    let mut cumulative_tokens = state.session_cumulative_tokens().unwrap_or(0);
     let mut show_shortcut_hint = true;
     let initial_registry =
         build_tool_registry(&config, paths, mode, crate::question_tui::available(false))?;
@@ -6622,6 +6998,40 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/help") && command_args_empty {
             print_repl_help();
+            continue;
+        }
+        if command.eq_ignore_ascii_case("/usage") && command_args_empty {
+            let snapshot = state.usage_snapshot()?;
+            let context = Some((agent.effective_context_tokens()?, agent.context_window()));
+            println!("{}\n", usage_overview_text(&snapshot, context));
+            continue;
+        }
+        if command.eq_ignore_ascii_case("/persona") {
+            match run_persona_picker(paths, command_args) {
+                Ok(true) => {
+                    reload_repl_config(paths, &state, &mut config, &mut client)?;
+                    footer = ReplFooterStatus::from_config(
+                        &config,
+                        agent.effective_context_tokens()?,
+                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                    );
+                    let thinking_summary = client.thinking_variant_summary();
+                    footer.update_thinking_variant(thinking_summary.as_deref());
+                    let registry = build_tool_registry(
+                        &config,
+                        paths,
+                        mode,
+                        crate::question_tui::available(false),
+                    )?;
+                    agent.reload_config(config.clone(), client.clone())?;
+                    agent.switch_mode(mode, registry);
+                    footer.update_context_window(agent.context_window());
+                    println!("{}", t("configuration reloaded", "配置已重新加载"));
+                }
+                Ok(false) => {}
+                Err(error) => println!("\x1b[31m{error:#}\x1b[0m"),
+            }
+            println!();
             continue;
         }
         if command.eq_ignore_ascii_case("/models") {
@@ -6896,7 +7306,10 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                     cumulative_tokens =
                         cumulative_tokens.saturating_add(render::usage_total(usage));
                 }
-                let context_tokens = agent.effective_context_tokens()?;
+                let context_tokens = match crate::web::real_context_tokens(&result) {
+                    Some(tokens) => tokens,
+                    None => agent.effective_context_tokens()?,
+                };
                 footer.update_token_usage(
                     &result,
                     context_tokens,
@@ -6957,6 +7370,11 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                         live.reload_queue(&state)
                     })?;
                 }
+                // An interrupted turn is persisted and will be replayed into
+                // the next request, so the context meter must reflect it.
+                cumulative_tokens = state.session_cumulative_tokens().unwrap_or(cumulative_tokens);
+                footer.update_session_tokens(agent.effective_context_tokens()?);
+                footer.update_cumulative_tokens(cumulative_tokens);
             }
             Err(err) if crate::question::is_question_cancelled(&err) => {
                 if let Some(live) = live_repl.as_mut() {
@@ -6964,7 +7382,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                         live.reload_queue(&state)
                     })?;
                 }
+                cumulative_tokens = state.session_cumulative_tokens().unwrap_or(cumulative_tokens);
                 footer.update_session_tokens(agent.effective_context_tokens()?);
+                footer.update_cumulative_tokens(cumulative_tokens);
                 continue;
             }
             Err(err) => {
@@ -10480,6 +10900,8 @@ enum ReplSlashCommand {
     Delete,
     Workspace,
     Models,
+    Persona,
+    Usage,
     Config,
     Variant,
     Undo,
@@ -10553,6 +10975,20 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "[index|provider/model|default]",
         help_en: "switch this session's model",
         help_zh: "切换当前会话使用的模型",
+    },
+    ReplCommandSpec {
+        name: "/persona",
+        command: ReplSlashCommand::Persona,
+        arg_hint: "[name]",
+        help_en: "switch the active persona",
+        help_zh: "切换当前人格",
+    },
+    ReplCommandSpec {
+        name: "/usage",
+        command: ReplSlashCommand::Usage,
+        arg_hint: "",
+        help_en: "show token usage details",
+        help_zh: "显示 Token 用量详情",
     },
     ReplCommandSpec {
         name: "/config",
@@ -11707,11 +12143,15 @@ mod repl_input_tests {
                 prompt_tokens: 80,
                 completion_tokens: 20,
                 total_tokens: 100,
+                ..Usage::default()
             }),
             usage_estimated: false,
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            finish_reason: None,
+            thinking_signature: None,
+            last_request_usage: None,
             responses_continuation: None,
         };
 
@@ -12114,7 +12554,17 @@ mod repl_input_tests {
     fn pop_is_a_repl_command_with_an_optional_count() {
         assert!(repl_commands().contains(&"/pop"));
         assert_eq!(split_repl_command("/pop 3"), ("/pop", "3"));
-        assert_eq!(resolve_repl_command("/p"), "/pop");
+        // "/p" became ambiguous once /persona joined the table.
+        assert_eq!(resolve_repl_command("/po"), "/pop");
+        assert_eq!(resolve_repl_command("/pe"), "/persona");
+    }
+
+    #[test]
+    fn usage_and_persona_are_repl_commands() {
+        assert!(repl_commands().contains(&"/usage"));
+        assert!(repl_commands().contains(&"/persona"));
+        assert_eq!(resolve_repl_command("/us"), "/usage");
+        assert_eq!(split_repl_command("/persona Alice.md"), ("/persona", "Alice.md"));
     }
 
     #[test]
@@ -12581,6 +13031,9 @@ fn run_history_with_state(state: &StateStore, args: HistoryArgs) -> Result<()> {
                 tool_calls: Vec::new(),
                 provider_id: None,
                 model: None,
+                finish_reason: None,
+                thinking_signature: None,
+                last_request_usage: None,
                 responses_continuation: None,
             };
             render::print_assistant_response(&response, !args.no_thinking)?;

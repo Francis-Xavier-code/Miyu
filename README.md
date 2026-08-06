@@ -102,8 +102,6 @@ miyu config
 
 Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.jsonc`、主题和 shell 集成；`~/.miyu/data` 存放 prompts、identities、persona-avatars、scripts 和 skills；运行状态与 Skill 草稿位于 `~/.miyu/state`。
 
-旧版本位于 `config` 下的用户资源会在冲突预检后自动迁移到 `data`，迁移不会覆盖现有目标。Skill 遵循 Agent Skills 的 `SKILL.md` 目录格式。可以直接要求 Miyu 创建或更新 Skill：Miyu 会先编辑隔离草稿，校验后再原子发布。人格 Skill 优先于同名全局 Skill，Skill 内的 `scripts/` 只作为资源，不会自动注册成工具。
-
 ### 内置插件
 
 <details><summary>[展开/收起] 具体介绍</summary>
@@ -279,8 +277,11 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
 - [Opencode](https://github.com/anomalyco/opencode) 
 - [Claude Code](https://github.com/anthropics/claude-code)
+- [Pi](https://github.com/earendil-works/pi)
+- [Deepseek-Reasonix](https://github.com/esengine/deepseek-reasonix)
 - [Astrbot](https://github.com/AstrBotDevs/AstrBot) 
 - [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 
+
 
 #### 插件设计参考
 
@@ -290,6 +291,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 - [Railgun19457/astrbot_plugin_image_generation](Railgun19457/astrbot_plugin_image_generation)
 - [xiewoc/astrbot_plugin_weather_wttr_in](xiewoc/astrbot_plugin_weather_wttr_in)
 - [muyouzhi6/astrbot_plugin_recall_cancel](muyouzhi6/astrbot_plugin_recall_cancel)
+- []()
 
 ## 许可
 

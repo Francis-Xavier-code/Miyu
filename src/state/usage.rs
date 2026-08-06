@@ -27,6 +27,14 @@ struct UsageState {
     total_tokens: u64,
     #[serde(default)]
     conversation_tokens: u64,
+    /// Cumulative provider-cache accounting (v7 Release 1). cache_read is the
+    /// portion of prompt_tokens served from the provider's prompt cache.
+    #[serde(default)]
+    cache_read_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+    #[serde(default)]
+    reasoning_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +49,9 @@ pub struct UsageSnapshot {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub conversation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
     pub last_usage: Option<Usage>,
     pub last_conversation_usage: Option<Usage>,
 }
@@ -57,6 +68,9 @@ impl From<UsageState> for UsageSnapshot {
             completion_tokens: state.completion_tokens,
             total_tokens: state.total_tokens,
             conversation_tokens: state.conversation_tokens,
+            cache_read_tokens: state.cache_read_tokens,
+            cache_write_tokens: state.cache_write_tokens,
+            reasoning_tokens: state.reasoning_tokens,
             last_usage: state.last_usage,
             last_conversation_usage,
         }
@@ -83,6 +97,9 @@ fn add_usage_with_scope(path: &Path, usage: &Usage, is_conversation: bool) -> Re
     state.prompt_tokens += usage.prompt_tokens;
     state.completion_tokens += usage.completion_tokens;
     state.total_tokens += usage.effective_total_tokens();
+    state.cache_read_tokens += usage.cache_read_tokens;
+    state.cache_write_tokens += usage.cache_write_tokens;
+    state.reasoning_tokens += usage.reasoning_tokens;
     if is_conversation {
         state.conversation_tokens += usage.effective_total_tokens();
     }
@@ -140,6 +157,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            ..Usage::default()
         };
 
         add_usage(&path, &usage).unwrap();
@@ -171,6 +189,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
+                ..Usage::default()
             },
         )
         .unwrap();
@@ -180,6 +199,7 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 2,
                 total_tokens: 7,
+                ..Usage::default()
             },
         )
         .unwrap();
@@ -201,6 +221,7 @@ mod tests {
                 prompt_tokens: 7,
                 completion_tokens: 3,
                 total_tokens: 0,
+                ..Usage::default()
             },
         )
         .unwrap();
@@ -220,6 +241,7 @@ mod tests {
                 prompt_tokens: 7,
                 completion_tokens: 3,
                 total_tokens: 10,
+                ..Usage::default()
             },
         )
         .unwrap();
