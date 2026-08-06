@@ -3469,6 +3469,41 @@ impl ConversationDb {
         )? == 1)
     }
 
+    /// Hard-drop every still-queued prompt of a queue session and return
+    /// their ids. Unlike `discard_queued_prompts` this never folds prompts
+    /// into the conversation: it backs an explicit user cancel, where the
+    /// queued follow-ups are withdrawn rather than preserved as context.
+    pub fn delete_queued_prompts(
+        &self,
+        session_id: &str,
+        queue_session_id: &str,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prompt_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT prompt_id FROM queued_prompts
+                 WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2
+                 ORDER BY seq",
+            )?;
+            let prompt_ids = stmt
+                .query_map(params![session_id, queue_session_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            prompt_ids
+        };
+        if !prompt_ids.is_empty() {
+            tx.execute(
+                "DELETE FROM queued_prompts
+                 WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2",
+                params![session_id, queue_session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(prompt_ids)
+    }
+
     pub fn discard_stale_queued_prompts(
         &self,
         current_session_id: &str,

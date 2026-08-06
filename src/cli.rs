@@ -4997,6 +4997,16 @@ async fn try_run_remote_chat(
                     })?;
                 }
             }
+            "queue.removed" => {
+                if let Some(live) = live.as_deref_mut() {
+                    if let Some(prompt_id) = data.get("prompt_id").and_then(serde_json::Value::as_str)
+                    {
+                        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                            live.drop_queued(&[prompt_id.to_string()])
+                        })?;
+                    }
+                }
+            }
             "generation.superseded" => {
                 content.clear();
                 reasoning.clear();
@@ -7437,6 +7447,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 show_shortcut_hint = false;
             }
             Ok(None) => {
+                // An explicit cancel also withdraws the queued follow-ups;
+                // reloading afterwards clears their bubbles.
+                let _ = state.delete_queued_prompts();
                 if let Some(live) = live_repl.as_mut() {
                     synchronized_terminal_update(CursorAfterUpdate::Shown, || {
                         live.reload_queue(&state)
@@ -7449,6 +7462,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 footer.update_cumulative_tokens(cumulative_tokens);
             }
             Err(err) if crate::question::is_question_cancelled(&err) => {
+                let _ = state.delete_queued_prompts();
                 if let Some(live) = live_repl.as_mut() {
                     synchronized_terminal_update(CursorAfterUpdate::Shown, || {
                         live.reload_queue(&state)
@@ -9090,6 +9104,21 @@ impl LiveReplTail {
         write_committed_user_messages(&[("", mode)], true)?;
         let output_cursor = cursor::position()?;
         self.output_cursor = output_cursor;
+        self.resume_at(output_cursor)
+    }
+
+    /// Remove queued bubbles without committing them as sent messages —
+    /// the daemon dropped these prompts (explicit cancel), they were never
+    /// answered and never entered the conversation.
+    fn drop_queued(&mut self, prompt_ids: &[String]) -> Result<()> {
+        let ids = prompt_ids.iter().collect::<std::collections::HashSet<_>>();
+        if !self.queued.iter().any(|prompt| ids.contains(&prompt.prompt_id)) {
+            return Ok(());
+        }
+        let output_cursor = self.output_cursor;
+        self.suspend()?;
+        self.queued
+            .retain(|prompt| !ids.contains(&prompt.prompt_id));
         self.resume_at(output_cursor)
     }
 

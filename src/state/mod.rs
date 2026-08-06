@@ -1302,6 +1302,13 @@ impl StateStore {
         )
     }
 
+    /// Explicit-cancel variant of queue cleanup: drop still-queued prompts
+    /// outright (no fold into context) and return the dropped ids.
+    pub fn delete_queued_prompts(&self) -> Result<Vec<String>> {
+        self.conv_db
+            .delete_queued_prompts(&self.session(), &self.queue_session_id)
+    }
+
     pub fn discard_queued_prompts(&self) -> Result<usize> {
         self.conv_db
             .discard_queued_prompts(&self.session(), &self.queue_session_id)
@@ -2358,6 +2365,27 @@ mod tests {
             turn.followups[0].preceding_assistant_content.as_deref(),
             Some("answer")
         );
+    }
+
+    #[test]
+    fn cancelled_turn_cleanup_deletes_queued_prompts_without_folding() {
+        let (_temp, store) = test_store();
+        store
+            .start_turn("turn_1", "initial", std::process::id())
+            .unwrap();
+        store
+            .enqueue_prompt("q1", "排队消息", "排队消息", &[])
+            .unwrap();
+        store.interrupt_turn("turn_1").unwrap();
+
+        let dropped = store.delete_queued_prompts().unwrap();
+        assert_eq!(dropped, vec!["q1".to_string()]);
+        // Neither still queued nor folded into the turn as a follow-up.
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+        let turn = store.load_turns().unwrap().remove(0);
+        assert!(turn.followups.is_empty());
+        // Idempotent on an already-empty queue.
+        assert!(store.delete_queued_prompts().unwrap().is_empty());
     }
 
     #[test]

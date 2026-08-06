@@ -6181,6 +6181,7 @@ async fn run_turn_task(
 
     let result = match chat_outcome {
         TurnOutcome::Cancelled => {
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             finish_cancelled_run(
                 manager,
                 events,
@@ -6194,6 +6195,7 @@ async fn run_turn_task(
         }
         TurnOutcome::Finished(Err(error)) if question::is_question_cancelled(&error) => {
             questions.cancel_run(run_id);
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             finish_cancelled_run(
                 manager,
                 events,
@@ -6261,6 +6263,7 @@ async fn run_turn_task(
     };
     match overflow_outcome {
         OverflowOutcome::Cancelled => {
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             let context =
                 current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
             finish_run(manager, run_id, updates_context().then_some(context));
@@ -6981,6 +6984,39 @@ fn clear_actor_session_content(
         manager.lock().unwrap().context = context;
     }
     Ok(())
+}
+
+/// An explicit cancel withdraws the follow-ups still queued behind the
+/// reply: the user aborted the exchange, so folding them into context would
+/// keep answering messages they no longer want processed. Published before
+/// `run.cancelled` so clients still draining the event stream can clear
+/// their queue bubbles.
+fn drop_cancelled_queue(store: &StateStore, events: &EventHub, run_id: &str, session_id: &str) {
+    match store.delete_queued_prompts() {
+        Ok(prompt_ids) => {
+            for prompt_id in prompt_ids {
+                events.publish(
+                    "queue.removed",
+                    json!({
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "prompt_id": prompt_id,
+                    }),
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "{}",
+                t(
+                    "failed to drop queued prompts for a cancelled turn",
+                    "无法丢弃已取消回复的排队消息"
+                )
+            );
+        }
+    }
 }
 
 fn finish_cancelled_run(
