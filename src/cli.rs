@@ -7365,10 +7365,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                     cumulative_tokens =
                         cumulative_tokens.saturating_add(render::usage_total(usage));
                 }
-                let context_tokens = match crate::web::real_context_tokens(&result) {
-                    Some(tokens) => tokens,
-                    None => agent.effective_context_tokens()?,
-                };
+                let context_tokens = agent.effective_context_tokens()?;
                 footer.update_token_usage(
                     &result,
                     context_tokens,

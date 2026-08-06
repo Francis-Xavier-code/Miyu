@@ -7078,9 +7078,11 @@ fn publish_completed(
     result: &ChatResult,
     context: ContextSnapshot,
 ) {
-    // Prefer the provider-reported context size (final request's prompt +
-    // completion) over the local BPE estimate when real usage is available.
-    let context_tokens = real_context_tokens(result).unwrap_or(context.tokens);
+    // Always the local estimate of the persisted context: provider-reported
+    // request usage measures what this turn consumed, not what the context
+    // holds now — the two diverge after post-turn compaction/pruning, and
+    // the footer meter must refresh with those rewrites.
+    let context_tokens = context.tokens;
     events.publish(
         "run.completed",
         json!({
@@ -7095,20 +7097,6 @@ fn publish_completed(
             "cumulative_tokens": context.cumulative_tokens,
         }),
     );
-}
-
-/// True provider-side context size after a completed turn: the final
-/// request's prompt+completion tokens, when the provider reported real usage.
-pub(crate) fn real_context_tokens(result: &ChatResult) -> Option<u64> {
-    if result.usage_estimated {
-        return None;
-    }
-    let usage = result
-        .last_request_usage
-        .as_ref()
-        .or(result.usage.as_ref())?;
-    let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
-    (total > 0).then_some(total)
 }
 
 fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
