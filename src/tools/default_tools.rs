@@ -211,7 +211,7 @@ fn plist_value(raw: &str, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn read_file(args: Value) -> Result<String> {
+pub(crate) fn read_file(args: Value) -> Result<String> {
     let path = path_arg(&args, "path")?;
     let offset = args
         .get("offset")
@@ -387,7 +387,7 @@ fn trash_path_with(
 }
 
 async fn glob_files(args: Value) -> Result<String> {
-    let path = optional_path(&args).unwrap_or(std::env::current_dir()?);
+    let path = optional_path(&args).unwrap_or_else(super::workspace::effective_workdir);
     let search_path = prepare_search_path(&path)?;
     let pattern = required(&args, "pattern")?;
     let max_results = max_results(&args);
@@ -410,7 +410,7 @@ async fn glob_files(args: Value) -> Result<String> {
 }
 
 async fn grep_text(args: Value) -> Result<String> {
-    let path = optional_path(&args).unwrap_or(std::env::current_dir()?);
+    let path = optional_path(&args).unwrap_or_else(super::workspace::effective_workdir);
     let is_file = path.is_file();
     let search_root = if is_file {
         path.parent()
@@ -484,6 +484,9 @@ async fn execute_command(command: &str, timeout: u64, progress: ToolProgress) ->
     command_process
         .arg("-lc")
         .arg(command)
+        // Explicit cwd: shell commands must run in the turn workspace, not
+        // whatever the daemon process cwd happens to be.
+        .current_dir(super::workspace::effective_workdir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -566,21 +569,46 @@ impl Drop for CommandProcessGroup {
     }
 }
 
+/// Cumulative cap for collected command output. Beyond it the stream is
+/// still drained (so the child never blocks on a full pipe) but no longer
+/// buffered or forwarded — unbounded collection plus a clone per chunk
+/// into the progress channel is a memory hazard on runaway commands.
+const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 async fn read_command_output(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     progress: ToolProgress,
     report: impl Fn(&ToolProgress, Vec<u8>),
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0; 8192];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        let chunk = buffer[..read].to_vec();
+        let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(output.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let take = read.min(remaining);
+        if take < read {
+            truncated = true;
+        }
+        let chunk = buffer[..take].to_vec();
         output.extend_from_slice(&chunk);
         report(&progress, chunk);
+    }
+    if truncated {
+        output.extend_from_slice(
+            crate::i18n::text(
+                "\n[output truncated at the 8MB cap]",
+                "\n[输出超出 8MB 上限，已截断]",
+            )
+            .as_bytes(),
+        );
     }
     Ok(output)
 }
@@ -824,7 +852,7 @@ fn resolve_existing_path_without_following_leaf(path: &Path) -> Result<PathBuf> 
 }
 
 fn ensure_safe_trash_target(path: &Path) -> Result<()> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
+    let cwd = super::workspace::effective_workdir().canonicalize()?;
     let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     let dangerous = [
         Path::new("/"),
@@ -957,9 +985,7 @@ fn expand_path(value: &str) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        super::workspace::effective_workdir().join(path)
     }
 }
 

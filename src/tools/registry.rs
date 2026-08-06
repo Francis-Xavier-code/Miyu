@@ -28,6 +28,10 @@ pub enum ToolProgressEvent {
         path: PathBuf,
         alt: String,
     },
+    Artifact {
+        path: PathBuf,
+        title: String,
+    },
     CommandOutput {
         stream: CommandOutputStream,
         chunk: Vec<u8>,
@@ -63,6 +67,15 @@ impl ToolProgress {
             let _ = sender.send(ToolProgressEvent::Image {
                 path: path.into(),
                 alt: alt.into(),
+            });
+        }
+    }
+
+    pub fn report_artifact(&self, path: impl Into<PathBuf>, title: impl Into<String>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(ToolProgressEvent::Artifact {
+                path: path.into(),
+                title: title.into(),
             });
         }
     }
@@ -125,6 +138,7 @@ pub struct ToolSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolPermission {
     ReadOnly,
+    Presentation,
     Writes,
 }
 
@@ -182,6 +196,11 @@ impl ToolSpec {
         self
     }
 
+    pub fn presentation(mut self) -> Self {
+        self.permission = ToolPermission::Presentation;
+        self
+    }
+
     pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
         self
@@ -212,11 +231,13 @@ impl ToolSpec {
     }
 
     pub fn apply_built_in_description(mut self) -> Self {
-        if self.name == "load_skill" {
-            return self;
-        }
         if let Some(desc) = crate::tools::tool_descriptions::get(&self.name) {
-            self.description = desc.description.clone();
+            // load_skill owns a dynamic catalog description, but still uses
+            // the same loading policy, groups, schema, and display metadata
+            // as every other built-in tool.
+            if self.name != "load_skill" {
+                self.description = desc.description.clone();
+            }
             self.parameters = desc.parameters.clone();
             self.display_name = Some(desc.display_name.clone());
             self.always_loaded = desc.always_loaded;
@@ -257,6 +278,7 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<ToolSpec>>,
     script_tool_names: BTreeSet<String>,
     unregistered_scripts: Vec<UnregisteredScript>,
+    skill_catalog_fingerprint: Option<[u8; 32]>,
 }
 
 impl ToolRegistry {
@@ -267,6 +289,34 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: ToolSpec) {
         let tool = tool.apply_built_in_description();
         self.tools.insert(tool.name.clone(), Arc::new(tool));
+    }
+
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.script_tool_names.remove(name);
+        self.tools.remove(name).is_some()
+    }
+
+    pub(crate) fn skill_catalog_fingerprint(&self) -> Option<[u8; 32]> {
+        self.skill_catalog_fingerprint
+    }
+
+    pub(crate) fn set_skill_catalog_fingerprint(&mut self, fingerprint: [u8; 32]) {
+        self.skill_catalog_fingerprint = Some(fingerprint);
+    }
+
+    /// Appends runtime info to a registered tool's description. Applied
+    /// after `apply_built_in_description`, so it survives the built-in
+    /// overlay (which wholesale replaces the description). The registry is
+    /// rebuilt per turn, keeping such suffixes current with the config.
+    pub fn amend_description(&mut self, name: &str, suffix: &str) {
+        if suffix.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.tools.get(name) {
+            let mut spec = (**tool).clone();
+            spec.description.push_str(suffix);
+            self.tools.insert(name.to_string(), Arc::new(spec));
+        }
     }
 
     pub fn replace_script_tools(
@@ -326,14 +376,67 @@ impl ToolRegistry {
             .map(|tool| {
                 let mut definition = tool.definition();
                 if tool.name == "load_tools" {
+                    // v7 Phase 1.3-b: the catalog always lists the full target
+                    // set instead of subtracting `loaded`, so the description
+                    // stays byte-stable across lazy loads within a session and
+                    // the tools array prefix keeps hitting the provider cache.
+                    // Re-loading an already-loaded target is tolerated by
+                    // expand_load_targets with a clear notice.
                     definition.function.description =
-                        super::load_tools::dynamic_description(self, loaded);
+                        super::load_tools::dynamic_description(self, &BTreeSet::new());
                 }
                 definition
             })
             .collect::<Vec<_>>();
         definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         definitions
+    }
+
+    /// Stub loading mode (v7 §八点七): the provider-visible tools array stays
+    /// byte-constant for the whole session. always_loaded tools ship their
+    /// full contract; every lazy tool ships a stub — real name, one-line
+    /// summary, permissive parameter shell — and the full contract is fetched
+    /// on demand through `load_tools`, whose result rides the conversation
+    /// tail without touching the cached prefix.
+    pub fn stub_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = self
+            .tools
+            .values()
+            .map(|tool| {
+                if tool.always_loaded {
+                    let mut definition = tool.definition();
+                    if tool.name == "load_tools" {
+                        definition.function.description =
+                            super::load_tools::stub_mode_description(self);
+                    }
+                    definition
+                } else {
+                    stub_definition(tool)
+                }
+            })
+            .collect::<Vec<_>>();
+        definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        definitions
+    }
+
+    /// Full contracts (name + complete description + JSON Schema) for the
+    /// given tool names; unknown names are silently skipped (the caller
+    /// reports them through `skipped`).
+    pub(super) fn tool_contracts(&self, names: &[String]) -> Vec<serde_json::Value> {
+        let mut seen = BTreeSet::new();
+        names
+            .iter()
+            .filter(|name| seen.insert((*name).clone()))
+            .filter_map(|name| self.tools.get(name))
+            .map(|tool| {
+                let definition = tool.definition();
+                serde_json::json!({
+                    "name": definition.function.name,
+                    "description": definition.function.description,
+                    "parameters": definition.function.parameters,
+                })
+            })
+            .collect()
     }
 
     pub fn requires_lazy_load(&self, name: &str, loaded: &BTreeSet<String>) -> bool {
@@ -351,11 +454,16 @@ impl ToolRegistry {
     }
 
     pub fn definitions_except(&self, excluded: &[&str]) -> Vec<ToolDefinition> {
-        self.tools
+        let mut definitions = self
+            .tools
             .values()
             .filter(|tool| !excluded.iter().any(|name| *name == tool.name))
             .map(|tool| tool.definition())
-            .collect()
+            .collect::<Vec<_>>();
+        // Deterministic order: HashMap iteration order would reshuffle the
+        // subagent tools array between calls and defeat provider prefix caches.
+        definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        definitions
     }
 
     pub fn permission(&self, name: &str) -> Result<ToolPermission> {
@@ -414,6 +522,10 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub(crate) fn loadable_tools(&self, loaded: &BTreeSet<String>) -> Vec<&ToolSpec> {
         let mut tools = self
             .tools
@@ -427,13 +539,18 @@ impl ToolRegistry {
         tools
     }
 
+    /// Expands requested load targets. Individual problem targets never fail
+    /// the whole request: they are reported in the returned `skipped` list so
+    /// the valid remainder still loads (a model asking for an always-loaded
+    /// tool alongside a group must not lose the group).
     pub(crate) fn expand_load_targets(
         &self,
         requested: &[String],
         loaded: &BTreeSet<String>,
-    ) -> Result<(Vec<String>, Vec<String>)> {
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut loaded_targets = BTreeSet::new();
         let mut loaded_tools = BTreeSet::new();
+        let mut skipped = Vec::new();
         for target in requested {
             let target = target.trim();
             if target.is_empty() {
@@ -442,11 +559,13 @@ impl ToolRegistry {
             if let Some(group) = target.strip_prefix("group:") {
                 let group = group.trim();
                 if group.is_empty() {
-                    bail!("group target is missing a group name");
+                    skipped.push("group target is missing a group name".to_string());
+                    continue;
                 }
                 let group_tools = self.group_loadable_tool_names(group, loaded);
                 if group_tools.is_empty() {
-                    bail!("unknown or already-loaded tool group: {group}");
+                    skipped.push(format!("group:{group}: unknown or already fully loaded"));
+                    continue;
                 }
                 loaded_targets.insert(format!("group:{group}"));
                 loaded_tools.extend(group_tools);
@@ -454,25 +573,31 @@ impl ToolRegistry {
             }
 
             let Some(tool) = self.tools.get(target) else {
-                bail!("unknown tool or script: {target}");
+                skipped.push(format!("{target}: unknown tool or script"));
+                continue;
             };
             if tool.name == "load_tools" || tool.always_loaded {
-                bail!(
-                    "tool cannot be loaded with load_tools: {target}. Only names listed in available_load_targets can be loaded."
-                );
+                skipped.push(format!(
+                    "{target}: already available (always loaded); no need to load it"
+                ));
+                continue;
             }
             if tool.load_policy == LoadPolicy::Hidden {
-                bail!("tool is hidden from load_tools: {target}");
+                skipped.push(format!("{target}: not loadable via load_tools"));
+                continue;
             }
-            if !loaded.contains(&tool.name) {
+            if loaded.contains(&tool.name) {
+                skipped.push(format!("{target}: already loaded"));
+            } else {
                 loaded_targets.insert(tool.name.clone());
                 loaded_tools.insert(tool.name.clone());
             }
         }
-        Ok((
+        (
             loaded_targets.into_iter().collect(),
             loaded_tools.into_iter().collect(),
-        ))
+            skipped,
+        )
     }
 
     fn group_loadable_tool_names(&self, group: &str, loaded: &BTreeSet<String>) -> Vec<String> {
@@ -536,6 +661,28 @@ impl ToolRegistry {
         &self.unregistered_scripts
     }
 
+    pub(crate) fn script_summary_xml(&self) -> String {
+        let mut scripts = self
+            .tools
+            .values()
+            .filter(|tool| tool.is_script)
+            .collect::<Vec<_>>();
+        scripts.sort_by(|left, right| left.name.cmp(&right.name));
+        let always_loaded = scripts.iter().filter(|tool| tool.always_loaded).count();
+        let names = scripts
+            .iter()
+            .map(|tool| super::load_tools::xml_escape(&tool.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "<script_summary>\n  <total>{}</total>\n  <always_loaded>{}</always_loaded>\n  <lazy>{}</lazy>\n  <unregistered>{}</unregistered>\n  <registered_names>{names}</registered_names>\n</script_summary>",
+            scripts.len(),
+            always_loaded,
+            scripts.len() - always_loaded,
+            self.unregistered_scripts.len(),
+        )
+    }
+
     pub fn clone_filtered(&self, allowed: &[&str]) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         for name in allowed {
@@ -560,8 +707,52 @@ fn load_target_tool_xml(tool: &ToolSpec) -> String {
     format!(
         "  <target>\n    <name>{}</name>\n    <type>{kind}</type>\n    <summary>{}</summary>\n  </target>",
         xml_escape(&tool.name),
-        xml_escape(&tool.description),
+        xml_escape(&load_target_summary(&tool.description)),
     )
+}
+
+fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
+    let summary = load_target_summary(&tool.description);
+    let description = if summary.is_empty() {
+        "（精简条目）先调用 load_tools 获取本工具的完整参数契约，再按契约直接填写参数调用本工具。".to_string()
+    } else {
+        format!(
+            "{summary}（精简条目：先调用 load_tools 获取完整参数契约，再按契约直接填写参数调用本工具。）"
+        )
+    };
+    ToolDefinition {
+        kind: "function",
+        function: crate::llm::FunctionDefinition {
+            name: tool.name.clone(),
+            description,
+            // Permissive shell: real parameters go at the top level exactly as
+            // in a normal call, so execution needs no unwrapping; the actual
+            // contract arrives via the load_tools result.
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }),
+        },
+    }
+}
+
+/// Catalog entries carry a bounded one-line summary instead of the full tool
+/// description. This keeps the loader catalog small and byte-stable: without
+/// the bound, `load_skill`'s description (which embeds the whole skills
+/// catalog) was nested wholesale into the loader XML and re-rendered on every
+/// skills rescan.
+fn load_target_summary(description: &str) -> String {
+    let first_line = description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut summary: String = first_line.chars().take(200).collect();
+    if first_line.chars().count() > 200 {
+        summary.push('…');
+    }
+    summary
 }
 
 fn xml_escape(text: &str) -> String {
@@ -671,5 +862,22 @@ mod tests {
             registry.get("replaceable_tool").unwrap().description,
             "new description"
         );
+    }
+
+    #[test]
+    fn unregister_only_changes_the_current_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolSpec::new(
+            "remember_fact",
+            "remember",
+            json!({"type":"object","properties":{}}),
+            |_| async { Ok(String::new()) },
+        ));
+        let cached = registry.clone();
+
+        assert!(registry.unregister("remember_fact"));
+        assert!(registry.get("remember_fact").is_none());
+        assert!(cached.get("remember_fact").is_some());
+        assert!(!registry.unregister("remember_fact"));
     }
 }

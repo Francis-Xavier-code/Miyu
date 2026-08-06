@@ -20,6 +20,13 @@ pub(crate) fn braille_frame(frame: usize) -> &'static str {
     BRAILLE_FRAMES[frame % BRAILLE_FRAMES.len()]
 }
 
+/// Marks a sub-phase line as a live block header that carries its own
+/// animated spinner glyph (parallel subagents: one spinner per block).
+/// When any sub-phase line starts with this marker the spinner renders in
+/// block mode: marker lines get the glyph, blank lines are preserved as
+/// block separators, and the phase line is not rendered.
+pub(crate) const BLOCK_MARKER: char = '\u{1}';
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpinnerStyle {
     Scanner,
@@ -117,6 +124,11 @@ fn render_frame_at_width(
     state: &WaitSpinner,
     terminal_width: usize,
 ) -> (String, u16) {
+    if let Some(sub) = &state.sub_phase {
+        if sub.contains(BLOCK_MARKER) {
+            return render_block_frame(frame, sub, terminal_width);
+        }
+    }
     let (spinner_prefix, spinner_width) = match state.style {
         SpinnerStyle::Scanner => {
             let scanner = scanner_state(frame % total_frames_scanner());
@@ -150,6 +162,32 @@ fn render_frame_at_width(
             }
         }
         _ => {}
+    }
+    let count = lines.len().min(u16::MAX as usize) as u16;
+    (lines.join("\n"), count)
+}
+
+/// Renders the multi-block live layout: each `BLOCK_MARKER` line is a
+/// running block header with its own animated glyph; blank lines separate
+/// blocks; other lines already carry their own indentation (running-block
+/// detail lines are indented by the builder, settled blocks are flush).
+fn render_block_frame(frame: usize, sub: &str, terminal_width: usize) -> (String, u16) {
+    let usable = terminal_width.saturating_sub(1).max(1);
+    let glyph = paint_secondary(braille_frame(frame));
+    let mut lines = Vec::new();
+    for line in sub.lines() {
+        if let Some(rest) = line.strip_prefix(BLOCK_MARKER) {
+            let rest = clip_to_display_width(rest, usable.saturating_sub(2));
+            lines.push(format!(
+                "{glyph} {}",
+                paint_for_style(&rest, SpinnerStyle::Braille)
+            ));
+        } else if line.trim().is_empty() {
+            lines.push(String::new());
+        } else {
+            let clipped = clip_to_display_width(line, usable);
+            lines.push(paint_for_style(&clipped, SpinnerStyle::Braille));
+        }
     }
     let count = lines.len().min(u16::MAX as usize) as u16;
     (lines.join("\n"), count)

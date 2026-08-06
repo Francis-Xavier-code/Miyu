@@ -77,9 +77,16 @@ pub fn register(registry: &mut ToolRegistry, paths: &MiyuPaths) {
         paths.system_scripts_dir.as_path(),
         paths.scripts_dir.as_path(),
     ];
-    if let Ok(scan) = scan_scripts(&dirs) {
-        let specs = script_specs(&scan.entries, &paths.scripts_dir);
-        let _ = registry.replace_script_tools(specs, scan.unregistered);
+    match scan_scripts(&dirs) {
+        Ok(scan) => {
+            let specs = script_specs(&scan.entries, &paths.scripts_dir);
+            if let Err(error) = registry.replace_script_tools(specs, scan.unregistered) {
+                tracing::warn!(error = %error, "failed to register Miyu script tools");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to scan Miyu script directories during tool registration");
+        }
     }
     register_script_tools(registry, paths.scripts_dir.clone());
 }
@@ -91,10 +98,15 @@ pub fn rescan_scripts(registry: &mut ToolRegistry, paths: &MiyuPaths) {
     ];
     let scan = match scan_scripts(&dirs) {
         Ok(scan) => scan,
-        Err(_) => return,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to rescan Miyu script directories");
+            return;
+        }
     };
     let specs = script_specs(&scan.entries, &paths.scripts_dir);
-    let _ = registry.replace_script_tools(specs, scan.unregistered);
+    if let Err(error) = registry.replace_script_tools(specs, scan.unregistered) {
+        tracing::warn!(error = %error, "failed to replace Miyu script tools");
+    }
 }
 
 fn script_specs(entries: &[ScriptEntry], scripts_dir: &Path) -> Vec<ToolSpec> {
@@ -238,6 +250,25 @@ fn canonicalize_key(path: &Path) -> PathBuf {
 fn resolve_script_path(path_str: &str, scripts_dir: &Path) -> PathBuf {
     let p = Path::new(path_str);
     if p.is_absolute() {
+        if p.starts_with(scripts_dir) {
+            return p.to_path_buf();
+        }
+        if let Some(root) = scripts_dir
+            .parent()
+            .filter(|parent| parent.file_name().and_then(|name| name.to_str()) == Some("data"))
+            .and_then(Path::parent)
+        {
+            let legacy = root.join("config/scripts");
+            if let Ok(relative) = p.strip_prefix(&legacy) {
+                return scripts_dir.join(relative);
+            }
+        }
+        if let Some(base) = directories::BaseDirs::new() {
+            let legacy = base.config_dir().join("miyu/scripts");
+            if let Ok(relative) = p.strip_prefix(&legacy) {
+                return scripts_dir.join(relative);
+            }
+        }
         p.to_path_buf()
     } else {
         scripts_dir.join(p)
@@ -539,24 +570,66 @@ async fn run_script(
         }
     }
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("script timed out after {timeout_secs}s"))??;
+    // Collect with a hard per-stream cap: wait_with_output() buffers
+    // without bounds, so a runaway script could exhaust memory.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (status, stdout_bytes, stderr_bytes) =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            let (stdout_bytes, stderr_bytes, status) = tokio::join!(
+                read_capped_stream(stdout_pipe),
+                read_capped_stream(stderr_pipe),
+                child.wait(),
+            );
+            status.map(|status| (status, stdout_bytes, stderr_bytes))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("script timed out after {timeout_secs}s"))??;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let stdout = clip_output(stdout.trim());
     let stderr = clip_output(stderr.trim());
 
     Ok(serde_json::to_string_pretty(&json!({
-        "success": output.status.success(),
-        "exit_code": output.status.code(),
+        "success": status.success(),
+        "exit_code": status.code(),
         "stdout": stdout,
         "stderr": stderr,
     }))?)
+}
+
+/// Drains a child stream, keeping at most 8MB in memory.
+async fn read_capped_stream(reader: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    const CAP: usize = 8 * 1024 * 1024;
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = CAP.saturating_sub(output.len());
+                if remaining == 0 {
+                    truncated = true;
+                    continue;
+                }
+                let take = read.min(remaining);
+                if take < read {
+                    truncated = true;
+                }
+                output.extend_from_slice(&buffer[..take]);
+            }
+        }
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[truncated at 8MB]");
+    }
+    output
 }
 
 fn clip_output(value: &str) -> String {
@@ -961,6 +1034,17 @@ fn find_auto_detected_path(scripts_dir: &Path, id: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_script_index_absolute_paths_follow_the_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts_dir = temp.path().join("data/scripts");
+        let legacy = temp.path().join("config/scripts/tool.sh");
+        assert_eq!(
+            resolve_script_path(&legacy.display().to_string(), &scripts_dir),
+            scripts_dir.join("tool.sh")
+        );
+    }
 
     #[test]
     fn extracts_description_from_shebang_script() {

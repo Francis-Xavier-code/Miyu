@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -101,7 +103,9 @@ struct Cache {
 }
 
 static CACHE: OnceLock<Mutex<Option<Cache>>> = OnceLock::new();
+static PROVIDER_API_CACHE: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
 static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ACTIVE_METADATA_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn cache_lock() -> &'static Mutex<Option<Cache>> {
     CACHE.get_or_init(|| Mutex::new(None))
@@ -109,6 +113,10 @@ fn cache_lock() -> &'static Mutex<Option<Cache>> {
 
 fn refresh_lock() -> &'static Mutex<()> {
     REFRESH_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn provider_api_cache_lock() -> &'static Mutex<HashMap<(String, String), u64>> {
+    PROVIDER_API_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn is_loaded() -> bool {
@@ -126,7 +134,7 @@ fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, HashMap<String, Mode
 }
 
 fn parse_api_response(text: &str) -> Result<HashMap<String, HashMap<String, ModelInfo>>> {
-    let api: ApiResponse = serde_json::from_str(&text).context("failed to parse models cache")?;
+    let api: ApiResponse = serde_json::from_str(text).context("failed to parse models cache")?;
     let mut result = HashMap::new();
     for (provider_id, provider) in api.0 {
         let mut models = HashMap::new();
@@ -268,6 +276,16 @@ pub fn try_load(paths: &crate::paths::MiyuPaths) {
     }
 }
 
+pub fn try_load_active(paths: &crate::paths::MiyuPaths, config: &crate::config::AppConfig) {
+    let path = cache_file(paths);
+    let data = load_from_disk(&path).ok();
+    if let Some(mut data) = data {
+        retain_configured_models(&mut data, config);
+        let mut lock = cache_lock().lock().unwrap();
+        *lock = Some(Cache { data });
+    }
+}
+
 pub fn spawn_background_refresh(paths: crate::paths::MiyuPaths) {
     let path = cache_file(&paths);
     std::thread::spawn(move || {
@@ -277,6 +295,99 @@ pub fn spawn_background_refresh(paths: crate::paths::MiyuPaths) {
             let mut lock = cache_lock().lock().unwrap();
             *lock = Some(Cache { data });
         }
+    });
+}
+
+pub fn spawn_background_refresh_active(
+    paths: crate::paths::MiyuPaths,
+    config: crate::config::AppConfig,
+) {
+    spawn_provider_api_refresh(config.providers.clone());
+    let path = cache_file(&paths);
+    std::thread::spawn(move || {
+        let _refresh = refresh_lock().lock().unwrap();
+        let fetched = fetch_and_cache(&path).ok();
+        if let Some(mut data) = fetched {
+            retain_configured_models(&mut data, &config);
+            let mut lock = cache_lock().lock().unwrap();
+            *lock = Some(Cache { data });
+        }
+    });
+}
+
+pub fn ensure_active_metadata(paths: &crate::paths::MiyuPaths, config: &crate::config::AppConfig) {
+    if !is_loaded() {
+        try_load_active(paths, config);
+    }
+    if ACTIVE_METADATA_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        spawn_background_refresh_active(paths.clone(), config.clone());
+    }
+}
+
+fn retain_configured_models(
+    data: &mut HashMap<String, HashMap<String, ModelInfo>>,
+    config: &crate::config::AppConfig,
+) {
+    let mut selected = HashMap::<String, HashSet<String>>::new();
+    let mut selected_model_ids = HashSet::new();
+    for provider in &config.providers {
+        selected
+            .entry(provider.id.clone())
+            .or_default()
+            .insert(provider.default_model.clone());
+        if !provider.default_model.trim().is_empty() {
+            selected_model_ids.insert(provider.default_model.clone());
+        }
+    }
+    let conversation_models = config.platforms.qq.conversations.iter().flat_map(|route| {
+        route
+            .text_models
+            .iter()
+            .flatten()
+            .chain(route.multimodal_models.iter().flatten())
+    });
+    let real_context_models = config
+        .platforms
+        .qq
+        .plugins
+        .get(crate::config::REAL_CONTEXT_PLUGIN_ID)
+        .and_then(|instance| crate::config::RealContextPluginSettings::from_instance(instance).ok())
+        .and_then(|settings| settings.text_models)
+        .unwrap_or_default();
+    for choice in config
+        .active_provider_models
+        .iter()
+        .flatten()
+        .chain(config.active_multimodal_provider_models.iter().flatten())
+        .chain(config.platforms.qq.text_models.iter().flatten())
+        .chain(config.platforms.qq.multimodal_models.iter().flatten())
+        .chain(
+            config
+                .platforms
+                .qq
+                .non_whitelist_text_models
+                .iter()
+                .flatten(),
+        )
+        .chain(conversation_models)
+        .chain(real_context_models.iter())
+    {
+        selected
+            .entry(choice.provider_id.clone())
+            .or_default()
+            .insert(choice.model.clone());
+        selected_model_ids.insert(choice.model.clone());
+    }
+    data.retain(|provider_id, models| {
+        let provider_models = selected.get(provider_id);
+        models.retain(|model_id, _| {
+            provider_models.is_some_and(|ids| ids.contains(model_id))
+                || selected_model_ids.contains(model_id)
+        });
+        !models.is_empty()
     });
 }
 
@@ -327,9 +438,123 @@ fn lookup_input_modalities(
 }
 
 pub fn context_window(provider_id: &str, model_id: &str) -> Option<u64> {
+    if let Some(window) = provider_api_cache_lock()
+        .lock()
+        .unwrap()
+        .get(&(provider_id.to_string(), model_id.to_string()))
+        .copied()
+    {
+        return Some(window);
+    }
     let lock = cache_lock().lock().unwrap();
     let cache = lock.as_ref()?;
     lookup_context_window(&cache.data, provider_id, model_id)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderApiCacheEntry {
+    provider_id: String,
+    model: String,
+    context_window: u64,
+}
+
+pub fn spawn_provider_api_refresh(providers: Vec<crate::config::ProviderConfig>) {
+    std::thread::spawn(move || {
+        let mut discovered = Vec::new();
+        for provider in providers {
+            if let Ok(entries) = fetch_provider_context_windows(&provider) {
+                discovered.extend(entries);
+            }
+        }
+        if discovered.is_empty() {
+            return;
+        }
+        let mut cache = provider_api_cache_lock().lock().unwrap();
+        for entry in discovered {
+            cache.insert((entry.provider_id, entry.model), entry.context_window);
+        }
+    });
+}
+
+fn fetch_provider_context_windows(
+    provider: &crate::config::ProviderConfig,
+) -> Result<Vec<ProviderApiCacheEntry>> {
+    let mut api_key = provider.api_key.as_deref().unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved_key;
+    if let Some(env_name) = api_key.strip_prefix("$env:") {
+        resolved_key = std::env::var(env_name).unwrap_or_default();
+        api_key = &resolved_key;
+    }
+    if api_key.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = provider_models_url(&provider.base_url);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.min(5)))
+        .build()?;
+    let mut request = client
+        .get(url)
+        .header("Accept", "application/json")
+        .header("User-Agent", "miyu-model-metadata");
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let value = request.send()?.error_for_status()?.json::<Value>()?;
+    let Some(models) = value.get("data").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    Ok(models
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?.trim();
+            let context_window = api_context_window(model)?;
+            (!id.is_empty() && context_window > 0).then(|| ProviderApiCacheEntry {
+                provider_id: provider.id.clone(),
+                model: id.to_string(),
+                context_window,
+            })
+        })
+        .collect())
+}
+
+fn provider_models_url(base_url: &str) -> String {
+    let mut url = base_url.trim().trim_end_matches('/').to_string();
+    if url.ends_with("/chat/completions") {
+        url.truncate(url.len() - "/chat/completions".len());
+    }
+    if url.ends_with("/v1") {
+        format!("{url}/models")
+    } else {
+        format!("{url}/v1/models")
+    }
+}
+
+fn api_context_window(model: &Value) -> Option<u64> {
+    for key in [
+        "context_window",
+        "context_length",
+        "max_context_length",
+        "max_input_tokens",
+        "input_token_limit",
+    ] {
+        if let Some(value) = model.get(key).and_then(Value::as_u64).filter(|v| *v > 0) {
+            return Some(value);
+        }
+    }
+    for parent in ["limit", "limits"] {
+        if let Some(value) = model
+            .get(parent)
+            .and_then(|value| value.get("context"))
+            .and_then(Value::as_u64)
+            .filter(|v| *v > 0)
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 pub fn reasoning_info(provider_id: &str, model_id: &str) -> Option<ModelReasoningInfo> {
@@ -456,7 +681,7 @@ fn lookup_context_window(
         .collect::<Vec<_>>();
     matches.sort_unstable();
     matches.dedup();
-    (matches.len() == 1).then(|| matches[0])
+    matches.into_iter().min()
 }
 
 pub fn refresh_blocking(paths: &crate::paths::MiyuPaths) -> Result<()> {
@@ -503,7 +728,157 @@ mod tests {
     }
 
     #[test]
-    fn context_window_fallback_requires_one_unique_value() {
+    fn compact_cache_retains_only_configured_models() {
+        let config = crate::config::AppConfig::default();
+        let provider = &config.providers[0];
+        let mut data = HashMap::from([
+            (
+                provider.id.clone(),
+                HashMap::from([
+                    (provider.default_model.clone(), model(128_000)),
+                    ("unused-model".to_string(), model(64_000)),
+                ]),
+            ),
+            (
+                "unused-provider".to_string(),
+                HashMap::from([("unused-model".to_string(), model(32_000))]),
+            ),
+        ]);
+
+        retain_configured_models(&mut data, &config);
+
+        assert!(!data.contains_key("unused-provider"));
+        assert!(data[&provider.id].contains_key(&provider.default_model));
+        assert!(!data[&provider.id].contains_key("unused-model"));
+    }
+
+    #[test]
+    fn compact_cache_retains_models_used_only_by_platform_routes() {
+        let mut config = crate::config::AppConfig::default();
+        let provider_id = config.providers[0].id.clone();
+        config.providers[0].models.extend([
+            "route-text".to_string(),
+            "route-vision".to_string(),
+            "platform-text".to_string(),
+            "non-whitelist-text".to_string(),
+            "context-text".to_string(),
+        ]);
+        config.platforms.qq.text_models = Some(vec![crate::config::ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "platform-text".to_string(),
+        }]);
+        config.platforms.qq.non_whitelist_text_models =
+            Some(vec![crate::config::ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: "non-whitelist-text".to_string(),
+            }]);
+        let mut real_context = crate::config::PlatformPluginInstanceConfig::default();
+        crate::config::merge_real_context_settings(
+            &mut real_context,
+            &crate::config::RealContextPluginSettings {
+                text_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "context-text".to_string(),
+                }]),
+                ..Default::default()
+            },
+        );
+        config.platforms.qq.plugins.insert(
+            crate::config::REAL_CONTEXT_PLUGIN_ID.to_string(),
+            real_context,
+        );
+        config
+            .platforms
+            .qq
+            .conversations
+            .push(crate::config::PlatformModelRoute {
+                conversation: crate::config::PlatformConversationConfig {
+                    kind: crate::config::PlatformConversationKind::Group,
+                    id: "20000".to_string(),
+                },
+                persona: crate::config::PlatformPersonaOverride::Inherit,
+                text_models_inheritance: crate::config::PlatformModelPoolInheritance::Platform,
+                text_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "route-text".to_string(),
+                }]),
+                multimodal_models_inheritance:
+                    crate::config::PlatformModelPoolInheritance::Platform,
+                multimodal_models: Some(vec![crate::config::ActiveProviderModelConfig {
+                    provider_id: provider_id.clone(),
+                    model: "route-vision".to_string(),
+                }]),
+                extra_prompt: String::new(),
+                session_limits: None,
+            });
+        let mut data = HashMap::from([(
+            provider_id.clone(),
+            HashMap::from([
+                (config.providers[0].default_model.clone(), model(128_000)),
+                ("route-text".to_string(), model(64_000)),
+                ("route-vision".to_string(), model(96_000)),
+                ("platform-text".to_string(), model(64_000)),
+                ("non-whitelist-text".to_string(), model(64_000)),
+                ("context-text".to_string(), model(64_000)),
+                ("unused-model".to_string(), model(32_000)),
+            ]),
+        )]);
+
+        retain_configured_models(&mut data, &config);
+
+        let retained = &data[&provider_id];
+        assert!(retained.contains_key("route-text"));
+        assert!(retained.contains_key("route-vision"));
+        assert!(retained.contains_key("platform-text"));
+        assert!(retained.contains_key("non-whitelist-text"));
+        assert!(retained.contains_key("context-text"));
+        assert!(!retained.contains_key("unused-model"));
+    }
+
+    #[test]
+    fn compact_cache_retains_same_model_metadata_from_other_providers() {
+        let mut config = crate::config::AppConfig::default();
+        let provider = &mut config.providers[0];
+        provider.models = vec!["custom-model".to_string()];
+        provider.default_model = "custom-model".to_string();
+        let mut data = HashMap::from([
+            (
+                provider.id.clone(),
+                HashMap::from([("custom-model".to_string(), model(64_000))]),
+            ),
+            (
+                "catalog-provider".to_string(),
+                HashMap::from([("custom-model".to_string(), model(128_000))]),
+            ),
+        ]);
+
+        retain_configured_models(&mut data, &config);
+
+        assert!(data.contains_key("catalog-provider"));
+        assert_eq!(
+            lookup_context_window(&data, "custom-provider", "custom-model"),
+            Some(64_000)
+        );
+    }
+
+    #[test]
+    fn provider_api_context_window_accepts_common_metadata_shapes() {
+        assert_eq!(
+            api_context_window(&serde_json::json!({"context_window": 128000})),
+            Some(128000)
+        );
+        assert_eq!(
+            api_context_window(&serde_json::json!({"limit": {"context": 64000}})),
+            Some(64000)
+        );
+        assert_eq!(
+            api_context_window(&serde_json::json!({"id": "model"})),
+            None
+        );
+    }
+
+    #[test]
+    fn context_window_fallback_uses_the_conservative_minimum() {
         let same = HashMap::from([
             (
                 "provider-a".to_string(),
@@ -526,7 +901,7 @@ mod tests {
             .insert("shared-model".to_string(), model(128_000));
         assert_eq!(
             lookup_context_window(&conflicting, "custom", "shared-model"),
-            None
+            Some(128_000)
         );
     }
 

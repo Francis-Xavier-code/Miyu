@@ -39,14 +39,10 @@ pub(crate) fn display_path(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        super::workspace::effective_workdir().join(path)
     };
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(stripped) = absolute.strip_prefix(cwd) {
-            return stripped.display().to_string();
-        }
+    if let Ok(stripped) = absolute.strip_prefix(super::workspace::effective_workdir()) {
+        return stripped.display().to_string();
     }
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);

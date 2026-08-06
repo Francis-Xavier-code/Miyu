@@ -201,8 +201,6 @@ fn expand_path(value: &str) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        super::workspace::effective_workdir().join(path)
     }
 }

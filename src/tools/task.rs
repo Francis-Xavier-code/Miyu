@@ -1,6 +1,6 @@
 use super::subagent_runner::{ProgressMode, SubagentProgress, SubagentRunner, SubagentStats};
 use super::{ToolRegistry, ToolSpec};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ModelTier};
 use crate::i18n::agent_text as t;
 use crate::llm::OpenAiCompatibleClient;
 use crate::paths::MiyuPaths;
@@ -29,6 +29,11 @@ const GENERAL_EXCLUDED: &[&str] = &[
     "deep_diagnose",
     "deep_research_linux_game_compatibility",
     "load_skill",
+    "create_skill",
+    "update_skill",
+    "delete_skill",
+    "publish_skill",
+    "list_skill_drafts",
     "set_alarm",
     "list_alarms",
     "cancel_alarm",
@@ -110,6 +115,15 @@ impl SubagentType {
             Self::General => GENERAL_TOTAL_TIMEOUT,
         }
     }
+
+    /// Default model tier when the caller doesn't pick one: exploration is
+    /// read-only search (cheap), general work gets the balanced tier.
+    fn default_tier(self) -> ModelTier {
+        match self {
+            Self::Explore => ModelTier::Cheap,
+            Self::General => ModelTier::Balanced,
+        }
+    }
 }
 
 pub fn register(
@@ -118,6 +132,7 @@ pub fn register(
     paths: MiyuPaths,
     tools: ToolRegistry,
 ) {
+    let config_for_status = config.clone();
     let context = TaskContext {
         config,
         paths,
@@ -149,6 +164,15 @@ pub fn register(
                 "max_steps": {
                     "type": "integer",
                     "description": t("Optional. Override the subagent's tool call budget. explore defaults to 30, general defaults to 50.", "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。")
+                },
+                "resume_id": {
+                    "type": "string",
+                    "description": t("Optional. When a previous task failed with a resume_id in its error, pass it here to continue that subagent from its last completed tool round instead of starting over (process-local; lost on restart).", "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。")
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["cheap", "balanced", "strong"],
+                    "description": t("Optional model tier, picked by task complexity: cheap for simple lookups/mechanical steps, balanced for typical multi-step work, strong for hard reasoning. Defaults: explore→cheap, general→balanced. Unconfigured tiers fall back to the main model.", "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 explore→cheap、general→balanced。未配置的档位回退主模型。")
                 }
             },
             "required": ["description", "prompt"],
@@ -159,6 +183,43 @@ pub fn register(
             async move { run_task(args, context, progress).await }
         },
     ).writes());
+    registry.amend_description("task", &tier_pool_status(&config_for_status));
+}
+
+/// Human-readable tier pool status appended to the task tool description,
+/// so the calling agent knows which tiers are configured and with which
+/// concrete models when choosing a tier.
+fn tier_pool_status(config: &AppConfig) -> String {
+    let describe = |tier: ModelTier| {
+        let pool = config.subagent_tier_choices(tier);
+        if pool.is_empty() {
+            t(
+                "not configured (falls back to the main model pool)",
+                "未配置（回退主模型池）",
+            )
+            .to_string()
+        } else {
+            pool.iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    format!(
+        "{}cheap=[{}]; balanced=[{}]; strong=[{}]",
+        t(" Current tier pools: ", " 当前档位池状态："),
+        describe(ModelTier::Cheap),
+        describe(ModelTier::Balanced),
+        describe(ModelTier::Strong),
+    )
+}
+
+fn main_pool_choice(config: &AppConfig) -> Option<(String, String)> {
+    config
+        .active_provider_model_choices()
+        .into_iter()
+        .next()
+        .map(|choice| (choice.provider_id, choice.model))
 }
 
 async fn run_task(
@@ -189,6 +250,12 @@ async fn run_task(
             .and_then(Value::as_str)
             .unwrap_or("general"),
     );
+    let resume_id = args
+        .get("resume_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
     let max_steps = args
         .get("max_steps")
         .and_then(Value::as_u64)
@@ -197,12 +264,55 @@ async fn run_task(
     let tool_timeout = sa_type.tool_timeout();
     let total_timeout = sa_type.total_timeout();
 
+    let tier = args
+        .get("tier")
+        .and_then(Value::as_str)
+        .and_then(ModelTier::from_str)
+        .unwrap_or_else(|| sa_type.default_tier());
+
     let mode = ProgressMode::from_config(&context.config);
     let enabled = context.config.plugins.deep_research.show_progress;
     let sa_progress = SubagentProgress::new(progress, mode, enabled);
 
-    let client = OpenAiCompatibleClient::from_config(&context.config, &context.paths)?
-        .for_subagent_output(mode == ProgressMode::Full);
+    // Tier routing: the tier's pool gets its own load-balanced client;
+    // an unconfigured pool silently uses the main model pool, and a
+    // configured-but-unusable pool falls back with a notice returned to
+    // the calling agent (not printed to the user).
+    let pool = context.config.subagent_tier_choices(tier);
+    let mut tier_notice: Option<String> = None;
+    let (client, model_choice) = if pool.is_empty() {
+        if !context.config.subagent_tiers.pool(tier).is_empty() {
+            tier_notice = Some(format!(
+                "tier '{}' pool has no usable model (models were removed from the text models); fell back to the main model pool",
+                tier.label()
+            ));
+        }
+        (
+            OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+            main_pool_choice(&context.config),
+        )
+    } else {
+        match OpenAiCompatibleClient::from_choices(&context.config, &context.paths, &pool) {
+            Ok(client) => {
+                let first = &pool[0];
+                (
+                    client,
+                    Some((first.provider_id.clone(), first.model.clone())),
+                )
+            }
+            Err(err) => {
+                tier_notice = Some(format!(
+                    "tier '{}' pool is unavailable ({err}); fell back to the main model pool",
+                    tier.label()
+                ));
+                (
+                    OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+                    main_pool_choice(&context.config),
+                )
+            }
+        }
+    };
+    let client = client.for_subagent_output(mode == ProgressMode::Full);
     let tools = match sa_type {
         SubagentType::Explore => context.tools.clone_filtered(EXPLORE_ALLOWED),
         SubagentType::General => context.tools.clone(),
@@ -217,30 +327,56 @@ async fn run_task(
             &[]
         });
 
-    let (result, stats) =
-        match tokio::time::timeout(Duration::from_secs(total_timeout), runner.run(&prompt)).await {
+    let (result, stats) = match tokio::time::timeout(
+        Duration::from_secs(total_timeout),
+        runner.run_with_resume(&prompt, resume_id.as_deref()),
+    )
+    .await
+    {
             Ok(Ok((result, stats))) => (result, stats),
             Ok(Err(err)) => {
-                return Ok(serde_json::to_string_pretty(&json!({
+                let output = serde_json::to_string_pretty(&json!({
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
+                    "tier": tier.label(),
+                    "tier_notice": tier_notice,
                     "description": description,
                     "state": "error",
                     "error": err.to_string(),
                     "stats": SubagentStats::default().public(),
-                }))?);
+                }))?;
+                record_subagent_audit(
+                    &context,
+                    &description,
+                    &prompt,
+                    &output,
+                    None,
+                    &model_choice,
+                );
+                return Ok(output);
             }
             Err(_) => {
-                return Ok(serde_json::to_string_pretty(&json!({
+                let output = serde_json::to_string_pretty(&json!({
                     "ok": false,
                     "kind": "task",
                     "subagent_type": sa_type.label(),
+                    "tier": tier.label(),
+                    "tier_notice": tier_notice,
                     "description": description,
                     "state": "timeout",
                     "error": format!("subagent timed out after {total_timeout}s"),
                     "stats": SubagentStats::default().public(),
-                }))?);
+                }))?;
+                record_subagent_audit(
+                    &context,
+                    &description,
+                    &prompt,
+                    &output,
+                    None,
+                    &model_choice,
+                );
+                return Ok(output);
             }
         };
 
@@ -252,13 +388,95 @@ async fn run_task(
 
     let final_text = result.content.trim().to_string();
 
-    Ok(serde_json::to_string_pretty(&json!({
+    let output = serde_json::to_string_pretty(&json!({
         "ok": true,
         "kind": "task",
         "subagent_type": sa_type.label(),
+        "tier": tier.label(),
+        "tier_notice": tier_notice,
         "description": description,
         "state": state,
         "result": final_text,
         "stats": stats.public(),
-    }))?)
+    }))?;
+    // Prefer the endpoint that actually produced the final reply (pools
+    // load-balance, so the representative pool entry may differ).
+    let model_choice = match (&result.provider_id, &result.model) {
+        (Some(provider_id), Some(model)) => Some((provider_id.clone(), model.clone())),
+        _ => model_choice,
+    };
+    record_subagent_audit(
+        &context,
+        &description,
+        &prompt,
+        &output,
+        Some(&stats),
+        &model_choice,
+    );
+    Ok(output)
+}
+
+/// Persists an audit session for a subagent run: a hidden `kind='subagent'`
+/// session linked to the parent turn's session, holding one turn (prompt →
+/// result JSON) plus the model identity and token usage on the session row.
+/// Best-effort: audit failures never fail the task itself.
+fn record_subagent_audit(
+    context: &TaskContext,
+    description: &str,
+    prompt: &str,
+    output: &str,
+    stats: Option<&SubagentStats>,
+    model_choice: &Option<(String, String)>,
+) {
+    let outcome = (|| -> Result<()> {
+        let store = crate::state::StateStore::new(&context.paths)?;
+        let parent = crate::tools::workspace::try_session();
+        let persona = context.config.active_persona_scope();
+        let name: String = description.chars().take(40).collect();
+        let record = store.create_session(&persona, &name, "subagent", parent.as_deref())?;
+        let pinned = store.pinned(&record.session_id);
+        let turn_id = format!(
+            "sat_{}_{:08x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            rand::random::<u32>()
+        );
+        pinned.start_turn(&turn_id, prompt, std::process::id())?;
+        pinned.complete_turn(&turn_id, output, None)?;
+        let (provider_id, model) = match model_choice.as_ref() {
+            Some((provider_id, model)) => (Some(provider_id.as_str()), Some(model.as_str())),
+            None => (None, None),
+        };
+        let context_window = match (provider_id, model) {
+            (Some(provider), Some(model)) => context
+                .config
+                .context_window_for_provider_model(provider, model)
+                .ok()
+                .flatten()
+                .map(|window| window as i64),
+            _ => None,
+        };
+        let (prompt_tokens, completion_tokens, total_tokens) = match stats {
+            Some(stats) => (
+                stats.prompt_tokens as i64,
+                stats.completion_tokens as i64,
+                stats.total_tokens.max(stats.token_estimate) as i64,
+            ),
+            None => (0, 0, 0),
+        };
+        store.record_subagent_usage(
+            &record.session_id,
+            provider_id,
+            model,
+            context_window,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+    })();
+    if let Err(error) = outcome {
+        tracing::warn!(error = %error, "{}", crate::i18n::text("failed to record subagent audit session", "记录子代理审计会话失败"));
+    }
 }

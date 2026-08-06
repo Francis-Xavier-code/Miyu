@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
@@ -101,7 +101,7 @@ async fn get_page(args: Value) -> Result<String> {
         for sec in &sections {
             let url = format!("{MAN7_BASE}/man{}/{name}.{sec}.html", &sec[..1]);
             if let Ok(html) = fetch_text(&url).await {
-                let text = html2text::from_read(html.as_bytes(), 120);
+                let text = html_conversion::to_text_async(html, 120).await?;
                 return Ok(clip(&format!("Source: {url}\n\n{text}"), max_chars));
             }
         }
@@ -110,7 +110,8 @@ async fn get_page(args: Value) -> Result<String> {
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
-    Ok(reqwest::get(url).await?.error_for_status()?.text().await?)
+    let response = reqwest::get(url).await?.error_for_status()?;
+    http_response::read_text(response, http_response::MAX_HTML_RESPONSE_BYTES).await
 }
 
 fn required(args: &Value, key: &str) -> Result<String> {

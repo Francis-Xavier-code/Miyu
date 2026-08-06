@@ -3,30 +3,35 @@ mod conversation;
 pub(crate) mod overflow;
 
 use crate::clipboard::{ClipboardImage, PastedImage};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, PromptAudience};
 use crate::llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind,
-    ImageUrlContent, OpenAiCompatibleClient, Usage,
+    ImageUrlContent, OpenAiCompatibleClient, ToolCall, ToolCallFunction, Usage,
 };
-use crate::memory::{EvictedTurn, MemoryStore};
+use crate::memory::{EvictedTurn, MemoryAccess, MemoryOrganizerHandle, MemoryOrigin, MemoryStore};
 use crate::paths::MiyuPaths;
+use crate::platforms::{PlatformContextImageRef, PlatformTurnContext};
 use crate::question::{
-    answered_tool_output, unavailable_tool_output, QuestionCancelled, QuestionExchange,
-    QuestionRequest, QuestionResponse,
+    answered_tool_output, closed_tool_output, unavailable_tool_output, QuestionCancelled,
+    QuestionExchange, QuestionRequest, QuestionResponse,
 };
 use crate::render::wait_spinner::SPINNER_INTERVAL;
-use crate::state::{QueuedPrompt, QueuedPromptAttachment, StateStore};
+use crate::state::{
+    QueuedPrompt, QueuedPromptAttachment, RedoCandidate, RedoInputKind, StateStore,
+    TurnRedoCheckpointPayload,
+};
 use crate::tools::{self, memes, vision, ToolPermission, ToolRegistry};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Local;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 const MAX_QUESTION_ROUNDS_PER_TURN: usize = 8;
 
@@ -80,9 +85,82 @@ impl PendingTurnGuard {
 impl Drop for PendingTurnGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.state.interrupt_turn(&self.turn_id);
+            if let Err(error) = self.state.interrupt_turn(&self.turn_id) {
+                tracing::error!(
+                    turn_id = %self.turn_id,
+                    error = %error,
+                    "failed to persist an interrupted turn"
+                );
+            }
         }
     }
+}
+
+struct PendingRedoGuard {
+    state: StateStore,
+    turn_id: String,
+    revision: i64,
+    completed: bool,
+}
+
+impl PendingRedoGuard {
+    fn new(state: StateStore, turn_id: String, revision: i64) -> Self {
+        Self {
+            state,
+            turn_id,
+            revision,
+            completed: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_with_model(
+        mut self,
+        content: &str,
+        reasoning: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        token_total: Option<u64>,
+        token_usage_estimated: bool,
+    ) -> Result<()> {
+        self.state.complete_turn_revision_with_usage_and_model(
+            &self.turn_id,
+            self.revision,
+            content,
+            reasoning,
+            provider_id,
+            model,
+            token_total,
+            token_usage_estimated,
+        )?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingRedoGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Err(error) = self
+                .state
+                .interrupt_turn_revision(&self.turn_id, self.revision)
+            {
+                tracing::error!(
+                    turn_id = %self.turn_id,
+                    revision = self.revision,
+                    error = %error,
+                    "failed to recover an interrupted redo generation"
+                );
+            }
+        }
+    }
+}
+
+pub struct RedoPromptInput {
+    pub prompt_id: String,
+    pub content: String,
+    pub display_content: String,
+    pub images: Vec<Option<PastedImage>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -98,6 +176,104 @@ pub struct AgentTurnControl {
     normal_tools: ToolRegistry,
     plan_tools: ToolRegistry,
     chat_tools: ToolRegistry,
+    queue_ingress: Option<Arc<QueueIngressBarrier>>,
+    supersede: Option<Arc<TurnSupersedeSignal>>,
+    supersede_seen: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+pub(crate) struct TurnSupersedeSignal {
+    generation: AtomicU64,
+    changed: Notify,
+}
+
+impl TurnSupersedeSignal {
+    pub(crate) fn trigger(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.changed.notify_waiters();
+        generation
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    async fn wait_after(&self, observed: u64) {
+        loop {
+            let changed = self.changed.notified();
+            if self.generation() != observed {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct QueueIngressBarrier {
+    state: Mutex<QueueIngressState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct QueueIngressState {
+    active_calls: HashSet<String>,
+    reservations: usize,
+    closed: bool,
+}
+
+pub(crate) struct QueueIngressReservation {
+    barrier: Arc<QueueIngressBarrier>,
+}
+
+impl QueueIngressBarrier {
+    pub(crate) fn tool_started(&self, call_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        if !state.closed {
+            state.active_calls.insert(call_id.to_string());
+        }
+    }
+
+    pub(crate) fn tool_finished(&self, call_id: &str) {
+        self.state.lock().unwrap().active_calls.remove(call_id);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn try_reserve(self: &Arc<Self>) -> Option<QueueIngressReservation> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.active_calls.is_empty() {
+            return None;
+        }
+        state.reservations = state.reservations.saturating_add(1);
+        Some(QueueIngressReservation {
+            barrier: self.clone(),
+        })
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.active_calls.clear();
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_for_reserved_ingress(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.state.lock().unwrap().reservations == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for QueueIngressReservation {
+    fn drop(&mut self) {
+        let mut state = self.barrier.state.lock().unwrap();
+        state.reservations = state.reservations.saturating_sub(1);
+        self.barrier.changed.notify_waiters();
+    }
 }
 
 impl AgentTurnControl {
@@ -112,7 +288,27 @@ impl AgentTurnControl {
             normal_tools,
             plan_tools,
             chat_tools,
+            queue_ingress: None,
+            supersede: None,
+            supersede_seen: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn set_queue_ingress(&mut self, ingress: Arc<QueueIngressBarrier>) {
+        self.queue_ingress = Some(ingress);
+    }
+
+    pub(crate) fn set_supersede_signal(&mut self, signal: Arc<TurnSupersedeSignal>) {
+        self.supersede = Some(signal);
+    }
+
+    fn pending_supersede_generation(&self) -> Option<u64> {
+        let generation = self.supersede.as_ref()?.generation();
+        (generation != self.supersede_seen.load(Ordering::Acquire)).then_some(generation)
+    }
+
+    fn mark_supersede_seen(&self, generation: u64) {
+        self.supersede_seen.store(generation, Ordering::Release);
     }
 
     pub fn mode(&self) -> AgentMode {
@@ -164,6 +360,13 @@ pub enum AgentEvent {
         turn_id: String,
     },
     Chunk(ChatStreamChunk),
+    /// Raw provider reasoning, persisted before the UI title/body filter.
+    /// This event is consumed by `TurnJournalSink` and is never shown to a
+    /// transport directly.
+    RawReasoning(ChatStreamChunk),
+    /// Internal durability barrier used before non-stream state mutations that
+    /// create journal boundaries.
+    FlushJournal,
     ReasoningStart {
         received_at: Instant,
     },
@@ -178,19 +381,26 @@ pub enum AgentEvent {
     },
     ReasoningTitle(String),
     ToolCall {
+        call_id: String,
         name: String,
         arguments: String,
     },
+    ToolPreparing {
+        name: String,
+    },
     ToolResult {
+        call_id: String,
         name: String,
         ok: bool,
         output: String,
     },
     ToolProgress {
+        call_id: String,
         name: String,
         message: String,
     },
     CommandOutput {
+        call_id: String,
         name: String,
         stream: tools::CommandOutputStream,
         chunk: Vec<u8>,
@@ -199,11 +409,19 @@ pub enum AgentEvent {
         ready: oneshot::Sender<bool>,
     },
     Image {
+        call_id: String,
         name: String,
         path: PathBuf,
         alt: String,
     },
+    Artifact {
+        call_id: String,
+        name: String,
+        path: PathBuf,
+        title: String,
+    },
     AskQuestion {
+        call_id: String,
         request: QuestionRequest,
         responder: oneshot::Sender<QuestionResponse>,
     },
@@ -213,16 +431,415 @@ pub enum AgentEvent {
         provider_id: Option<String>,
         model: Option<String>,
     },
+    GenerationSuperseded {
+        prompt_ids: Vec<String>,
+    },
     SpinnerTick,
     CompactStart,
     CompactChunk(ChatStreamChunk),
     CompactEnd,
     PopStart,
     PopEnd,
+    /// One-shot operational notice shown to the user (e.g. auto-compaction
+    /// paused because the window is too small).
+    Notice {
+        text: String,
+    },
+}
+
+const JOURNAL_FLUSH_BYTES: usize = 16 * 1024;
+const JOURNAL_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+
+struct PendingJournalChunk {
+    kind: ChatStreamKind,
+    text: String,
+}
+
+/// Persists semantic stream events before forwarding them to a transport.
+/// Small adjacent deltas are coalesced so a long answer does not turn into a
+/// SQLite transaction per provider token.
+struct TurnJournalSink {
+    state: StateStore,
+    turn_id: String,
+    revision: i64,
+    segment_index: i64,
+    pending: Option<PendingJournalChunk>,
+    pending_reasoning_display: String,
+    last_flush: Instant,
+}
+
+impl TurnJournalSink {
+    fn new(state: StateStore, turn_id: String, revision: i64) -> Self {
+        Self {
+            state,
+            turn_id,
+            revision,
+            segment_index: 0,
+            pending: None,
+            pending_reasoning_display: String::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn emit<F>(&mut self, event: AgentEvent, on_event: &mut F) -> Result<()>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        match event {
+            AgentEvent::Chunk(chunk)
+                if matches!(
+                    chunk.kind,
+                    ChatStreamKind::Content | ChatStreamKind::ToolCall
+                ) =>
+            {
+                self.push_chunk(chunk, on_event)
+            }
+            AgentEvent::Chunk(chunk) if chunk.kind == ChatStreamKind::Reasoning => {
+                self.pending_reasoning_display.push_str(&chunk.text);
+                Ok(())
+            }
+            AgentEvent::RawReasoning(chunk) => {
+                if chunk.kind == ChatStreamKind::Reasoning && !chunk.text.is_empty() {
+                    self.push_chunk(chunk, on_event)
+                } else {
+                    Ok(())
+                }
+            }
+            AgentEvent::FlushJournal => self.flush(on_event),
+            AgentEvent::SpinnerTick => {
+                self.flush(on_event)?;
+                on_event(AgentEvent::SpinnerTick)
+            }
+            AgentEvent::ReasoningStart { received_at } => {
+                self.flush(on_event)?;
+                self.append("reasoning_start", None, None, None, None, None)?;
+                on_event(AgentEvent::ReasoningStart { received_at })
+            }
+            AgentEvent::ReasoningReset { received_at } => {
+                self.flush(on_event)?;
+                self.append("reasoning_reset", None, None, None, None, None)?;
+                on_event(AgentEvent::ReasoningReset { received_at })
+            }
+            AgentEvent::ReasoningPartStart { received_at } => {
+                self.flush(on_event)?;
+                self.append("reasoning_part_start", None, None, None, None, None)?;
+                on_event(AgentEvent::ReasoningPartStart { received_at })
+            }
+            AgentEvent::ReasoningPartEnd { received_at } => {
+                self.flush(on_event)?;
+                self.append("reasoning_part_end", None, None, None, None, None)?;
+                on_event(AgentEvent::ReasoningPartEnd { received_at })
+            }
+            AgentEvent::ReasoningTitle(title) => {
+                self.flush(on_event)?;
+                self.append("reasoning_title", None, None, Some(&title), None, None)?;
+                on_event(AgentEvent::ReasoningTitle(title))
+            }
+            AgentEvent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                self.flush(on_event)?;
+                self.append(
+                    "tool_call",
+                    Some(&call_id),
+                    Some(&name),
+                    Some(&arguments),
+                    None,
+                    None,
+                )?;
+                on_event(AgentEvent::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                })
+            }
+            AgentEvent::ToolPreparing { name } => {
+                self.flush(on_event)?;
+                self.append("tool_preparing", None, Some(&name), Some(&name), None, None)?;
+                on_event(AgentEvent::ToolPreparing { name })
+            }
+            AgentEvent::ToolResult {
+                call_id,
+                name,
+                ok,
+                output,
+            } => {
+                self.flush(on_event)?;
+                self.append(
+                    "tool_result",
+                    Some(&call_id),
+                    Some(&name),
+                    Some(&output),
+                    None,
+                    Some(ok),
+                )?;
+                on_event(AgentEvent::ToolResult {
+                    call_id,
+                    name,
+                    ok,
+                    output,
+                })
+            }
+            AgentEvent::ToolProgress {
+                call_id,
+                name,
+                message,
+            } => {
+                self.flush(on_event)?;
+                self.append(
+                    "tool_progress",
+                    Some(&call_id),
+                    Some(&name),
+                    Some(&message),
+                    None,
+                    None,
+                )?;
+                on_event(AgentEvent::ToolProgress {
+                    call_id,
+                    name,
+                    message,
+                })
+            }
+            AgentEvent::CommandOutput {
+                call_id,
+                name,
+                stream,
+                chunk,
+            } => {
+                self.flush(on_event)?;
+                let kind = match stream {
+                    tools::CommandOutputStream::Stdout => "command_stdout",
+                    tools::CommandOutputStream::Stderr => "command_stderr",
+                };
+                self.append(kind, Some(&call_id), Some(&name), None, Some(&chunk), None)?;
+                on_event(AgentEvent::CommandOutput {
+                    call_id,
+                    name,
+                    stream,
+                    chunk,
+                })
+            }
+            AgentEvent::Image {
+                call_id,
+                name,
+                path,
+                alt,
+            } => {
+                self.flush(on_event)?;
+                let payload = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "alt": alt,
+                });
+                let payload = serde_json::to_string(&payload)?;
+                self.append(
+                    "image",
+                    Some(&call_id),
+                    Some(&name),
+                    Some(&payload),
+                    None,
+                    None,
+                )?;
+                on_event(AgentEvent::Image {
+                    call_id,
+                    name,
+                    path,
+                    alt,
+                })
+            }
+            AgentEvent::Artifact {
+                call_id,
+                name,
+                path,
+                title,
+            } => {
+                self.flush(on_event)?;
+                let payload = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "title": title,
+                });
+                let payload = serde_json::to_string(&payload)?;
+                self.append(
+                    "artifact",
+                    Some(&call_id),
+                    Some(&name),
+                    Some(&payload),
+                    None,
+                    None,
+                )?;
+                on_event(AgentEvent::Artifact {
+                    call_id,
+                    name,
+                    path,
+                    title,
+                })
+            }
+            AgentEvent::AskQuestion {
+                call_id,
+                request,
+                responder,
+            } => {
+                self.flush(on_event)?;
+                let payload = serde_json::to_string(&request)?;
+                self.append(
+                    "question",
+                    Some(&call_id),
+                    Some("ask_question"),
+                    Some(&payload),
+                    None,
+                    None,
+                )?;
+                on_event(AgentEvent::AskQuestion {
+                    call_id,
+                    request,
+                    responder,
+                })
+            }
+            AgentEvent::GenerationSuperseded { prompt_ids } => {
+                self.flush(on_event)?;
+                self.state.supersede_turn_journal_segment(
+                    &self.turn_id,
+                    self.revision,
+                    self.segment_index,
+                )?;
+                on_event(AgentEvent::GenerationSuperseded { prompt_ids })
+            }
+            AgentEvent::QueuedPromptsConsumed {
+                prompt_ids,
+                mode,
+                provider_id,
+                model,
+            } => {
+                self.flush(on_event)?;
+                self.segment_index = self.segment_index.saturating_add(1);
+                on_event(AgentEvent::QueuedPromptsConsumed {
+                    prompt_ids,
+                    mode,
+                    provider_id,
+                    model,
+                })
+            }
+            AgentEvent::CompactStart
+            | AgentEvent::CompactChunk(_)
+            | AgentEvent::CompactEnd
+            | AgentEvent::PopStart
+            | AgentEvent::PopEnd
+            | AgentEvent::Notice { .. }
+            | AgentEvent::TurnStarted { .. }
+            | AgentEvent::PrepareForExternalOutput { .. } => on_event(event),
+            AgentEvent::Chunk(chunk) => on_event(AgentEvent::Chunk(chunk)),
+        }
+    }
+
+    fn push_chunk<F>(&mut self, chunk: ChatStreamChunk, on_event: &mut F) -> Result<()>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        if self.pending.is_none() && !self.pending_reasoning_display.is_empty() {
+            self.flush(on_event)?;
+        }
+        let should_flush = self.pending.as_ref().is_some_and(|pending| {
+            pending.kind != chunk.kind
+                || pending.text.len().saturating_add(chunk.text.len()) >= JOURNAL_FLUSH_BYTES
+                || self.last_flush.elapsed() >= JOURNAL_FLUSH_INTERVAL
+        });
+        if should_flush {
+            self.flush(on_event)?;
+        }
+        if let Some(pending) = self.pending.as_mut() {
+            pending.text.push_str(&chunk.text);
+        } else {
+            self.pending = Some(PendingJournalChunk {
+                kind: chunk.kind,
+                text: chunk.text,
+            });
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.text.len() >= JOURNAL_FLUSH_BYTES)
+        {
+            self.flush(on_event)?;
+        }
+        Ok(())
+    }
+
+    fn flush<F>(&mut self, on_event: &mut F) -> Result<()>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let Some(pending) = self.pending.take() else {
+            if self.pending_reasoning_display.is_empty() {
+                return Ok(());
+            }
+            let text = std::mem::take(&mut self.pending_reasoning_display);
+            on_event(AgentEvent::Chunk(ChatStreamChunk {
+                kind: ChatStreamKind::Reasoning,
+                text,
+            }))?;
+            self.last_flush = Instant::now();
+            return Ok(());
+        };
+        let kind = match pending.kind {
+            ChatStreamKind::Content => "assistant_content",
+            ChatStreamKind::Reasoning => "assistant_reasoning",
+            ChatStreamKind::ToolCall => "tool_call_delta",
+            ChatStreamKind::ReasoningReset
+            | ChatStreamKind::ReasoningPartStart
+            | ChatStreamKind::ReasoningPartEnd => return Ok(()),
+        };
+        self.append(kind, None, None, Some(&pending.text), None, None)?;
+        self.last_flush = Instant::now();
+        if pending.kind == ChatStreamKind::Reasoning {
+            let text = std::mem::take(&mut self.pending_reasoning_display);
+            if text.is_empty() {
+                return Ok(());
+            }
+            return on_event(AgentEvent::Chunk(ChatStreamChunk {
+                kind: ChatStreamKind::Reasoning,
+                text,
+            }));
+        }
+        on_event(AgentEvent::Chunk(ChatStreamChunk {
+            kind: pending.kind,
+            text: pending.text,
+        }))
+    }
+
+    fn finish<F>(&mut self, on_event: &mut F) -> Result<()>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        self.flush(on_event)
+    }
+
+    fn append(
+        &self,
+        kind: &str,
+        call_id: Option<&str>,
+        name: Option<&str>,
+        text_payload: Option<&str>,
+        blob_payload: Option<&[u8]>,
+        ok: Option<bool>,
+    ) -> Result<()> {
+        self.state.append_turn_journal_event(
+            &self.turn_id,
+            self.revision,
+            self.segment_index,
+            kind,
+            call_id,
+            name,
+            text_payload,
+            blob_payload,
+            ok,
+        )
+    }
 }
 
 fn emit_tool_progress<F>(
     on_event: &mut F,
+    call_id: &str,
     name: &str,
     progress: tools::ToolProgressEvent,
 ) -> Result<()>
@@ -231,6 +848,7 @@ where
 {
     match progress {
         tools::ToolProgressEvent::Message(message) => on_event(AgentEvent::ToolProgress {
+            call_id: call_id.to_string(),
             name: name.to_string(),
             message,
         }),
@@ -238,12 +856,20 @@ where
             on_event(AgentEvent::PrepareForExternalOutput { ready })
         }
         tools::ToolProgressEvent::Image { path, alt } => on_event(AgentEvent::Image {
+            call_id: call_id.to_string(),
             name: name.to_string(),
             path,
             alt,
         }),
+        tools::ToolProgressEvent::Artifact { path, title } => on_event(AgentEvent::Artifact {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            path,
+            title,
+        }),
         tools::ToolProgressEvent::CommandOutput { stream, chunk } => {
             on_event(AgentEvent::CommandOutput {
+                call_id: call_id.to_string(),
                 name: name.to_string(),
                 stream,
                 chunk,
@@ -256,22 +882,68 @@ pub struct Agent {
     state: StateStore,
     client: OpenAiCompatibleClient,
     system_prompt: String,
+    /// Per-run system additions supplied by a transport/plugin. They are
+    /// intentionally excluded from prompt-change hashing and persistence.
+    runtime_system_context: Vec<String>,
+    /// Per-message transport context (sender identity JSON, message ids, …)
+    /// rendered as a tail system message after the user turn. Kept out of the
+    /// system prompt so the stable prefix stays byte-identical across turns.
+    turn_system_context: Vec<String>,
+    suppress_session_history: bool,
     trim_at_ratio: f32,
     trim_batch_ratio: f32,
     tools_enabled: bool,
     max_tool_rounds: usize,
     tools: Arc<Mutex<ToolRegistry>>,
     memory: MemoryStore,
+    memory_organizer: Option<MemoryOrganizerHandle>,
+    memory_origin: MemoryOrigin,
+    memory_database_id: String,
+    memory_generation: i64,
     mode: AgentMode,
+    prompt_audience: PromptAudience,
     config: AppConfig,
     paths: MiyuPaths,
     on_overflow: String,
+    turn_display_content: Option<String>,
+    attachment_run_id: Option<String>,
+    image_platform: Option<String>,
+    image_platform_label: Option<String>,
+    platform_context: Option<Arc<PlatformTurnContext>>,
+    context_images: Vec<PlatformContextImageRef>,
+    /// Exact (messages, tools) of the most recent live request; feeds the
+    /// idle cache-keepalive pings (v7 DeepSeek 高命中策略). Only populated
+    /// while `cache.keepalive_seconds > 0`.
+    last_request_snapshot: Option<(Vec<ChatMessage>, Vec<crate::llm::ToolDefinition>)>,
+    /// Cancels the currently running keepalive loop, if any.
+    keepalive_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Consecutive auto-compactions that failed to bring the context back
+    /// under the trigger. A healthy compaction lands below the trigger; two
+    /// in a row mean the verbatim floor alone exceeds it (window too small),
+    /// so auto-compaction latches off until the context drops (`compact_stuck`).
+    consecutive_compacts: std::sync::atomic::AtomicU32,
+    compact_stuck: std::sync::atomic::AtomicBool,
+    /// Max turn seq observed right after the previous auto-compaction (-1 =
+    /// none yet). A new compaction firing within a few turns of the last one
+    /// means some single item (a huge paste or tool output) refills the
+    /// window instantly — compacting harder won't help ("thrashing").
+    last_compact_max_seq: std::sync::atomic::AtomicI64,
+    rapid_compacts: std::sync::atomic::AtomicU32,
+    /// One-shot "context is getting large" notice at the soft watermark.
+    soft_notice_sent: std::sync::atomic::AtomicBool,
 }
 
 struct PreparedUserInput {
     content: String,
     message: ChatMessage,
     hints: Vec<ChatMessage>,
+}
+
+/// Output of a `task` call executed in the parallel group.
+struct GroupTaskOutput {
+    output: String,
+    /// Persistable tool report, extracted at completion.
+    report: Option<String>,
 }
 
 impl Agent {
@@ -283,41 +955,417 @@ impl Agent {
         tools: ToolRegistry,
         mode: AgentMode,
     ) -> Result<Self> {
-        let base_system_prompt = config.system_prompt(paths)?;
-        if matches!(mode, AgentMode::Normal | AgentMode::Chat) {
-            state.reset_if_prompt_changed(&base_system_prompt)?;
-            state.recover_stale_turns()?;
-        }
+        Self::new_for_audience(
+            config,
+            paths,
+            state,
+            client,
+            tools,
+            mode,
+            PromptAudience::Owner,
+        )
+    }
+
+    pub(crate) fn new_for_audience(
+        config: AppConfig,
+        paths: &MiyuPaths,
+        state: StateStore,
+        client: OpenAiCompatibleClient,
+        tools: ToolRegistry,
+        mode: AgentMode,
+        prompt_audience: PromptAudience,
+    ) -> Result<Self> {
+        // Construction is side-effect free (aside from idempotent memory
+        // init) so concurrent turns can each build their own Agent; startup
+        // maintenance (prompt-change reset, stale-turn recovery) lives in
+        // `prepare_for_turn`.
+        let base_system_prompt = config.system_prompt_for(paths, prompt_audience)?;
         let system_prompt = with_mode_reminder(base_system_prompt, mode);
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
         let memory = MemoryStore::new(&config, paths);
         memory.init()?;
+        let (memory_database_id, memory_generation) = memory.identity()?;
+        let memory_origin = MemoryOrigin::local(state.session_id().to_string());
         let on_overflow = config.context.on_overflow.clone();
         Ok(Self {
             state,
             client,
             system_prompt,
+            runtime_system_context: Vec::new(),
+            turn_system_context: Vec::new(),
+            suppress_session_history: false,
             trim_at_ratio: config.context.trim_at_ratio,
             trim_batch_ratio: config.context.trim_batch_ratio,
             tools_enabled,
             max_tool_rounds,
             tools: Arc::new(Mutex::new(tools)),
             memory,
+            memory_organizer: None,
+            memory_origin,
+            memory_database_id,
+            memory_generation,
             mode,
+            prompt_audience,
             config,
             paths: paths.clone(),
             on_overflow,
+            turn_display_content: None,
+            attachment_run_id: None,
+            image_platform: None,
+            image_platform_label: None,
+            platform_context: None,
+            context_images: Vec::new(),
+            last_request_snapshot: None,
+            keepalive_cancel: None,
+            consecutive_compacts: std::sync::atomic::AtomicU32::new(0),
+            compact_stuck: std::sync::atomic::AtomicBool::new(false),
+            last_compact_max_seq: std::sync::atomic::AtomicI64::new(-1),
+            rapid_compacts: std::sync::atomic::AtomicU32::new(0),
+            soft_notice_sent: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
+    /// Stops the idle cache-keepalive loop (called whenever a new request is
+    /// about to change the context, and before dropping the agent).
+    pub fn cancel_cache_keepalive(&mut self) {
+        if let Some(cancel) = self.keepalive_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Starts the idle keepalive loop for the last request prefix. No-op when
+    /// disabled or when no snapshot exists.
+    fn start_cache_keepalive(&mut self) {
+        self.cancel_cache_keepalive();
+        let interval = self.config.cache.keepalive_seconds;
+        if interval == 0 {
+            return;
+        }
+        let Some((messages, tools)) = self.last_request_snapshot.clone() else {
+            return;
+        };
+        let max_pings = self.config.cache.keepalive_max_pings;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.keepalive_cancel = Some(cancel.clone());
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            for ping in 0..max_pings {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                match client.cache_keepalive(messages.clone(), tools.clone()).await {
+                    Ok(Some(usage)) => {
+                        tracing::info!(
+                            ping = ping + 1,
+                            prompt_tokens = usage.prompt_tokens,
+                            cache_read = usage.cache_read_tokens,
+                            "cache keepalive ping"
+                        );
+                        let _ = state.add_auxiliary_usage(&usage);
+                    }
+                    Ok(None) => return, // protocol without keepalive support
+                    Err(error) => {
+                        tracing::warn!(error = %error, "cache keepalive ping failed");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     pub fn prepare_for_turn(&mut self) -> Result<()> {
-        let base_system_prompt = self.config.system_prompt(&self.paths)?;
+        let effective_system_prompt = self
+            .config
+            .system_prompt_for(&self.paths, self.prompt_audience)?;
         if matches!(self.mode, AgentMode::Normal | AgentMode::Chat) {
-            self.state.reset_if_prompt_changed(&base_system_prompt)?;
+            let fingerprint_prompt = self.config.base_system_prompt(&self.paths)?;
+            let compatible_previous = matches!(self.prompt_audience, PromptAudience::Owner)
+                .then_some(effective_system_prompt.as_str());
+            self.state.reset_if_prompt_changed_with_compatible(
+                &fingerprint_prompt,
+                compatible_previous,
+            )?;
             self.state.recover_stale_turns()?;
         }
-        self.system_prompt = with_mode_reminder(base_system_prompt, self.mode);
+        self.system_prompt = with_runtime_system_context(
+            with_mode_reminder(effective_system_prompt, self.mode),
+            &self.runtime_system_context,
+        );
+        Ok(())
+    }
+
+    pub fn set_runtime_system_context(&mut self, context: Vec<String>) -> Result<()> {
+        self.runtime_system_context = context
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        self.refresh_system_prompt()
+    }
+
+    /// Per-message transport blocks that ride the turn tail (after the user
+    /// message) instead of the system prompt. No prompt refresh needed: they
+    /// are consumed at message-assembly time.
+    pub fn set_turn_system_context(&mut self, context: Vec<String>) {
+        self.turn_system_context = context
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+    }
+
+    pub(crate) fn set_memory_writes_enabled(&mut self, enabled: bool) {
+        self.memory.set_writes_enabled(enabled);
+    }
+
+    pub(crate) fn set_memory_organizer(&mut self, organizer: MemoryOrganizerHandle) {
+        self.memory_organizer = Some(organizer);
+    }
+
+    pub(crate) fn set_memory_origin(&mut self, origin: MemoryOrigin) {
+        self.memory_origin = origin;
+    }
+
+    pub(crate) fn set_memory_request_context(
+        &mut self,
+        access: MemoryAccess,
+        writer_principal: Option<String>,
+        writer_display_name: impl Into<String>,
+    ) {
+        self.memory
+            .set_request_context(access, writer_principal, writer_display_name);
+    }
+
+    pub(crate) fn set_image_platform(&mut self, platform: &str, display_name: &str) {
+        let platform = platform
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .collect::<String>();
+        self.image_platform = (!platform.is_empty()).then_some(platform);
+        self.image_platform_label = self.image_platform.as_ref().and_then(|_| {
+            (!display_name.trim().is_empty()).then(|| display_name.trim().to_string())
+        });
+    }
+
+    pub(crate) fn set_platform_context_images(
+        &mut self,
+        context: Arc<PlatformTurnContext>,
+        images: Vec<PlatformContextImageRef>,
+    ) {
+        self.platform_context = Some(context);
+        self.context_images = images;
+    }
+
+    pub fn set_turn_persistence(
+        &mut self,
+        display_content: String,
+        attachment_run_id: Option<String>,
+    ) {
+        self.turn_display_content = Some(display_content);
+        self.attachment_run_id = attachment_run_id;
+    }
+
+    pub fn set_session_history_suppressed(&mut self, suppressed: bool) {
+        self.suppress_session_history = suppressed;
+    }
+
+    /// Runs a batch's `task` tool calls concurrently, in waves bounded by
+    /// `tools.subagent_concurrency`. Subagents are independent by design, so
+    /// fanning them out preserves semantics while collapsing wall-clock time.
+    /// Batches with fewer than two task calls — or a not-yet-loaded task tool
+    /// (hybrid lazy loading) — return an empty map and take the serial path.
+    async fn execute_parallel_task_calls<F>(
+        &self,
+        calls: &[crate::llm::ToolCall],
+        loaded_tools: &std::collections::BTreeSet<String>,
+        on_event: &mut F,
+    ) -> Result<std::collections::HashMap<usize, GroupTaskOutput>>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let mut outputs = std::collections::HashMap::new();
+        let eligible: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.function.name == "task")
+            .map(|(index, _)| index)
+            .collect();
+        if eligible.len() < 2 {
+            return Ok(outputs);
+        }
+        {
+            let tools = self.tools.lock().unwrap();
+            if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode)
+                && tools.requires_lazy_load("task", loaded_tools)
+            {
+                return Ok(outputs);
+            }
+        }
+
+        struct Slot {
+            call_index: usize,
+            call_id: String,
+            event_name: String,
+            future: Option<tools::ToolFuture>,
+            progress: mpsc::UnboundedReceiver<tools::ToolProgressEvent>,
+        }
+        enum WaveEvent {
+            Done(usize, Result<String>),
+            Progress(usize, tools::ToolProgressEvent),
+            Spinner,
+        }
+
+        let limit = self.config.tools.subagent_concurrency.max(1);
+        for wave in eligible.chunks(limit) {
+            let mut slots: Vec<Slot> = Vec::new();
+            {
+                let tools = self.tools.lock().unwrap();
+                for &call_index in wave {
+                    let call = &calls[call_index];
+                    let event_name = tool_event_name(&call.function.name, &call.function.arguments);
+                    on_event(AgentEvent::ToolCall {
+                        call_id: call.id.clone(),
+                        name: event_name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    })?;
+                    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+                    match tools.call_with_progress_future(
+                        &call.function.name,
+                        &call.function.arguments,
+                        progress_tx,
+                    ) {
+                        Ok(future) => slots.push(Slot {
+                            call_index,
+                            call_id: call.id.clone(),
+                            event_name,
+                            future: Some(future),
+                            progress: progress_rx,
+                        }),
+                        Err(err) => {
+                            let output = format!("tool error: {err}");
+                            on_event(AgentEvent::ToolResult {
+                                call_id: call.id.clone(),
+                                name: event_name,
+                                ok: false,
+                                output: output.clone(),
+                            })?;
+                            outputs.insert(
+                                call_index,
+                                GroupTaskOutput {
+                                    output,
+                                    report: None,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            let mut remaining = slots.iter().filter(|slot| slot.future.is_some()).count();
+            let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+            spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            spinner_interval.tick().await;
+            while remaining > 0 {
+                let event = {
+                    let poll_slots = std::future::poll_fn(|context| {
+                        for (position, slot) in slots.iter_mut().enumerate() {
+                            if let std::task::Poll::Ready(Some(progress)) =
+                                slot.progress.poll_recv(context)
+                            {
+                                return std::task::Poll::Ready(WaveEvent::Progress(
+                                    position, progress,
+                                ));
+                            }
+                            if let Some(future) = slot.future.as_mut() {
+                                if let std::task::Poll::Ready(result) =
+                                    future.as_mut().poll(context)
+                                {
+                                    slot.future = None;
+                                    return std::task::Poll::Ready(WaveEvent::Done(
+                                        position, result,
+                                    ));
+                                }
+                            }
+                        }
+                        std::task::Poll::Pending
+                    });
+                    tokio::select! {
+                        event = poll_slots => event,
+                        _ = spinner_interval.tick() => WaveEvent::Spinner,
+                    }
+                };
+                match event {
+                    WaveEvent::Spinner => on_event(AgentEvent::SpinnerTick)?,
+                    WaveEvent::Progress(position, progress) => {
+                        emit_tool_progress(
+                            on_event,
+                            &slots[position].call_id,
+                            &slots[position].event_name,
+                            progress,
+                        )?;
+                    }
+                    WaveEvent::Done(position, result) => {
+                        remaining -= 1;
+                        while let Ok(progress) = slots[position].progress.try_recv() {
+                            emit_tool_progress(
+                                on_event,
+                                &slots[position].call_id,
+                                &slots[position].event_name,
+                                progress,
+                            )?;
+                        }
+                        let call_index = slots[position].call_index;
+                        let call_id = slots[position].call_id.clone();
+                        let event_name = slots[position].event_name.clone();
+                        match result {
+                            Ok(output) => {
+                                on_event(AgentEvent::ToolResult {
+                                    call_id,
+                                    name: event_name,
+                                    ok: true,
+                                    output: output.clone(),
+                                })?;
+                                let report = extract_persistable_tool_report("task", &output);
+                                outputs.insert(call_index, GroupTaskOutput { output, report });
+                            }
+                            Err(err) => {
+                                let output = format!("tool error: {err}");
+                                on_event(AgentEvent::ToolResult {
+                                    call_id,
+                                    name: event_name,
+                                    ok: false,
+                                    output: output.clone(),
+                                })?;
+                                outputs.insert(
+                                    call_index,
+                                    GroupTaskOutput {
+                                        output,
+                                        report: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// Rebuilds the system prompt for the current mode without running
+    /// turn-entry maintenance. Used for mid-turn mode switches, where
+    /// `reset_if_prompt_changed` must never fire (it would wipe the very
+    /// turn that is running).
+    fn refresh_system_prompt(&mut self) -> Result<()> {
+        let base_system_prompt = self
+            .config
+            .system_prompt_for(&self.paths, self.prompt_audience)?;
+        self.system_prompt = with_runtime_system_context(
+            with_mode_reminder(base_system_prompt, self.mode),
+            &self.runtime_system_context,
+        );
         Ok(())
     }
 
@@ -339,9 +1387,18 @@ impl Agent {
         Ok(tokens)
     }
 
+    /// Session-scoped lifetime token total (Σ in the footer): keeps growing
+    /// across compactions, resets to zero with the session history. The old
+    /// global usage.json figure lives on in /usage as the global overview.
+    pub fn conversation_usage_tokens(&self) -> Result<u64> {
+        self.state.session_cumulative_tokens()
+    }
+
     fn tool_definition_tokens(&self, loaded_tools: &BTreeSet<String>) -> usize {
         let tools = self.tools.lock().unwrap();
-        let definitions = if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+        let definitions = if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+            tools.stub_definitions()
+        } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
             tools.lazy_definitions(loaded_tools)
         } else {
             tools.definitions()
@@ -355,15 +1412,17 @@ impl Agent {
         messages: &mut Vec<ChatMessage>,
         queued: Vec<QueuedPrompt>,
         preceding_assistant: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
+        checkpoint: TurnRedoCheckpointPayload,
         control: &AgentTurnControl,
         on_event: &mut F,
     ) -> Result<()>
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        on_event(AgentEvent::FlushJournal)?;
         let mut prepared = Vec::with_capacity(queued.len());
         for prompt in queued {
-            let images = queued_prompt_images(&prompt)?;
+            let images = self.queued_prompt_images(&prompt)?;
             let input = self.prepare_user_input(&prompt.content, &images).await?;
             prepared.push((prompt, input));
         }
@@ -371,7 +1430,7 @@ impl Agent {
         let mode = control.mode();
         if self.mode != mode {
             self.switch_mode(mode, control.tools(mode));
-            self.prepare_for_turn()?;
+            self.refresh_system_prompt()?;
         }
         replace_request_mode_context(messages, &self.system_prompt, mode);
 
@@ -379,7 +1438,7 @@ impl Agent {
             .iter()
             .map(|(prompt, input)| (prompt.prompt_id.clone(), input.content.clone()))
             .collect::<Vec<_>>();
-        self.state.consume_queued_prompts_with_model(
+        self.state.consume_queued_prompts_with_checkpoint(
             current_turn_id,
             &consumed,
             preceding_assistant
@@ -394,6 +1453,7 @@ impl Agent {
             preceding_assistant
                 .3
                 .filter(|model| !model.trim().is_empty()),
+            checkpoint,
         )?;
         on_event(AgentEvent::QueuedPromptsConsumed {
             prompt_ids: consumed.iter().map(|(id, _)| id.clone()).collect(),
@@ -452,7 +1512,16 @@ impl Agent {
             if total <= target {
                 break;
             }
-            total = total.saturating_sub(turn_context_tokens(turn));
+            let turn_tokens = if turn.status == crate::state::TurnStatus::Interrupted
+                && !turn.journal_events.is_empty()
+            {
+                let mut replay = vec![self.turn_user_message(turn)];
+                replay.extend(interrupted_turn_replay_messages(self, turn));
+                overflow::estimate_messages_tokens(&replay)
+            } else {
+                turn_context_tokens(turn)
+            };
+            total = total.saturating_sub(turn_tokens);
             if let Some(items) = loaded_tool_sources.as_mut() {
                 items.retain(|(_, source)| source.as_deref() != Some(turn.turn_id.as_str()));
                 let remaining = items
@@ -487,6 +1556,10 @@ impl Agent {
         self.client = client;
     }
 
+    pub(crate) fn cloned_client(&self) -> OpenAiCompatibleClient {
+        self.client.clone()
+    }
+
     pub fn reload_config(
         &mut self,
         config: AppConfig,
@@ -499,14 +1572,26 @@ impl Agent {
         self.trim_at_ratio = self.config.context.trim_at_ratio;
         self.trim_batch_ratio = self.config.context.trim_batch_ratio;
         self.on_overflow = self.config.context.on_overflow.clone();
-        self.memory = MemoryStore::new(&self.config, &self.paths);
+        let (access, writer_principal, writer_display_name) = self.memory.request_context();
+        self.memory = MemoryStore::new(&self.config, &self.paths).with_request_context(
+            access,
+            writer_principal,
+            writer_display_name,
+        );
         self.memory.init()?;
+        (self.memory_database_id, self.memory_generation) = self.memory.identity()?;
         self.prepare_for_turn()
     }
 
     pub fn reset_memory(&mut self) -> Result<()> {
-        self.memory = MemoryStore::new(&self.config, &self.paths);
+        let (access, writer_principal, writer_display_name) = self.memory.request_context();
+        self.memory = MemoryStore::new(&self.config, &self.paths).with_request_context(
+            access,
+            writer_principal,
+            writer_display_name,
+        );
         self.memory.init()?;
+        (self.memory_database_id, self.memory_generation) = self.memory.identity()?;
         Ok(())
     }
 
@@ -544,6 +1629,158 @@ impl Agent {
             .await
     }
 
+    pub async fn redo_stream_with_control<F>(
+        &mut self,
+        candidate: &RedoCandidate,
+        prompts: Vec<RedoPromptInput>,
+        control: &AgentTurnControl,
+        on_event: F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        self.cancel_cache_keepalive();
+        self.state.recover_stale_turns()?;
+        self.trim_visible_context()?;
+        if prompts.is_empty()
+            || prompts.last().map(|prompt| prompt.prompt_id.as_str())
+                != Some(candidate.input_id.as_str())
+        {
+            bail!("redo prompts no longer match the selected input");
+        }
+        let current_turn = self
+            .state
+            .load_turns()?
+            .into_iter()
+            .find(|turn| turn.turn_id == candidate.turn_id)
+            .context("redo turn no longer exists")?;
+
+        let mut prepared = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let input = self
+                .prepare_user_input(&prompt.content, &prompt.images)
+                .await?;
+            prepared.push((prompt, input));
+        }
+        let (last_prompt, last_input) = prepared.last().context("redo input is empty")?;
+        let last_content = last_input.content.clone();
+        let last_display_content = last_prompt.display_content.clone();
+        let diary_input = last_content.clone();
+        let redo = self.state.begin_redo(
+            &candidate.turn_id,
+            &candidate.input_id,
+            candidate.input_kind,
+            candidate.revision,
+            &last_content,
+            &last_display_content,
+            std::process::id(),
+        )?;
+        let guard =
+            PendingRedoGuard::new(self.state.clone(), candidate.turn_id.clone(), redo.revision);
+        let mut on_event = on_event;
+        on_event(AgentEvent::TurnStarted {
+            turn_id: candidate.turn_id.clone(),
+        })?;
+
+        let mut messages = self.chat_messages(&candidate.turn_id, "")?;
+        // chat_messages ends with [.., user placeholder, runtime]; drop both
+        // and re-append the runtime right after the real redo input so the
+        // transient tail keeps sitting behind the user message.
+        let runtime_message = messages.pop();
+        let _ = messages.pop();
+        let replay_start;
+        let fossil_start;
+        let base_tool_reports;
+        let initial_tool_rounds;
+        let initial_question_rounds;
+        match candidate.input_kind {
+            RedoInputKind::Initial => {
+                let (_, input) = prepared.pop().context("redo input is empty")?;
+                messages.push(input.message);
+                fossil_start = messages.len();
+                messages.extend(runtime_message);
+                replay_start = messages.len();
+                messages.extend(input.hints);
+                base_tool_reports = Vec::new();
+                initial_tool_rounds = 0;
+                initial_question_rounds = 0;
+            }
+            RedoInputKind::Followup => {
+                let checkpoint = redo.checkpoint.context("redo checkpoint is unavailable")?;
+                messages.push(self.turn_user_message(&current_turn));
+                fossil_start = messages.len();
+                messages.extend(runtime_message);
+                replay_start = messages.len();
+                messages.extend(checkpoint.replay_messages);
+                for (_, input) in prepared {
+                    messages.push(input.message);
+                    messages.extend(input.hints);
+                }
+                base_tool_reports = checkpoint.prefix_tool_reports;
+                initial_tool_rounds = checkpoint.tool_rounds;
+                initial_question_rounds = checkpoint.question_rounds;
+            }
+        }
+        // Redo rewrites the turn, so refresh its fossilized tail to match what
+        // this generation actually sends (new runtime stamp + replayed tail).
+        self.state.set_turn_context_messages(
+            &candidate.turn_id,
+            &fossil_context_messages(&messages[fossil_start..]),
+        )?;
+
+        let mut used_tools = Vec::new();
+        let mut persisted_tool_reports = Vec::new();
+        let mut journal =
+            TurnJournalSink::new(self.state.clone(), candidate.turn_id.clone(), redo.revision);
+        let stream_result = {
+            let mut journaled_event = |event| journal.emit(event, &mut on_event);
+            self.chat_with_tools(
+                &candidate.turn_id,
+                &mut messages,
+                &mut used_tools,
+                &mut persisted_tool_reports,
+                replay_start,
+                &base_tool_reports,
+                initial_tool_rounds,
+                initial_question_rounds,
+                Some(control),
+                &mut journaled_event,
+            )
+            .await
+        };
+        journal.finish(&mut on_event)?;
+        let result = stream_result?;
+        let reports = persisted_tool_reports
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect::<Vec<_>>();
+        self.state
+            .append_persisted_contexts(&candidate.turn_id, &reports)?;
+        let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
+        guard.complete_with_model(
+            &result.content,
+            result.reasoning.as_deref(),
+            result.provider_id.as_deref(),
+            result.model.as_deref(),
+            token_total,
+            result.usage_estimated,
+        )?;
+        if self.memory.process_after_turn(
+            &diary_input,
+            &result.content,
+            &self.memory_origin,
+            &self.memory_database_id,
+            self.memory_generation,
+        )? {
+            self.wake_memory_organizer();
+        }
+        if let Some(usage) = result.usage.clone() {
+            self.state.add_usage(&usage)?;
+        }
+        self.start_cache_keepalive();
+        Ok(result)
+    }
+
     async fn chat_stream_with_images_inner<F>(
         &mut self,
         input: &str,
@@ -554,6 +1791,9 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        // A new turn is about to mutate the context; stop pinging the stale
+        // prefix (the turn's own requests refresh the cache anyway).
+        self.cancel_cache_keepalive();
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
         let prepared = self.prepare_user_input(input, images).await?;
@@ -566,24 +1806,51 @@ impl Agent {
                 .unwrap_or(0),
             rand::random::<u16>()
         );
-        self.state
-            .start_turn(&turn_id, &input, std::process::id())?;
+        let display_content = self
+            .turn_display_content
+            .take()
+            .unwrap_or_else(|| input.clone());
+        let attachment_run_id = self.attachment_run_id.take();
+        self.state.start_turn_with_display(
+            &turn_id,
+            &input,
+            &display_content,
+            std::process::id(),
+            attachment_run_id.as_deref(),
+        )?;
         let guard = PendingTurnGuard::new(self.state.clone(), turn_id.clone());
         let mut on_event = on_event;
         on_event(AgentEvent::TurnStarted {
             turn_id: turn_id.clone(),
         })?;
         let mut messages = self.chat_messages(&turn_id, &input)?;
-        if let Some(last) = messages.last_mut() {
-            *last = prepared.message;
+        // chat_messages ends with [.., user, runtime]; swap in the prepared
+        // user message (attachments/images) at its position before the
+        // transient runtime tail.
+        let user_index = messages.len().saturating_sub(2);
+        if let Some(user) = messages.get_mut(user_index) {
+            *user = prepared.message;
+        }
+        let replay_start = messages.len();
+        if !self.turn_system_context.is_empty() {
+            // Trusted transport/control tail (v7 §三): host-derived per-message
+            // context lands after the user message, before untrusted blocks.
+            messages.push(ChatMessage::system(self.turn_system_context.join("\n\n")));
         }
         messages.extend(prepared.hints);
         if self.mode != AgentMode::Chat {
             if let Some(association) = self.memory.association(&input)? {
-                messages.insert(
-                    1,
-                    ChatMessage::system(self.memory.format_association(&association)),
-                );
+                if association.organization_due {
+                    self.wake_memory_organizer();
+                }
+                // v7 Phase 1.1: the associative-memory block rides the turn
+                // tail instead of `insert(1)`, so the stable history prefix in
+                // front stays byte-identical for provider prefix caches. It
+                // lands after `replay_start`, so redo checkpoints freeze the
+                // recalled snapshot (decision 6).
+                messages.push(ChatMessage::system(
+                    self.memory.format_association(&association),
+                ));
             }
         }
         if self.mode != AgentMode::Plan {
@@ -591,21 +1858,41 @@ impl Agent {
                 messages.push(ChatMessage::system(reminder));
             }
         }
+        // v7 append-only fossilization ("注入了就别删"): archive the transient
+        // system tail exactly as sent — runtime stamp, trusted transport
+        // context, hints, associative memory, meme reminder — so future
+        // history replay is a byte-exact extension of this request and the
+        // provider prefix cache never sees a divergence at this turn.
+        self.state.set_turn_context_messages(
+            &turn_id,
+            &fossil_context_messages(&messages[user_index + 1..]),
+        )?;
         let mut used_tools = Vec::new();
         let mut persisted_tool_reports = Vec::new();
-        let result = self
-            .chat_with_tools(
+        let mut journal = TurnJournalSink::new(self.state.clone(), turn_id.clone(), 0);
+        let stream_result = {
+            let mut journaled_event = |event| journal.emit(event, &mut on_event);
+            self.chat_with_tools(
                 &turn_id,
                 &mut messages,
                 &mut used_tools,
                 &mut persisted_tool_reports,
+                replay_start,
+                &[],
+                0,
+                0,
                 control,
-                &mut on_event,
+                &mut journaled_event,
             )
-            .await?;
-        for (_, report) in persisted_tool_reports {
-            self.state.append_persisted_context(&turn_id, &report)?;
-        }
+            .await
+        };
+        journal.finish(&mut on_event)?;
+        let result = stream_result?;
+        let reports = persisted_tool_reports
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect::<Vec<_>>();
+        self.state.append_persisted_contexts(&turn_id, &reports)?;
         let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
         guard.complete_with_model(
             &result.content,
@@ -615,11 +1902,26 @@ impl Agent {
             token_total,
             result.usage_estimated,
         )?;
-        self.memory.process_after_turn(&input, &result.content)?;
+        if self.memory.process_after_turn(
+            &input,
+            &result.content,
+            &self.memory_origin,
+            &self.memory_database_id,
+            self.memory_generation,
+        )? {
+            self.wake_memory_organizer();
+        }
         if let Some(usage) = result.usage.clone() {
             self.state.add_usage(&usage)?;
         }
+        self.start_cache_keepalive();
         Ok(result)
+    }
+
+    fn wake_memory_organizer(&self) {
+        if let Some(organizer) = &self.memory_organizer {
+            organizer.wake(self.config.clone(), self.paths.clone(), self.state.clone());
+        }
     }
 
     async fn prepare_user_input(
@@ -642,61 +1944,109 @@ impl Agent {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let absolute_image_paths = resolve_pasted_image_paths(images, &self.paths);
-        let temp_paths = absolute_image_paths
+        let absolute_image_paths =
+            resolve_pasted_image_paths(images, &self.paths, self.image_platform.as_deref());
+        let binary_paths = images
             .iter()
-            .filter_map(|path| path.clone())
+            .zip(&absolute_image_paths)
+            .filter_map(|(image, path)| {
+                matches!(image, Some(PastedImage::Binary(_)))
+                    .then(|| path.clone())
+                    .flatten()
+            })
             .collect::<Vec<_>>();
+        // v7 Phase 1.3-b: register the scoped vision tool whenever the platform
+        // path is active, even with no images this turn. A conditional
+        // registration made the tools array appear/disappear between turns,
+        // invalidating the provider prefix cache from token 0; an empty scope
+        // simply rejects analysis requests with a clear message instead.
+        if self.tools_enabled
+            && self.config.plugins.vision.enabled
+            && self.image_platform.is_some()
+        {
+            let mut tools = self.tools.lock().unwrap();
+            if let Some(platform_context) = self.platform_context.clone() {
+                vision::register_scoped_platform(
+                    &mut tools,
+                    self.config.clone(),
+                    self.paths.clone(),
+                    binary_paths.iter().map(PathBuf::from).collect(),
+                    self.context_images.clone(),
+                    platform_context,
+                );
+            } else if !tools.contains("vision_analyze") {
+                vision::register_scoped_local(
+                    &mut tools,
+                    self.config.clone(),
+                    self.paths.clone(),
+                    binary_paths.iter().map(PathBuf::from).collect(),
+                );
+            }
+        }
+        let vision_tool_available =
+            self.tools_enabled && self.tools.lock().unwrap().contains("vision_analyze");
         let input = rewrite_image_placeholders_with_paths(&input, &absolute_image_paths);
-        let content = if !binary_images.is_empty() && !self.current_model_supports_vision() {
+        let current_model_supports_vision = self.current_model_supports_vision();
+        let content = if !binary_images.is_empty() && !current_model_supports_vision {
             self.describe_images_with_vision_provider(&input, &binary_images)
                 .await?
         } else {
             input
         };
 
-        let message = if !binary_images.is_empty() && self.current_model_supports_vision() {
+        let message = if !binary_images.is_empty() && current_model_supports_vision {
             let mut parts = vec![ChatContentPart::Text {
                 text: content.clone(),
             }];
             parts.extend(binary_images.iter().map(|image| ChatContentPart::ImageUrl {
                 image_url: ImageUrlContent {
-                    url: image.data_url(),
+                    url: image.data_url().to_string(),
                 },
             }));
-            ChatMessage {
-                role: "user".to_string(),
-                content: Some(ChatContent::Parts(parts)),
-                tool_call_id: None,
-                tool_calls: None,
-            }
+            ChatMessage::user_parts(parts)
         } else {
             ChatMessage::plain("user", &content)
         };
 
         let mut hints = Vec::new();
-        if !temp_paths.is_empty() {
-            let hint = if temp_paths.len() == 1 {
+        if !binary_paths.is_empty() {
+            let source = self
+                .image_platform_label
+                .as_deref()
+                .or(self.image_platform.as_deref())
+                .map(|platform| format!("通过 {platform} 发送"))
+                .unwrap_or_else(|| "粘贴".to_string());
+            let tool_hint = if vision_tool_available {
+                "\n你可以使用 vision_analyze 工具对此图片进行更详细的分析。"
+            } else {
+                ""
+            };
+            let hint = if binary_paths.len() == 1 {
                 format!(
-                    "用户粘贴了 1 张剪贴板图片，已保存到临时文件：{}\n你可以使用 vision_analyze 工具对此图片进行更详细的分析。",
-                    temp_paths[0]
+                    "用户{source}了 1 张图片，已保存到临时文件：{}{}",
+                    binary_paths[0], tool_hint
                 )
             } else {
-                let list = temp_paths
+                let list = binary_paths
                     .iter()
                     .enumerate()
                     .map(|(index, path)| format!("  [Image {}] {}", index + 1, path))
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "用户粘贴了 {} 张剪贴板图片，已保存到临时文件：\n{}\n你可以使用 vision_analyze 工具对这些图片进行更详细的分析。",
-                    temp_paths.len(),
-                    list
+                    "用户{source}了 {} 张图片，已保存到临时文件：\n{}{}",
+                    binary_paths.len(),
+                    list,
+                    if vision_tool_available {
+                        "\n你可以使用 vision_analyze 工具对这些图片进行更详细的分析。"
+                    } else {
+                        ""
+                    }
                 )
             };
             hints.push(ChatMessage::system(hint));
         }
-        if !path_images.is_empty() {
+        if !path_images.is_empty() && vision_tool_available {
             let list = path_images
                 .iter()
                 .enumerate()
@@ -707,6 +2057,17 @@ impl Agent {
                 "用户粘贴了 {} 张本地图片路径：\n{}\n你可以使用 vision_analyze 工具读取并分析这些图片。",
                 path_images.len(),
                 list
+            )));
+        }
+        if !self.context_images.is_empty() && vision_tool_available {
+            let ids = self
+                .context_images
+                .iter()
+                .map(|image| image.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            hints.push(ChatMessage::system(format!(
+                "此前群聊记录中有可按需查看的历史图片：{ids}。你尚未看到这些图片的实际内容；只有回答确实依赖图片时，才使用 vision_analyze，并把对应 ID 作为 image 参数。不得根据图片占位符猜测内容。"
             )));
         }
 
@@ -738,6 +2099,10 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            finish_reason: None,
+            thinking_signature: None,
+            last_request_usage: None,
+            responses_continuation: None,
         }))
     }
 
@@ -784,9 +2149,27 @@ impl Agent {
             self.state.clone(),
             context_window,
             check.reserved_tokens,
+            self.compact_tail_budget(context_window),
+            matches!(self.mode, AgentMode::Chat),
         );
         let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
-        let compact = match compactor.perform_compact(&mut on_chunk).await {
+        let fork_builder = |fold_ids: &[String]| -> Result<compact::CompactForkParts> {
+            Ok((
+                self.compact_fork_prefix(fold_ids)?,
+                self.live_tool_definitions()?,
+            ))
+        };
+        let fork_builder: Option<compact::CompactForkBuilder<'_>> = self
+            .config
+            .context
+            .compact_cache_reuse
+            .then_some(&fork_builder);
+        // Manual /compact is an explicit user request: bypass the
+        // fold-economics gate (but tail retention still applies).
+        let compact = match compactor
+            .perform_compact(true, false, fork_builder, &mut on_chunk)
+            .await
+        {
             Ok(result) => {
                 on_event(AgentEvent::CompactEnd)?;
                 result
@@ -808,7 +2191,41 @@ impl Agent {
             tool_calls: Vec::new(),
             provider_id: None,
             model: None,
+            finish_reason: None,
+            thinking_signature: None,
+            last_request_usage: None,
+            responses_continuation: None,
         }))
+    }
+
+    /// Mechanical prune behind the harvest gate: rewriting history is a
+    /// prefix-cache reset, so the batch must save at least ~window/64 tokens
+    /// (~window/16 chars) to pay for it. Protects the newest 2 turns.
+    fn prune_stale_history(&self, context_window: usize) -> Result<crate::state::PruneStats> {
+        let min_saved_chars = (context_window / 16).max(8192);
+        let stats = self.state.prune_stale_tool_reports(2, min_saved_chars)?;
+        if stats.turns > 0 {
+            tracing::info!(
+                turns = stats.turns,
+                saved_chars = stats.saved_chars,
+                "context_rewrite reason=prune"
+            );
+        }
+        Ok(stats)
+    }
+
+    /// Derives the verbatim tail budget for compaction. Fixed token count by
+    /// design (the trigger scales with the window, the tail does not — that
+    /// geometry is what stops the re-compaction loop); chat sessions default
+    /// smaller because casual history has less verbatim value.
+    fn compact_tail_budget(&self, context_window: usize) -> usize {
+        self.config.context.compact_tail_tokens.unwrap_or({
+            if matches!(self.mode, AgentMode::Chat) {
+                8192
+            } else {
+                16384.min(context_window / 4)
+            }
+        })
     }
 
     async fn handle_overflow<F>(
@@ -819,10 +2236,64 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        use std::sync::atomic::Ordering;
         let context_window = self.context_window();
         let check = overflow::OverflowCheck::new(context_window, self.trim_at_ratio, None);
         let context_tokens = usize::try_from(context_tokens).unwrap_or(usize::MAX);
-        if !check.is_enabled() || !check.check_tokens(context_tokens) {
+        if !check.is_enabled() {
+            return Ok(None);
+        }
+        if !check.check_tokens(context_tokens) {
+            // Breathing room below the trigger is what a healthy compaction
+            // buys; clear the stuck latch and the run counters here, before
+            // any other branch can return, so a compaction that settles the
+            // context anywhere under the trigger fully re-arms
+            // auto-compaction (a stale count would latch the next one off).
+            self.consecutive_compacts.store(0, Ordering::Relaxed);
+            self.rapid_compacts.store(0, Ordering::Relaxed);
+            self.compact_stuck.store(false, Ordering::Relaxed);
+            // Below-trigger watermarks: each tier does only the cheapest
+            // thing that helps. snip prunes stale tool reports mechanically
+            // (no LLM call); soft just says the context is growing, once.
+            if let Some(window) = context_window {
+                let snip_threshold = (window as f32
+                    * self.config.context.compact_snip_ratio)
+                    .max(1.0) as usize;
+                let soft_threshold = (window as f32
+                    * self.config.context.compact_soft_ratio)
+                    .max(1.0) as usize;
+                if context_tokens >= snip_threshold {
+                    if self.config.context.prune_stale_tool_reports {
+                        let stats = self.prune_stale_history(window)?;
+                        if stats.turns > 0 {
+                            on_event(AgentEvent::Notice {
+                                text: format!(
+                                    "{} {} · ~{} chars",
+                                    crate::i18n::text(
+                                        "Folded stale tool records from turns:",
+                                        "已机械折叠旧轮次的工具记录："
+                                    ),
+                                    stats.turns,
+                                    stats.saved_chars,
+                                ),
+                            })?;
+                        }
+                    }
+                } else if context_tokens >= soft_threshold
+                    && !self.soft_notice_sent.swap(true, Ordering::Relaxed)
+                {
+                    on_event(AgentEvent::Notice {
+                        text: crate::i18n::text(
+                            "Context is getting large; older tool records will fold first, then the history will be compacted automatically.",
+                            "上下文渐大；将先机械折叠旧工具记录，随后才会自动压缩历史。",
+                        )
+                        .to_string(),
+                    })?;
+                }
+            }
+            return Ok(None);
+        }
+        if self.compact_stuck.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let compact_result = match self.on_overflow.as_str() {
@@ -831,16 +2302,57 @@ impl Agent {
                 if visible_count == 0 {
                     return Ok(None);
                 }
+                let window = context_window.unwrap();
+                let force_threshold = (window as f32
+                    * self.config.context.compact_force_ratio)
+                    .max(1.0) as usize;
+                let force = context_tokens >= force_threshold;
+                // Prune first: it is free, and when it alone lands the
+                // context back under the trigger the paid summary call (and
+                // its cache reset) is skipped entirely.
+                if self.config.context.prune_stale_tool_reports {
+                    let stats = self.prune_stale_history(window)?;
+                    if stats.turns > 0 && !force {
+                        let post_tokens = usize::try_from(self.effective_context_tokens()?)
+                            .unwrap_or(usize::MAX);
+                        if !check.check_tokens(post_tokens) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Folded stale tool records; context is back under the compaction threshold.",
+                                    "已机械折叠旧工具记录；上下文已回落到压缩阈值之下。",
+                                )
+                                .to_string(),
+                            })?;
+                            return Ok(None);
+                        }
+                    }
+                }
                 on_event(AgentEvent::CompactStart)?;
                 let compactor = compact::Compactor::new(
                     self.client.clone(),
                     self.state.clone(),
-                    context_window.unwrap(),
+                    window,
                     check.reserved_tokens,
+                    self.compact_tail_budget(window),
+                    matches!(self.mode, AgentMode::Chat),
                 );
                 let mut on_chunk =
                     |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
-                match compactor.perform_compact(&mut on_chunk).await {
+                let fork_builder = |fold_ids: &[String]| -> Result<compact::CompactForkParts> {
+                    Ok((
+                        self.compact_fork_prefix(fold_ids)?,
+                        self.live_tool_definitions()?,
+                    ))
+                };
+                let fork_builder: Option<compact::CompactForkBuilder<'_>> = self
+                    .config
+                    .context
+                    .compact_cache_reuse
+                    .then_some(&fork_builder);
+                let result = match compactor
+                    .perform_compact(force, true, fork_builder, &mut on_chunk)
+                    .await
+                {
                     Ok(result) => {
                         on_event(AgentEvent::CompactEnd)?;
                         result
@@ -849,7 +2361,69 @@ impl Agent {
                         on_event(AgentEvent::CompactEnd)?;
                         return Err(e);
                     }
+                };
+                if let Some(result) = result.as_ref() {
+                    on_event(AgentEvent::Notice {
+                        text: format!(
+                            "{} {} → {} {}",
+                            crate::i18n::text("Compacted: folded turns", "压缩完成：折叠轮次"),
+                            result.folded_turns,
+                            crate::i18n::text("kept verbatim", "逐字保留最近轮次"),
+                            result.kept_turns,
+                        ),
+                    })?;
                 }
+                if result.is_some() {
+                    // Post-compaction check: still over the trigger means the
+                    // verbatim floor plus system prompt alone exceed it.
+                    // Twice in a row would re-fire every turn (cratering the
+                    // prefix cache each time), so latch auto-compaction off
+                    // and say why, once.
+                    let post_tokens =
+                        usize::try_from(self.effective_context_tokens()?).unwrap_or(usize::MAX);
+                    if check.check_tokens(post_tokens) {
+                        let runs = self.consecutive_compacts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if runs >= 2 && !self.compact_stuck.swap(true, Ordering::Relaxed) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Automatic context compaction paused: the context window is too small for compaction to help (the system prompt plus the verbatim tail already exceed the trigger). Raise context window or reduce tool output; compaction resumes once the context drops.",
+                                    "自动上下文压缩已暂停：上下文窗口太小，压缩无法奏效（system prompt 加逐字尾巴已超过触发线）。请调大上下文窗口或减小工具输出；上下文回落后自动恢复。",
+                                )
+                                .to_string(),
+                            })?;
+                        }
+                    } else {
+                        self.consecutive_compacts.store(0, Ordering::Relaxed);
+                    }
+                    // Thrashing check: a healthy compaction buys many turns
+                    // of breathing room. Refilling within ~3 turns, three
+                    // times in a row, means a single oversized item refills
+                    // the window and each compaction only craters the cache.
+                    let max_seq = self
+                        .state
+                        .load_visible_turns()?
+                        .last()
+                        .map(|turn| turn.seq)
+                        .unwrap_or(-1);
+                    let previous = self.last_compact_max_seq.swap(max_seq, Ordering::Relaxed);
+                    // Each turn advances seq by 1 and the compaction summary
+                    // itself takes one, so "within 3 turns" is a delta <= 4.
+                    if previous >= 0 && max_seq.saturating_sub(previous) <= 4 {
+                        let rapid = self.rapid_compacts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if rapid >= 3 && !self.compact_stuck.swap(true, Ordering::Relaxed) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Automatic context compaction paused: the context refills within a few turns of each compaction. A single message or tool output is likely too large for the window — read in smaller chunks, or /clear to start fresh.",
+                                    "自动上下文压缩已暂停：每次压缩后几轮内上下文就再次填满。可能有单条消息或工具输出对窗口而言过大——请分块读取，或使用 /clear 重新开始。",
+                                )
+                                .to_string(),
+                            })?;
+                        }
+                    } else {
+                        self.rapid_compacts.store(0, Ordering::Relaxed);
+                    }
+                }
+                result
             }
             "pop" => {
                 on_event(AgentEvent::PopStart)?;
@@ -863,14 +2437,7 @@ impl Agent {
     }
 
     fn current_model_supports_vision(&self) -> bool {
-        let provider = match self.config.provider(None) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        match provider.supports_vision(&provider.default_model) {
-            Some(true) => true,
-            _ => false,
-        }
+        should_use_active_text_pool_for_images(&self.config)
     }
 
     async fn describe_images_with_vision_provider(
@@ -880,8 +2447,19 @@ impl Agent {
     ) -> Result<String> {
         let vision_cfg = &self.config.plugins.vision;
         if !vision_cfg.enabled {
-            return Ok(input.to_string());
+            bail!(
+                "{}",
+                crate::i18n::text(
+                    "the active text model cannot read images and the vision plugin is disabled",
+                    "当前文本模型无法读取图片，并且视觉插件已禁用"
+                )
+            );
         }
+        let strict_pool = self
+            .config
+            .active_multimodal_provider_models
+            .as_ref()
+            .is_some_and(|pool| !pool.is_empty());
         let mut descriptions = Vec::new();
         for (i, img) in images.iter().enumerate() {
             let prompt = if input.trim().is_empty() {
@@ -892,7 +2470,7 @@ impl Agent {
             match vision::analyze_image_url_with_prompt(
                 &self.config,
                 &self.paths,
-                &img.data_url(),
+                img.data_url(),
                 &prompt,
             )
             .await
@@ -900,8 +2478,16 @@ impl Agent {
                 Ok(desc) => {
                     descriptions.push(format!("[Image {} 的描述]\n{}", i + 1, desc.trim()));
                 }
-                Err(e) => {
-                    descriptions.push(format!("[Image {} 识图失败: {}]", i + 1, e));
+                Err(error) if strict_pool => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "configured multimodal model pool failed for image {}",
+                            i + 1
+                        )
+                    });
+                }
+                Err(error) => {
+                    descriptions.push(format!("[Image {} 识图失败: {}]", i + 1, error));
                 }
             }
         }
@@ -919,28 +2505,88 @@ impl Agent {
         messages: &mut Vec<ChatMessage>,
         used_tools: &mut Vec<String>,
         persisted_tool_reports: &mut Vec<(String, String)>,
+        replay_start: usize,
+        base_tool_reports: &[String],
+        initial_tool_rounds: usize,
+        initial_question_rounds: usize,
         control: Option<&AgentTurnControl>,
         on_event: &mut F,
     ) -> Result<ChatResult>
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
-        let mut tool_round = 0usize;
-        let mut question_rounds = 0usize;
+        let mut tool_round = initial_tool_rounds;
+        let mut question_rounds = initial_question_rounds;
+        let mut replay_start = replay_start;
+        // Passive overflow recovery is a one-shot barrier per turn: the
+        // post-compaction retry must not recover another overflow (pi /
+        // opencode / Claude Code all converge on exactly one attempt).
+        let mut overflow_recovery_attempted = false;
         let mut loaded_tools = self.initial_loaded_tools(messages)?;
         let mut usage_accumulator = UsageAccumulator::default();
+        // v7 cache write-grace: provider prefix-cache writes are async, so a
+        // follow-up fired within ~2s can miss the prefix the previous round
+        // just computed (measured on DeepSeek). Track round completion time.
+        let mut last_round_completed_at: Option<Instant> = None;
+        let mut responses_continuation = None;
+        let mut continuation_input_start = messages.len();
+        let mut continuation_context: Option<(usize, Vec<ChatMessage>)> = None;
+        let artifact_auto_publish = self.mode == AgentMode::Normal
+            && self.prompt_audience == PromptAudience::External
+            && artifact_delivery_requested(messages)
+            && self
+                .tools
+                .lock()
+                .unwrap()
+                .tool_names()
+                .iter()
+                .any(|name| name == "create_artifact");
+        let mut artifact_candidates = Vec::<AutoArtifactCandidate>::new();
+        let mut artifact_published = false;
         loop {
             let tool_limit_reached = self.max_tool_rounds > 0 && tool_round >= self.max_tool_rounds;
 
-            if self.mode == AgentMode::Normal {
-                let mut tools = self.tools.lock().unwrap();
-                tools::rescan_scripts(&mut tools, &self.paths);
-                tools::register_script_display_names(&tools);
+            if self.mode != AgentMode::Chat && self.config.skills.enabled {
+                if self.mode == AgentMode::Normal {
+                    let mut registry = self.tools.lock().unwrap();
+                    tools::rescan_scripts(&mut registry, &self.paths);
+                    tools::register_script_display_names(&registry);
+                }
+                let current_fingerprint = {
+                    let registry = self.tools.lock().unwrap();
+                    registry
+                        .contains("load_skill")
+                        .then(|| registry.skill_catalog_fingerprint())
+                };
+                if let Some(current_fingerprint) = current_fingerprint {
+                    let config = self.config.clone();
+                    let paths = self.paths.clone();
+                    let refresh = tokio::task::spawn_blocking(move || {
+                        tools::prepare_skill_refresh(current_fingerprint, &config, &paths)
+                            .map(|snapshot| (snapshot, config, paths))
+                    })
+                    .await;
+                    match refresh {
+                        Ok(Ok((Some(snapshot), config, paths))) => {
+                            let mut registry = self.tools.lock().unwrap();
+                            tools::apply_skill_refresh(&mut registry, &config, &paths, snapshot);
+                        }
+                        Ok(Ok((None, _, _))) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "failed to refresh Miyu skill catalog")
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Miyu skill catalog worker stopped")
+                        }
+                    }
+                }
             }
 
             let definitions = if self.tools_enabled && !tool_limit_reached {
                 let tools = self.tools.lock().unwrap();
-                if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+                if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+                    tools.stub_definitions()
+                } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
                     tools.lazy_definitions(&loaded_tools)
                 } else {
                     tools.definitions()
@@ -954,26 +2600,79 @@ impl Agent {
             })?;
             let (chunk_tx, mut chunk_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(ChatStreamChunk, Instant)>();
-            let request_messages = messages.clone();
+            let mut request_messages = if responses_continuation.is_some() {
+                messages
+                    .get(continuation_input_start..)
+                    .context("Responses continuation input cursor is out of bounds")?
+                    .to_vec()
+            } else {
+                messages.clone()
+            };
+            if let Some((context_index, context_messages)) = continuation_context.as_ref() {
+                let offset = context_index
+                    .checked_sub(continuation_input_start)
+                    .context("Responses continuation context cursor is out of bounds")?;
+                if offset > request_messages.len() {
+                    bail!("Responses continuation context cursor is out of bounds");
+                }
+                request_messages.splice(offset..offset, context_messages.clone());
+            }
             let mut reasoning_filter = ReasoningTitleFilter::default();
-            let result = {
-                let llm_future =
-                    self.client
-                        .chat_stream(request_messages.clone(), definitions, move |chunk| {
-                            let _ = chunk_tx.send((chunk, Instant::now()));
-                            Ok(())
-                        });
+            if self.config.cache.write_grace_ms > 0 {
+                if let Some(previous) = last_round_completed_at {
+                    let grace = std::time::Duration::from_millis(self.config.cache.write_grace_ms);
+                    let elapsed = previous.elapsed();
+                    if elapsed < grace {
+                        tokio::time::sleep(grace - elapsed).await;
+                    }
+                }
+            }
+            if self.config.cache.keepalive_seconds > 0 && responses_continuation.is_none() {
+                self.last_request_snapshot =
+                    Some((request_messages.clone(), definitions.clone()));
+            }
+            let round_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let round = {
+                let streamed_flag = round_streamed.clone();
+                let llm_future = self.client.chat_stream_with_continuation(
+                    request_messages.clone(),
+                    definitions,
+                    responses_continuation.as_deref(),
+                    move |chunk| {
+                        streamed_flag.store(true, Ordering::Relaxed);
+                        let _ = chunk_tx.send((chunk, Instant::now()));
+                        Ok(())
+                    },
+                );
                 tokio::pin!(llm_future);
                 let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
                 spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 spinner_interval.tick().await;
+                let supersede = control.and_then(|control| control.supersede.as_deref());
+                let supersede_generation = control.and_then(|control| {
+                    supersede.map(|_| control.supersede_seen.load(Ordering::Acquire))
+                });
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = async {
+                            match (supersede, supersede_generation) {
+                                (Some(signal), Some(generation)) => signal.wait_after(generation).await,
+                                _ => std::future::pending::<()>().await,
+                            }
+                        } => {
+                            break None;
+                        }
                         result = &mut llm_future => {
-                            break result?;
+                            break Some(result);
                         }
                         Some((chunk, received_at)) = chunk_rx.recv() => {
-                            emit_filtered_chunk_at(chunk, received_at, &mut reasoning_filter, on_event)?;
+                            emit_model_chunk_at(
+                                chunk,
+                                received_at,
+                                &mut reasoning_filter,
+                                on_event,
+                            )?;
                         }
                         _ = spinner_interval.tick() => {
                             on_event(AgentEvent::SpinnerTick)?;
@@ -981,8 +2680,138 @@ impl Agent {
                     }
                 }
             };
+            let round = match round {
+                Some(Err(error)) => {
+                    // Passive overflow trigger (compact-and-retry). Only at
+                    // the turn's initial request, before any assistant output
+                    // was streamed: mid-loop the live tool exchange is not
+                    // rebuildable from the DB, and a partially shown answer
+                    // must not be silently retried (opencode's
+                    // hasAssistantStarted guard).
+                    let initial_request = tool_round == initial_tool_rounds
+                        && question_rounds == initial_question_rounds
+                        && responses_continuation.is_none()
+                        && !round_streamed.load(Ordering::Relaxed);
+                    let window = self.context_window();
+                    if initial_request
+                        && !overflow_recovery_attempted
+                        && window.is_some()
+                        && crate::llm::is_context_overflow_error(&error)
+                    {
+                        overflow_recovery_attempted = true;
+                        let window = window.unwrap();
+                        let check = overflow::OverflowCheck::new(
+                            Some(window),
+                            self.trim_at_ratio,
+                            None,
+                        );
+                        on_event(AgentEvent::CompactStart)?;
+                        let compactor = compact::Compactor::new(
+                            self.client.clone(),
+                            self.state.clone(),
+                            window,
+                            check.reserved_tokens,
+                            self.compact_tail_budget(window),
+                            matches!(self.mode, AgentMode::Chat),
+                        );
+                        let mut on_compact_chunk =
+                            |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
+                        // No fork here: a fork of an overflowing conversation
+                        // overflows identically — recovery must use the
+                        // isolated serialized path.
+                        let compacted = compactor
+                            .perform_compact(true, true, None, &mut on_compact_chunk)
+                            .await;
+                        on_event(AgentEvent::CompactEnd)?;
+                        if let Ok(Some(compact_result)) = compacted {
+                            self.state.add_auxiliary_usage(&compact_result.usage)?;
+                            // Splice the rebuilt (compacted) history prefix in
+                            // front of the current turn's user message; the
+                            // live tail (user input, runtime stamp, hints)
+                            // is preserved byte-for-byte.
+                            let user_index = replay_start.saturating_sub(2).min(messages.len());
+                            let rebuilt = self.chat_messages(current_turn_id, "")?;
+                            let prefix_len = rebuilt.len().saturating_sub(2);
+                            let tail = messages.split_off(user_index);
+                            messages.clear();
+                            messages.extend(rebuilt.into_iter().take(prefix_len));
+                            messages.extend(tail);
+                            replay_start = prefix_len + 2;
+                            continuation_input_start = messages.len();
+                            tracing::info!(
+                                folded = compact_result.folded_turns,
+                                kept = compact_result.kept_turns,
+                                "context overflow recovered by compact-and-retry"
+                            );
+                            continue;
+                        }
+                        if let Err(compact_error) = compacted {
+                            tracing::warn!(
+                                error = %compact_error,
+                                "compact-and-retry failed; surfacing the original overflow"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+                Some(Ok(result)) => Some(result),
+                None => None,
+            };
+            let Some(result) = round else {
+                if let Some(control) = control {
+                    if let Some(generation) = control.pending_supersede_generation() {
+                        control.mark_supersede_seen(generation);
+                    }
+                }
+                let queued = self.state.load_queued_prompts()?;
+                if queued.is_empty() {
+                    continue;
+                }
+                let prompt_ids = queued
+                    .iter()
+                    .map(|prompt| prompt.prompt_id.clone())
+                    .collect::<Vec<_>>();
+                on_event(AgentEvent::GenerationSuperseded { prompt_ids })?;
+                let checkpoint = redo_checkpoint_payload(
+                    messages,
+                    replay_start,
+                    base_tool_reports,
+                    persisted_tool_reports,
+                    tool_round,
+                    question_rounds,
+                );
+                let continuation_context_index = responses_continuation.as_ref().map(|_| {
+                    continuation_context
+                        .as_ref()
+                        .map(|(index, _)| *index)
+                        .unwrap_or(messages.len())
+                });
+                self.consume_queued_prompts(
+                    current_turn_id,
+                    messages,
+                    queued,
+                    (None, None, None, None),
+                    checkpoint,
+                    control.expect("supersede requires turn control"),
+                    on_event,
+                )
+                .await?;
+                if let Some(index) = continuation_context_index {
+                    continuation_context = Some((
+                        index,
+                        vec![
+                            ChatMessage::system(continuation_system_prompt(
+                                &self.system_prompt,
+                                self.mode,
+                            )),
+                            ChatMessage::system(runtime_context(self.mode)),
+                        ],
+                    ));
+                }
+                continue;
+            };
             while let Ok((chunk, received_at)) = chunk_rx.try_recv() {
-                emit_filtered_chunk_at(chunk, received_at, &mut reasoning_filter, on_event)?;
+                emit_model_chunk_at(chunk, received_at, &mut reasoning_filter, on_event)?;
             }
             let (title, text) = reasoning_filter.finish();
             if let Some(title) = title {
@@ -994,15 +2823,56 @@ impl Agent {
                     text,
                 }))?;
             }
-            usage_accumulator.add_result(&result, &request_messages);
+            usage_accumulator.add_result(&result, messages);
+            last_round_completed_at = Some(Instant::now());
             if result.tool_calls.is_empty() || !self.tools_enabled {
+                responses_continuation = None;
+                continuation_input_start = messages.len();
+                continuation_context = None;
                 if let Some(control) = control {
                     let queued = self.state.load_queued_prompts()?;
                     if !queued.is_empty() {
-                        messages.push(ChatMessage::plain(
-                            "assistant",
-                            chat_result_replay_content(&result),
-                        ));
+                        if let Some(generation) = control.pending_supersede_generation() {
+                            let prompt_ids = queued
+                                .iter()
+                                .map(|prompt| prompt.prompt_id.clone())
+                                .collect();
+                            on_event(AgentEvent::GenerationSuperseded { prompt_ids })?;
+                            let checkpoint = redo_checkpoint_payload(
+                                messages,
+                                replay_start,
+                                base_tool_reports,
+                                persisted_tool_reports,
+                                tool_round,
+                                question_rounds,
+                            );
+                            self.consume_queued_prompts(
+                                current_turn_id,
+                                messages,
+                                queued,
+                                (None, None, None, None),
+                                checkpoint,
+                                control,
+                                on_event,
+                            )
+                            .await?;
+                            control.mark_supersede_seen(generation);
+                            continue;
+                        }
+                        push_assistant_context_messages(
+                            messages,
+                            &result.content,
+                            result.reasoning.as_deref(),
+                            true,
+                        );
+                        let checkpoint = redo_checkpoint_payload(
+                            messages,
+                            replay_start,
+                            base_tool_reports,
+                            persisted_tool_reports,
+                            tool_round,
+                            question_rounds,
+                        );
                         self.consume_queued_prompts(
                             current_turn_id,
                             messages,
@@ -1013,6 +2883,7 @@ impl Agent {
                                 result.provider_id.as_deref(),
                                 result.model.as_deref(),
                             ),
+                            checkpoint,
                             control,
                             on_event,
                         )
@@ -1021,7 +2892,11 @@ impl Agent {
                     }
                 }
                 let mut result = result;
+                if artifact_auto_publish && !artifact_published {
+                    publish_auto_artifact_candidates(&artifact_candidates, on_event)?;
+                }
                 if let Some(usage) = usage_accumulator.usage() {
+                    result.last_request_usage = result.usage.take();
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -1045,16 +2920,45 @@ impl Agent {
                 }))?;
                 result.tool_calls.clear();
                 if let Some(usage) = usage_accumulator.usage() {
+                    result.last_request_usage = result.usage.take();
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
                 return Ok(result);
             }
             tool_round += 1;
-            messages.push(ChatMessage::assistant(
+            let next_responses_continuation = result.responses_continuation.clone();
+            push_assistant_message_with_reasoning(
+                messages,
                 result.content.clone(),
+                result.reasoning.as_deref(),
+                result.thinking_signature.as_deref(),
                 Some(result.tool_calls.clone()),
-            ));
+                true,
+            );
+            if result
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| reason.eq_ignore_ascii_case("length"))
+                && !result.tool_calls.is_empty()
+            {
+                // A "length" stop means the output hit the token limit, so every
+                // tool call in this message may carry silently truncated
+                // arguments. Refuse to execute any of them and let the model
+                // re-issue the calls with complete arguments.
+                for call in &result.tool_calls {
+                    messages.push(ChatMessage::tool(
+                        call.id.clone(),
+                        "error: 本次回复因输出 token 上限被截断，工具调用参数可能不完整。请重新发起该工具调用并给出完整参数。",
+                    ));
+                }
+                continue;
+            }
+            if next_responses_continuation.is_some() {
+                continuation_input_start = messages.len();
+            }
+            responses_continuation = next_responses_continuation;
+            continuation_context = None;
             let ask_question_enabled = self
                 .tools
                 .lock()
@@ -1073,15 +2977,36 @@ impl Agent {
             let question_round_allowed =
                 question_call_count == 1 && question_rounds <= MAX_QUESTION_ROUNDS_PER_TURN;
             let defer_sibling_tools = question_call_count == 1 && result.tool_calls.len() > 1;
-            for call in result.tool_calls {
+            // Multiple `task` calls in one batch run concurrently (subagents
+            // are independent by design); everything else stays serial.
+            let mut parallel_task_outputs =
+                if defer_sibling_tools || matches!(self.mode, AgentMode::Plan | AgentMode::Chat) {
+                    std::collections::HashMap::new()
+                } else {
+                    self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
+                        .await?
+                };
+            for (call_index, call) in result.tool_calls.into_iter().enumerate() {
+                if let Some(group_output) = parallel_task_outputs.remove(&call_index) {
+                    // Executed in the parallel group; events already emitted.
+                    used_tools.push(call.function.name.clone());
+                    if let Some(report) = group_output.report {
+                        persisted_tool_reports.push((call.function.name.clone(), report));
+                    }
+                    messages.push(ChatMessage::tool(call.id, group_output.output));
+                    continue;
+                }
+                let call_id = call.id.clone();
                 let event_name = tool_event_name(&call.function.name, &call.function.arguments);
                 on_event(AgentEvent::ToolCall {
+                    call_id: call_id.clone(),
                     name: event_name.clone(),
                     arguments: call.function.arguments.clone(),
                 })?;
                 if question_call_count > 1 {
                     let output = "tool error: only one ask_question call is allowed per tool batch; combine all questions into one call".to_string();
                     on_event(AgentEvent::ToolResult {
+                        call_id: call_id.clone(),
                         name: event_name.clone(),
                         ok: false,
                         output: output.clone(),
@@ -1092,6 +3017,7 @@ impl Agent {
                 if defer_sibling_tools && call.function.name != "ask_question" {
                     let output = "tool error: deferred until the user answers ask_question; reissue this tool call after receiving the answer".to_string();
                     on_event(AgentEvent::ToolResult {
+                        call_id: call_id.clone(),
                         name: event_name.clone(),
                         ok: false,
                         output: output.clone(),
@@ -1105,6 +3031,7 @@ impl Agent {
                             "tool error: ask_question exceeded the per-turn limit of {MAX_QUESTION_ROUNDS_PER_TURN}"
                         );
                         on_event(AgentEvent::ToolResult {
+                            call_id: call_id.clone(),
                             name: event_name.clone(),
                             ok: false,
                             output: output.clone(),
@@ -1117,6 +3044,7 @@ impl Agent {
                         Err(err) => {
                             let output = format!("tool error: invalid ask_question request: {err}");
                             on_event(AgentEvent::ToolResult {
+                                call_id: call_id.clone(),
                                 name: event_name.clone(),
                                 ok: false,
                                 output: output.clone(),
@@ -1127,6 +3055,7 @@ impl Agent {
                     };
                     let (response_tx, response_rx) = oneshot::channel();
                     on_event(AgentEvent::AskQuestion {
+                        call_id: call_id.clone(),
                         request: request.clone(),
                         responder: response_tx,
                     })?;
@@ -1138,11 +3067,13 @@ impl Agent {
                                 .append_question_exchange(current_turn_id, &exchange)?;
                             answered_tool_output(&exchange)
                         }
+                        QuestionResponse::Closed => closed_tool_output(),
                         QuestionResponse::Cancelled => return Err(QuestionCancelled.into()),
                         QuestionResponse::Unavailable(reason) => unavailable_tool_output(&reason),
                     };
                     messages.push(ChatMessage::tool(call.id, output.clone()));
                     on_event(AgentEvent::ToolResult {
+                        call_id: call_id.clone(),
                         name: event_name,
                         ok: true,
                         output,
@@ -1152,9 +3083,8 @@ impl Agent {
                 used_tools.push(call.function.name.clone());
                 {
                     let tools = self.tools.lock().unwrap();
-                    if matches!(self.mode, AgentMode::Plan | AgentMode::Chat)
-                        && tools.permission(&call.function.name)? != ToolPermission::ReadOnly
-                    {
+                    let permission = tools.permission(&call.function.name)?;
+                    if !mode_allows_tool_permission(self.mode, permission) {
                         bail!(
                             "{} mode blocked non-read-only tool: {}",
                             self.mode.label(),
@@ -1180,6 +3110,7 @@ impl Agent {
                                 call.function.name,
                             );
                             on_event(AgentEvent::ToolResult {
+                                call_id: call_id.clone(),
                                 name: event_name.clone(),
                                 ok: false,
                                 output: output.clone(),
@@ -1194,6 +3125,7 @@ impl Agent {
                 {
                     let output = "tool error: install_aur_package cannot run in the same turn as review_aur_package; ask the user to confirm installation first".to_string();
                     on_event(AgentEvent::ToolResult {
+                        call_id: call_id.clone(),
                         name: event_name.clone(),
                         ok: false,
                         output: output.clone(),
@@ -1215,6 +3147,7 @@ impl Agent {
                     Err(err) => {
                         let output = format!("tool error: {err}");
                         on_event(AgentEvent::ToolResult {
+                            call_id: call_id.clone(),
                             name: event_name.clone(),
                             ok: false,
                             output: output.clone(),
@@ -1233,15 +3166,16 @@ impl Agent {
                             break match result {
                                 Ok(output) => {
                                     while let Ok(progress) = progress_rx.try_recv() {
-                                        emit_tool_progress(on_event, &event_name, progress)?;
+                                        emit_tool_progress(on_event, &call_id, &event_name, progress)?;
                                     }
                                     (output, true)
                                 }
                                 Err(err) => {
                                     while let Ok(progress) = progress_rx.try_recv() {
-                                        emit_tool_progress(on_event, &event_name, progress)?;
+                                        emit_tool_progress(on_event, &call_id, &event_name, progress)?;
                                     }
                                     on_event(AgentEvent::ToolResult {
+                                        call_id: call_id.clone(),
                                         name: event_name.clone(),
                                         ok: false,
                                         output: format!("tool error: {err}"),
@@ -1251,7 +3185,7 @@ impl Agent {
                             };
                         }
                         Some(progress) = progress_rx.recv() => {
-                            emit_tool_progress(on_event, &event_name, progress)?;
+                            emit_tool_progress(on_event, &call_id, &event_name, progress)?;
                         }
                         _ = spinner_interval.tick() => {
                             on_event(AgentEvent::SpinnerTick)?;
@@ -1293,6 +3227,7 @@ impl Agent {
                             "The current model does not support images and the vision plugin is disabled, so the clipboard image cannot be analyzed."
                         };
                         on_event(AgentEvent::ToolProgress {
+                            call_id: call_id.clone(),
                             name: event_name.clone(),
                             message: message.to_string(),
                         })?;
@@ -1318,6 +3253,7 @@ impl Agent {
                                 _ = progress_interval.tick() => {
                                     progress_tick = progress_tick.wrapping_add(1);
                                     on_event(AgentEvent::ToolProgress {
+                                        call_id: call_id.clone(),
                                         name: event_name.clone(),
                                         message: vision_analysis_progress(progress_tick),
                                     })?;
@@ -1335,15 +3271,25 @@ impl Agent {
                     }
                 }
                 if tool_succeeded {
-                    let result_ok = if call.function.name == "run_command" {
-                        serde_json::from_str::<serde_json::Value>(&output)
-                            .ok()
-                            .and_then(|v| v.get("success").and_then(serde_json::Value::as_bool))
-                            .unwrap_or(true)
-                    } else {
-                        true
-                    };
+                    let result_ok = tool_output_succeeded(&output);
+                    if result_ok {
+                        if matches!(
+                            call.function.name.as_str(),
+                            "create_artifact" | "apply_artifact_patch" | "present_artifact"
+                        ) {
+                            artifact_published = true;
+                        } else if artifact_auto_publish {
+                            for path in artifact_candidate_paths(&call.function.name, &output) {
+                                artifact_candidates.push(AutoArtifactCandidate {
+                                    call_id: call_id.clone(),
+                                    tool_name: event_name.clone(),
+                                    path,
+                                });
+                            }
+                        }
+                    }
                     on_event(AgentEvent::ToolResult {
+                        call_id,
                         name: event_name.clone(),
                         ok: result_ok,
                         output: output.clone(),
@@ -1359,22 +3305,68 @@ impl Agent {
                 tool_round = tool_round.saturating_sub(1);
             }
             if let Some(control) = control {
+                if let Some(queue_ingress) = control.queue_ingress.as_ref() {
+                    queue_ingress.wait_for_reserved_ingress().await;
+                }
                 let queued = self.state.load_queued_prompts()?;
                 if !queued.is_empty() {
+                    let supersede_generation = control.pending_supersede_generation();
+                    if supersede_generation.is_some() {
+                        let prompt_ids = queued
+                            .iter()
+                            .map(|prompt| prompt.prompt_id.clone())
+                            .collect();
+                        on_event(AgentEvent::GenerationSuperseded { prompt_ids })?;
+                    }
+                    let checkpoint = redo_checkpoint_payload(
+                        messages,
+                        replay_start,
+                        base_tool_reports,
+                        persisted_tool_reports,
+                        tool_round,
+                        question_rounds,
+                    );
+                    let preceding_assistant = if supersede_generation.is_some() {
+                        (None, None, None, None)
+                    } else {
+                        (
+                            Some(result.content.as_str()),
+                            result.reasoning.as_deref(),
+                            result.provider_id.as_deref(),
+                            result.model.as_deref(),
+                        )
+                    };
+                    let continuation_context_index = responses_continuation.as_ref().map(|_| {
+                        continuation_context
+                            .as_ref()
+                            .map(|(index, _)| *index)
+                            .unwrap_or(messages.len())
+                    });
                     self.consume_queued_prompts(
                         current_turn_id,
                         messages,
                         queued,
-                        (
-                            Some(&result.content),
-                            result.reasoning.as_deref(),
-                            result.provider_id.as_deref(),
-                            result.model.as_deref(),
-                        ),
+                        preceding_assistant,
+                        checkpoint,
                         control,
                         on_event,
                     )
                     .await?;
+                    if let Some(index) = continuation_context_index {
+                        continuation_context = Some((
+                            index,
+                            vec![
+                                ChatMessage::system(continuation_system_prompt(
+                                    &self.system_prompt,
+                                    self.mode,
+                                )),
+                                ChatMessage::system(runtime_context(self.mode)),
+                            ],
+                        ));
+                    }
+                    if let Some(generation) = supersede_generation {
+                        control.mark_supersede_seen(generation);
+                    }
                 }
             }
         }
@@ -1402,16 +3394,13 @@ impl Agent {
 
     async fn clipboard_image_message(&self, img: ClipboardImage) -> Result<Option<ChatMessage>> {
         if self.current_model_supports_vision() {
-            return Ok(Some(ChatMessage {
-                role: "user".to_string(),
-                content: Some(ChatContent::Parts(vec![ChatContentPart::ImageUrl {
+            return Ok(Some(ChatMessage::user_parts(vec![
+                ChatContentPart::ImageUrl {
                     image_url: ImageUrlContent {
-                        url: img.data_url(),
+                        url: img.data_url().to_string(),
                     },
-                }])),
-                tool_call_id: None,
-                tool_calls: None,
-            }));
+                },
+            ])));
         }
 
         let images = vec![&img];
@@ -1430,18 +3419,43 @@ impl Agent {
         current_input: &str,
     ) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
-        if let Some(summary) = self.state.load_last_summary()? {
-            messages.push(ChatMessage::system(format!(
-                "<conversation-summary>\n{}\n</conversation-summary>",
-                summary.assistant_content
-            )));
-        }
-        let turns = self.state.load_visible_turns_excluding(current_turn_id)?;
-        for turn in &turns {
-            if turn.is_summary {
-                continue;
+        if !self.suppress_session_history {
+            if let Some(summary) = self.state.load_last_summary()? {
+                messages.push(summary_checkpoint_message(&summary.assistant_content));
             }
-            messages.push(ChatMessage::plain("user", &turn.user_content));
+            let turns = self.state.load_visible_turns_excluding(current_turn_id)?;
+            for turn in &turns {
+                if turn.is_summary {
+                    continue;
+                }
+                self.push_history_turn(&mut messages, turn);
+            }
+        }
+        // v7 §三: the minute-level runtime stamp is transient tail and must sit
+        // AFTER the current user message. When it preceded the user message,
+        // every next turn's replayed history diverged from the provider's
+        // cached prefix exactly at this position, capping cross-turn prefix
+        // cache reuse at the end of the stored history (verified byte-level
+        // against DeepSeek prefix caching).
+        messages.push(ChatMessage::plain("user", current_input));
+        messages.push(ChatMessage::system(runtime_context(self.mode)));
+        Ok(messages)
+    }
+
+    /// Renders one stored turn exactly as the live request rendered it
+    /// (byte-identical replay incl. the fossilized transient tail), shared by
+    /// the main request path and the compaction fork prefix.
+    fn push_history_turn(&self, messages: &mut Vec<ChatMessage>, turn: &crate::state::Turn) {
+        messages.push(self.turn_user_message(turn));
+        // Fossilized transient tail (v7 append-only): replay the
+        // system messages that followed the user message in the live
+        // request, byte-identical and in order, so this turn renders
+        // as a pure extension of what the provider already cached.
+        messages.extend(turn.context_messages.iter().cloned());
+        if turn.status == crate::state::TurnStatus::Interrupted && !turn.journal_events.is_empty()
+        {
+            messages.extend(interrupted_turn_replay_messages(self, turn));
+        } else {
             for exchange in &turn.question_exchanges {
                 messages.push(ChatMessage::plain(
                     "assistant",
@@ -1453,29 +3467,72 @@ impl Agent {
                 ));
             }
             for followup in &turn.followups {
-                if let Some(content) = followup_assistant_replay_content(followup) {
-                    messages.push(ChatMessage::plain("assistant", content));
-                }
+                push_assistant_context_messages(
+                    messages,
+                    followup
+                        .preceding_assistant_content
+                        .as_deref()
+                        .unwrap_or_default(),
+                    followup.preceding_assistant_reasoning.as_deref(),
+                    false,
+                );
                 messages.push(self.followup_user_message(followup));
             }
-            messages.push(ChatMessage::plain(
-                "assistant",
-                assistant_replay_content(turn),
-            ));
+            push_assistant_context_messages(
+                messages,
+                &turn.assistant_content,
+                turn.assistant_reasoning.as_deref(),
+                true,
+            );
             if !turn.tool_reports.is_empty() {
                 messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
             }
         }
-        messages.push(ChatMessage::system(runtime_context(self.mode)));
-        messages.push(ChatMessage::plain("user", current_input));
+    }
+
+    /// Byte-identical prefix of the live conversation covering exactly the
+    /// turns about to fold: `[system][checkpoint][fold turns...]`. A fork
+    /// summarization request built on this prefix re-reads the history at
+    /// cached price instead of full price (the serialized fallback shares no
+    /// bytes with the provider's cache).
+    fn compact_fork_prefix(&self, fold_turn_ids: &[String]) -> Result<Vec<ChatMessage>> {
+        let fold: std::collections::HashSet<&str> =
+            fold_turn_ids.iter().map(|id| id.as_str()).collect();
+        let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
+        if let Some(summary) = self.state.load_last_summary()? {
+            messages.push(summary_checkpoint_message(&summary.assistant_content));
+        }
+        for turn in self.state.load_visible_turns()? {
+            if turn.is_summary || !fold.contains(turn.turn_id.as_str()) {
+                continue;
+            }
+            self.push_history_turn(&mut messages, &turn);
+        }
         Ok(messages)
+    }
+
+    fn live_tool_definitions(&self) -> Result<Vec<crate::llm::ToolDefinition>> {
+        if !self.tools_enabled {
+            return Ok(Vec::new());
+        }
+        let loaded = self.initial_loaded_tools(&[])?;
+        let tools = self.tools.lock().unwrap();
+        Ok(
+            if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
+                tools.stub_definitions()
+            } else if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode) {
+                tools.lazy_definitions(&loaded)
+            } else {
+                tools.definitions()
+            },
+        )
     }
 
     fn followup_user_message(&self, followup: &crate::state::TurnFollowup) -> ChatMessage {
         if !self.current_model_supports_vision() {
             return ChatMessage::plain("user", &followup.content);
         }
-        let images = followup
+        let mut images = followup
             .attachments
             .iter()
             .filter_map(|attachment| match attachment {
@@ -1489,6 +3546,7 @@ impl Agent {
                 QueuedPromptAttachment::Path { .. } => None,
             })
             .collect::<Vec<_>>();
+        images.extend(self.uploaded_attachment_image_parts(&followup.uploaded_attachments));
         if images.is_empty() {
             return ChatMessage::plain("user", &followup.content);
         }
@@ -1496,13 +3554,268 @@ impl Agent {
             text: followup.content.clone(),
         }];
         parts.extend(images);
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(ChatContent::Parts(parts)),
-            tool_call_id: None,
-            tool_calls: None,
+        ChatMessage::user_parts(parts)
+    }
+
+    fn turn_user_message(&self, turn: &crate::state::Turn) -> ChatMessage {
+        if !self.current_model_supports_vision() {
+            return ChatMessage::plain("user", &turn.user_content);
+        }
+        let images = self.uploaded_attachment_image_parts(&turn.attachments);
+        if images.is_empty() {
+            return ChatMessage::plain("user", &turn.user_content);
+        }
+        let mut parts = vec![ChatContentPart::Text {
+            text: turn.user_content.clone(),
+        }];
+        parts.extend(images);
+        ChatMessage::user_parts(parts)
+    }
+
+    fn uploaded_attachment_image_parts(
+        &self,
+        attachments: &[crate::state::UserAttachment],
+    ) -> Vec<ChatContentPart> {
+        attachments
+            .iter()
+            .filter(|attachment| attachment.kind == "image")
+            .filter_map(|attachment| {
+                self.state
+                    .load_user_attachment(&attachment.attachment_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|attachment| ChatContentPart::ImageUrl {
+                image_url: ImageUrlContent {
+                    url: ClipboardImage::new(attachment.attachment.mime, attachment.bytes)
+                        .data_url()
+                        .to_string(),
+                },
+            })
+            .collect()
+    }
+
+    fn queued_prompt_images(&self, prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>>> {
+        let mut images = queued_prompt_images(prompt)?;
+        for attachment in &prompt.uploaded_attachments {
+            if attachment.kind != "image" {
+                continue;
+            }
+            if let Some(data) = self.state.load_user_attachment(&attachment.attachment_id)? {
+                images.push(Some(PastedImage::Binary(ClipboardImage::new(
+                    data.attachment.mime,
+                    data.bytes,
+                ))));
+            }
+        }
+        Ok(images)
+    }
+}
+
+fn tool_output_succeeded(output: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| value.get("ok").and_then(serde_json::Value::as_bool))
+        })
+        .unwrap_or(true)
+}
+
+fn mode_allows_tool_permission(mode: AgentMode, permission: ToolPermission) -> bool {
+    match mode {
+        AgentMode::Normal => true,
+        AgentMode::Plan => matches!(
+            permission,
+            ToolPermission::ReadOnly | ToolPermission::Presentation
+        ),
+        AgentMode::Chat => permission == ToolPermission::ReadOnly,
+    }
+}
+
+#[derive(Debug)]
+struct AutoArtifactCandidate {
+    call_id: String,
+    tool_name: String,
+    path: PathBuf,
+}
+
+fn artifact_delivery_requested(messages: &[ChatMessage]) -> bool {
+    let text = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(chat_message_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    let zh_action = ["生成", "创建", "制作", "导出", "保存为", "写一", "写个"]
+        .iter()
+        .any(|word| text.contains(word));
+    let zh_deliverable = [
+        "报告",
+        "文档",
+        "文件",
+        "网页",
+        "页面",
+        "表格",
+        "清单",
+        "markdown",
+        "md",
+        "html",
+        "json",
+        "csv",
+        "pdf",
+        "代码文件",
+        "独立脚本",
+        "示例程序",
+    ]
+    .iter()
+    .any(|word| text.contains(word));
+    let en_action = ["create", "generate", "write", "make", "export", "save"]
+        .iter()
+        .any(|word| text.split_whitespace().any(|part| part == *word));
+    let en_deliverable = [
+        "report",
+        "document",
+        "file",
+        "webpage",
+        "page",
+        "table",
+        "spreadsheet",
+        "markdown",
+        "html",
+        "json",
+        "csv",
+        "pdf",
+        "script",
+        "standalone program",
+    ]
+    .iter()
+    .any(|word| text.contains(word));
+    (zh_action && zh_deliverable) || (en_action && en_deliverable)
+}
+
+fn chat_message_text(message: &ChatMessage) -> Option<String> {
+    match message.content.as_ref()? {
+        ChatContent::Text(text) => Some(text.clone()),
+        ChatContent::Parts(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    ChatContentPart::Text { text } => Some(text.as_str()),
+                    ChatContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
+}
+
+fn artifact_candidate_paths(tool_name: &str, output: &str) -> Vec<PathBuf> {
+    let Ok(payload) = serde_json::from_str::<Value>(output) else {
+        return Vec::new();
+    };
+    let raw_paths = match tool_name {
+        "write_file" if payload.get("created").and_then(Value::as_bool) == Some(true) => payload
+            .get("path")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "apply_patch" => payload
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|file| file.get("operation").and_then(Value::as_str) == Some("add"))
+            .filter_map(|file| file.get("path").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    raw_paths
+        .into_iter()
+        .map(resolve_tool_output_path)
+        .filter(|path| artifact_candidate_extension(path))
+        .collect()
+}
+
+fn resolve_tool_output_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
         }
     }
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        tools::workspace::effective_workdir().join(path)
+    }
+}
+
+fn artifact_candidate_extension(path: &std::path::Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "md" | "markdown"
+            | "html"
+            | "htm"
+            | "pdf"
+            | "json"
+            | "jsonl"
+            | "csv"
+            | "tsv"
+            | "txt"
+            | "log"
+            | "css"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "rs"
+            | "py"
+            | "sh"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "sql"
+    )
+}
+
+fn publish_auto_artifact_candidates<F>(
+    candidates: &[AutoArtifactCandidate],
+    on_event: &mut F,
+) -> Result<()>
+where
+    F: FnMut(AgentEvent) -> Result<()>,
+{
+    let mut published = HashSet::new();
+    for candidate in candidates {
+        let key = candidate
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.path.clone());
+        if !published.insert(key) || !candidate.path.is_file() {
+            continue;
+        }
+        on_event(AgentEvent::Artifact {
+            call_id: candidate.call_id.clone(),
+            name: candidate.tool_name.clone(),
+            path: candidate.path.clone(),
+            title: String::new(),
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1510,6 +3823,10 @@ struct UsageAccumulator {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cache_reported: bool,
     has_usage: bool,
     estimated: bool,
 }
@@ -1528,6 +3845,7 @@ impl UsageAccumulator {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                ..Usage::default()
             },
             true,
         );
@@ -1540,6 +3858,12 @@ impl UsageAccumulator {
             .saturating_add(usage.completion_tokens);
         let total = usage.effective_total_tokens();
         self.total_tokens = self.total_tokens.saturating_add(total);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(usage.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(usage.reasoning_tokens);
+        self.cache_reported |= usage.cache_reported;
         self.has_usage = true;
         self.estimated |= estimated;
     }
@@ -1549,6 +3873,11 @@ impl UsageAccumulator {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_reported: self.cache_reported,
+            ..Usage::default()
         })
     }
 }
@@ -1572,6 +3901,20 @@ fn queued_prompt_images(prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>
         .collect()
 }
 
+/// The fossilizable prefix of a transient tail: the contiguous run of
+/// system-role text messages. Stops at the first non-system or non-text
+/// message so redo checkpoints (which append loop messages) never leak
+/// assistant/tool content into the fossil record.
+fn fossil_context_messages(tail: &[ChatMessage]) -> Vec<ChatMessage> {
+    tail.iter()
+        .take_while(|message| {
+            message.role == "system"
+                && matches!(message.content.as_ref(), Some(ChatContent::Text(_)))
+        })
+        .cloned()
+        .collect()
+}
+
 fn replace_request_mode_context(
     messages: &mut [ChatMessage],
     system_prompt: &str,
@@ -1589,6 +3932,17 @@ fn replace_request_mode_context(
     }) {
         *runtime = ChatMessage::system(runtime_context(mode));
     }
+}
+
+fn continuation_system_prompt(system_prompt: &str, mode: AgentMode) -> String {
+    let mode = match mode {
+        AgentMode::Normal => "normal",
+        AgentMode::Plan => "plan",
+        AgentMode::Chat => "chat",
+    };
+    format!(
+        "<mode-update active=\"{mode}\">This supersedes all earlier mode-specific instructions.</mode-update>\n\n{system_prompt}"
+    )
 }
 
 fn estimate_result_tokens(result: &ChatResult) -> usize {
@@ -1615,6 +3969,10 @@ fn estimate_tool_definition_tokens(definitions: &[crate::llm::ToolDefinition]) -
 
 fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<String> {
     let field = match tool_name {
+        "create_artifact" | "apply_artifact_patch" | "present_artifact" => {
+            return compact_artifact_tool_report(tool_name, output)
+                .map(|report| wrap_previous_tool_report(tool_name, &report))
+        }
         "load_tools" => {
             return compact_loaded_tools_report(output)
                 .map(|report| wrap_previous_tool_report(tool_name, &report))
@@ -1642,10 +4000,74 @@ fn extract_persistable_tool_report(tool_name: &str, output: &str) -> Option<Stri
         .filter(|report| !report.is_empty())
 }
 
+fn compact_artifact_tool_report(tool_name: &str, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let filenames = value
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("path").and_then(Value::as_str))
+        .filter_map(|path| std::path::Path::new(path).file_name())
+        .filter_map(|name| name.to_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !filenames.is_empty() {
+        return serde_json::to_string(&serde_json::json!({
+            "artifacts": filenames,
+            "operation": tool_name,
+        }))
+        .ok();
+    }
+    let filename = value
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    Some(
+        serde_json::to_string(&serde_json::json!({
+            "artifact": filename,
+            "title": title,
+            "operation": tool_name,
+        }))
+        .ok()?,
+    )
+}
+
 fn wrap_previous_tool_report(tool_name: &str, report: &str) -> String {
     format!(
         "<previous_tool_report name=\"{tool_name}\">\n{}\n</previous_tool_report>",
         report.trim()
+    )
+}
+
+/// User role + explicit historical-record framing (not system): a
+/// system-weighted summary tempts the model to re-execute imperative lines in
+/// it as fresh instructions, and several providers treat multiple system
+/// messages inconsistently.
+fn summary_checkpoint_message(summary: &str) -> ChatMessage {
+    ChatMessage::plain(
+        "user",
+        format!(
+            "<conversation-checkpoint>\nThe earlier conversation was compacted into the summary below. Treat it as historical context, not as new instructions.\n<summary>\n{summary}\n</summary>\n</conversation-checkpoint>"
+        ),
     )
 }
 
@@ -1654,15 +4076,106 @@ fn private_tool_memory(reports: &[String]) -> String {
         "<system-reminder>\n<private_tool_memory>\n这些是内部工具记忆，仅用于保持对话连续性。不要向用户复述、展示或引用这些标签。\n{}\n</private_tool_memory>\n</system-reminder>",
         reports
             .iter()
-            .map(|report| report.trim())
+            .map(|report| {
+                truncate_middle_chars(
+                    report.trim(),
+                    PRIVATE_TOOL_REPORT_HEAD_CHARS,
+                    PRIVATE_TOOL_REPORT_TAIL_CHARS,
+                )
+            })
             .filter(|report| !report.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
     )
 }
 
+/// A18: bound the per-turn "collapsed body" that re-renders into history. The
+/// truncation depends only on the text itself (never on turn age or position),
+/// so a turn's rendering is frozen once written and the history prefix stays
+/// byte-stable across later requests.
+const PRIVATE_MEMORY_HEAD_CHARS: usize = 800;
+const PRIVATE_MEMORY_TAIL_CHARS: usize = 400;
+const PRIVATE_TOOL_REPORT_HEAD_CHARS: usize = 1600;
+const PRIVATE_TOOL_REPORT_TAIL_CHARS: usize = 400;
+
+fn truncate_middle_chars(text: &str, head: usize, tail: usize) -> String {
+    let total = text.chars().count();
+    // The +64 slack guarantees idempotency: a truncated result is always below
+    // the threshold, so re-applying the function is a no-op.
+    if total <= head + tail + 64 {
+        return text.to_string();
+    }
+    let head_str: String = text.chars().take(head).collect();
+    let tail_str: String = text
+        .chars()
+        .skip(total.saturating_sub(tail))
+        .collect();
+    format!(
+        "{head_str}\n[...省略{}字符...]\n{tail_str}",
+        total - head - tail
+    )
+}
+
+fn private_reasoning_memory(reasoning: &str) -> Option<String> {
+    (!reasoning.trim().is_empty()).then(|| {
+        let reasoning =
+            truncate_middle_chars(reasoning, PRIVATE_MEMORY_HEAD_CHARS, PRIVATE_MEMORY_TAIL_CHARS);
+        format!(
+            "<system-reminder>\n<previous_assistant_reasoning>\n{reasoning}\n</previous_assistant_reasoning>\n这些是上一轮 assistant 已经产生的原始思考内容，用于继续工作；不要向用户复述这些标签。\n</system-reminder>"
+        )
+    })
+}
+
+fn push_assistant_context_messages(
+    messages: &mut Vec<ChatMessage>,
+    content: &str,
+    reasoning: Option<&str>,
+    force_assistant_message: bool,
+) {
+    push_assistant_message_with_reasoning(
+        messages,
+        content.to_string(),
+        reasoning,
+        None,
+        None,
+        force_assistant_message,
+    );
+}
+
+fn push_assistant_message_with_reasoning(
+    messages: &mut Vec<ChatMessage>,
+    content: String,
+    reasoning: Option<&str>,
+    thinking_signature: Option<&str>,
+    tool_calls: Option<Vec<ToolCall>>,
+    force_assistant_message: bool,
+) {
+    let has_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+    if has_tool_calls {
+        // A17: DeepSeek thinking mode requires the `reasoning_content` KEY on
+        // assistant tool_calls turns of the live tool loop (an empty string is
+        // accepted, a missing key is a 400). Carry it on the assistant message
+        // itself; the provider adapter strips it for endpoints that do not
+        // understand the field and rebuilds the Anthropic thinking block from
+        // the signature where present.
+        let mut message = ChatMessage::assistant(content, tool_calls);
+        message.reasoning_content = Some(reasoning.unwrap_or_default().to_string());
+        message.thinking_signature = thinking_signature.map(str::to_string);
+        messages.push(message);
+        return;
+    }
+    if let Some(reasoning) = reasoning.and_then(private_reasoning_memory) {
+        messages.push(ChatMessage::system(reasoning));
+    }
+    if force_assistant_message || !content.trim().is_empty() {
+        messages.push(ChatMessage::assistant(content, None));
+    }
+}
+
 fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
     let mut messages = vec![ChatMessage::plain("user", &turn.user_content)];
+    // Fossilized transient tail is replayed with the turn, so count it.
+    messages.extend(turn.context_messages.iter().cloned());
     for exchange in &turn.question_exchanges {
         messages.push(ChatMessage::plain(
             "assistant",
@@ -1674,15 +4187,23 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
         ));
     }
     for followup in &turn.followups {
-        if let Some(content) = followup_assistant_replay_content(followup) {
-            messages.push(ChatMessage::plain("assistant", content));
-        }
+        push_assistant_context_messages(
+            &mut messages,
+            followup
+                .preceding_assistant_content
+                .as_deref()
+                .unwrap_or_default(),
+            followup.preceding_assistant_reasoning.as_deref(),
+            false,
+        );
         messages.push(ChatMessage::plain("user", &followup.content));
     }
-    messages.push(ChatMessage::plain(
-        "assistant",
-        assistant_replay_content(turn),
-    ));
+    push_assistant_context_messages(
+        &mut messages,
+        &turn.assistant_content,
+        turn.assistant_reasoning.as_deref(),
+        true,
+    );
     if !turn.tool_reports.is_empty() {
         messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
     }
@@ -1712,15 +4233,289 @@ fn followup_assistant_replay_content(followup: &crate::state::TurnFollowup) -> O
         })
 }
 
-fn chat_result_replay_content(result: &ChatResult) -> &str {
-    if !result.content.trim().is_empty() {
-        return &result.content;
+fn interrupted_turn_replay_messages(agent: &Agent, turn: &crate::state::Turn) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    messages.push(ChatMessage::system(
+        "<interrupted-turn-recovery>上一轮回复已中断。以下内容是中断前已经持久化的模型输出和工具进度；不要重新执行已经完成的工具，基于这些内容继续处理当前用户请求。</interrupted-turn-recovery>",
+    ));
+
+    // A redo revision only journals the new branch. Preserve the already
+    // committed clarification/follow-up prefix from the turn row before
+    // replaying the new branch's events.
+    let replayed_prompt_ids = turn
+        .journal_events
+        .iter()
+        .filter(|event| event.kind == "queued_prompts_consumed")
+        .flat_map(|event| {
+            event
+                .text_payload
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<Vec<String>>(payload).ok())
+                .unwrap_or_default()
+        })
+        .collect::<HashSet<_>>();
+    if turn.revision > 0 {
+        let prefix_question_count = turn
+            .journal_events
+            .iter()
+            .find(|event| event.kind == "redo_prefix_question_count")
+            .and_then(|event| event.text_payload.as_deref())
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                let branch_answers = turn
+                    .journal_events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "tool_result"
+                            && event.name.as_deref() == Some("ask_question")
+                            && event
+                                .text_payload
+                                .as_deref()
+                                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                                .and_then(|payload| {
+                                    payload
+                                        .get("status")
+                                        .and_then(Value::as_str)
+                                        .map(|status| status == "answered")
+                                })
+                                .unwrap_or(false)
+                    })
+                    .count();
+                turn.question_exchanges.len().saturating_sub(branch_answers)
+            });
+        for exchange in turn.question_exchanges.iter().take(prefix_question_count) {
+            messages.push(ChatMessage::plain(
+                "assistant",
+                crate::question::assistant_exchange_text(exchange),
+            ));
+            messages.push(ChatMessage::plain(
+                "user",
+                crate::question::user_exchange_text(exchange),
+            ));
+        }
+        for followup in &turn.followups {
+            if replayed_prompt_ids.contains(&followup.prompt_id) {
+                continue;
+            }
+            push_assistant_context_messages(
+                &mut messages,
+                followup
+                    .preceding_assistant_content
+                    .as_deref()
+                    .unwrap_or_default(),
+                followup.preceding_assistant_reasoning.as_deref(),
+                false,
+            );
+            messages.push(agent.followup_user_message(followup));
+        }
     }
-    result
-        .reasoning
-        .as_deref()
-        .filter(|reasoning| !reasoning.trim().is_empty())
-        .unwrap_or(&result.content)
+
+    let mut assistant_text = String::new();
+    let mut assistant_reasoning = String::new();
+    let mut pending_calls = Vec::<ToolCall>::new();
+    let mut open_calls = Vec::<ToolCall>::new();
+    let mut progress = HashMap::<String, String>::new();
+    let mut command_tail = HashMap::<String, Vec<u8>>::new();
+
+    for event in &turn.journal_events {
+        match event.kind.as_str() {
+            "assistant_content" => {
+                if let Some(text) = &event.text_payload {
+                    assistant_text.push_str(text);
+                }
+            }
+            "assistant_reasoning" => {
+                if let Some(text) = &event.text_payload {
+                    assistant_reasoning.push_str(text);
+                }
+            }
+            "reasoning_reset" => assistant_reasoning.clear(),
+            "tool_call" => {
+                let Some(call_id) = event.call_id.clone() else {
+                    continue;
+                };
+                let Some(name) = event.name.as_deref() else {
+                    continue;
+                };
+                pending_calls.push(ToolCall {
+                    id: call_id,
+                    kind: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: replay_tool_function_name(name),
+                        arguments: event.text_payload.clone().unwrap_or_default(),
+                    },
+                });
+            }
+            "tool_result" => {
+                open_calls.extend(flush_interrupted_assistant(
+                    &mut messages,
+                    &mut assistant_reasoning,
+                    &mut assistant_text,
+                    &mut pending_calls,
+                ));
+                if let Some(call_id) = &event.call_id {
+                    let output = event.text_payload.as_deref().unwrap_or_default();
+                    messages.push(ChatMessage::tool(call_id, truncate_chars(output, 48_000)));
+                    open_calls.retain(|call| call.id != *call_id);
+                    progress.remove(call_id);
+                    command_tail.remove(call_id);
+                }
+            }
+            "tool_progress" => {
+                if let Some(call_id) = &event.call_id {
+                    progress.insert(
+                        call_id.clone(),
+                        truncate_chars(event.text_payload.as_deref().unwrap_or_default(), 4_000),
+                    );
+                }
+            }
+            "command_stdout" | "command_stderr" => {
+                if let Some(call_id) = &event.call_id {
+                    let tail = command_tail.entry(call_id.clone()).or_default();
+                    if let Some(bytes) = &event.blob_payload {
+                        tail.extend_from_slice(bytes);
+                        const MAX_COMMAND_TAIL: usize = 8 * 1024;
+                        if tail.len() > MAX_COMMAND_TAIL {
+                            let start = tail.len() - MAX_COMMAND_TAIL;
+                            tail.drain(..start);
+                        }
+                    }
+                }
+            }
+            "queued_prompts_consumed" => {
+                open_calls.extend(flush_interrupted_assistant(
+                    &mut messages,
+                    &mut assistant_reasoning,
+                    &mut assistant_text,
+                    &mut pending_calls,
+                ));
+                append_interrupted_tool_results(
+                    &mut messages,
+                    &mut open_calls,
+                    &mut progress,
+                    &mut command_tail,
+                );
+                let prompt_ids = event
+                    .text_payload
+                    .as_deref()
+                    .and_then(|payload| serde_json::from_str::<Vec<String>>(payload).ok())
+                    .unwrap_or_default();
+                for prompt_id in prompt_ids {
+                    if let Some(followup) = turn
+                        .followups
+                        .iter()
+                        .find(|followup| followup.prompt_id == prompt_id)
+                    {
+                        messages.push(agent.followup_user_message(followup));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    open_calls.extend(flush_interrupted_assistant(
+        &mut messages,
+        &mut assistant_reasoning,
+        &mut assistant_text,
+        &mut pending_calls,
+    ));
+    append_interrupted_tool_results(
+        &mut messages,
+        &mut open_calls,
+        &mut progress,
+        &mut command_tail,
+    );
+    messages
+}
+
+fn flush_interrupted_assistant(
+    messages: &mut Vec<ChatMessage>,
+    assistant_reasoning: &mut String,
+    assistant_text: &mut String,
+    pending_calls: &mut Vec<ToolCall>,
+) -> Vec<ToolCall> {
+    if assistant_reasoning.trim().is_empty()
+        && assistant_text.trim().is_empty()
+        && pending_calls.is_empty()
+    {
+        return Vec::new();
+    }
+    if !assistant_reasoning.trim().is_empty() {
+        if let Some(reasoning) = private_reasoning_memory(assistant_reasoning) {
+            messages.push(ChatMessage::system(reasoning));
+        }
+    }
+    assistant_reasoning.clear();
+    let text = std::mem::take(assistant_text);
+    let calls = std::mem::take(pending_calls);
+    let replay_calls = (!calls.is_empty()).then(|| calls.clone());
+    messages.push(ChatMessage::assistant(text, replay_calls));
+    calls
+}
+
+fn append_interrupted_tool_results(
+    messages: &mut Vec<ChatMessage>,
+    open_calls: &mut Vec<ToolCall>,
+    progress: &mut HashMap<String, String>,
+    command_tail: &mut HashMap<String, Vec<u8>>,
+) {
+    for call in std::mem::take(open_calls) {
+        let mut output =
+            "tool execution was interrupted before a final result was persisted".to_string();
+        if let Some(message) = progress.remove(&call.id) {
+            output.push_str("\nlast progress: ");
+            output.push_str(&message);
+        }
+        if let Some(bytes) = command_tail.remove(&call.id) {
+            let tail = String::from_utf8_lossy(&bytes);
+            if !tail.trim().is_empty() {
+                output.push_str("\nlast command output:\n");
+                output.push_str(&truncate_chars(&tail, 8_000));
+            }
+        }
+        messages.push(ChatMessage::tool(call.id, output));
+    }
+}
+
+fn replay_tool_function_name(name: &str) -> String {
+    match name.split_once(':').map(|(prefix, _)| prefix) {
+        Some("load_skill") | Some("load_tools") | Some("task") => {
+            name.split(':').next().unwrap_or(name).to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn redo_checkpoint_payload(
+    messages: &[ChatMessage],
+    replay_start: usize,
+    base_tool_reports: &[String],
+    pending_tool_reports: &[(String, String)],
+    tool_rounds: usize,
+    question_rounds: usize,
+) -> TurnRedoCheckpointPayload {
+    let mut prefix_tool_reports = Vec::with_capacity(
+        base_tool_reports
+            .len()
+            .saturating_add(pending_tool_reports.len()),
+    );
+    prefix_tool_reports.extend(base_tool_reports.iter().cloned());
+    prefix_tool_reports.extend(
+        pending_tool_reports
+            .iter()
+            .map(|(_, report)| report.clone()),
+    );
+    TurnRedoCheckpointPayload {
+        replay_messages: messages.get(replay_start..).unwrap_or_default().to_vec(),
+        prefix_tool_reports,
+        tool_rounds,
+        question_rounds,
+        loaded_items: Vec::new(),
+        prefix_question_count: 0,
+        prefix_image_asset_ids: Vec::new(),
+        prefix_artifact_asset_ids: Vec::new(),
+    }
 }
 
 fn evicted_turn_entries(
@@ -1740,6 +4535,7 @@ fn evicted_turn_entries(
             timestamp: turn.user_timestamp.clone(),
             role: "user".to_string(),
             content: turn.user_content.clone(),
+            ..EvictedTurn::default()
         });
 
         for (index, exchange) in turn.question_exchanges.iter().enumerate() {
@@ -1756,6 +4552,7 @@ fn evicted_turn_entries(
                 timestamp: timestamp.clone(),
                 role: "assistant".to_string(),
                 content: assistant_content,
+                ..EvictedTurn::default()
             });
             let user_content = crate::question::user_exchange_text(exchange);
             entries.push(crate::state::StoredConversationEntry {
@@ -1769,6 +4566,7 @@ fn evicted_turn_entries(
                 timestamp,
                 role: "user".to_string(),
                 content: user_content,
+                ..EvictedTurn::default()
             });
         }
 
@@ -1789,6 +4587,7 @@ fn evicted_turn_entries(
                     timestamp: followup.submitted_at.clone(),
                     role: "assistant".to_string(),
                     content,
+                    ..EvictedTurn::default()
                 });
             }
             entries.push(crate::state::StoredConversationEntry {
@@ -1802,6 +4601,7 @@ fn evicted_turn_entries(
                 timestamp: followup.submitted_at.clone(),
                 role: "user".to_string(),
                 content: followup.content.clone(),
+                ..EvictedTurn::default()
             });
         }
 
@@ -1817,6 +4617,7 @@ fn evicted_turn_entries(
             timestamp: timestamp.clone(),
             role: "assistant".to_string(),
             content: turn.assistant_content.clone(),
+            ..EvictedTurn::default()
         });
 
         for (index, report) in turn.tool_reports.iter().enumerate() {
@@ -1831,6 +4632,7 @@ fn evicted_turn_entries(
                 timestamp: timestamp.clone(),
                 role: "assistant".to_string(),
                 content: report.clone(),
+                ..EvictedTurn::default()
             });
         }
     }
@@ -1851,7 +4653,8 @@ fn archive_and_delete_visible_turns_checked(
     turns: &[crate::state::Turn],
     expected_loaded_tools: Option<&[(String, Option<String>)]>,
 ) -> Result<Vec<crate::state::StoredConversationEntry>> {
-    let (entries, evicted) = evicted_turn_entries(turns);
+    let (entries, mut evicted) = evicted_turn_entries(turns);
+    memory.apply_evicted_ownership(&mut evicted);
     let turn_ids = turns
         .iter()
         .map(|turn| turn.turn_id.clone())
@@ -2069,6 +4872,18 @@ fn tool_event_name(name: &str, arguments: &str) -> String {
             .filter(|tools| !tools.is_empty())
             .map(|tools| format!("load_tools:{tools}"))
             .unwrap_or_else(|| name.to_string()),
+        // Each subagent gets a distinct event name so concurrent task calls
+        // render as separate status lines instead of one aggregated counter.
+        "task" => args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(|description| {
+                let truncated: String = description.chars().take(32).collect();
+                format!("task:{truncated}")
+            })
+            .unwrap_or_else(|| name.to_string()),
         _ => name.to_string(),
     }
 }
@@ -2106,13 +4921,20 @@ fn clipboard_binary_image_from_tool_result(
 fn resolve_pasted_image_paths(
     images: &[Option<PastedImage>],
     paths: &MiyuPaths,
+    image_platform: Option<&str>,
 ) -> Vec<Option<String>> {
     images
         .iter()
         .enumerate()
         .map(|(i, image)| match image {
-            Some(PastedImage::Binary(img)) => img
-                .write_temp_file(&paths.cache_dir, i + 1)
+            Some(PastedImage::Binary(img)) => image_platform
+                .map(|platform| {
+                    img.write_cache_file(
+                        &paths.cache_dir,
+                        &PathBuf::from("platform_images").join(platform),
+                    )
+                })
+                .unwrap_or_else(|| img.write_temp_file(&paths.cache_dir, i + 1))
                 .ok()
                 .map(|path| path.display().to_string()),
             Some(PastedImage::Path(path)) => Some(path.clone()),
@@ -2177,6 +4999,31 @@ fn with_mode_reminder(system_prompt: String, mode: AgentMode) -> String {
         prompt.push_str(reminder);
     }
     prompt
+}
+
+fn with_runtime_system_context(mut system_prompt: String, context: &[String]) -> String {
+    for item in context
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !item.is_empty())
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(item);
+    }
+    system_prompt
+}
+
+fn active_text_pool_supports_vision(config: &AppConfig) -> bool {
+    let choices = config.active_provider_model_choices();
+    !choices.is_empty()
+        && choices.iter().all(|choice| {
+            config.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+        })
+}
+
+fn should_use_active_text_pool_for_images(config: &AppConfig) -> bool {
+    config.plugins.vision.prefer_current_multimodal_model
+        && active_text_pool_supports_vision(config)
 }
 
 #[derive(Default)]
@@ -2345,6 +5192,17 @@ where
             }
             on_event(AgentEvent::ReasoningPartEnd { received_at })?;
         }
+        ChatStreamKind::ToolCall => {
+            if matches!(
+                chunk.text.as_str(),
+                "apply_patch" | "apply_artifact_patch" | "ask_question"
+            ) {
+                on_event(AgentEvent::ToolPreparing {
+                    name: chunk.text.clone(),
+                })?;
+            }
+            on_event(AgentEvent::Chunk(chunk))?;
+        }
         ChatStreamKind::Reasoning => {
             let (title, text) = filter.push(&chunk.text);
             if let Some(title) = title {
@@ -2360,6 +5218,21 @@ where
         _ => on_event(AgentEvent::Chunk(chunk))?,
     }
     Ok(())
+}
+
+fn emit_model_chunk_at<F>(
+    chunk: ChatStreamChunk,
+    received_at: Instant,
+    filter: &mut ReasoningTitleFilter,
+    on_event: &mut F,
+) -> Result<()>
+where
+    F: FnMut(AgentEvent) -> Result<()>,
+{
+    if chunk.kind == ChatStreamKind::Reasoning {
+        on_event(AgentEvent::RawReasoning(chunk.clone()))?;
+    }
+    emit_filtered_chunk_at(chunk, received_at, filter, on_event)
 }
 
 #[cfg(test)]
@@ -2402,9 +5275,9 @@ fn parse_reasoning_title_chunks<'a>(
 }
 
 fn runtime_context(mode: AgentMode) -> String {
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let cwd = crate::tools::workspace::effective_workdir()
+        .display()
+        .to_string();
     if mode == AgentMode::Chat {
         format!(
             "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",
@@ -2494,12 +5367,136 @@ fn strip_tagged_sections(mut text: String, tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, ProviderConfig};
+    use crate::config::{ActiveProviderModelConfig, AppConfig, ProviderConfig};
     use crate::paths::MiyuPaths;
+    use crate::platforms::{
+        ConversationKind, OutboundMessage, PlatformAdapter, PlatformConversation, SendReceipt,
+    };
     use crate::tools::{empty_parameters, ToolSpec};
+    use futures_util::future::BoxFuture;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    struct NoopPlatformAdapter;
+
+    #[test]
+    fn plan_allows_presentation_without_allowing_workspace_writes() {
+        assert!(mode_allows_tool_permission(
+            AgentMode::Plan,
+            ToolPermission::Presentation
+        ));
+        assert!(!mode_allows_tool_permission(
+            AgentMode::Plan,
+            ToolPermission::Writes
+        ));
+        assert!(!mode_allows_tool_permission(
+            AgentMode::Chat,
+            ToolPermission::Presentation
+        ));
+    }
+
+    #[test]
+    fn artifact_delivery_detection_is_conservative() {
+        assert!(artifact_delivery_requested(&[ChatMessage::plain(
+            "user",
+            "生成一个 Linux 游玩报告，保存为 Markdown 文件",
+        )]));
+        assert!(artifact_delivery_requested(&[ChatMessage::plain(
+            "user",
+            "create a standalone HTML file",
+        )]));
+        assert!(!artifact_delivery_requested(&[ChatMessage::plain(
+            "user",
+            "修改 src/main.rs 修复这个错误",
+        )]));
+    }
+
+    #[test]
+    fn artifact_candidates_only_include_new_files() {
+        let created = artifact_candidate_paths(
+            "write_file",
+            r#"{"ok":true,"created":true,"path":"report.md"}"#,
+        );
+        assert_eq!(created.len(), 1);
+        assert!(artifact_candidate_paths(
+            "write_file",
+            r#"{"ok":true,"created":false,"path":"src/main.rs"}"#,
+        )
+        .is_empty());
+        assert!(artifact_candidate_paths(
+            "apply_patch",
+            r#"{"ok":true,"files":[{"path":"report.md","operation":"update"}]}"#,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn tool_call_stream_announces_patch_and_question_preparation() {
+        let mut filter = ReasoningTitleFilter::default();
+        let mut prepared = Vec::new();
+        let mut streamed = Vec::new();
+        let mut on_event = |event| {
+            match event {
+                AgentEvent::ToolPreparing { name } => prepared.push(name),
+                AgentEvent::Chunk(chunk) if chunk.kind == ChatStreamKind::ToolCall => {
+                    streamed.push(chunk.text)
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        for name in [
+            "apply_patch",
+            "apply_artifact_patch",
+            "ask_question",
+            "read_file",
+        ] {
+            emit_filtered_chunk(
+                ChatStreamChunk {
+                    kind: ChatStreamKind::ToolCall,
+                    text: name.to_string(),
+                },
+                &mut filter,
+                &mut on_event,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            prepared,
+            ["apply_patch", "apply_artifact_patch", "ask_question"]
+        );
+        assert_eq!(
+            streamed,
+            [
+                "apply_patch",
+                "apply_artifact_patch",
+                "ask_question",
+                "read_file"
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_tool_report_keeps_cross_turn_filename_memory() {
+        let report = extract_persistable_tool_report(
+            "apply_artifact_patch",
+            r#"{"ok":true,"files":[{"path":"report.md","operation":"update"}]}"#,
+        )
+        .unwrap();
+        assert!(report.contains("report.md"));
+        assert!(!report.contains("/home/test"));
+    }
+
+    impl PlatformAdapter for NoopPlatformAdapter {
+        fn send<'a>(&'a self, _message: OutboundMessage) -> BoxFuture<'a, Result<SendReceipt>> {
+            Box::pin(async { bail!("send is not used in this test") })
+        }
+
+        fn bot_display_name<'a>(&'a self) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("Miyu".to_string()) })
+        }
+    }
 
     #[test]
     fn strips_pasted_system_reminder_from_user_input() {
@@ -2899,6 +5896,423 @@ mod tests {
     }
 
     #[test]
+    fn user_identity_is_limited_to_owner_prompts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut config = AppConfig::default();
+        std::fs::create_dir_all(config.identities_dir_path(&paths)).unwrap();
+        std::fs::write(config.user_identity_path(&paths), "legacy-owner-marker").unwrap();
+
+        let owner = config
+            .system_prompt_for(&paths, PromptAudience::Owner)
+            .unwrap();
+        let external = config
+            .system_prompt_for(&paths, PromptAudience::External)
+            .unwrap();
+        let internal = config
+            .system_prompt_for(&paths, PromptAudience::Internal)
+            .unwrap();
+        assert!(owner.contains("legacy-owner-marker"));
+        assert!(!external.contains("legacy-owner-marker"));
+        assert!(!internal.contains("legacy-owner-marker"));
+
+        config.prompt.active_identity = "owner.md".to_string();
+        std::fs::write(
+            config.identity_path(&paths, "owner.md"),
+            "active-owner-marker",
+        )
+        .unwrap();
+        assert!(config
+            .system_prompt_for(&paths, PromptAudience::Owner)
+            .unwrap()
+            .contains("active-owner-marker"));
+        assert!(!config
+            .system_prompt_for(&paths, PromptAudience::External)
+            .unwrap()
+            .contains("active-owner-marker"));
+    }
+
+    #[test]
+    fn runtime_system_context_refreshes_the_effective_prompt_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        agent
+            .set_runtime_system_context(vec!["  platform-only notice  ".to_string()])
+            .unwrap();
+        assert!(agent.system_prompt.contains("platform-only notice"));
+        assert_eq!(
+            agent.runtime_system_context,
+            vec!["platform-only notice".to_string()]
+        );
+    }
+
+    #[test]
+    fn structured_platform_context_can_suppress_ambiguous_session_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        state
+            .start_turn("old", "anonymous old user", 999_999)
+            .unwrap();
+        state.complete_turn("old", "old assistant", None).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        assert!(agent
+            .chat_messages("current", "new user")
+            .unwrap()
+            .iter()
+            .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
+        agent.set_session_history_suppressed(true);
+        let messages = agent.chat_messages("current", "new user").unwrap();
+        assert!(!messages
+            .iter()
+            .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
+        // [.., user, runtime tail]: the current user message sits right before
+        // the transient runtime stamp.
+        assert!(format!("{:?}", messages[messages.len() - 2].content).contains("new user"));
+        assert!(format!("{:?}", messages.last().unwrap().content).contains("<runtime now="));
+    }
+
+    #[test]
+    fn fossilized_transient_tail_replays_between_user_and_assistant() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        state.start_turn("old", "old question", 999_999).unwrap();
+        state
+            .set_turn_context_messages(
+                "old",
+                &[
+                    ChatMessage::system("<runtime now=\"frozen stamp\"/>"),
+                    ChatMessage::system("<associative-memory>frozen recall</associative-memory>"),
+                ],
+            )
+            .unwrap();
+        state.complete_turn("old", "old answer", None).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        let messages = agent.chat_messages("current", "next question").unwrap();
+        let text = |message: &ChatMessage| format!("{:?}", message.content);
+        let user = messages
+            .iter()
+            .position(|m| text(m).contains("old question"))
+            .unwrap();
+        let assistant = messages
+            .iter()
+            .position(|m| text(m).contains("old answer"))
+            .unwrap();
+        // The fossils sit, in order, strictly between the user message and the
+        // assistant reply — byte-for-byte what the live request sent.
+        assert_eq!(messages[user + 1].role, "system");
+        assert!(text(&messages[user + 1]).contains("frozen stamp"));
+        assert_eq!(messages[user + 2].role, "system");
+        assert!(text(&messages[user + 2]).contains("frozen recall"));
+        assert!(user + 2 < assistant);
+    }
+
+    #[test]
+    fn fossil_capture_stops_at_first_non_system_message() {
+        let tail = vec![
+            ChatMessage::system("<runtime now=\"x\"/>"),
+            ChatMessage::system("hint"),
+            ChatMessage::plain("assistant", "loop starts here"),
+            ChatMessage::system("after loop — must not be captured"),
+        ];
+        let fossil = fossil_context_messages(&tail);
+        assert_eq!(fossil.len(), 2);
+        assert!(format!("{:?}", fossil[1].content).contains("hint"));
+    }
+
+    #[test]
+    fn vision_support_requires_every_effective_text_pool_model() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        provider.default_model = "vision-model".to_string();
+        provider.models = vec!["vision-model".to_string(), "text-model".to_string()];
+        provider.model_modalities.insert(
+            "vision-model".to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        provider
+            .model_modalities
+            .insert("text-model".to_string(), vec!["text".to_string()]);
+        let provider_id = provider.id.clone();
+
+        config.active_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: provider_id.clone(),
+            model: "vision-model".to_string(),
+        }]);
+        assert!(active_text_pool_supports_vision(&config));
+
+        config
+            .active_provider_models
+            .as_mut()
+            .unwrap()
+            .push(ActiveProviderModelConfig {
+                provider_id,
+                model: "text-model".to_string(),
+            });
+        assert!(!active_text_pool_supports_vision(&config));
+    }
+
+    #[test]
+    fn vision_preference_controls_direct_image_delivery_to_the_text_pool() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        provider.model_modalities.insert(
+            provider.default_model.clone(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+
+        assert!(should_use_active_text_pool_for_images(&config));
+        config.plugins.vision.prefer_current_multimodal_model = false;
+        assert!(!should_use_active_text_pool_for_images(&config));
+    }
+
+    #[tokio::test]
+    async fn platform_images_register_a_turn_scoped_vision_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+        agent.set_image_platform("qq", "QQ");
+        let images = vec![Some(PastedImage::Binary(ClipboardImage::new(
+            "image/png".to_string(),
+            vec![1, 2, 3],
+        )))];
+
+        let prepared = agent.prepare_user_input("看图", &images).await.unwrap();
+        let hint = format!("{:?}", prepared.hints);
+        assert!(hint.contains("vision_analyze"));
+        let tools = agent.tools.lock().unwrap().clone();
+        assert!(tools.contains("vision_analyze"));
+        let error = tools
+            .call("vision_analyze", r#"{"image":"/etc/passwd"}"#)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("image is not attached to the current platform turn"));
+    }
+
+    #[tokio::test]
+    async fn context_image_ids_register_vision_without_a_current_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config.clone(),
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+        agent.set_image_platform("qq", "QQ");
+        let context = Arc::new(PlatformTurnContext::new(
+            PlatformConversation {
+                platform: "onebot".to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Group,
+                conversation_id: "20000".to_string(),
+            },
+            "30000".to_string(),
+            "tester".to_string(),
+            false,
+            config,
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            Arc::new(NoopPlatformAdapter),
+            Arc::new(crate::platforms::plugins::PlatformPluginRegistry::default()),
+        ));
+        agent.set_platform_context_images(
+            context,
+            vec![PlatformContextImageRef {
+                id: "context_image_1".to_string(),
+                message_id: "90".to_string(),
+                image_index: 1,
+            }],
+        );
+
+        let prepared = agent.prepare_user_input("接着说", &[]).await.unwrap();
+        assert!(format!("{:?}", prepared.hints).contains("context_image_1"));
+        let tools = agent.tools.lock().unwrap();
+        assert!(tools.contains("vision_analyze"));
+        let definition = tools
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.function.name == "vision_analyze")
+            .unwrap();
+        assert!(definition.function.description.contains("context_image_N"));
+    }
+
+    #[tokio::test]
+    async fn binary_image_reaches_vision_pool_then_text_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let vision_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let text_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config =
+            queue_test_config(format!("http://{}/v1", text_listener.local_addr().unwrap()));
+        config.tools.enabled = false;
+        config.plugins.vision.enabled = true;
+        config.providers.push(ProviderConfig {
+            id: "vision-test".to_string(),
+            display_name: "Vision Test".to_string(),
+            base_url: format!("http://{}/v1", vision_listener.local_addr().unwrap()),
+            protocol: "openai-chat".to_string(),
+            api_key: Some("test-key".to_string()),
+            models: vec!["vision-model".to_string()],
+            model_context_window: Default::default(),
+            model_modalities: [(
+                "vision-model".to_string(),
+                vec!["text".to_string(), "image".to_string()],
+            )]
+            .into(),
+            default_model: "vision-model".to_string(),
+            timeout_seconds: 30,
+            temperature: 0.0,
+            anthropic_max_tokens: 4096,
+            extra_body: None,
+        });
+        config.active_multimodal_provider_models = Some(vec![ActiveProviderModelConfig {
+            provider_id: "vision-test".to_string(),
+            model: "vision-model".to_string(),
+        }]);
+
+        let (vision_request_tx, vision_request_rx) = oneshot::channel();
+        let vision_server = tokio::spawn(async move {
+            let (mut stream, _) = vision_listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            let _ = vision_request_tx.send(request);
+            write_test_sse(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"a red square\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+        let (text_request_tx, text_request_rx) = oneshot::channel();
+        let text_server = tokio::spawn(async move {
+            let (mut stream, _) = text_listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            let _ = text_request_tx.send(request);
+            write_test_sse(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I can see it.\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let text_provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&text_provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+        let image = PastedImage::Binary(ClipboardImage::new(
+            "image/png".to_string(),
+            b"qq-image-bytes".to_vec(),
+        ));
+
+        let result = agent
+            .chat_stream_with_images("What is shown?", &[Some(image)], |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "I can see it.");
+        let vision_request: Value =
+            serde_json::from_slice(&vision_request_rx.await.unwrap()).unwrap();
+        let vision_parts = vision_request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "user")
+            .unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert!(vision_parts.iter().any(|part| {
+            part["type"] == "image_url"
+                && part["image_url"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        }));
+
+        let text_request: Value = serde_json::from_slice(&text_request_rx.await.unwrap()).unwrap();
+        let serialized = serde_json::to_string(&text_request).unwrap();
+        assert!(serialized.contains("What is shown?"));
+        assert!(serialized.contains("a red square"));
+        vision_server.await.unwrap();
+        text_server.await.unwrap();
+    }
+
+    #[test]
     fn effective_context_tokens_include_tool_definitions() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
@@ -2969,11 +6383,212 @@ mod tests {
     }
 
     #[test]
+    fn structured_tool_business_failure_marks_the_event_failed() {
+        assert!(!tool_output_succeeded(r#"{"success":false}"#));
+        assert!(!tool_output_succeeded(r#"{"ok":false}"#));
+        assert!(tool_output_succeeded(r#"{"success":true}"#));
+        assert!(tool_output_succeeded("plain tool output"));
+    }
+
+    #[tokio::test]
+    async fn queue_ingress_waits_for_a_reserved_tool_followup() {
+        let barrier = Arc::new(QueueIngressBarrier::default());
+        barrier.tool_started("call_1");
+        let reservation = barrier
+            .try_reserve()
+            .expect("active tool accepts follow-up");
+        barrier.tool_finished("call_1");
+
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            barrier.wait_for_reserved_ingress()
+        )
+        .await
+        .is_err());
+        assert!(barrier.try_reserve().is_none());
+
+        drop(reservation);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            barrier.wait_for_reserved_ingress(),
+        )
+        .await
+        .expect("released follow-up reservation wakes the agent");
+    }
+
+    #[test]
+    fn queue_ingress_tracks_parallel_tool_calls_by_id() {
+        let barrier = Arc::new(QueueIngressBarrier::default());
+        barrier.tool_started("call_1");
+        barrier.tool_started("call_2");
+        barrier.tool_finished("call_1");
+        assert!(barrier.try_reserve().is_some());
+        barrier.tool_finished("call_2");
+        assert!(barrier.try_reserve().is_none());
+    }
+
+    #[test]
+    fn journal_persists_a_stream_batch_before_displaying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::new(&test_paths(temp.path())).unwrap();
+        state
+            .start_turn("journal-turn", "long task", std::process::id())
+            .unwrap();
+        let mut sink = TurnJournalSink::new(state.clone(), "journal-turn".to_string(), 0);
+        let mut displayed = Vec::new();
+        {
+            let mut on_event = |event| {
+                if let AgentEvent::Chunk(chunk) = event {
+                    displayed.push(chunk.text);
+                }
+                Ok(())
+            };
+            sink.emit(
+                AgentEvent::Chunk(ChatStreamChunk {
+                    kind: ChatStreamKind::Content,
+                    text: "durable partial".to_string(),
+                }),
+                &mut on_event,
+            )
+            .unwrap();
+        }
+        assert!(displayed.is_empty());
+        assert!(state.load_turns().unwrap()[0].journal_events.is_empty());
+
+        {
+            let mut on_event = |event| {
+                if let AgentEvent::Chunk(chunk) = event {
+                    displayed.push(chunk.text);
+                }
+                Ok(())
+            };
+            sink.emit(AgentEvent::SpinnerTick, &mut on_event).unwrap();
+        }
+        assert_eq!(displayed, ["durable partial"]);
+        assert_eq!(state.load_turns().unwrap()[0].journal_events.len(), 1);
+
+        state.interrupt_turn("journal-turn").unwrap();
+        assert!(state.load_turns().unwrap()[0]
+            .assistant_content
+            .contains("durable partial"));
+    }
+
+    #[test]
+    fn raw_reasoning_is_batched_before_filtered_display() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::new(&test_paths(temp.path())).unwrap();
+        state
+            .start_turn("reasoning-turn", "long task", std::process::id())
+            .unwrap();
+        let mut sink = TurnJournalSink::new(state.clone(), "reasoning-turn".to_string(), 0);
+        let mut displayed = Vec::new();
+        {
+            let mut on_event = |event| {
+                if let AgentEvent::Chunk(chunk) = event {
+                    displayed.push(chunk.text);
+                }
+                Ok(())
+            };
+            sink.emit(
+                AgentEvent::RawReasoning(ChatStreamChunk {
+                    kind: ChatStreamKind::Reasoning,
+                    text: "raw reasoning".to_string(),
+                }),
+                &mut on_event,
+            )
+            .unwrap();
+            sink.emit(
+                AgentEvent::Chunk(ChatStreamChunk {
+                    kind: ChatStreamKind::Reasoning,
+                    text: "filtered reasoning".to_string(),
+                }),
+                &mut on_event,
+            )
+            .unwrap();
+        }
+        assert!(displayed.is_empty());
+        assert!(state.load_turns().unwrap()[0].journal_events.is_empty());
+
+        {
+            let mut on_event = |event| {
+                if let AgentEvent::Chunk(chunk) = event {
+                    displayed.push(chunk.text);
+                }
+                Ok(())
+            };
+            sink.emit(AgentEvent::SpinnerTick, &mut on_event).unwrap();
+        }
+
+        assert_eq!(displayed, ["filtered reasoning"]);
+        assert_eq!(state.load_turns().unwrap()[0].journal_events.len(), 1);
+        assert_eq!(
+            state.load_turns().unwrap()[0].journal_events[0]
+                .text_payload
+                .as_deref(),
+            Some("raw reasoning")
+        );
+    }
+
+    #[test]
+    fn journal_flush_precedes_queued_prompt_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::new(&test_paths(temp.path())).unwrap();
+        state
+            .start_turn("boundary-turn", "long task", std::process::id())
+            .unwrap();
+        state
+            .enqueue_prompt("q1", "followup", "followup", &[])
+            .unwrap();
+        let mut sink = TurnJournalSink::new(state.clone(), "boundary-turn".to_string(), 0);
+        let mut displayed = Vec::new();
+        let mut transport = |event| {
+            if let AgentEvent::Chunk(chunk) = event {
+                displayed.push(chunk.text);
+            }
+            Ok(())
+        };
+        let mut journaled = |event| sink.emit(event, &mut transport);
+
+        journaled(AgentEvent::Chunk(ChatStreamChunk {
+            kind: ChatStreamKind::Content,
+            text: "answer before followup".to_string(),
+        }))
+        .unwrap();
+        journaled(AgentEvent::FlushJournal).unwrap();
+        state
+            .consume_queued_prompts(
+                "boundary-turn",
+                &[("q1".to_string(), "followup".to_string())],
+                Some("answer before followup"),
+                None,
+            )
+            .unwrap();
+        journaled(AgentEvent::QueuedPromptsConsumed {
+            prompt_ids: vec!["q1".to_string()],
+            mode: AgentMode::Normal,
+            provider_id: None,
+            model: None,
+        })
+        .unwrap();
+
+        let events = state.load_turns().unwrap()[0].journal_events.clone();
+        assert_eq!(displayed, ["answer before followup"]);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["assistant_content", "queued_prompts_consumed"]
+        );
+    }
+
+    #[test]
     fn turn_context_tokens_match_sent_messages() {
         let mut turn = crate::state::Turn {
             turn_id: "t1".to_string(),
             seq: 1,
             user_content: "question".to_string(),
+            display_content: "question".to_string(),
             user_timestamp: String::new(),
             assistant_content: "answer".to_string(),
             assistant_reasoning: Some("hidden reasoning ".repeat(1_000)),
@@ -2984,18 +6599,23 @@ mod tests {
             tool_reports: Vec::new(),
             question_exchanges: Vec::new(),
             followups: Vec::new(),
+            attachments: Vec::new(),
             hidden: false,
             is_summary: false,
             owner_pid: None,
             token_total: 0,
             token_usage_estimated: false,
+            revision: 0,
+            journal_events: Vec::new(),
+            context_messages: Vec::new(),
         };
-        let without_reports = turn_context_tokens(&turn);
+        let with_reasoning = turn_context_tokens(&turn);
         turn.assistant_reasoning = None;
-        assert_eq!(turn_context_tokens(&turn), without_reports);
+        let without_reasoning = turn_context_tokens(&turn);
+        assert!(with_reasoning > without_reasoning);
 
         turn.tool_reports.push("persisted tool result".to_string());
-        assert!(turn_context_tokens(&turn) > without_reports);
+        assert!(turn_context_tokens(&turn) > without_reasoning);
 
         turn.tool_reports.clear();
         turn.assistant_content.clear();
@@ -3007,6 +6627,317 @@ mod tests {
         let with_replayed_reasoning = turn_context_tokens(&turn);
         turn.assistant_reasoning = None;
         assert!(with_replayed_reasoning > turn_context_tokens(&turn));
+    }
+
+    #[test]
+    fn assistant_reasoning_is_replayed_as_private_context() {
+        let mut messages = Vec::new();
+        push_assistant_context_messages(
+            &mut messages,
+            "visible answer",
+            Some("raw provider reasoning"),
+            true,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(matches!(
+            messages[0].content.as_ref(),
+            Some(ChatContent::Text(content))
+                if content.contains("<previous_assistant_reasoning>\nraw provider reasoning")
+        ));
+        assert_eq!(messages[1].role, "assistant");
+        assert!(matches!(
+            messages[1].content.as_ref(),
+            Some(ChatContent::Text(content)) if content == "visible answer"
+        ));
+    }
+
+    #[test]
+    fn interrupted_redo_replays_prefix_followups_before_new_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+        let followup =
+            |prompt_id: &str, content: &str, preceding: &str| crate::state::TurnFollowup {
+                prompt_id: prompt_id.to_string(),
+                content: content.to_string(),
+                display_content: content.to_string(),
+                attachments: Vec::new(),
+                uploaded_attachments: Vec::new(),
+                submitted_at: String::new(),
+                preceding_assistant_content: Some(preceding.to_string()),
+                preceding_assistant_reasoning: None,
+                preceding_assistant_provider_id: None,
+                preceding_assistant_model: None,
+            };
+        let mut turn = crate::state::Turn {
+            turn_id: "redo-turn".to_string(),
+            seq: 1,
+            user_content: "initial".to_string(),
+            display_content: "initial".to_string(),
+            user_timestamp: String::new(),
+            assistant_content: crate::state::pending_placeholder().to_string(),
+            assistant_reasoning: None,
+            assistant_provider_id: None,
+            assistant_model: None,
+            assistant_timestamp: None,
+            status: crate::state::TurnStatus::Interrupted,
+            tool_reports: Vec::new(),
+            question_exchanges: vec![
+                QuestionExchange {
+                    questions: vec![crate::question::QuestionPrompt {
+                        header: "Route".to_string(),
+                        question: "Pick a route".to_string(),
+                        options: vec![crate::question::QuestionOption {
+                            label: "A".to_string(),
+                            description: "".to_string(),
+                        }],
+                        multiple: false,
+                        custom: false,
+                    }],
+                    answers: vec![vec!["A".to_string()]],
+                    answered_at: String::new(),
+                },
+                QuestionExchange {
+                    questions: vec![crate::question::QuestionPrompt {
+                        header: "Branch".to_string(),
+                        question: "Current branch question".to_string(),
+                        options: vec![crate::question::QuestionOption {
+                            label: "B".to_string(),
+                            description: "".to_string(),
+                        }],
+                        multiple: false,
+                        custom: false,
+                    }],
+                    answers: vec![vec!["B".to_string()]],
+                    answered_at: String::new(),
+                },
+            ],
+            followups: vec![
+                followup("q1", "edited first followup", "first answer"),
+                followup("q2", "new followup", "after q1"),
+            ],
+            attachments: Vec::new(),
+            hidden: false,
+            is_summary: false,
+            owner_pid: None,
+            token_total: 0,
+            token_usage_estimated: false,
+            revision: 1,
+            journal_events: vec![
+                crate::state::TurnJournalEvent {
+                    event_id: 0,
+                    revision: 1,
+                    segment_index: 0,
+                    kind: "redo_prefix_question_count".to_string(),
+                    call_id: None,
+                    name: None,
+                    text_payload: Some("1".to_string()),
+                    blob_payload: None,
+                    ok: None,
+                },
+                crate::state::TurnJournalEvent {
+                    event_id: 1,
+                    revision: 1,
+                    segment_index: 0,
+                    kind: "assistant_content".to_string(),
+                    call_id: None,
+                    name: None,
+                    text_payload: Some("after q1".to_string()),
+                    blob_payload: None,
+                    ok: None,
+                },
+                crate::state::TurnJournalEvent {
+                    event_id: 2,
+                    revision: 1,
+                    segment_index: 0,
+                    kind: "queued_prompts_consumed".to_string(),
+                    call_id: None,
+                    name: None,
+                    text_payload: Some("[\"q2\"]".to_string()),
+                    blob_payload: None,
+                    ok: None,
+                },
+                crate::state::TurnJournalEvent {
+                    event_id: 3,
+                    revision: 1,
+                    segment_index: 1,
+                    kind: "assistant_content".to_string(),
+                    call_id: None,
+                    name: None,
+                    text_payload: Some("after q2".to_string()),
+                    blob_payload: None,
+                    ok: None,
+                },
+            ],
+            context_messages: Vec::new(),
+        };
+
+        let messages = interrupted_turn_replay_messages(&agent, &turn);
+        let text_messages = messages
+            .iter()
+            .filter_map(|message| match message.content.as_ref() {
+                Some(ChatContent::Text(text)) => Some((message.role.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let q1 = text_messages
+            .iter()
+            .position(|(_, text)| *text == "edited first followup")
+            .unwrap();
+        let clarification = text_messages
+            .iter()
+            .position(|(_, text)| text.contains("Pick a route"))
+            .unwrap();
+        assert!(!text_messages
+            .iter()
+            .any(|(_, text)| text.contains("Current branch question")));
+        let after_q1 = text_messages
+            .iter()
+            .position(|(_, text)| *text == "after q1")
+            .unwrap();
+        let q2 = text_messages
+            .iter()
+            .position(|(_, text)| *text == "new followup")
+            .unwrap();
+        let after_q2 = text_messages
+            .iter()
+            .position(|(_, text)| *text == "after q2")
+            .unwrap();
+        assert!(clarification < q1);
+        assert!(q1 < after_q1);
+        assert!(after_q1 < q2);
+        assert!(q2 < after_q2);
+
+        turn.journal_events
+            .retain(|event| event.kind != "redo_prefix_question_count");
+        turn.journal_events.push(crate::state::TurnJournalEvent {
+            event_id: 4,
+            revision: 1,
+            segment_index: 1,
+            kind: "tool_result".to_string(),
+            call_id: Some("question-call".to_string()),
+            name: Some("ask_question".to_string()),
+            text_payload: Some("{\"status\":\"answered\"}".to_string()),
+            blob_payload: None,
+            ok: Some(true),
+        });
+        let legacy_messages = interrupted_turn_replay_messages(&agent, &turn);
+        let legacy_text = legacy_messages
+            .iter()
+            .filter_map(|message| match message.content.as_ref() {
+                Some(ChatContent::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(legacy_text.iter().any(|text| text.contains("Pick a route")));
+        assert!(!legacy_text
+            .iter()
+            .any(|text| text.contains("Current branch question")));
+    }
+
+    #[tokio::test]
+    async fn parallel_task_calls_run_concurrently_and_map_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::tools::ToolSpec::new(
+            "task",
+            "stub subagent",
+            crate::tools::empty_parameters(),
+            |args| async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(format!(
+                    "done:{}",
+                    args.get("n")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                ))
+            },
+        ));
+        let agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            registry,
+            AgentMode::Normal,
+        )
+        .unwrap();
+
+        let calls: Vec<crate::llm::ToolCall> = (0..3)
+            .map(|index| crate::llm::ToolCall {
+                id: format!("call_{index}"),
+                kind: "function".to_string(),
+                function: crate::llm::ToolCallFunction {
+                    name: "task".to_string(),
+                    arguments: format!(r#"{{"n":"{index}"}}"#),
+                },
+            })
+            .collect();
+        let mut events = Vec::new();
+        let started = std::time::Instant::now();
+        let outputs = agent
+            .execute_parallel_task_calls(&calls, &std::collections::BTreeSet::new(), &mut |event| {
+                match &event {
+                    AgentEvent::ToolCall { call_id, .. } => events.push((call_id.clone(), "call")),
+                    AgentEvent::ToolResult {
+                        call_id, ok: true, ..
+                    } => events.push((call_id.clone(), "ok")),
+                    AgentEvent::ToolResult {
+                        call_id, ok: false, ..
+                    } => events.push((call_id.clone(), "err")),
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(outputs.len(), 3);
+        for index in 0..3 {
+            assert_eq!(outputs[&index].output, format!("done:{index}"));
+        }
+        // Three 80ms tasks run concurrently, not sequentially (~240ms).
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "tasks did not run in parallel: {elapsed:?}"
+        );
+        for index in 0..3 {
+            let call_id = format!("call_{index}");
+            assert!(events.contains(&(call_id.clone(), "call")));
+            assert!(events.contains(&(call_id, "ok")));
+        }
+
+        // Fewer than two task calls: empty map, serial path handles it.
+        let single = agent
+            .execute_parallel_task_calls(
+                &calls[..1],
+                &std::collections::BTreeSet::new(),
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert!(single.is_empty());
     }
 
     #[test]
@@ -3296,7 +7227,13 @@ mod tests {
         state.complete_turn("t1", "reply", None).unwrap();
         let turns = state.oldest_evictable_visible_turns(1).unwrap();
         state
-            .replace_visible_with_summary(turns[0].seq, &["t1".to_string()], "summary", None, false)
+            .replace_visible_with_summary(
+                &["t1".to_string()],
+                &["t1".to_string()],
+                "summary",
+                None,
+                false,
+            )
             .unwrap();
         let memory = MemoryStore::new(&config, &paths);
 
@@ -3330,6 +7267,7 @@ mod tests {
         );
         let server_control = control.clone();
         let (request_tx, request_rx) = oneshot::channel();
+        let (redo_request_tx, redo_request_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let _ = read_test_http_request(&mut first).await;
@@ -3337,6 +7275,7 @@ mod tests {
             write_test_sse(
                 &mut first,
                 concat!(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first reasoning\"}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{\"content\":\"first answer\"}}]}\n\n",
                     "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
                     "data: [DONE]\n\n"
@@ -3351,6 +7290,19 @@ mod tests {
                 &mut second,
                 concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"continued answer\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+
+            let (mut third, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut third).await;
+            let _ = redo_request_tx.send(request);
+            write_test_sse(
+                &mut third,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"redone answer\"}}]}\n\n",
                     "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
@@ -3411,11 +7363,23 @@ mod tests {
                     })
             })
             .unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("<previous_assistant_reasoning>\nfirst reasoning")
+                })
+        }));
         assert!(first_answer < followup);
         let turns = state.load_turns().unwrap();
         assert_eq!(
             turns[0].followups[0].preceding_assistant_content.as_deref(),
             Some("first answer")
+        );
+        assert_eq!(
+            turns[0].followups[0]
+                .preceding_assistant_reasoning
+                .as_deref(),
+            Some("first reasoning")
         );
         let history = agent.chat_messages("", "next prompt").unwrap();
         assert!(history.iter().any(|message| {
@@ -3425,6 +7389,309 @@ mod tests {
                     if parts.iter().any(|part| matches!(part, ChatContentPart::ImageUrl { .. }))
             )
         }));
+        let candidate = state.redo_candidate().unwrap().unwrap();
+        let redo = agent
+            .redo_stream_with_control(
+                &candidate,
+                vec![RedoPromptInput {
+                    prompt_id: "q1".to_string(),
+                    content: "edited followup".to_string(),
+                    display_content: "edited followup".to_string(),
+                    images: vec![Some(PastedImage::Binary(ClipboardImage::new(
+                        "image/png".to_string(),
+                        b"image-data".to_vec(),
+                    )))],
+                }],
+                &control,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redo.content, "redone answer");
+        let redo_request: serde_json::Value =
+            serde_json::from_slice(&redo_request_rx.await.unwrap()).unwrap();
+        let redo_messages = redo_request["messages"].as_array().unwrap();
+        assert!(redo_messages.iter().any(|message| {
+            message["role"] == "assistant" && message["content"] == "first answer"
+        }));
+        assert!(redo_messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["type"] == "text" && part["text"] == "edited followup")
+                })
+        }));
+        assert!(!redo_messages.iter().any(|message| {
+            message["role"] == "assistant" && message["content"] == "continued answer"
+        }));
+        let turn = state.load_turns().unwrap().remove(0);
+        assert_eq!(turn.assistant_content, "redone answer");
+        assert_eq!(turn.followups[0].content, "edited followup");
+        assert_eq!(turn.revision, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supersede_restarts_the_same_turn_without_replaying_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = false;
+        let (partial_tx, partial_rx) = oneshot::channel();
+        let (second_request_tx, second_request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_test_http_request(&mut first).await;
+            first
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "content-type: text/event-stream\r\n",
+                        "connection: close\r\n\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"discarded partial\"}}]}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first.flush().await.unwrap();
+            let _ = partial_tx.send(());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut second).await;
+            let _ = second_request_tx.send(request);
+            write_test_sse(
+                &mut second,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"updated final\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            ToolRegistry::new(),
+            AgentMode::Normal,
+        )
+        .unwrap();
+        let signal = Arc::new(TurnSupersedeSignal::default());
+        let mut control = AgentTurnControl::new(
+            AgentMode::Normal,
+            ToolRegistry::new(),
+            ToolRegistry::new(),
+            ToolRegistry::new(),
+        );
+        control.set_supersede_signal(signal.clone());
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let event_log = events.clone();
+        let chat = agent.chat_stream_with_control("original", &[], &control, move |event| {
+            if matches!(event, AgentEvent::GenerationSuperseded { .. }) {
+                event_log.lock().unwrap().push("superseded");
+            }
+            Ok(())
+        });
+        let enqueue = async {
+            partial_rx.await.unwrap();
+            state
+                .enqueue_prompt("update", "changed requirement", "changed requirement", &[])
+                .unwrap();
+            signal.trigger();
+        };
+        let (result, ()) = tokio::join!(chat, enqueue);
+        let result = result.unwrap();
+        assert_eq!(result.content, "updated final");
+        assert_eq!(&*events.lock().unwrap(), &["superseded"]);
+        let request: Value = serde_json::from_slice(&second_request_rx.await.unwrap()).unwrap();
+        let serialized = serde_json::to_string(&request["messages"]).unwrap();
+        assert!(serialized.contains("changed requirement"));
+        assert!(!serialized.contains("discarded partial"));
+        let turns = state.load_turns().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant_content, "updated final");
+        assert_eq!(turns[0].followups.len(), 1);
+        assert!(turns[0].followups[0].preceding_assistant_content.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_tool_round_uses_previous_response_id_and_only_new_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = true;
+        config.tools.loading_mode = "full".to_string();
+        config.skills.enabled = false;
+        config.memory.enabled = false;
+        config.providers[0].protocol = "openai-responses".to_string();
+        config.providers[0].models = vec!["gpt-5".to_string()];
+        config.providers[0].default_model = "gpt-5".to_string();
+
+        let mut tools = ToolRegistry::new();
+        tools.register(ToolSpec::new(
+            "responses_continuation_tool",
+            "returns a fixed result",
+            empty_parameters(),
+            |_| async { Ok("tool finished".to_string()) },
+        ));
+        let control = AgentTurnControl::new(
+            AgentMode::Normal,
+            tools.clone(),
+            tools.clone(),
+            tools.clone(),
+        );
+        let server_control = control.clone();
+
+        let (first_request_tx, first_request_rx) = oneshot::channel();
+        let (second_request_tx, second_request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_test_http_request(&mut first).await;
+            let _ = first_request_tx.send(first_request);
+            server_control.set_mode(AgentMode::Plan);
+            write_test_sse(
+                &mut first,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"responses_continuation_tool\",\"arguments\":\"\"}}\n\n",
+                    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{}\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"responses_continuation_tool\",\"arguments\":\"{}\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
+                ),
+            )
+            .await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = read_test_http_request(&mut second).await;
+            let _ = second_request_tx.send(second_request);
+            write_test_sse(
+                &mut second,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_2\",\"delta\":\"final answer\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\"}}\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            tools,
+            AgentMode::Normal,
+        )
+        .unwrap();
+        state
+            .enqueue_prompt("q1", "queued followup", "queued followup", &[])
+            .unwrap();
+
+        let result = agent
+            .chat_stream_with_control("initial prompt", &[], &control, |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "final answer");
+        assert_eq!(agent.mode(), AgentMode::Plan);
+        assert!(result.responses_continuation.is_none());
+        assert!(result.usage_estimated);
+        let tool_only_tokens =
+            overflow::estimate_messages_tokens(&[ChatMessage::tool("call_1", "tool finished")])
+                as u64;
+        assert!(result.usage.as_ref().unwrap().prompt_tokens > 5 + tool_only_tokens);
+        let first_request: Value =
+            serde_json::from_slice(&first_request_rx.await.unwrap()).unwrap();
+        assert!(first_request.get("previous_response_id").is_none());
+        assert!(first_request["input"].as_array().is_some_and(|input| {
+            input.iter().any(|item| item["role"] == "user")
+                && input.iter().any(|item| item["role"] == "system")
+        }));
+
+        let second_request: Value =
+            serde_json::from_slice(&second_request_rx.await.unwrap()).unwrap();
+        assert_eq!(second_request["previous_response_id"], "resp_1");
+        let input = second_request["input"].as_array().unwrap();
+        let function_output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(function_output["call_id"], "call_1");
+        assert_eq!(function_output["output"], "tool finished");
+        let function_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .unwrap();
+        let mode_index = input
+            .iter()
+            .position(|item| {
+                item["role"] == "system"
+                    && item["content"].as_str().is_some_and(|content| {
+                        content.contains("<mode-update active=\"plan\">")
+                            && content.contains(crate::prompts::PLAN_REMINDER)
+                    })
+            })
+            .unwrap();
+        assert!(input.iter().any(|item| {
+            item["role"] == "system"
+                && item["content"].as_str().is_some_and(|content| {
+                    content.contains("<mode-update active=\"plan\">")
+                        && content.contains(crate::prompts::PLAN_REMINDER)
+                })
+        }));
+        let queued_index = input
+            .iter()
+            .position(|item| {
+                item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part["type"] == "input_text" && part["text"] == "queued followup"
+                        })
+                    })
+            })
+            .unwrap();
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part["type"] == "input_text" && part["text"] == "queued followup"
+                    })
+                })
+        }));
+        assert!(function_index < mode_index && mode_index < queued_index);
+        assert!(!serde_json::to_string(input)
+            .unwrap()
+            .contains("initial prompt"));
+        assert!(second_request["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "responses_continuation_tool")
+        }));
+        assert_eq!(
+            state.load_turns().unwrap()[0].assistant_content,
+            "final answer"
+        );
         server.await.unwrap();
     }
 
@@ -3602,6 +7869,27 @@ mod tests {
         config.skills.enabled = false;
         config.memory.enabled = false;
         config
+    }
+
+    #[test]
+    fn binary_image_cache_is_isolated_by_platform() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let images = vec![Some(PastedImage::Binary(ClipboardImage::new(
+            "image/jpeg".to_string(),
+            b"same-image-content".to_vec(),
+        )))];
+
+        let platform = resolve_pasted_image_paths(&images, &paths, Some("qq"));
+        let platform_path = PathBuf::from(platform[0].as_deref().unwrap());
+        assert!(platform_path.starts_with(paths.cache_dir.join("platform_images/qq")));
+        assert!(platform_path.is_file());
+
+        let clipboard = resolve_pasted_image_paths(&images, &paths, None);
+        let clipboard_path = PathBuf::from(clipboard[0].as_deref().unwrap());
+        assert!(clipboard_path.starts_with(paths.cache_dir.join("clipboard_images")));
+        assert!(clipboard_path.is_file());
+        assert_ne!(platform_path, clipboard_path);
     }
 
     fn test_paths(root: &std::path::Path) -> MiyuPaths {

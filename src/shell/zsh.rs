@@ -1,7 +1,6 @@
 use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::Result;
-use std::io::Write;
 use std::path::Path;
 
 const BEGIN_MARKER: &str = "# >>> miyu zsh hook >>>";
@@ -27,7 +26,7 @@ pub fn install(paths: &MiyuPaths) -> Result<()> {
     }
     std::fs::write(&paths.zsh_hook_file, hook())?;
     let rc_path = home_file(".zshrc");
-    append_source_block(&rc_path, BEGIN_MARKER, END_MARKER, &paths.zsh_hook_file)?;
+    super::upsert_source_block(&rc_path, BEGIN_MARKER, END_MARKER, &paths.zsh_hook_file)?;
     println!(
         "{}: {}",
         t("installed zsh hook", "已安装 zsh hook"),
@@ -56,27 +55,6 @@ fn home_file(name: &str) -> std::path::PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(name))
         .unwrap_or_else(|| std::path::PathBuf::from(name))
-}
-
-fn append_source_block(rc_path: &Path, begin: &str, end: &str, hook_file: &Path) -> Result<()> {
-    let existing = std::fs::read_to_string(rc_path).unwrap_or_default();
-    if existing.contains(begin) && existing.contains(end) {
-        return Ok(());
-    }
-    if let Some(parent) = rc_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(rc_path)?;
-    if !existing.ends_with('\n') && !existing.is_empty() {
-        writeln!(file)?;
-    }
-    writeln!(file, "{begin}")?;
-    writeln!(file, "[ -r {:?} ] && source {:?}", hook_file, hook_file)?;
-    writeln!(file, "{end}")?;
-    Ok(())
 }
 
 fn remove_source_block(rc_path: &Path, begin: &str, end: &str) -> Result<bool> {
@@ -158,5 +136,26 @@ mod tests {
             "before\nafter\n"
         );
         assert!(!remove_source_block(&rc_path, BEGIN_MARKER, END_MARKER).unwrap());
+    }
+
+    #[test]
+    fn installing_again_refreshes_an_existing_hook_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let rc_path = temp.path().join(".zshrc");
+        std::fs::write(
+            &rc_path,
+            format!("before\n{BEGIN_MARKER}\nsource '/old/miyu-hook.zsh'\n{END_MARKER}\nafter\n"),
+        )
+        .unwrap();
+        let hook = temp.path().join("new miyu-hook.zsh");
+
+        crate::shell::upsert_source_block(&rc_path, BEGIN_MARKER, END_MARKER, &hook).unwrap();
+
+        let updated = std::fs::read_to_string(rc_path).unwrap();
+        assert!(updated.contains("new miyu-hook.zsh"));
+        assert!(!updated.contains("/old/miyu-hook.zsh"));
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+        assert!(updated.starts_with("before\n"));
+        assert!(updated.ends_with("after\n"));
     }
 }

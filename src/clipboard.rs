@@ -2,6 +2,7 @@ use anyhow::Result;
 use base64::Engine;
 use sha2::Digest;
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,8 +12,8 @@ use std::time::{Duration, Instant};
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const CLIPBOARD_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const CLIPBOARD_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-static LAST_CLIPBOARD_CLEANUP: LazyLock<Mutex<Option<Instant>>> =
-    LazyLock::new(|| Mutex::new(None));
+static LAST_IMAGE_CACHE_CLEANUP: LazyLock<Mutex<HashMap<PathBuf, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub struct ClipboardImage {
     pub mime: String,
@@ -34,33 +35,49 @@ impl ClipboardImage {
         }
     }
 
-    pub fn data_url(&self) -> String {
+    pub fn data_url(&self) -> &str {
         self.data_url
             .get_or_init(|| {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&self.data);
                 format!("data:{};base64,{}", self.mime, encoded)
             })
-            .clone()
+            .as_str()
     }
 
     pub fn write_temp_file(&self, cache_dir: &std::path::Path, _index: usize) -> Result<PathBuf> {
-        let dir = cache_dir.join("clipboard_images");
-        std::fs::create_dir_all(&dir)?;
-        cleanup_clipboard_images_throttled(&dir);
-        let ext = self
-            .mime
-            .split('/')
-            .nth(1)
-            .filter(|e| !e.is_empty())
-            .unwrap_or("png");
-        let hash = sha2::Sha256::digest(&self.data);
-        let short_hash = hex::encode(&hash[..4]);
-        let path = dir.join(format!("{short_hash}.{ext}"));
-        if !path.exists() {
-            std::fs::write(&path, &self.data)?;
-        }
-        Ok(path)
+        self.write_cache_file(cache_dir, Path::new("clipboard_images"))
     }
+
+    pub fn write_cache_file(&self, cache_dir: &Path, relative_dir: &Path) -> Result<PathBuf> {
+        write_image_cache_file(cache_dir, relative_dir, &self.mime, &self.data)
+    }
+}
+
+pub(crate) fn write_image_cache_file(
+    cache_dir: &Path,
+    relative_dir: &Path,
+    mime: &str,
+    data: &[u8],
+) -> Result<PathBuf> {
+    let dir = cache_dir.join(relative_dir);
+    std::fs::create_dir_all(&dir)?;
+    cleanup_image_cache_throttled(&dir);
+    let ext = match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpeg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "img",
+    };
+    let hash = sha2::Sha256::digest(data);
+    let short_hash = hex::encode(&hash[..16]);
+    let path = dir.join(format!("{short_hash}.{ext}"));
+    if !path.exists() {
+        std::fs::write(&path, data)?;
+    }
+    Ok(path)
 }
 
 pub fn read_clipboard_image() -> Result<Option<ClipboardImage>> {
@@ -289,22 +306,23 @@ pub fn cleanup_clipboard_images(dir: &Path) {
     cleanup_clipboard_images_with_max(dir, CLIPBOARD_CACHE_MAX_BYTES);
 }
 
-fn cleanup_clipboard_images_throttled(dir: &Path) {
-    let should_cleanup = LAST_CLIPBOARD_CLEANUP
+fn cleanup_image_cache_throttled(dir: &Path) {
+    let should_cleanup = LAST_IMAGE_CACHE_CLEANUP
         .lock()
-        .map(|mut last| {
+        .map(|mut cleanups| {
             let now = Instant::now();
-            let due = last
-                .map(|previous| now.duration_since(previous) >= CLIPBOARD_CLEANUP_INTERVAL)
+            let due = cleanups
+                .get(dir)
+                .map(|previous| now.duration_since(*previous) >= CLIPBOARD_CLEANUP_INTERVAL)
                 .unwrap_or(true);
             if due {
-                *last = Some(now);
+                cleanups.insert(dir.to_path_buf(), now);
             }
             due
         })
         .unwrap_or(true);
     if should_cleanup {
-        cleanup_clipboard_images(dir);
+        cleanup_clipboard_images_with_max(dir, CLIPBOARD_CACHE_MAX_BYTES);
     }
 }
 

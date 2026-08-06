@@ -1,5 +1,7 @@
 use super::subagent_runner::format_token_count;
-use super::{readable_tool_name, ToolProgress, ToolRegistry, ToolSpec};
+use super::{
+    html_conversion, http_response, readable_tool_name, ToolProgress, ToolRegistry, ToolSpec,
+};
 use crate::config::AppConfig;
 use crate::i18n::{is_zh, text as t};
 use crate::llm::{
@@ -508,11 +510,11 @@ async fn gather_linux_game_compatibility_signals(args: Value) -> Result<String> 
     } else {
         None
     };
-    let can_i_play_result = fetch_first_text(&client, &slug_candidates, |slug| {
+    let mut can_i_play_result = fetch_first_text(&client, &slug_candidates, |slug| {
         format!("https://caniplayonlinux.com/games/{slug}/")
     })
     .await;
-    let anticheat_result = fetch_first_text(&client, &slug_candidates, |slug| {
+    let mut anticheat_result = fetch_first_text(&client, &slug_candidates, |slug| {
         format!("https://areweanticheatyet.com/game/{slug}")
     })
     .await;
@@ -521,6 +523,14 @@ async fn gather_linux_game_compatibility_signals(args: Value) -> Result<String> 
     let verdict = verdict(&protondb, can_i_play, anticheat, &issue);
     let confidence = compatibility_confidence(appid, &protondb, can_i_play, anticheat, &verdict);
     let needs_followup = confidence["needs_followup"].as_bool().unwrap_or(true);
+    let can_i_play_summary = match can_i_play_result.text.take() {
+        Some(html) => Some(extract_can_i_play_summary(html).await?),
+        None => None,
+    };
+    let anticheat_summary = match anticheat_result.text.take() {
+        Some(html) => Some(extract_anticheat_summary(html).await?),
+        None => None,
+    };
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "game_query": game,
@@ -537,8 +547,8 @@ async fn gather_linux_game_compatibility_signals(args: Value) -> Result<String> 
         "confidence": confidence,
         "needs_followup": needs_followup,
         "protondb": protondb,
-        "can_i_play_on_linux": can_i_play.map(extract_can_i_play_summary),
-        "are_we_anticheat_yet": anticheat.map(extract_anticheat_summary),
+        "can_i_play_on_linux": can_i_play_summary,
+        "are_we_anticheat_yet": anticheat_summary,
         "sources": {
             "steam": appid.map(|id| format!("https://store.steampowered.com/app/{id}/")),
             "protondb": appid.map(|id| format!("https://www.protondb.com/app/{id}")),
@@ -669,13 +679,8 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<Value> {
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
-    Ok(client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?)
+    let response = client.get(url).send().await?.error_for_status()?;
+    http_response::read_text(response, http_response::MAX_HTML_RESPONSE_BYTES).await
 }
 
 fn verdict(
@@ -795,9 +800,9 @@ fn compatibility_confidence(
     })
 }
 
-fn extract_can_i_play_summary(html: &str) -> Value {
-    let text = html2text::from_read(html.as_bytes(), 120);
-    json!({
+async fn extract_can_i_play_summary(html: String) -> Result<Value> {
+    let text = html_conversion::to_text_async(html, 120).await?;
+    Ok(json!({
         "works": text.contains("Works"),
         "partial": text.contains("Partial"),
         "broken": text.contains("Broken"),
@@ -806,25 +811,30 @@ fn extract_can_i_play_summary(html: &str) -> Value {
         "known_issues": section_excerpt(&text, "Known issues", "Fixes", 1200),
         "fixes": section_excerpt(&text, "Fixes", "Verdict", 1200),
         "text_excerpt": excerpt(&text, 2000),
-    })
+    }))
 }
 
-fn extract_anticheat_summary(html: &str) -> Value {
-    let text = html2text::from_read(html.as_bytes(), 120);
+async fn extract_anticheat_summary(html: String) -> Result<Value> {
+    let text = html_conversion::to_text_async(html, 120).await?;
     let status = ["Supported", "Running", "Planned", "Broken", "Denied"]
         .into_iter()
         .find(|status| text.contains(status));
-    json!({
+    Ok(json!({
         "status": status,
         "mentions_eac": text.contains("Easy Anti-Cheat"),
         "mentions_battleye": text.contains("BattlEye"),
         "text_excerpt": excerpt(&text, 1600),
-    })
+    }))
 }
 
 fn value_after_label(text: &str, label: &str) -> Option<String> {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     while let Some(line) = lines.next() {
+        if let Some((key, value)) = line.split_once('│') {
+            if key.trim() == label {
+                return Some(value.trim().chars().take(120).collect());
+            }
+        }
         if line == label {
             return lines.next().map(|value| value.chars().take(120).collect());
         }
@@ -833,9 +843,39 @@ fn value_after_label(text: &str, label: &str) -> Option<String> {
 }
 
 fn section_excerpt(text: &str, start: &str, end: &str, max_chars: usize) -> Option<String> {
+    if let Some(section) = markdown_section(text, start, end) {
+        return Some(excerpt(&section, max_chars));
+    }
     let after = text.split(start).nth(1)?;
     let section = after.split(end).next().unwrap_or(after);
     Some(excerpt(section, max_chars))
+}
+
+fn markdown_section(text: &str, title_prefix: &str, end_prefix: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let start_level = lines.find_map(|line| {
+        let line = line.trim_start();
+        let level = line.bytes().take_while(|byte| *byte == b'#').count();
+        (level > 0 && line[level..].trim().starts_with(title_prefix)).then_some(level)
+    })?;
+    let mut section = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if level > 0 && level <= start_level {
+            break;
+        }
+        if trimmed
+            .trim_matches('*')
+            .trim_start()
+            .starts_with(end_prefix)
+        {
+            break;
+        }
+        section.push(line);
+    }
+    let section = section.join("\n");
+    (!section.trim().is_empty()).then_some(section)
 }
 
 fn excerpt(text: &str, max_chars: usize) -> String {
@@ -982,11 +1022,14 @@ mod tests {
         assert_eq!(result["traffic_light"], "🟢");
     }
 
-    #[test]
-    fn can_i_play_marks_recommended_proton_as_source_value() {
+    #[tokio::test]
+    async fn can_i_play_marks_recommended_proton_as_source_value() {
         let summary = extract_can_i_play_summary(
-            "<p>Works</p><p>Recommended Proton</p><p>Proton 9.0-3</p><p>Steam Deck Verified</p>",
-        );
+            "<p>Works</p><table><tr><td>Recommended Proton</td><td>Proton 9.0-3</td></tr></table><p>Steam Deck Verified</p>"
+                .to_string(),
+        )
+        .await
+        .unwrap();
         assert_eq!(summary["source_recommended_proton"], "Proton 9.0-3");
         assert!(summary.get("recommended_proton").is_none());
     }

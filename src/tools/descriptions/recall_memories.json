@@ -1,7 +1,7 @@
 {
   "name": "recall_memories",
   "display_name": "召回记忆",
-  "description": "搜索已记住的事实",
+  "description": "搜索长期知识点、近期日记和长期日记。",
   "parameters": {
     "type": "object",
     "properties": {

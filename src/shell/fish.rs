@@ -2,7 +2,7 @@ use crate::i18n::text as t;
 use crate::paths::MiyuPaths;
 use anyhow::Result;
 
-fn completion_entries() -> [(&'static str, &'static str); 15] {
+fn completion_entries() -> [(&'static str, &'static str); 16] {
     [
         (
             "ask",
@@ -11,8 +11,8 @@ fn completion_entries() -> [(&'static str, &'static str); 15] {
         (
             "init",
             t(
-                "Create default configuration and state files",
-                "创建默认配置和状态文件",
+                "Create default configuration and state files; use <shell>-init for shell hooks",
+                "创建默认配置和状态文件；Shell 集成请使用对应的 <shell>-init 命令",
             ),
         ),
         (
@@ -22,6 +22,13 @@ fn completion_entries() -> [(&'static str, &'static str); 15] {
         (
             "config",
             t("Open or manage configuration", "打开或管理配置"),
+        ),
+        (
+            "reload",
+            t(
+                "Reload configuration in the running Miyu daemon",
+                "在运行中的 Miyu daemon 内重新加载配置",
+            ),
         ),
         ("models", t("List or switch models", "列出或切换模型")),
         (
@@ -154,6 +161,7 @@ function __miyu_on_prompt --on-event fish_prompt
 
     trap __miyu_restore_cursor INT TERM EXIT
     __miyu_replay_buffer "$buffer"
+    printf '\n'
     printf '%s' "$buffer" | miyu --shell-intercept --shell fish --stdin
     set -l miyu_status $status
     trap - INT TERM EXIT
@@ -177,26 +185,16 @@ function __miyu_buffer_is_multiline
     test (string split \n -- "$argv[1]" | count) -gt 1
 end
 
-function __miyu_multiline_has_unknown_command
-    set -l buffer $argv[1]
-    for line in (string split \n -- "$buffer")
-        set -l trimmed (string trim -- "$line")
-        if test -z "$trimmed"; or string match -q '#*' -- "$trimmed"
+function __miyu_first_command
+    set -l tokens (commandline --input="$argv[1]" --tokens-expanded 2>/dev/null)
+    while test (count $tokens) -gt 0
+        set -l token $tokens[1]
+        if string match -qr '^[A-Za-z_][A-Za-z0-9_]*=' -- "$token"
+            set -e tokens[1]
             continue
         end
-
-        set -l tokens (string split -n ' ' -- "$trimmed")
-        while test (count $tokens) -gt 0
-            set -l token $tokens[1]
-            if string match -qr '^[A-Za-z_][A-Za-z0-9_]*=' -- "$token"
-                set -e tokens[1]
-                continue
-            end
-            break
-        end
-        set -l command $tokens[1]
-        test -n "$command"; or continue
-        type -q -- "$command"; or return 0
+        printf '%s' "$token"
+        return 0
     end
     return 1
 end
@@ -205,7 +203,7 @@ function __miyu_accept_line
     status is-interactive; or return
 
     commandline -f expand-abbr
-    set -l buffer (commandline -b | string collect -N)
+    set -l buffer (commandline -b | string collect)
     set -l trimmed (string trim -- "$buffer")
     if test -z "$trimmed"
         __miyu_execute_or_continue
@@ -217,7 +215,18 @@ function __miyu_accept_line
         return
     end
 
-    if not __miyu_multiline_has_unknown_command "$buffer"
+    set -l first_command (__miyu_first_command "$buffer")
+    if test -n "$first_command"; and not contains -- "$first_command" time test date which type command history; and type -q -- "$first_command"
+        __miyu_execute_or_continue
+        return
+    end
+
+    printf '%s' "$buffer" | miyu --shell-classify --shell fish --stdin 2>/dev/null
+    set -l classify_status $status
+    if test $classify_status -eq 0
+        __miyu_execute_or_continue
+        return
+    else if test $classify_status -ne 1
         __miyu_execute_or_continue
         return
     end
@@ -241,6 +250,16 @@ function fish_command_not_found
     status is-interactive; or return 127
 
     set -e __miyu_image_counter
+
+    set -l current_line (status current-commandline 2>/dev/null | string collect)
+    if test -n "$current_line"; and not string match -qr '[\n\r]' -- "$current_line"
+        set -l top_command (__miyu_first_command "$current_line")
+        if test -z "$top_command"; or not type -q -- "$top_command"
+            printf '\n'
+            printf '%s' "$current_line" | miyu --shell-intercept --shell fish --stdin 2>/dev/null
+            return 127
+        end
+    end
 
     set -l command $argv
     if test (count $command) -eq 0
@@ -297,6 +316,9 @@ mod tests {
         let hook = hook();
         assert!(hook.contains("fish_command_not_found"));
         assert!(hook.contains("--shell fish"));
+        assert!(hook.contains("status current-commandline 2>/dev/null | string collect"));
+        assert!(hook.contains("not type -q -- \"$top_command\"\n            printf '\\n'"));
+        assert!(hook.contains("printf '%s' \"$current_line\" | miyu --shell-intercept"));
         assert!(hook.contains("return 127"));
     }
 
@@ -335,6 +357,7 @@ mod tests {
         assert!(hook.contains("if set -q __miyu_pending_buffer"));
         assert!(hook.contains("__miyu_replay_buffer"));
         assert!(hook.contains("__miyu_on_prompt --on-event fish_prompt"));
+        assert!(hook.contains("__miyu_replay_buffer \"$buffer\"\n    printf '\\n'"));
         assert!(!hook.contains("        fish_prompt\n"));
         assert!(hook.contains("string length --visible"));
         assert!(hook.contains("printf '\\e[?25l'"));
@@ -348,8 +371,9 @@ mod tests {
         assert!(hook.contains("__miyu_execute_or_continue"));
         assert!(hook.contains("__miyu_buffer_is_multiline"));
         assert!(hook.contains("test (string split \\n -- \"$argv[1]\" | count) -gt 1"));
-        assert!(hook.contains("__miyu_multiline_has_unknown_command"));
-        assert!(hook.contains("type -q -- \"$command\"; or return 0"));
+        assert!(hook.contains("__miyu_first_command"));
+        assert!(hook.contains("commandline --input=\"$argv[1]\" --tokens-expanded"));
+        assert!(hook.contains("type -q -- \"$first_command\""));
         assert!(hook.contains("set -g __miyu_pending_buffer \"$buffer\""));
         assert!(hook.contains("history append -- \"$buffer\""));
         assert!(hook.contains("commandline -b -- \"\""));
@@ -357,7 +381,10 @@ mod tests {
         assert!(hook.contains("commandline -f expand-abbr"));
         assert!(hook.contains("string match -qr '^[A-Za-z_][A-Za-z0-9_]*='"));
         assert!(!hook.contains("cancel-commandline"));
-        assert!(hook.contains("commandline -b | string collect -N"));
+        assert!(hook.contains("commandline -b | string collect"));
+        assert!(!hook.contains("commandline -b | string collect -N"));
+        assert!(!hook.contains("__miyu_multiline_has_unknown_command"));
+        assert!(hook.contains("--shell-classify --shell fish --stdin"));
         assert!(hook.contains("--shell-intercept --shell fish --stdin"));
         assert!(hook.contains("bind enter __miyu_accept_line"));
         assert!(hook.contains("bind \\r __miyu_accept_line"));

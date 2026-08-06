@@ -1,4 +1,4 @@
-use super::{ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -142,11 +142,12 @@ async fn query_caniplayonlinux(args: Value) -> Result<String> {
 
 async fn fetch_detail(client: &reqwest::Client, game: &ScoredGame) -> Result<Value> {
     let html = fetch_text(client, &game.entry.url).await?;
-    let text = html2text::from_read(html.as_bytes(), 120);
     let title = extract_title(&html).unwrap_or_else(|| game.entry.title.clone());
-    let summary =
-        extract_meta_description(&html).or_else(|| first_nonempty_line_after(&text, &title));
-    let verdict = extract_verdict(&html, &text);
+    let summary = extract_meta_description(&html);
+    let verdict = extract_html_verdict(&html);
+    let text = html_conversion::to_text_async(html, 120).await?;
+    let summary = summary.or_else(|| first_nonempty_line_after(&text, &title));
+    let verdict = verdict.or_else(|| extract_text_verdict(&text));
     let recommended_proton = value_after_label(&text, "Recommended Proton")
         .or_else(|| value_after_label(&text, "Proton"));
     let steam_deck_status = extract_steam_deck_status(&text);
@@ -224,13 +225,8 @@ async fn fetch_detail(client: &reqwest::Client, game: &ScoredGame) -> Result<Val
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
-    Ok(client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?)
+    let response = client.get(url).send().await?.error_for_status()?;
+    http_response::read_text(response, http_response::MAX_HTML_RESPONSE_BYTES).await
 }
 
 fn extract_games_from_list_page(html: &str) -> Vec<GameEntry> {
@@ -470,7 +466,7 @@ fn extract_meta_description(html: &str) -> Option<String> {
     attr_value(&html[pos..pos + tag_end], "content").map(|value| decode_entities(&value))
 }
 
-fn extract_verdict(html: &str, text: &str) -> Option<String> {
+fn extract_html_verdict(html: &str) -> Option<String> {
     let classes = [
         ("badge-native", "Native"),
         ("badge-works", "Works"),
@@ -483,6 +479,10 @@ fn extract_verdict(html: &str, text: &str) -> Option<String> {
             return Some(verdict.to_string());
         }
     }
+    None
+}
+
+fn extract_text_verdict(text: &str) -> Option<String> {
     ["Native", "Works", "Partial", "Broken", "Unknown"]
         .into_iter()
         .find(|verdict| text.lines().any(|line| line.trim() == *verdict))
@@ -637,6 +637,11 @@ fn first_nonempty_line_after(text: &str, title: &str) -> Option<String> {
 fn value_after_label(text: &str, label: &str) -> Option<String> {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     while let Some(line) = lines.next() {
+        if let Some((key, value)) = line.split_once('│') {
+            if key.trim() == label {
+                return Some(value.trim().chars().take(180).collect());
+            }
+        }
         if line == label {
             return lines.next().map(|value| value.chars().take(180).collect());
         }
@@ -645,6 +650,9 @@ fn value_after_label(text: &str, label: &str) -> Option<String> {
 }
 
 fn section_excerpt(text: &str, start: &str, end: &str, max_chars: usize) -> Option<String> {
+    if let Some(section) = markdown_section(text, start, end) {
+        return Some(excerpt(&section, max_chars));
+    }
     let after = text.split(start).nth(1)?;
     let section = after.split(end).next().unwrap_or(after);
     let value = excerpt(section, max_chars);
@@ -653,6 +661,33 @@ fn section_excerpt(text: &str, start: &str, end: &str, max_chars: usize) -> Opti
     } else {
         Some(value)
     }
+}
+
+fn markdown_section(text: &str, title_prefix: &str, end_prefix: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let start_level = lines.find_map(|line| {
+        let line = line.trim_start();
+        let level = line.bytes().take_while(|byte| *byte == b'#').count();
+        (level > 0 && line[level..].trim().starts_with(title_prefix)).then_some(level)
+    })?;
+    let mut section = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if level > 0 && level <= start_level {
+            break;
+        }
+        if trimmed
+            .trim_matches('*')
+            .trim_start()
+            .starts_with(end_prefix)
+        {
+            break;
+        }
+        section.push(line);
+    }
+    let section = section.join("\n");
+    (!section.trim().is_empty()).then_some(section)
 }
 
 fn excerpt(text: &str, max_chars: usize) -> String {
@@ -810,6 +845,24 @@ mod tests {
         assert_eq!(
             value_after_label(text, "Recommended Proton"),
             Some("9.0-3".to_string())
+        );
+        assert_eq!(
+            value_after_label("Recommended Proton│9.0-3", "Recommended Proton"),
+            Some("9.0-3".to_string())
+        );
+    }
+
+    #[test]
+    fn sections_ignore_navigation_links() {
+        let text = "3. [Known issues][1]\n4. [Fixes & workarounds][2]\n\n## Known issues\nReal issue\n\n## Fixes & workarounds\nReal fix\n\n**Verdict: Works**\nUnrelated prose";
+
+        assert_eq!(
+            section_excerpt(text, "Known issues", "Fixes", 100),
+            Some("Real issue".to_string())
+        );
+        assert_eq!(
+            section_excerpt(text, "Fixes", "Verdict", 100),
+            Some("Real fix".to_string())
         );
     }
 }

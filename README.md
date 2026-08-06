@@ -4,29 +4,44 @@
 
 # Miyu
 
-一个活在终端里的二次元少女。
+一个活在终端里的二次元少女。开箱即用的开源 AI 助手，支持接入通讯平台。
 
 >暂时
 
 ## 谁是 Miyu？
 
-Miyu 是从我曾经很喜欢的动画中的角色[久遠寺未有](http://www.minatosoft.com/kimiaru/chara-miyu.html)身上汲取灵感制作的人物。
-
-![](./pics/miyuwallpaper.png)
+Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚构角色。
 
 ## 有什么功能？
 
-`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。她并非专业的 Coding Agent，而是更偏向聊天日常、游戏娱乐、系统排障等日用场景。并且 `miyu` 还可以无缝与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
+`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。比起Coding，她更偏向聊天日常、游戏娱乐、系统排障等日用场景。
+
+`miyu` 可以与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
 
 ![](./pics/shell-init.png)
 
-`miyu` 还自带了 TUI 方便修改配置。
+有终端交互模式
+
+![](./pics/REPL.png)
+
+自带了 TUI 方便修改配置。
 
 ```
 miyu config
 ```
 
 ![](./pics/tui.png)
+
+还有 WebUI 
+
+![](./pics/webui.png)
+
+还可以通过 NapCat 接入 QQ，远程操作电脑；亦或是加入群聊，陪网友吹水，帮助你管理群聊。
+
+![](./pics/qq私聊.png)
+
+![](./pics/qq群聊管理.png)
+
 
 ## 如何安装？
 
@@ -38,39 +53,54 @@ miyu config
 
 - 从源码构建
 
-  需要安装 Rust 1.96 或更新版本、C 编译工具链、`pkg-config` 和 ALSA 开发库，图片显示功能依赖 `chafa`。Arch Linux、Fedora 和 Ubuntu 24.04 均已验证可构建。
-
   ```
   git clone https://github.com/SHORiN-KiWATA/Miyu.git
   cd Miyu
-  cargo build --release --locked
-  ./target/release/miyu --version
+  cargo build --release
   ```
 
-  各发行版依赖示例：
+
+安装完成后可以运行 `miyu init` 初始化配置和状态文件；也可以直接运行 `miyu daemon start`，首次启动会自动初始化。
+
+## 如何使用？
+
+> 与 `miyu` 运行最适配的是 `kitty`终端
+
+- REPL TUI 交互模式
 
   ```
-  # Arch Linux
-  sudo pacman -S --needed rust cargo pkgconf alsa-lib gcc
-
-  # Fedora
-  sudo dnf install cargo rust rust-std-static pkgconf-pkg-config alsa-lib-devel gcc
-
-  # Ubuntu 24.04
-  sudo apt install curl build-essential pkg-config libasound2-dev ca-certificates
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-  . "$HOME/.cargo/env"
+  miyu
   ```
 
-### 界面语言
+- webui 局域网网页
 
-Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。在 `miyu config` 的“全局设置 / Global Settings”中可将“界面语言 / Interface language”设为：
+  ```
+  miyu web
+  ```
 
-- `auto`：默认值，跟随系统 locale
-- `en`：英文
-- `zh`：简体中文
+- shell hook 终端集成
 
-`MIYU_LANG=en` 或 `MIYU_LANG=zh` 可以临时覆盖配置。语言选择优先级为 `MIYU_LANG`、`display.language`、系统 locale；在配置 TUI 中保存后，下次启动 Miyu 时生效。
+  最好的集成效果要求使用 `fish`，`zsh` 和`bash` 只能做到单行对话，`fish` 可以完整无缝集成。
+  
+  ```
+  miyu fish-init
+  ```
+
+### 重要配置调整
+
+运行 `miyu config` 命令打开配置 TUI。
+
+- 供应商和模型
+
+  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的 API。
+
+- 自定义提示词
+
+  `miyu`的默认提示词是无法修改的。你可以在`自定义提示词`中新建属于自己的 AI 人格，还可以配置 `用户身份` 让对话更加沉浸。 
+
+### 用户资源与 Skill
+
+Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.jsonc`、主题和 shell 集成；`~/.miyu/data` 存放 prompts、identities、persona-avatars、scripts 和 skills；运行状态与 Skill 草稿位于 `~/.miyu/state`。
 
 ### 内置插件
 
@@ -83,7 +113,7 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
   ![](./pics/nvidiafuckyou.png)
 
-  Miyu 自带了一些表情，存放在`/usr/share/miyu`，对应的用户空间目录是`~/.local/share/miyu`。表情库是跟随人格的，如果你在设置里新建了自己的人格，那么就无法使用 Miyu 的默认表情。你可以准备一些图片，把路径给 Ai，让其保存到表情库。届时会自动调用识图模型对图片进行分析并保存。Miyu 默认使用 opencode 公共模型服务中的多模态模型进行识图，所以即使不配置自己的多模态模型也可以看图片。
+  Miyu 自带了一些表情，存放在`/usr/share/miyu`，对应的用户空间目录位于`~/.miyu/data`。表情库是跟随人格的，如果你在设置里新建了自己的人格，那么就无法使用 Miyu 的默认表情。你可以准备一些图片，把路径给 Ai，让其保存到表情库。届时会自动调用识图模型对图片进行分析并保存。Miyu 默认使用 opencode 公共模型服务中的多模态模型进行识图，所以即使不配置自己的多模态模型也可以看图片。
 
 - 玄学算命
 
@@ -139,7 +169,7 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
 - 搜图
 
-  Miyu 还能帮你找图片喔！搜图会根据网络环境并行使用多个来源，并通过视觉模型筛选相关且安全的结果。图片会默认保存至`XDG图片目录/Miyu`。
+  Miyu 还能帮你找图片喔！搜图会根据网络环境并行使用多个来源，并通过视觉模型筛选相关且安全的结果。图片会默认保存至`~/.miyu/data/pictures/web-images`。
 
   >NSFW 禁止！
 
@@ -147,7 +177,7 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
 - 生图
 
-  支持 OpenAI 的画图服务喔。图片会默认保存至`XDG图片目录/Miyu`。
+  支持 OpenAI 的画图服务喔。图片会默认保存至`~/.miyu/data/pictures/generated-images`。
 
   >这个功能默认用不了，要自己在插件设置里开启并配置 API
 
@@ -215,7 +245,11 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
 - 记忆系统
 
-  Miyu 的记忆由两部分组成，其一是“曾经发生的事”，其二是“信息中的知识点”。对话时会根据用户消息自动召回条目，这是联想功能。
+  Miyu 的记忆分为短期日记、长期日记和知识点。每个成功完成的对话轮次会立即写入短期日记；同一人格累计 14 条未整理日记后，由独立后台线程并行提炼长期知识点和有回溯价值的长期经历，不会阻塞正常回复。成功整理的短期日记默认保留 14 天，每次有效联想会刷新保留时间；召回达到 3 次时会立即进入长期化整理。尚未成功整理的原文超期后会退出自动联想但不会丢失，后台仍可继续整理；整理成功后再物理清理。已经长期化的日记不再刷新短期原文的清理时间。
+
+  联想会同时检索三类记忆，并使用 `jieba-rs` 中文分词进行低成本匹配。Embedding 后续可以作为可选辅助接入，但不是记忆系统运行的前提。长期知识点和长期日记会随时间衰减为“已遗忘”，不物理删除；显式搜索仍可找回。
+
+  `/reset` 只清理当前会话，不删除人格记忆；终端或 WebUI 的 `/reset all` 会清空当前人格的短期日记、长期日记、知识点、修订记录和待整理状态。主体记忆在一个事务中清理，淘汰上下文随后独立清理。即使后台模型当时正在整理，旧结果也会因数据库身份或记忆代数变化而被拒绝，不能在清理后重新写回；重置前已经启动的其他会话也不能再写入旧日记。
 
   ![](./pics/记忆.png)
 
@@ -237,49 +271,27 @@ Miyu 的 CLI、REPL、配置 TUI 和工具状态支持英文与简体中文。�
 
 </details>
 
-## 做出贡献
-
-<details><summary>[展开/收起] 如果你想要一同开发 Miyu 请先阅读下面的内容</summary>
-<br>
-
-### 设计理念
-
-Miyu 的定位是桌面助手，不是 Coding Agent，她更注重拟真、系统集成度、实用、日常排障等方面。Miyu 应该开箱即用，并且足够轻量，不开发超重的 3D 桌宠，不使用 GUI 框架，也不设计需要学习成本的 CLI 选项，尽量通过自然语言和无缝无感的触发方式进行所有的操作。
-
-以下是一些可能的方向：
-
-- 提升系统日常排障能力、系统维护能力
-
-  作为桌面助手，尤其是 Linux 桌面端助手，对日常问题的排障能力是重重之中。她应当能够解决日用系统会遇到的问题，如输入法异常、显卡驱动异常、桌面软件崩溃等。
-
-- 知识和信息
-
-  扩充默认的知识库。增加对软件推荐、游戏兼容性调查、时事新闻、学习辅助等非开发场景下会出现的情景的处理能力。增加知识和信息检索的时效性和可靠性也是关键点。
-
-- 提升角色扮演能力，提高对话娱乐性和拟真度
-
-  需要更多像“发送表情包”、“玄学算命”那样提升对话时的趣味性或拟真度的功能。TTS、语音对话等重要功能也在日程上。
-
-- 提高和系统的无缝集成
-
-  不使用任何命令作为触发器，能够直接使用自然语言开启对话。目前是通过 Command Not Found 内容交给 Miyu 的方式做到和终端的无缝集成，但是逐行解释命令的特点导致提示词包含多行内容时每一行都会调用一次，如何支持多行无缝对话是一个需要研究的点。
-  
-  终端以外的集成也值得研究，例如做成守护进程，拥有持续运行的能力，监听系统事件，在特定事件发生时做出特定反应等。
-
-- 优化功能和修复 BUG
-
-  在不变更设计语义，不影响现有功能效果的前提下优化运行表现，修复 BUG。已知目前流式输出兼容和工具调用兼容有点问题，不是所有模型都正常。
-
-### 如何 PR
-
-PR时必须提供功能的设计理念，作用场景和实际意义。一个 PR 必须仅包含一个功能，若包含多个功能，应当拆分后提交多个 PR。
-
-</details>
-
-
 ## 致谢
 
-- [opencode](https://github.com/anomalyco/opencode) 最好的开源 Coding Agent。
+#### 功能参考
+
+- [Opencode](https://github.com/anomalyco/opencode) 
+- [Claude Code](https://github.com/anthropics/claude-code)
+- [Pi](https://github.com/earendil-works/pi)
+- [Deepseek-Reasonix](https://github.com/esengine/deepseek-reasonix)
+- [Astrbot](https://github.com/AstrBotDevs/AstrBot) 
+- [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 
+
+
+#### 插件设计参考
+
+- [Yue-bin/astrbot_plugin_maskoff](https://github.com/Yue-bin/astrbot_plugin_maskoff)
+- [nuomicici/astrbot_plugin_GroupMemberQuery](nuomicici/astrbot_plugin_GroupMemberQuery)
+- [advent259141/Astrbot_plugin_Heartflow](advent259141/Astrbot_plugin_Heartflow)
+- [Railgun19457/astrbot_plugin_image_generation](Railgun19457/astrbot_plugin_image_generation)
+- [xiewoc/astrbot_plugin_weather_wttr_in](xiewoc/astrbot_plugin_weather_wttr_in)
+- [muyouzhi6/astrbot_plugin_recall_cancel](muyouzhi6/astrbot_plugin_recall_cancel)
+- []()
 
 ## 许可
 
