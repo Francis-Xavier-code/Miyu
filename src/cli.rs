@@ -6159,7 +6159,36 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let jobs_shared = spawn_jobs_poll_thread(paths.clone());
     let jobs_feed = JobsFeed::Shared(jobs_shared.clone());
 
+    // Terminal closed (SIGHUP) or process killed (SIGTERM): the graceful
+    // exit path at the bottom never runs, so stop this session's background
+    // jobs from a signal task before dying. SIGKILL still leaks them — the
+    // daemon keeps those running and their completion wakes queue up.
+    {
+        let paths = paths.clone();
+        let feed = jobs_shared.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut hangup), Ok(mut terminate)) = (
+                signal(SignalKind::hangup()),
+                signal(SignalKind::terminate()),
+            ) else {
+                return;
+            };
+            tokio::select! {
+                _ = hangup.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            let session = { feed.repl_session.lock().unwrap().clone() };
+            if let Some(session_id) = session {
+                let _ = send_ipc_admin(&paths, IpcCommand::StopSessionJobs { session_id }).await;
+            }
+            std::process::exit(0);
+        });
+    }
+
     loop {
+        // Keep the poll thread's session filter in step with /new & /session.
+        *jobs_shared.repl_session.lock().unwrap() = Some(active_session_id.clone());
         live_repl.set_footer(footer.clone());
         let (next_mode, input, images) = match read_live_repl_input(
             &mut live_repl,
@@ -7002,7 +7031,11 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 );
                 // Refresh the job strip right away — a background command
                 // spawned this turn must show up without waiting a poll.
-                if let Ok((jobs, _, wake_runs)) = fetch_jobs_overview(paths).await {
+                if let Ok((mut jobs, _, wake_runs)) = fetch_jobs_overview(paths).await {
+                    retain_session_jobs(
+                        &mut jobs,
+                        jobs_shared.repl_session.lock().unwrap().as_deref(),
+                    );
                     *jobs_shared.jobs.lock().unwrap() = jobs.clone();
                     *jobs_shared.wake_runs.lock().unwrap() = wake_runs;
                     live_repl.set_jobs(jobs);
@@ -9755,6 +9788,9 @@ impl Drop for LiveRawMode {
 /// Shared feed state between the remote REPL and its IPC poll thread.
 #[derive(Default)]
 struct SharedJobsFeed {
+    /// The owning REPL's current session — strip snapshots are filtered to
+    /// it (daemon "current session" can drift from the REPL's after /new).
+    repl_session: std::sync::Mutex<Option<String>>,
     jobs: std::sync::Mutex<Vec<crate::tools::jobs::JobOverview>>,
     /// Rendered wake-turn reports waiting to be printed into the scrollback.
     reports: std::sync::Mutex<Vec<BackgroundReport>>,
@@ -9771,6 +9807,16 @@ struct BackgroundReport {
     turn_id: String,
     headline: String,
     reply: String,
+}
+
+/// Session isolation for the strip: keep only `session`'s jobs (sessionless
+/// jobs stay visible as a legacy fallback; `None` session shows everything).
+fn retain_session_jobs(jobs: &mut Vec<crate::tools::jobs::JobOverview>, session: Option<&str>) {
+    if let Some(session) = session {
+        jobs.retain(|job| {
+            job.session_id.is_none() || job.session_id.as_deref() == Some(session)
+        });
+    }
 }
 
 /// Source of background-command snapshots for the idle status strip.
@@ -9855,6 +9901,8 @@ fn spawn_jobs_poll_thread(paths: MiyuPaths) -> std::sync::Arc<SharedJobsFeed> {
                     .unwrap_or_else(|_| Ok((Vec::new(), None, Vec::new())))
                 })
                 .unwrap_or_default();
+            let mut jobs = jobs;
+            retain_session_jobs(&mut jobs, feed.repl_session.lock().unwrap().as_deref());
             *feed.jobs.lock().unwrap() = jobs;
             *feed.wake_runs.lock().unwrap() = wake_runs;
             if let (Some(store), Some(session_id)) = (store.as_ref(), session_id) {

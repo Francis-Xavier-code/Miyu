@@ -135,6 +135,9 @@ pub struct JobOverview {
     /// "command" or "subagent" — UIs word their labels by this.
     #[serde(default)]
     pub kind: String,
+    /// Owning turn session; UIs only strip-display jobs of their own session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub status: String,
     pub running: bool,
     pub runtime_seconds: u64,
@@ -186,6 +189,7 @@ fn overview_of(job: &JobEntry) -> JobOverview {
             JobKind::Command { .. } => "command".to_string(),
             JobKind::Subagent { .. } => "subagent".to_string(),
         },
+        session_id: job.session_id.as_deref().map(str::to_string),
         status: job.state.label(),
         running: !job.state.is_terminal(),
         runtime_seconds: job
@@ -648,6 +652,19 @@ fn read_log_slice(path: &PathBuf, offset: u64) -> (String, u64, u64, bool) {
     (slice, end as u64, size, truncated)
 }
 
+/// Session-scoped visibility: a tool call only sees jobs of its own turn
+/// session unless it passes `all=true`. Jobs or callers without a session
+/// (tests, direct invocations outside a turn) stay globally visible.
+fn job_visible(job: &JobEntry, current: Option<&str>, all: bool) -> bool {
+    if all {
+        return true;
+    }
+    match (current, job.session_id.as_deref()) {
+        (Some(current), Some(session)) => current == session,
+        _ => true,
+    }
+}
+
 async fn job_status(args: Value) -> Result<String> {
     let job_id = args
         .get("job_id")
@@ -660,17 +677,21 @@ async fn job_status(args: Value) -> Result<String> {
         .unwrap_or(0)
         .min(MAX_WAIT_SECONDS);
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let current = super::workspace::try_session();
 
     let Some(job_id) = job_id else {
-        // No job_id: list all jobs. With wait_seconds, block until ANY job
-        // that was running at call time finishes (or the wait elapses) —
-        // one call can await a whole batch instead of polling each job.
+        // No job_id: list this session's jobs (all=true lists every
+        // session's). With wait_seconds, block until ANY watched job that
+        // was running at call time finishes (or the wait elapses) — one
+        // call can await a whole batch instead of polling each job.
         let running_at_start = || {
             jobs()
                 .lock()
                 .unwrap()
                 .values()
                 .filter(|job| !job.state.is_terminal())
+                .filter(|job| job_visible(job, current.as_deref(), all))
                 .map(|job| job.job_id.clone())
                 .collect::<Vec<_>>()
         };
@@ -691,7 +712,10 @@ async fn job_status(args: Value) -> Result<String> {
             }
         }
         let jobs = jobs().lock().unwrap();
-        let mut rows = jobs.values().collect::<Vec<_>>();
+        let mut rows = jobs
+            .values()
+            .filter(|job| job_visible(job, current.as_deref(), all))
+            .collect::<Vec<_>>();
         rows.sort_by_key(|job| job.started_wall);
         let rows = rows
             .into_iter()
@@ -713,6 +737,14 @@ async fn job_status(args: Value) -> Result<String> {
         }))?);
     };
 
+    {
+        let jobs = jobs().lock().unwrap();
+        if let Some(job) = jobs.get(job_id) {
+            if !job_visible(job, current.as_deref(), all) {
+                bail!("后台任务 {job_id} 属于其他会话；如确需查看请传 all=true");
+            }
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut job = job_snapshot(job_id).with_context(|| {
         format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空")
@@ -795,6 +827,16 @@ async fn job_stop(args: Value) -> Result<String> {
     if ids.is_empty() {
         bail!("job_id 或 job_ids 至少提供一个；usage: job_stop({{\"job_ids\":[\"abc123\"]}})");
     }
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let current = super::workspace::try_session();
+    for id in &ids {
+        let jobs = jobs().lock().unwrap();
+        if let Some(job) = jobs.get(id) {
+            if !job_visible(job, current.as_deref(), all) {
+                bail!("后台任务 {id} 属于其他会话；如确需停止请传 all=true");
+            }
+        }
+    }
     if ids.len() > 1 {
         let mut results = Vec::new();
         for id in ids {
@@ -872,8 +914,8 @@ pub fn register_management(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_stop",
             t(
-                "Stop background tasks (commands or subagents). Commands get SIGTERM then SIGKILL; subagents are aborted. Accepts job_ids for batch stops.",
-                "停止后台任务（后台命令或后台子代理）。命令向进程组发送 SIGTERM，宽限期后升级 SIGKILL；子代理直接中止。支持 job_ids 批量。",
+                "Stop this session's background tasks (commands or subagents). Commands get SIGTERM then SIGKILL; subagents are aborted. Accepts job_ids for batch stops. Pass all=true to stop other sessions' jobs.",
+                "停止本会话的后台任务（后台命令或后台子代理）。命令向进程组发送 SIGTERM，宽限期后升级 SIGKILL；子代理直接中止。支持 job_ids 批量。停止其他会话的任务需传 all=true。",
             ),
             json!({
                 "type": "object",
@@ -883,7 +925,8 @@ pub fn register_management(registry: &mut ToolRegistry) {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "要停止的任务 id 列表（批量）。"
-                    }
+                    },
+                    "all": { "type": "boolean", "description": "true 时允许停止其他会话的后台任务。" }
                 },
                 "additionalProperties": false
             }),
@@ -900,15 +943,16 @@ pub fn register_status(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_status",
             t(
-                "Check background jobs started by run_command with background=true. Without job_id lists all jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset. wait_seconds is capped at 30.",
-                "查询 run_command background=true 启动的后台命令。不带 job_id 列出全部命令（此时 wait_seconds 表示等待任意一条运行中命令结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出。wait_seconds 上限 30 秒。",
+                "Check background jobs of the current session. Without job_id lists this session's jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset. wait_seconds is capped at 30. Pass all=true to see other sessions' jobs.",
+                "查询本会话的后台任务。不带 job_id 列出本会话全部任务（此时 wait_seconds 表示等待任意一条运行中任务结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出。wait_seconds 上限 30 秒。跨会话查询需传 all=true。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "job_id": { "type": "string", "description": "后台命令 id；省略则列出全部后台命令。" },
+                    "job_id": { "type": "string", "description": "后台任务 id；省略则列出本会话全部任务。" },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "任务未结束时最多阻塞等待多少秒再返回。" },
-                    "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" }
+                    "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" },
+                    "all": { "type": "boolean", "description": "true 时不限本会话，查询全部会话的后台任务。" }
                 },
                 "additionalProperties": false
             }),

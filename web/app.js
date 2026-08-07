@@ -3590,6 +3590,7 @@
       : null;
     renderConversation();
     renderQueueTray();
+    renderJobsStrip();
     restoreLiveRuns(runs);
     updateConversationChrome();
     updateControlState();
@@ -7317,10 +7318,17 @@
     return match ? `退出码 ${match[1]}` : value;
   }
 
+  function visibleBackgroundJobs() {
+    // 会话隔离: 状态条只显示当前查看会话的任务(无会话标记的旧任务保持可见)。
+    return Array.from(state.backgroundJobs.values()).filter(
+      (job) => !job.session_id || !state.viewSessionId || job.session_id === state.viewSessionId
+    );
+  }
+
   function renderJobsStrip() {
     const strip = elements.jobsStrip;
     if (!strip) return;
-    const jobs = Array.from(state.backgroundJobs.values());
+    const jobs = visibleBackgroundJobs();
     if (!jobs.length) {
       strip.hidden = true;
       strip.replaceChildren();
@@ -7407,10 +7415,11 @@
   }
 
   setInterval(() => {
-    if (!state.backgroundJobs.size) return;
+    const visible = visibleBackgroundJobs();
+    if (!visible.length) return;
     // 只更新计时文本：全量重建会重启 CSS 旋转动画，导致 spinner 每秒瞬移回原点。
     let missing = false;
-    for (const job of state.backgroundJobs.values()) {
+    for (const job of visible) {
       const row = elements.jobsStrip?.querySelector(`.job-chip[data-job-id="${CSS.escape(String(job.job_id))}"]`);
       if (!row) {
         missing = true;
@@ -7421,7 +7430,7 @@
       const seconds = Math.max(0, Math.round(job.runtime_seconds + (Date.now() - job.receivedAt) / 1000));
       time.textContent = formatJobDuration(seconds);
     }
-    if (missing && (state.jobsStripOpen || state.backgroundJobs.size < 3)) renderJobsStrip();
+    if (missing && (state.jobsStripOpen || visible.length < 3)) renderJobsStrip();
   }, 1000);
   setTimeout(seedJobsStrip, 800);
 
@@ -7581,7 +7590,9 @@
       if (live.meta) {
         const total = effectiveUsageTotal(data?.usage);
         const cached = asFiniteNumber(data?.usage?.cache_read_tokens, 0);
-        const cachedSuffix = cached > 0 ? ` · ${formatTokens(cached)} 缓存命中` : "";
+        const cachedSuffix = cached > 0 && total > 0
+          ? ` · 缓存命中 ${Math.min(100, Math.round((cached / total) * 100))}%`
+          : "";
         live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} 词元${cachedSuffix}` : "已完成";
       }
     } else if (kind === "cancelled") {

@@ -872,12 +872,11 @@ pub(crate) fn format_token_usage_inline_opts(
     if turn_tokens == 0 {
         session
     } else if cached_tokens > 0 {
-        // Absolute values on purpose: a percentage would dip whenever a turn
-        // adds fresh content even though the cached prefix still hit.
+        let cache_percent =
+            ((cached_tokens as f64 / turn_tokens as f64) * 100.0).round().min(100.0) as u64;
         format!(
-            "{}(C{}) · {session}",
+            "{}(C{cache_percent}%) · {session}",
             format_compact_count(turn_tokens),
-            format_compact_count(cached_tokens)
         )
     } else {
         format!("{} · {session}", format_compact_count(turn_tokens))
@@ -1876,7 +1875,10 @@ impl StreamRenderer {
         // under its spinner glyph; a settled block drops the glyph and sits
         // flush, matching the committed layout.
         let running_live = live && !stats.settled();
-        let detail_indent = if running_live { "  " } else { "" };
+        // Detail lines always sit two columns in, matching command blocks
+        // (`$ …` / `  ↳ cmd` / `  │ output`) and avoiding the leftward jump
+        // a block used to make when it settled.
+        let detail_indent = "  ";
         let mut lines = Vec::new();
         if running_live {
             lines.push(format!("{}{header}", wait_spinner::BLOCK_MARKER));
@@ -1986,7 +1988,7 @@ impl StreamRenderer {
                     // Skip subjects already shown in the header (subagent
                     // descriptions are part of the display name).
                     if !self.display_tool_name(name).contains(subject.as_str()) {
-                        lines.push(format!("↳ {subject}"));
+                        lines.push(format!("  ↳ {subject}"));
                     }
                 }
             }
@@ -1994,7 +1996,7 @@ impl StreamRenderer {
                 let progress = message
                     .lines()
                     .filter(|line| !line.trim().is_empty())
-                    .map(|line| format!("↳ {}", clip_progress_line(line, 120)))
+                    .map(|line| format!("  ↳ {}", clip_progress_line(line, 120)))
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !progress.is_empty() {
@@ -4332,7 +4334,7 @@ mod tests {
         assert_eq!(
             renderer.tool_summary_text(),
             format!(
-                "~ {}×1 {}\n↳ first subject",
+                "~ {}×1 {}\n  ↳ first subject",
                 t("Web search", "网页搜索"),
                 t("running", "运行中")
             )
@@ -4348,7 +4350,7 @@ mod tests {
         assert_eq!(
             renderer.tool_summary_text(),
             format!(
-                "~ {}×1 {}\n↳ second subject",
+                "~ {}×1 {}\n  ↳ second subject",
                 t("Web search", "网页搜索"),
                 t("running", "运行中")
             )
@@ -4378,7 +4380,7 @@ mod tests {
         assert_eq!(
             renderer.tool_summary_text(),
             format!(
-                "~ {}×1 {} · 0s\n↳ 确认工作区环境",
+                "~ {}×1 {} · 0s\n  ↳ 确认工作区环境",
                 t("Subagent", "子代理"),
                 t("running", "运行中")
             )
@@ -4389,7 +4391,7 @@ mod tests {
         assert_eq!(
             renderer.tool_summary_text(),
             format!(
-                "~ {}×1 {} · 2s\n↳ 确认工作区环境",
+                "~ {}×1 {} · 2s\n  ↳ 确认工作区环境",
                 t("Subagent", "子代理"),
                 t("running", "运行中")
             )
@@ -4994,7 +4996,7 @@ mod tests {
         assert_eq!(
             renderer.tool_summary_text(),
             format!(
-                "~ {}×1 ok\n✓ 工具调用 1 次　消耗词元 2.3K",
+                "~ {}×1 ok\n  ✓ 工具调用 1 次　消耗词元 2.3K",
                 t("Deep research", "深度研究")
             )
         );
@@ -5026,7 +5028,7 @@ mod tests {
         assert_eq!(renderer.tool_summary_header(), header);
         assert_eq!(
             renderer.tool_summary_text(),
-            format!("{header}\n↳ 定位活动摘要渲染链路")
+            format!("{header}\n  ↳ 定位活动摘要渲染链路")
         );
     }
 
@@ -5113,11 +5115,11 @@ mod tests {
         assert!(lines[0].starts_with(marker) && lines[0].contains("任务A"));
         assert_eq!(lines[1], "  ↳ 正在搜索");
         assert_eq!(lines[2], "");
-        // …while the settled block drops the spinner indent entirely and
-        // sits flush with its final stats, like the committed layout.
+        // …while the settled block drops the spinner glyph from its header;
+        // detail lines stay two columns in, matching the committed layout.
         assert!(lines[3].starts_with("~ ") && lines[3].contains("任务B"));
         assert!(lines[3].contains("ok"));
-        assert_eq!(lines[4], "✓ 工具调用 1 次");
+        assert_eq!(lines[4], "  ✓ 工具调用 1 次");
         assert_eq!(lines.len(), 5);
     }
 
@@ -5154,7 +5156,7 @@ mod tests {
         assert!(lines[0].starts_with("~ ") && lines[0].contains("任务A"));
         assert_eq!(lines[1], "");
         assert!(lines[2].starts_with("~ ") && lines[2].contains("任务B"));
-        assert_eq!(lines[3], "✓ 工具调用 1 次");
+        assert_eq!(lines[3], "  ✓ 工具调用 1 次");
         assert_eq!(lines.len(), 4);
     }
 
