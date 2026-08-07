@@ -86,7 +86,7 @@ mod tests {
             ("Rust + 中文 + emoji 🚀\nsecond line", 10),
             (" \t\n\r\n punctuation: !@#$%^&*()[]{}", 13),
             ("<|endoftext|><|endofprompt|>", 13),
-            (include_str!("prompts/miyu.md"), 3492),
+            (include_str!("prompts/miyu.md"), 3354),
             (include_str!("prompts/compact.md"), 416),
             (include_str!("prompts/compact_chat.md"), 481),
             (include_str!("prompts/plan.md"), 85),
