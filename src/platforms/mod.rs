@@ -42,6 +42,71 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+/// How long a delivered image stays deduplicated for its conversation.
+/// Auto-attached reply images (generate_image / search_web_images) must not
+/// be sent twice when a turn is retried or recovered after an interrupted
+/// send; an explicit "send it again" goes through send_message_to_user,
+/// which is not filtered by this.
+/// Kept short: it only needs to span a recovery turn, and a genuine
+/// "send that one again" outside the window must still work.
+const RECENT_IMAGE_TTL: Duration = Duration::from_secs(5 * 60);
+const RECENT_IMAGE_CONVERSATIONS: usize = 64;
+const RECENT_IMAGES_PER_CONVERSATION: usize = 32;
+
+type RecentImageLedger = HashMap<String, Vec<(blake3::Hash, Instant)>>;
+
+fn recent_images() -> &'static Mutex<RecentImageLedger> {
+    static LEDGER: OnceLock<Mutex<RecentImageLedger>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_recent_conversation_images(scope_key: &str, digests: &[blake3::Hash]) {
+    let now = Instant::now();
+    let mut ledger = recent_images().lock().unwrap();
+    ledger.retain(|_, entries| {
+        entries.retain(|(_, at)| now.duration_since(*at) < RECENT_IMAGE_TTL);
+        !entries.is_empty()
+    });
+    let entries = ledger.entry(scope_key.to_string()).or_default();
+    for digest in digests {
+        entries.retain(|(known, _)| known != digest);
+        entries.push((*digest, now));
+    }
+    if entries.len() > RECENT_IMAGES_PER_CONVERSATION {
+        let excess = entries.len() - RECENT_IMAGES_PER_CONVERSATION;
+        entries.drain(..excess);
+    }
+    if ledger.len() > RECENT_IMAGE_CONVERSATIONS {
+        // Bound the ledger even when every conversation stays inside the TTL.
+        let oldest = ledger
+            .iter()
+            .filter_map(|(key, entries)| {
+                entries.last().map(|(_, at)| (*at, key.clone()))
+            })
+            .min()
+            .map(|(_, key)| key);
+        if let Some(key) = oldest {
+            ledger.remove(&key);
+        }
+    }
+}
+
+fn recent_conversation_images(scope_key: &str) -> Vec<blake3::Hash> {
+    let now = Instant::now();
+    recent_images()
+        .lock()
+        .unwrap()
+        .get(scope_key)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(_, at)| now.duration_since(*at) < RECENT_IMAGE_TTL)
+                .map(|(digest, _)| *digest)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Hard ceiling for one platform-driven turn; beyond this the run is
 /// cancelled so a wedged turn cannot pin the bridge task forever.
 const PLATFORM_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -1001,6 +1066,7 @@ impl PlatformTurnContext {
             .lock()
             .unwrap()
             .extend(receipt.image_digests.iter().copied());
+        record_recent_conversation_images(&self.conversation.scope_key(), &receipt.image_digests);
     }
 
     fn record_partial_delivery(&self, error: &anyhow::Error) -> (bool, bool) {
@@ -1030,7 +1096,9 @@ impl PlatformTurnContext {
     }
 
     pub(crate) fn delivered_image_digests(&self) -> HashSet<blake3::Hash> {
-        self.delivered_image_digests.lock().unwrap().clone()
+        let mut digests = self.delivered_image_digests.lock().unwrap().clone();
+        digests.extend(recent_conversation_images(&self.conversation.scope_key()));
+        digests
     }
 
     pub(crate) async fn bot_display_name(&self) -> Result<String> {
@@ -2351,6 +2419,31 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    /// Regression: an auto-attached reply image delivered in one turn must
+    /// stay suppressed for the recovery turn that follows an interrupted
+    /// send — that replay is what duplicated pictures in QQ groups.
+    #[test]
+    fn delivered_images_stay_deduplicated_across_turns_per_conversation() {
+        let first = blake3::hash(b"generated-picture");
+        let second = blake3::hash(b"another-picture");
+        let scope = "onebot:1:group:duplicate-image-regression";
+        let other_scope = "onebot:1:group:unrelated";
+
+        assert!(recent_conversation_images(scope).is_empty());
+        record_recent_conversation_images(scope, &[first]);
+        assert_eq!(recent_conversation_images(scope), vec![first]);
+        // Other conversations are unaffected.
+        assert!(recent_conversation_images(other_scope).is_empty());
+
+        // Re-recording keeps one entry per digest.
+        record_recent_conversation_images(scope, &[first, second]);
+        let mut seen = recent_conversation_images(scope);
+        seen.sort_by_key(|digest| digest.as_bytes().to_vec());
+        let mut expected = vec![first, second];
+        expected.sort_by_key(|digest| digest.as_bytes().to_vec());
+        assert_eq!(seen, expected);
+    }
+
     struct SuppressingToolPlugin;
 
     impl plugins::PlatformPlugin for SuppressingToolPlugin {
@@ -2549,12 +2642,20 @@ mod tests {
             messages: Mutex::new(Vec::new()),
             group_members: test_group_members(),
         });
+        // Unique conversation per context: the delivered-image ledger is
+        // process-global and keyed by conversation, so two test contexts
+        // sharing an id would observe each other's deliveries.
+        static NEXT_CONVERSATION: AtomicUsize = AtomicUsize::new(0);
+        let conversation_id = format!(
+            "20000-{}",
+            NEXT_CONVERSATION.fetch_add(1, AtomicOrdering::Relaxed)
+        );
         let context = PlatformTurnContext::new(
             PlatformConversation {
                 platform: "onebot".to_string(),
                 account_id: "10000".to_string(),
                 kind: ConversationKind::Private,
-                conversation_id: "20000".to_string(),
+                conversation_id,
             },
             "20000".to_string(),
             "tester".to_string(),

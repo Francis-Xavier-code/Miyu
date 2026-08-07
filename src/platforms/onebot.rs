@@ -77,6 +77,8 @@ const MAX_BASE64_FILE_BYTES: usize = 16 * 1024 * 1024;
 const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const FILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const API_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling for size-scaled message sends (see `send_timeout_for`).
+const MAX_SEND_TIMEOUT: Duration = Duration::from_secs(180);
 const QUOTED_MESSAGE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounds parsed/in-flight events per NapCat connection. Same-conversation
 /// LLM turns are serialized later; this cap only prevents an unbounded task
@@ -5317,6 +5319,7 @@ impl OneBotAdapter {
     }
 
     async fn send_message_segments(&self, segments: Vec<Value>) -> Result<Value> {
+        let timeout = send_timeout_for(&segments);
         let (action, params) = match self.target {
             Target::Private { user_id } => (
                 "send_private_msg",
@@ -5327,7 +5330,9 @@ impl OneBotAdapter {
                 json!({ "group_id": group_id, "message": segments }),
             ),
         };
-        self.connection().call_api(action, params).await
+        self.connection()
+            .call_api_with_timeout(action, params, timeout)
+            .await
     }
 
     async fn upload_file(
@@ -5438,6 +5443,31 @@ fn partial_send_error(error: anyhow::Error, receipt: SendReceipt) -> anyhow::Err
     }
 }
 
+/// Sends carrying base64 images need far longer than a plain text call: a
+/// 2 MiB picture is ~2.9 MB of JSON that NapCat has to receive, decode and
+/// upload to QQ. Timing out early is worse than waiting — the message is
+/// still delivered, but Miyu records the turn as interrupted and the model
+/// re-sends it, which is exactly the duplicate-image bug.
+fn send_timeout_for(segments: &[Value]) -> Duration {
+    let payload_bytes: usize = segments
+        .iter()
+        .filter_map(|segment| {
+            segment
+                .get("data")
+                .and_then(|data| data.get("file"))
+                .and_then(Value::as_str)
+        })
+        .map(str::len)
+        .sum();
+    if payload_bytes == 0 {
+        return API_CALL_TIMEOUT;
+    }
+    let megabytes = (payload_bytes as u64).div_ceil(1024 * 1024);
+    API_CALL_TIMEOUT
+        .saturating_add(Duration::from_secs(20 * megabytes))
+        .min(MAX_SEND_TIMEOUT)
+}
+
 fn image_segment(bytes: &[u8]) -> Value {
     json!({
         "type": "image",
@@ -5523,8 +5553,8 @@ async fn deliver_dispatch(
                                 "{}",
                                 if already_delivered {
                                     t(
-                                        "suppressed a OneBot reply image already delivered earlier in the turn",
-                                        "已抑制本轮中先前已投递的 OneBot 回复图片",
+                                        "suppressed a OneBot reply image already delivered to this conversation",
+                                        "已抑制本会话中先前已投递的 OneBot 回复图片",
                                     )
                                 } else {
                                     t(
@@ -8072,6 +8102,26 @@ mod tests {
         assert!(error.contains("status=failed"));
         assert!(error.contains("retcode=1200"));
         assert!(error.contains("消息已超过撤回时限"));
+    }
+
+    /// Regression: a 2 MiB picture is ~2.9 MB of base64 JSON that NapCat
+    /// needs far longer than the plain 10s API budget to upload. Timing out
+    /// early made Miyu record a delivered reply as interrupted, and the
+    /// recovery turn re-sent the same image.
+    #[test]
+    fn image_sends_get_a_size_scaled_timeout() {
+        let text_only = vec![text_segment("hello")];
+        assert_eq!(send_timeout_for(&text_only), API_CALL_TIMEOUT);
+
+        let small_image = vec![image_segment(&vec![0u8; 64 * 1024])];
+        assert!(send_timeout_for(&small_image) > API_CALL_TIMEOUT);
+
+        let big_image = vec![image_segment(&vec![0u8; 2 * 1024 * 1024])];
+        assert!(send_timeout_for(&big_image) > send_timeout_for(&small_image));
+        assert!(send_timeout_for(&big_image) <= MAX_SEND_TIMEOUT);
+
+        let huge_image = vec![image_segment(&vec![0u8; 19 * 1024 * 1024])];
+        assert_eq!(send_timeout_for(&huge_image), MAX_SEND_TIMEOUT);
     }
 
     #[tokio::test]

@@ -19,3 +19,6 @@
 - artifact增强
 - 自带skill扩充
 - 通讯平台命令
+
+## BUG
+
