@@ -6,7 +6,7 @@
 //! instance kill anything a crashed predecessor leaked. Completion invokes
 //! an optional host hook (the daemon uses it to wake the model).
 
-use super::{ToolRegistry, ToolSpec};
+use super::{CommandOutputStream, ToolProgress, ToolRegistry, ToolSpec};
 use crate::i18n::agent_text as t;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
@@ -35,6 +34,35 @@ pub enum JobState {
     Stopped,
 }
 
+/// Human-facing Chinese label for a status string; tool outputs keep the
+/// raw English label for the model.
+pub fn status_display(status: &str) -> String {
+    if !crate::i18n::is_zh() {
+        return match status {
+            "stopped" => "stopped".to_string(),
+            "timed_out" => "timed out".to_string(),
+            "exited(signal)" => "killed".to_string(),
+            "exited(0)" => "done".to_string(),
+            other => other
+                .strip_prefix("exited(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| other.to_string()),
+        };
+    }
+    match status {
+        "stopped" => "已中断".to_string(),
+        "timed_out" => "已超时".to_string(),
+        "exited(signal)" => "异常退出".to_string(),
+        "exited(0)" => "完成".to_string(),
+        other => other
+            .strip_prefix("exited(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .map(|code| format!("退出码 {code}"))
+            .unwrap_or_else(|| other.to_string()),
+    }
+}
+
 impl JobState {
     fn label(&self) -> String {
         match self {
@@ -51,24 +79,42 @@ impl JobState {
     }
 }
 
+/// What a background job actually is: an OS process group, or an in-process
+/// detached subagent future.
+#[derive(Clone)]
+pub enum JobKind {
+    Command { pid: u32 },
+    Subagent { abort: tokio::task::AbortHandle },
+}
+
 #[derive(Clone)]
 struct JobEntry {
     job_id: String,
+    title: String,
     command: String,
     workspace: PathBuf,
     session_id: Option<Arc<str>>,
-    pid: u32,
+    kind: JobKind,
     started_wall: SystemTime,
     started: Instant,
     finished: Option<Instant>,
     log_path: PathBuf,
     state: JobState,
+    /// Set once the host reported the finished job (model wake delivered or
+    /// direct-REPL user moved on); acknowledged jobs leave the overview.
+    acknowledged: bool,
 }
 
 /// Completion details handed to the host hook (daemon: model wake-up).
 #[derive(Clone, Debug)]
 pub struct JobCompletion {
     pub job_id: String,
+    pub title: String,
+    /// False when the model itself stopped the command — the host should
+    /// clean up UI strips but not wake the model about it.
+    pub wake_requested: bool,
+    /// True for detached subagents (wording of the wake prompt differs).
+    pub is_subagent: bool,
     pub command: String,
     pub workspace: PathBuf,
     pub session_id: Option<Arc<str>>,
@@ -79,6 +125,20 @@ pub struct JobCompletion {
 }
 
 pub type CompletionHook = Arc<dyn Fn(JobCompletion) + Send + Sync>;
+pub type StartedHook = Arc<dyn Fn(JobOverview) + Send + Sync>;
+
+/// UI-facing snapshot of one job, for status strips and IPC polling.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JobOverview {
+    pub job_id: String,
+    pub title: String,
+    /// "command" or "subagent" — UIs word their labels by this.
+    #[serde(default)]
+    pub kind: String,
+    pub status: String,
+    pub running: bool,
+    pub runtime_seconds: u64,
+}
 
 #[derive(Serialize, Deserialize)]
 struct LedgerEntry {
@@ -90,7 +150,6 @@ struct LedgerEntry {
 
 struct JobHost {
     paths: MiyuPaths,
-    limit: usize,
     max_runtime: Duration,
 }
 
@@ -109,6 +168,56 @@ fn completion_hook() -> &'static Mutex<Option<CompletionHook>> {
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
+fn started_hook() -> &'static Mutex<Option<StartedHook>> {
+    static HOOK: OnceLock<Mutex<Option<StartedHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the host started hook (daemon: publish job.started to UIs).
+pub fn set_started_hook(hook: StartedHook) {
+    *started_hook().lock().unwrap() = Some(hook);
+}
+
+fn overview_of(job: &JobEntry) -> JobOverview {
+    JobOverview {
+        job_id: job.job_id.clone(),
+        title: job.title.clone(),
+        kind: match job.kind {
+            JobKind::Command { .. } => "command".to_string(),
+            JobKind::Subagent { .. } => "subagent".to_string(),
+        },
+        status: job.state.label(),
+        running: !job.state.is_terminal(),
+        runtime_seconds: job
+            .finished
+            .unwrap_or_else(Instant::now)
+            .duration_since(job.started)
+            .as_secs(),
+    }
+}
+
+/// Jobs the UI status strip should show: running only — finished commands
+/// are reported by the wake follow-up, so a terminal chip carries no
+/// information.
+pub fn overview() -> Vec<JobOverview> {
+    let jobs = jobs().lock().unwrap();
+    let mut rows = jobs
+        .values()
+        .filter(|job| !job.state.is_terminal())
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|job| job.started_wall);
+    rows.into_iter().map(overview_of).collect()
+}
+
+/// Mark a finished job as reported; it disappears from the overview.
+pub fn acknowledge(job_id: &str) {
+    if let Some(job) = jobs().lock().unwrap().get_mut(job_id) {
+        if job.state.is_terminal() {
+            job.acknowledged = true;
+        }
+    }
+}
+
 /// Install the host completion hook (daemon: wake the model). Replaces any
 /// previous hook; pass-through for the direct REPL which sets none.
 pub fn set_completion_hook(hook: CompletionHook) {
@@ -117,10 +226,9 @@ pub fn set_completion_hook(hook: CompletionHook) {
 
 /// One-time host init: remembers paths/limits and sweeps ledger entries
 /// left behind by dead predecessor processes.
-pub fn init(paths: &MiyuPaths, limit: usize, max_runtime_minutes: u64) {
+pub fn init(paths: &MiyuPaths, max_runtime_minutes: u64) {
     let _ = host().set(JobHost {
         paths: paths.clone(),
-        limit: limit.max(1),
         max_runtime: Duration::from_secs(max_runtime_minutes.max(1) * 60),
     });
     sweep_stale_jobs(paths);
@@ -142,12 +250,14 @@ fn ledger_path(paths: &MiyuPaths) -> PathBuf {
 }
 
 fn next_job_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "job_{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    // Short hex id for display friendliness; collision-checked against the
+    // live registry, so six chars are plenty for a per-process job list.
+    loop {
+        let id = format!("{:06x}", rand::random::<u32>() & 0xff_ffff);
+        if !jobs().lock().unwrap().contains_key(&id) {
+            return id;
+        }
+    }
 }
 
 fn signal_process_group(pid: u32, signal: i32) {
@@ -230,9 +340,10 @@ fn sync_ledger(paths: &MiyuPaths) {
         .unwrap()
         .values()
         .filter(|job| job.state == JobState::Running)
-        .map(|job| LedgerEntry {
+        .filter_map(|job| job.pid().map(|pid| (job, pid)))
+        .map(|(job, pid)| LedgerEntry {
             owner_pid,
-            pid: job.pid,
+            pid,
             job_id: job.job_id.clone(),
             started_unix: job
                 .started_wall
@@ -265,14 +376,21 @@ pub fn shutdown_all() {
         .unwrap()
         .values()
         .filter(|job| job.state == JobState::Running)
-        .map(|job| job.pid)
+        .map(|job| job.kind.clone())
         .collect::<Vec<_>>();
-    for pid in &running {
-        signal_process_group(*pid, libc::SIGTERM);
+    let mut pids = Vec::new();
+    for kind in &running {
+        match kind {
+            JobKind::Command { pid } => {
+                signal_process_group(*pid, libc::SIGTERM);
+                pids.push(*pid);
+            }
+            JobKind::Subagent { abort } => abort.abort(),
+        }
     }
-    if !running.is_empty() {
+    if !pids.is_empty() {
         std::thread::sleep(Duration::from_millis(300));
-        for pid in running {
+        for pid in pids {
             if process_alive(pid) {
                 signal_process_group(pid, libc::SIGKILL);
             }
@@ -285,20 +403,23 @@ pub fn shutdown_all() {
 
 /// Spawn `command` detached in its own process group; stdout+stderr stream
 /// into a log file. Returns the tool JSON for run_command.
-pub async fn spawn_background(command: &str) -> Result<String> {
+pub async fn spawn_background(
+    command: &str,
+    title: Option<&str>,
+    progress: &ToolProgress,
+) -> Result<String> {
     let host = require_host()?;
-    let running = jobs()
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|job| job.state == JobState::Running)
-        .count();
-    if running >= host.limit {
-        bail!(
-            "已有 {running} 个后台任务在运行（上限 {}）；先用 job_status 检查并用 job_stop 结束不需要的任务",
-            host.limit
-        );
-    }
+    let title = title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(16).collect::<String>())
+        .unwrap_or_else(|| {
+            let mut fallback = command.chars().take(20).collect::<String>();
+            if fallback.len() < command.len() {
+                fallback.push('…');
+            }
+            fallback
+        });
     let job_id = next_job_id();
     let dir = logs_dir(&host.paths);
     std::fs::create_dir_all(&dir)
@@ -320,18 +441,24 @@ pub async fn spawn_background(command: &str) -> Result<String> {
     let pid = child.id().context("background job has no pid")?;
     let entry = JobEntry {
         job_id: job_id.clone(),
+        title,
         command: command.to_string(),
         workspace: workspace.clone(),
         session_id: super::workspace::try_session(),
-        pid,
+        kind: JobKind::Command { pid },
         started_wall: SystemTime::now(),
         started: Instant::now(),
         finished: None,
         log_path: log_path.clone(),
         state: JobState::Running,
+        acknowledged: false,
     };
+    let started = overview_of(&entry);
     jobs().lock().unwrap().insert(job_id.clone(), entry);
     sync_ledger(&host.paths);
+    if let Some(hook) = started_hook().lock().unwrap().clone() {
+        hook(started);
+    }
 
     let reaper_job_id = job_id.clone();
     let max_runtime = host.max_runtime;
@@ -357,16 +484,105 @@ pub async fn spawn_background(command: &str) -> Result<String> {
         finalize_job(&reaper_job_id, state, true);
     });
 
+    // Surface the job id in the tool's visible output stream so the user
+    // can see at a glance which job this call started.
+    progress.report_command_output(
+        CommandOutputStream::Stdout,
+        format!(
+            "{} {job_id}\n",
+            crate::i18n::text("Running in background:", "已后台运行")
+        )
+        .into_bytes(),
+    );
+
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "job_id": job_id,
         "pid": pid,
         "log": log_path.display().to_string(),
-        "note": "后台运行中。用 job_status 轮询（可用 wait_seconds 阻塞等待）；任务完成前不要臆测其结果。"
+        "note": t("Background command running. Query with job_status (wait_seconds blocks); never assume its result before it finishes.", "后台命令运行中。用 job_status 查询（可用 wait_seconds 阻塞等待）；命令完成前不要臆测其结果。")
     }))?)
 }
 
-fn finalize_job(job_id: &str, state: JobState, fire_hook: bool) {
+/// Detach a subagent as a background job: allocate an id and log file,
+/// register the entry, spawn the provided future, and finalize through the
+/// same completion hook as background commands (same wake, strip, stop).
+/// The builder receives (job_id, log_path) so the future can stream its
+/// progress into the log that `job_status` reads.
+pub async fn spawn_background_subagent<F>(
+    title: Option<&str>,
+    description: &str,
+    progress: &ToolProgress,
+    build: impl FnOnce(String, PathBuf) -> F,
+) -> Result<String>
+where
+    F: std::future::Future<Output = JobState> + Send + 'static,
+{
+    let host = require_host()?;
+    let job_id = next_job_id();
+    let dir = logs_dir(&host.paths);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create job log dir {}", dir.display()))?;
+    let log_path = dir.join(format!("{job_id}.log"));
+    std::fs::write(&log_path, b"")
+        .with_context(|| format!("failed to create job log {}", log_path.display()))?;
+    let title = title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(16).collect::<String>())
+        .unwrap_or_else(|| {
+            let mut fallback = description.chars().take(16).collect::<String>();
+            if fallback.chars().count() < description.chars().count() {
+                fallback.push('…');
+            }
+            fallback
+        });
+    let fut = build(job_id.clone(), log_path.clone());
+    let reaper_job_id = job_id.clone();
+    let handle = tokio::spawn(async move {
+        let state = fut.await;
+        finalize_job(&reaper_job_id, state, true);
+    });
+    let entry = JobEntry {
+        job_id: job_id.clone(),
+        title,
+        command: description.to_string(),
+        workspace: super::workspace::effective_workdir(),
+        session_id: super::workspace::try_session(),
+        kind: JobKind::Subagent {
+            abort: handle.abort_handle(),
+        },
+        started_wall: SystemTime::now(),
+        started: Instant::now(),
+        finished: None,
+        log_path: log_path.clone(),
+        state: JobState::Running,
+        acknowledged: false,
+    };
+    let started = overview_of(&entry);
+    jobs().lock().unwrap().insert(job_id.clone(), entry);
+    if let Some(hook) = started_hook().lock().unwrap().clone() {
+        hook(started);
+    }
+    // Subagent detach note rides its own progress channel so it lands as the
+    // block's ↳ subject line; CommandOutput is dropped for non-run_command.
+    progress.report(format!(
+        "__subagent_detach__{} {job_id}",
+        crate::i18n::text("Running in background:", "已后台运行")
+    ));
+    Ok(serde_json::to_string_pretty(&json!({
+        "ok": true,
+        "kind": "background_subagent",
+        "job_id": job_id,
+        "log": log_path.display().to_string(),
+        "note": t(
+            "Subagent detached to the background. Query with job_status (the log holds its progress); never assume its result before it finishes — you will be woken automatically when it completes.",
+            "子代理已后台分离运行。用 job_status 查询（日志即其进度）；完成前不要臆测结果，完成后会自动唤起你跟进。"
+        )
+    }))?)
+}
+
+fn finalize_job(job_id: &str, state: JobState, wake_requested: bool) {
     let completion = {
         let mut jobs = jobs().lock().unwrap();
         let Some(job) = jobs.get_mut(job_id) else {
@@ -379,6 +595,9 @@ fn finalize_job(job_id: &str, state: JobState, fire_hook: bool) {
         job.finished = Some(Instant::now());
         JobCompletion {
             job_id: job.job_id.clone(),
+            title: job.title.clone(),
+            wake_requested,
+            is_subagent: matches!(job.kind, JobKind::Subagent { .. }),
             command: job.command.clone(),
             workspace: job.workspace.clone(),
             session_id: job.session_id.clone(),
@@ -394,13 +613,18 @@ fn finalize_job(job_id: &str, state: JobState, fire_hook: bool) {
     if let Some(host) = host().get() {
         sync_ledger(&host.paths);
     }
-    if fire_hook {
-        let hook = completion_hook().lock().unwrap().clone();
-        if let Some(hook) = hook {
-            hook(completion);
+    let hook = completion_hook().lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook(completion);
+    }
+}
+
+impl JobEntry {
+    fn pid(&self) -> Option<u32> {
+        match &self.kind {
+            JobKind::Command { pid } => Some(*pid),
+            JobKind::Subagent { .. } => None,
         }
-    } else {
-        let _ = completion;
     }
 }
 
@@ -430,7 +654,42 @@ async fn job_status(args: Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let wait = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_WAIT_SECONDS);
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+
     let Some(job_id) = job_id else {
+        // No job_id: list all jobs. With wait_seconds, block until ANY job
+        // that was running at call time finishes (or the wait elapses) —
+        // one call can await a whole batch instead of polling each job.
+        let running_at_start = || {
+            jobs()
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|job| !job.state.is_terminal())
+                .map(|job| job.job_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let watched = running_at_start();
+        if wait > 0 && !watched.is_empty() {
+            let deadline = Instant::now() + Duration::from_secs(wait);
+            while Instant::now() < deadline {
+                let finished = {
+                    let jobs = jobs().lock().unwrap();
+                    watched.iter().any(|id| {
+                        jobs.get(id).map(|job| job.state.is_terminal()).unwrap_or(true)
+                    })
+                };
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(STATUS_POLL).await;
+            }
+        }
         let jobs = jobs().lock().unwrap();
         let mut rows = jobs.values().collect::<Vec<_>>();
         rows.sort_by_key(|job| job.started_wall);
@@ -439,6 +698,7 @@ async fn job_status(args: Value) -> Result<String> {
             .map(|job| {
                 json!({
                     "job_id": job.job_id,
+                    "title": job.title,
                     "status": job.state.label(),
                     "command": truncate_command(&job.command),
                     "runtime_seconds": job.finished.unwrap_or_else(Instant::now)
@@ -453,16 +713,9 @@ async fn job_status(args: Value) -> Result<String> {
         }))?);
     };
 
-    let wait = args
-        .get("wait_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(MAX_WAIT_SECONDS);
-    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
-
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut job = job_snapshot(job_id).with_context(|| {
-        format!("job {job_id} not found; jobs are process-local and cleared on restart")
+        format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空")
     })?;
     while !job.state.is_terminal() && Instant::now() < deadline {
         tokio::time::sleep(STATUS_POLL).await;
@@ -488,39 +741,120 @@ async fn job_status(args: Value) -> Result<String> {
     }))?)
 }
 
+/// Stop every running job bound to `session_id`; returns how many were
+/// stopped. Used when the owning REPL exits — background commands follow
+/// their conversation's lifecycle.
+pub async fn stop_session_jobs(session_id: &str) -> usize {
+    let targets = jobs()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|job| {
+            job.state == JobState::Running
+                && job.session_id.as_deref() == Some(session_id)
+        })
+        .map(|job| job.job_id.clone())
+        .collect::<Vec<_>>();
+    let mut stopped = 0;
+    for job_id in targets {
+        if stop_job(&job_id).await.is_ok() {
+            stopped += 1;
+        }
+    }
+    stopped
+}
+
+/// Host-initiated stop (WebUI strip ✕ button); same semantics as job_stop.
+pub async fn stop_job(job_id: &str) -> Result<()> {
+    job_stop(json!({ "job_id": job_id })).await.map(|_| ())
+}
+
 async fn job_stop(args: Value) -> Result<String> {
-    let job_id = args
+    let mut ids: Vec<String> = args
+        .get("job_ids")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(single) = args
         .get("job_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .context("job_id is required; usage: job_stop({\"job_id\":\"job_...\"})")?;
+    {
+        ids.push(single.to_string());
+    }
+    ids.dedup();
+    if ids.is_empty() {
+        bail!("job_id 或 job_ids 至少提供一个；usage: job_stop({{\"job_ids\":[\"abc123\"]}})");
+    }
+    if ids.len() > 1 {
+        let mut results = Vec::new();
+        for id in ids {
+            match stop_one(&id).await {
+                Ok(status) => results.push(json!({ "job_id": id, "ok": true, "status": status })),
+                Err(error) => {
+                    results.push(json!({ "job_id": id, "ok": false, "error": error.to_string() }))
+                }
+            }
+        }
+        return Ok(serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "results": results,
+        }))?);
+    }
+    let job_id = &ids[0];
     let job = job_snapshot(job_id)
-        .with_context(|| format!("job {job_id} not found"))?;
+        .with_context(|| format!("后台任务 {job_id} 不存在"))?;
     if job.state.is_terminal() {
         return Ok(serde_json::to_string_pretty(&json!({
             "ok": true,
             "job_id": job_id,
             "status": job.state.label(),
-            "note": "任务此前已结束",
+            "note": t("the background task had already finished", "该后台任务此前已结束"),
         }))?);
     }
-    // Mark terminal first so the reaper's own finalize becomes a no-op and
-    // the completion hook never fires for a stop the model itself requested.
-    finalize_job(job_id, JobState::Stopped, false);
-    signal_process_group(job.pid, libc::SIGTERM);
-    let deadline = Instant::now() + STOP_GRACE;
-    while process_alive(job.pid) && Instant::now() < deadline {
-        tokio::time::sleep(STATUS_POLL).await;
-    }
-    if process_alive(job.pid) {
-        signal_process_group(job.pid, libc::SIGKILL);
-    }
+    let status = stop_one(job_id).await?;
     Ok(serde_json::to_string_pretty(&json!({
         "ok": true,
         "job_id": job_id,
-        "status": "stopped",
+        "status": status,
     }))?)
+}
+
+/// Stop a single job; returns its resulting status label.
+async fn stop_one(job_id: &str) -> Result<String> {
+    let job = job_snapshot(job_id)
+        .with_context(|| format!("后台任务 {job_id} 不存在"))?;
+    if job.state.is_terminal() {
+        return Ok(job.state.label());
+    }
+    // Mark terminal first so the reaper's own finalize becomes a no-op;
+    // wake_requested=false tells the host to clean up without waking.
+    finalize_job(job_id, JobState::Stopped, false);
+    acknowledge(job_id);
+    match &job.kind {
+        JobKind::Command { pid } => {
+            let pid = *pid;
+            signal_process_group(pid, libc::SIGTERM);
+            let deadline = Instant::now() + STOP_GRACE;
+            while process_alive(pid) && Instant::now() < deadline {
+                tokio::time::sleep(STATUS_POLL).await;
+            }
+            if process_alive(pid) {
+                signal_process_group(pid, libc::SIGKILL);
+            }
+        }
+        JobKind::Subagent { abort } => abort.abort(),
+    }
+    Ok("stopped".to_string())
 }
 
 fn truncate_command(command: &str) -> String {
@@ -538,21 +872,25 @@ pub fn register_management(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_stop",
             t(
-                "Stop a background job started by run_command with background=true. Sends SIGTERM to its process group, escalating to SIGKILL after a grace period.",
-                "停止 run_command background=true 启动的后台任务。向其进程组发送 SIGTERM，宽限期后升级为 SIGKILL。",
+                "Stop background tasks (commands or subagents). Commands get SIGTERM then SIGKILL; subagents are aborted. Accepts job_ids for batch stops.",
+                "停止后台任务（后台命令或后台子代理）。命令向进程组发送 SIGTERM，宽限期后升级 SIGKILL；子代理直接中止。支持 job_ids 批量。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "job_id": { "type": "string", "description": "要停止的后台任务 id。" }
+                    "job_id": { "type": "string", "description": "要停止的任务 id（单个）。" },
+                    "job_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "要停止的任务 id 列表（批量）。"
+                    }
                 },
-                "required": ["job_id"],
                 "additionalProperties": false
             }),
             |args| async move { job_stop(args).await },
         )
         .writes()
-        .with_display_name(t("Stop background job", "停止后台任务")),
+        .with_display_name(t("Stop background task", "停止后台任务")),
     );
 }
 
@@ -562,13 +900,13 @@ pub fn register_status(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_status",
             t(
-                "Check background jobs started by run_command with background=true. Without job_id lists all jobs; with job_id returns status plus incremental log output from offset. wait_seconds (max 30) blocks until the job finishes or the wait elapses.",
-                "查询 run_command background=true 启动的后台任务。不带 job_id 列出全部任务；带 job_id 返回状态和从 offset 起的增量日志输出。wait_seconds（上限 30）会阻塞等待任务结束或超时。",
+                "Check background jobs started by run_command with background=true. Without job_id lists all jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset. wait_seconds is capped at 30.",
+                "查询 run_command background=true 启动的后台命令。不带 job_id 列出全部命令（此时 wait_seconds 表示等待任意一条运行中命令结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出。wait_seconds 上限 30 秒。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "job_id": { "type": "string", "description": "任务 id；省略则列出全部后台任务。" },
+                    "job_id": { "type": "string", "description": "后台命令 id；省略则列出全部后台命令。" },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "任务未结束时最多阻塞等待多少秒再返回。" },
                     "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" }
                 },
@@ -576,13 +914,19 @@ pub fn register_status(registry: &mut ToolRegistry) {
             }),
             |args| async move { job_status(args).await },
         )
-        .with_display_name(t("Check background jobs", "查询后台任务")),
+        .with_display_name(t("Check background tasks", "查询后台任务")),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_progress() -> ToolProgress {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        Box::leak(Box::new(receiver));
+        ToolProgress::new(sender)
+    }
 
     /// `init` is process-global (OnceLock), so every test shares one leaked
     /// home; individual tests must tolerate jobs from their siblings.
@@ -600,7 +944,7 @@ mod tests {
                 state_dir: root.join("state"),
                 ..crate::paths::MiyuPaths::new().unwrap()
             };
-            init(&paths, 8, 120);
+            init(&paths, 120);
         });
     }
 
@@ -608,7 +952,7 @@ mod tests {
     async fn background_job_lifecycle() {
         shared_init();
         let spawned: Value =
-            serde_json::from_str(&spawn_background("echo hello; exit 3").await.unwrap()).unwrap();
+            serde_json::from_str(&spawn_background("echo hello; exit 3", Some("退出码测试"), &test_progress()).await.unwrap()).unwrap();
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
         assert!(spawned["ok"].as_bool().unwrap());
 
@@ -624,10 +968,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_subagent_lifecycle() {
+        shared_init();
+        let spawned: Value = serde_json::from_str(
+            &spawn_background_subagent(Some("子代理测试"), "描述文本", &test_progress(), |_job_id, log_path| {
+                async move {
+                    let _ = std::fs::write(&log_path, "工作中\n");
+                    JobState::Exited { code: Some(0) }
+                }
+            })
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let job_id = spawned["job_id"].as_str().unwrap().to_string();
+        assert_eq!(spawned["kind"], "background_subagent");
+        let status: Value = serde_json::from_str(
+            &job_status(json!({"job_id": job_id, "wait_seconds": 10}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "exited(0)");
+        assert!(status["output"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("工作中"));
+    }
+
+    #[tokio::test]
     async fn job_stop_terminates_a_running_job() {
         shared_init();
         let spawned: Value =
-            serde_json::from_str(&spawn_background("sleep 300").await.unwrap()).unwrap();
+            serde_json::from_str(&spawn_background("sleep 300", None, &test_progress()).await.unwrap()).unwrap();
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
         let stopped: Value =
             serde_json::from_str(&job_stop(json!({"job_id": job_id})).await.unwrap()).unwrap();
@@ -641,7 +1014,7 @@ mod tests {
     async fn incremental_output_reads_from_offset() {
         shared_init();
         let spawned: Value =
-            serde_json::from_str(&spawn_background("printf 'AAABBB'").await.unwrap()).unwrap();
+            serde_json::from_str(&spawn_background("printf 'AAABBB'", None, &test_progress()).await.unwrap()).unwrap();
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
         let first: Value = serde_json::from_str(
             &job_status(json!({"job_id": job_id, "wait_seconds": 10})).await.unwrap(),

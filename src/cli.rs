@@ -194,13 +194,25 @@ fn repl_footer_line(mode: AgentMode, footer: &ReplFooterStatus, cols: usize) -> 
     let bar = input_prompt_bar(mode);
     let bar_width = visible_width(&bar);
     let usage = footer.token_usage;
-    let right_plain = render::format_token_usage_inline(
-        usage.turn_tokens,
-        usage.cached_tokens,
-        usage.session_tokens,
-        usage.context_window,
-        usage.cumulative_tokens,
-    );
+    // Narrow terminals: drop the cumulative total first, then the percent,
+    // so the core context meter survives as long as possible.
+    let mut right_plain = String::new();
+    for (with_cumulative, with_percent) in [(true, true), (false, true), (false, false)] {
+        right_plain = render::format_token_usage_inline_opts(
+            usage.turn_tokens,
+            usage.cached_tokens,
+            usage.session_tokens,
+            usage.context_window,
+            usage.cumulative_tokens.filter(|_| with_cumulative),
+            with_percent,
+        );
+        let left_room = cols
+            .saturating_sub(bar_width)
+            .saturating_sub(visible_width(&right_plain));
+        if left_room >= 24 {
+            break;
+        }
+    }
     let right = format!("\x1b[2m{right_plain}\x1b[0m");
     let right_width = visible_width(&right);
     let left_budget = cols.saturating_sub(bar_width.saturating_add(right_width).saturating_add(1));
@@ -4234,6 +4246,7 @@ async fn run_chat_with_images(
             AgentMode::Normal,
             &pasted_images,
             None,
+            None,
         )
         .await
         {
@@ -4441,6 +4454,7 @@ async fn run_chat_with_options(
             mode,
             &[],
             session_override.clone(),
+            None,
         )
         .await
         {
@@ -4562,6 +4576,7 @@ async fn try_run_remote_chat(
     mode: AgentMode,
     images: &[Option<crate::clipboard::PastedImage>],
     session_override: Option<String>,
+    jobs_feed: Option<&JobsFeed>,
 ) -> Result<Option<RemoteTurnSummary>> {
     let refreshed_paths = if direct_mode_requested() {
         None
@@ -4602,7 +4617,7 @@ async fn try_run_remote_chat(
         bail!("Miyu core closed the connection before accepting the turn");
     };
     let run_id = match first {
-        IpcFrame::Accepted { run_id } => run_id,
+        IpcFrame::Accepted { run_id, .. } => run_id,
         IpcFrame::Error { message, .. } => bail!("{message}"),
         _ => bail!("Miyu core returned an invalid response"),
     };
@@ -4653,6 +4668,7 @@ async fn try_run_remote_chat(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(33));
+    let mut job_strip_tick: u32 = 0;
     spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     spinner_tick.tick().await;
     let mut input_tick = tokio::time::interval(Duration::from_millis(16));
@@ -4766,6 +4782,22 @@ async fn try_run_remote_chat(
                     renderer.tick_spinner()?;
                     if let Some(live) = live.as_deref_mut() {
                         live.apply_renderer_frame(&mut renderer)?;
+                        // The job strip is part of the live tail, so it keeps
+                        // rendering during streaming; throttle to ~every 8th
+                        // spinner frame.
+                        if let Some(feed) = jobs_feed {
+                            job_strip_tick = job_strip_tick.wrapping_add(1);
+                            if job_strip_tick % 8 == 0 && !live.external_output_active {
+                                if live.set_jobs(feed.current()) {
+                                    synchronized_terminal_update(
+                                        CursorAfterUpdate::Preserve,
+                                        || live.redraw(),
+                                    )?;
+                                } else {
+                                    live.tick_job_strip()?;
+                                }
+                            }
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -5204,7 +5236,7 @@ fn apply_repl_session_switch(
     }
     let store = StateStore::new(paths)?.pinned(&state.session_id);
     active_session_id.clone_from(&state.session_id);
-    *history = load_repl_input_history(&store)?;
+    *history = load_repl_input_history(&store, paths)?;
     live_repl.editor.history = history.clone();
     live_repl.editor.history_index = live_repl.editor.history.len();
     live_repl.editor.history_clean_index = None;
@@ -6107,7 +6139,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
     let mut active_session_id = daemon_state.session_id.clone();
     let history_state = StateStore::new(paths)?.pinned(&active_session_id);
-    let mut history = load_repl_input_history(&history_state)?;
+    let mut history = load_repl_input_history(&history_state, paths)?;
     drop(history_state);
     let mut cumulative_tokens = daemon_state.cumulative_tokens;
     let mut footer = ReplFooterStatus::from_config(
@@ -6120,11 +6152,34 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     footer.update_thinking_variant(thinking_summary.as_deref());
     footer.update_context_window(daemon_state.context_window);
     let mut live_repl = LiveReplTail::new(mode, history.clone(), Vec::new(), footer.clone())?;
+    let jobs_shared = spawn_jobs_poll_thread(paths.clone());
+    let jobs_feed = JobsFeed::Shared(jobs_shared.clone());
 
     loop {
         live_repl.set_footer(footer.clone());
-        let Some((next_mode, input, images)) = read_live_repl_input(&mut live_repl, paths)? else {
-            break;
+        let (next_mode, input, images) = match read_live_repl_input(
+            &mut live_repl,
+            paths,
+            &jobs_feed,
+            Some(&active_session_id),
+        )? {
+            LiveReplOutcome::Exit => break,
+            LiveReplOutcome::FollowWake { run_id, label } => {
+                if let Err(error) = follow_wake_run(
+                    paths,
+                    &mut live_repl,
+                    &run_id,
+                    &label,
+                    &jobs_feed,
+                    &jobs_shared,
+                )
+                .await
+                {
+                    tracing::debug!(error = %error, "wake follow detached with an error");
+                }
+                continue;
+            }
+            LiveReplOutcome::Submit(next_mode, input, images) => (next_mode, input, images),
         };
         mode = next_mode;
         let input = input.trim();
@@ -6892,9 +6947,6 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     else {
                         continue;
                     };
-                    history.clear();
-                    live_repl.editor.history.clear();
-                    live_repl.editor.history_index = 0;
                     live_repl.editor.input.clear();
                     live_repl.editor.cursor = 0;
                     footer.reset_token_usage(state.context_tokens, state.context_window);
@@ -6921,6 +6973,8 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             continue;
         }
         history.push(input.to_string());
+        live_repl.editor.record_history(input);
+        persist_repl_history_entry(paths, input);
         match try_run_remote_chat(
             paths,
             Some(&mut live_repl),
@@ -6930,6 +6984,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             mode,
             &images,
             Some(active_session_id.clone()),
+            Some(&jobs_feed),
         )
         .await
         {
@@ -6941,6 +6996,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     summary.context_window,
                     Some(cumulative_tokens),
                 );
+                // Refresh the job strip right away — a background command
+                // spawned this turn must show up without waiting a poll.
+                if let Ok((jobs, _, wake_runs)) = fetch_jobs_overview(paths).await {
+                    *jobs_shared.jobs.lock().unwrap() = jobs.clone();
+                    *jobs_shared.wake_runs.lock().unwrap() = wake_runs;
+                    live_repl.set_jobs(jobs);
+                }
                 live_repl.refresh_footer(footer.clone())?;
             }
             Ok(None) => bail!(
@@ -6986,6 +7048,31 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             }
         }
     }
+    // Background commands follow their conversation's lifecycle: leaving the
+    // REPL (exit/quit or Ctrl+C) terminates this session's running jobs.
+    if let Ok((_, data)) = send_ipc_admin(
+        paths,
+        IpcCommand::StopSessionJobs {
+            session_id: active_session_id.clone(),
+        },
+    )
+    .await
+    {
+        let stopped = data
+            .get("stopped")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if stopped > 0 {
+            println!(
+                "\x1b[2m{}\x1b[0m",
+                if is_zh() {
+                    format!("已停止 {stopped} 个后台命令")
+                } else {
+                    format!("stopped {stopped} background command(s)")
+                }
+            );
+        }
+    }
     Ok(())
 }
 
@@ -6999,11 +7086,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     let _cursor_restore = ReplCursorRestore;
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
-    tools::jobs::init(
-        paths,
-        config.tools.background_job_limit,
-        config.tools.background_job_max_minutes,
-    );
+    tools::jobs::init(paths, config.tools.background_job_max_minutes);
     let state = StateStore::new(paths)?;
     state.init_files()?;
     apply_session_model_override(&state, &mut config);
@@ -7012,7 +7095,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
     let mut client = OpenAiCompatibleClient::from_config(&config, paths)?;
     let mut mode = initial_mode;
-    let mut input_history = load_repl_input_history(&state)?;
+    let mut input_history = load_repl_input_history(&state, paths)?;
     let mut prefill = None::<String>;
     let mut live_repl = None::<LiveReplTail>;
 
@@ -7044,7 +7127,20 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         footer.update_thinking_variant(thinking_summary.as_deref());
         let next_input = if let Some(live) = live_repl.as_mut() {
             live.set_footer(footer.clone());
-            read_live_repl_input(live, paths)?
+            let input = match read_live_repl_input(live, paths, &JobsFeed::Local, None)? {
+                LiveReplOutcome::Exit | LiveReplOutcome::FollowWake { .. } => None,
+                LiveReplOutcome::Submit(next_mode, input, images) => {
+                    Some((next_mode, input, images))
+                }
+            };
+            // The user moved on: finished background commands count as
+            // reported in direct mode (no daemon wake exists here).
+            for job in crate::tools::jobs::overview() {
+                if !job.running {
+                    crate::tools::jobs::acknowledge(&job.job_id);
+                }
+            }
+            input
         } else {
             read_repl_input(
                 paths,
@@ -7297,10 +7393,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
             run_reset(paths, None).await?;
-            input_history.clear();
             if let Some(live) = live_repl.as_mut() {
-                live.editor.history.clear();
-                live.editor.history_index = 0;
                 live.queued.clear();
             }
             cumulative_tokens = 0;
@@ -7310,10 +7403,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().eq_ignore_ascii_case("all")
         {
             run_reset(paths, Some("all")).await?;
-            input_history.clear();
             if let Some(live) = live_repl.as_mut() {
-                live.editor.history.clear();
-                live.editor.history_index = 0;
                 live.queued.clear();
             }
             agent.reset_memory()?;
@@ -7325,6 +7415,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             continue;
         }
         input_history.push(input.to_string());
+        persist_repl_history_entry(paths, input);
         if let Some(live) = live_repl.as_mut() {
             live.editor.record_history(input);
         }
@@ -7996,14 +8087,74 @@ fn split_repl_command(input: &str) -> (&str, &str) {
     (command, args)
 }
 
-fn load_repl_input_history(state: &StateStore) -> Result<Vec<String>> {
-    Ok(state
+const REPL_HISTORY_CAP: usize = 200;
+
+fn repl_history_file(paths: &MiyuPaths) -> PathBuf {
+    paths.state_dir.join("repl-history.jsonl")
+}
+
+/// Prompt history that survives /reset and restarts: a global append-only
+/// file, capped on load. Conversation resets delete turns, so the file is
+/// the durable source; the turns-derived list only seeds sessions that
+/// predate it.
+fn load_persistent_repl_history(paths: &MiyuPaths) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(repl_history_file(paths)) else {
+        return Vec::new();
+    };
+    let mut entries = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<String>(line).ok())
+        .filter(|entry| !entry.trim().is_empty())
+        .collect::<Vec<_>>();
+    if entries.len() > REPL_HISTORY_CAP {
+        entries = entries.split_off(entries.len() - REPL_HISTORY_CAP);
+        // Opportunistic rewrite keeps the file from growing without bound.
+        let rewritten = entries
+            .iter()
+            .filter_map(|entry| serde_json::to_string(entry).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(repl_history_file(paths), rewritten + "\n");
+    }
+    entries
+}
+
+fn persist_repl_history_entry(paths: &MiyuPaths, entry: &str) {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(entry) else {
+        return;
+    };
+    let path = repl_history_file(paths);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            writeln!(file, "{line}")
+        });
+}
+
+fn load_repl_input_history(state: &StateStore, paths: &MiyuPaths) -> Result<Vec<String>> {
+    let mut merged: Vec<String> = state
         .load_conversation()?
         .into_iter()
         .filter(|entry| entry.role == "user" && !entry.content.trim().is_empty())
         .map(|entry| strip_terminal_control_sequences(&entry.content))
         .filter(|content| !content.trim().is_empty())
-        .collect())
+        .collect();
+    for entry in load_persistent_repl_history(paths) {
+        if !merged.contains(&entry) {
+            merged.push(entry);
+        }
+    }
+    Ok(merged)
 }
 
 fn print_repl_help() {
@@ -8195,16 +8346,17 @@ impl LiveReplEditor {
                     }
                 }
                 KeyCode::Esc => {
-                    if allow_interrupt
-                        && self
+                    // Esc never clears typed input (Ctrl+C does that); it
+                    // only arms the double-press interrupt while a reply is
+                    // running.
+                    if allow_interrupt {
+                        if self
                             .escape_armed_until
                             .is_some_and(|deadline| Instant::now() < deadline)
-                    {
-                        self.escape_armed_until = None;
-                        return Ok(LiveEditorAction::Interrupt);
-                    }
-                    self.clear();
-                    if allow_interrupt {
+                        {
+                            self.escape_armed_until = None;
+                            return Ok(LiveEditorAction::Interrupt);
+                        }
                         self.escape_armed_until = Some(Instant::now() + Duration::from_secs(2));
                     }
                 }
@@ -8450,6 +8602,8 @@ struct LiveReplTail {
     queued: Vec<QueuedPrompt>,
     pending_chunks: Vec<ChatStreamChunk>,
     footer: ReplFooterStatus,
+    jobs: Vec<crate::tools::jobs::JobOverview>,
+    job_spinner: usize,
     output_cursor: (u16, u16),
     tail_start: u16,
     tail_rows: u16,
@@ -8808,6 +8962,8 @@ impl LiveReplTail {
             queued,
             pending_chunks: Vec::new(),
             footer,
+            jobs: Vec::new(),
+            job_spinner: 0,
             output_cursor: cursor::position()?,
             tail_start: 0,
             tail_rows: 0,
@@ -8829,6 +8985,50 @@ impl LiveReplTail {
     /// Replaces the footer and redraws the live editor immediately when it is
     /// already on screen. Without the redraw, token/context updates remain
     /// invisible until the next input event causes the editor to render.
+    /// Update the background-command strip; returns true when a redraw is
+    /// needed (content changed, or spinners/timers must advance).
+    fn set_jobs(&mut self, jobs: Vec<crate::tools::jobs::JobOverview>) -> bool {
+        let changed = self.jobs.len() != jobs.len()
+            || self
+                .jobs
+                .iter()
+                .zip(jobs.iter())
+                .any(|(a, b)| a.job_id != b.job_id || a.status != b.status);
+        self.jobs = jobs;
+        changed
+    }
+
+    /// Lightweight spinner/timer repaint of the job strip only — no full
+    /// tail redraw, so it can run at animation frequency without flicker.
+    fn tick_job_strip(&mut self) -> Result<()> {
+        if !self.rendered || self.jobs.is_empty() {
+            return Ok(());
+        }
+        self.job_spinner = self.job_spinner.wrapping_add(1);
+        let (cols, _) = terminal::size().unwrap_or((80, 24));
+        let lines = background_job_lines(&self.jobs, self.job_spinner, usize::from(cols));
+        let rows = lines.len().min(u16::MAX as usize) as u16;
+        if rows > self.tail_rows {
+            return Ok(());
+        }
+        let start = self.tail_start.saturating_add(self.tail_rows).saturating_sub(rows);
+        let input_cursor = self.input_cursor;
+        // Lines are padded to the full terminal width, so plain overwrites
+        // suffice — no Clear, no intermediate blank state. The synchronized
+        // block keeps the cursor hop invisible over slow links (SSH).
+        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+            let mut stdout = io::stdout();
+            let mut row = start;
+            for line in &lines {
+                queue!(stdout, MoveTo(0, row), Print(line))?;
+                row = row.saturating_add(1);
+            }
+            queue!(stdout, MoveTo(input_cursor.0, input_cursor.1))?;
+            stdout.flush()?;
+            Ok(())
+        })
+    }
+
     fn refresh_footer(&mut self, footer: ReplFooterStatus) -> Result<()> {
         self.set_footer(footer);
         if self.rendered {
@@ -8887,10 +9087,13 @@ impl LiveReplTail {
             clipped.extend(queue_lines.split_off(queue_lines.len().saturating_sub(keep)));
             queue_lines = clipped;
         }
+        let job_lines = background_job_lines(&self.jobs, self.job_spinner, usize::from(cols));
+        let job_rows = job_lines.len().min(u16::MAX as usize) as u16;
         let total_rows = 1u16
             .saturating_add(queue_lines.len().min(u16::MAX as usize) as u16)
             .saturating_add(queue_gap)
-            .saturating_add(editor_rows);
+            .saturating_add(editor_rows)
+            .saturating_add(job_rows);
         let placement = live_tail_placement(output_col, output_row, total_rows, terminal_rows);
         if placement.overflow > 0 {
             let mut stdout = io::stdout();
@@ -8939,8 +9142,23 @@ impl LiveReplTail {
         // editor with the cursor hidden and then exited early). This is
         // the single convergence point for every editor redraw, so an
         // unconditional Show here prevents a permanently invisible cursor.
-        execute!(io::stdout(), crossterm::cursor::Show)?;
         self.input_cursor = cursor::position()?;
+        if !job_lines.is_empty() {
+            let mut stdout = io::stdout();
+            let mut job_row = input_row.saturating_add(rendered_rows);
+            for line in &job_lines {
+                queue!(
+                    stdout,
+                    MoveTo(0, job_row),
+                    Clear(ClearType::CurrentLine),
+                    Print(line)
+                )?;
+                job_row = job_row.saturating_add(1);
+            }
+            queue!(stdout, MoveTo(self.input_cursor.0, self.input_cursor.1))?;
+            stdout.flush()?;
+        }
+        execute!(io::stdout(), crossterm::cursor::Show)?;
         self.output_cursor = (output_col, output_row);
         self.tail_start = tail_start;
         self.tail_rows = total_rows;
@@ -9115,6 +9333,32 @@ impl LiveReplTail {
         self.resume_at(output_cursor)
     }
 
+    /// Print a background-command wake reply into the scrollback while the
+    /// REPL idles: dim header, then the assistant's report.
+    fn show_background_report(&mut self, report: &BackgroundReport) -> Result<()> {
+        self.suspend()?;
+        let mut stdout = io::stdout();
+        queue!(
+            stdout,
+            Print(format!(
+                "\x1b[2m⚙ {}\x1b[0m\r\n\r\n",
+                report
+                    .headline
+                    .strip_prefix("[后台任务完成] ")
+                    .or_else(|| report.headline.strip_prefix("[后台命令完成] "))
+                    .unwrap_or(&report.headline)
+            ))
+        )?;
+        for line in report.reply.lines() {
+            queue!(stdout, Print(format!("{}\r\n", render::render_markdown_line(line))))?;
+        }
+        queue!(stdout, Print("\r\n"))?;
+        stdout.flush()?;
+        self.output_cursor = cursor::position()?;
+        let output_cursor = self.output_cursor;
+        self.resume_at(output_cursor)
+    }
+
     /// Remove queued bubbles without committing them as sent messages —
     /// the daemon dropped these prompts (explicit cancel), they were never
     /// answered and never entered the conversation.
@@ -9174,6 +9418,70 @@ fn repl_input_rendered_rows(
     } else {
         3
     })
+}
+
+const JOB_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn format_job_duration(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Status strip under the footer: a leading blank line, then one line per
+/// background command with a blank line between entries. Timers are
+/// right-aligned to the terminal width.
+fn background_job_lines(
+    jobs: &[crate::tools::jobs::JobOverview],
+    spinner_phase: usize,
+    cols: usize,
+) -> Vec<String> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let kind_label = |job: &crate::tools::jobs::JobOverview| {
+        if job.kind == "subagent" {
+            crate::i18n::text("agent", "子代理")
+        } else {
+            crate::i18n::text("cmd", "命令")
+        }
+    };
+    // Pad kinds to one column so mixed command/subagent rows keep their ids
+    // and titles vertically aligned.
+    let kind_col = jobs
+        .iter()
+        .map(|job| visible_width(kind_label(job)))
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![String::new()];
+    for job in jobs.iter() {
+        let marker = JOB_SPINNER_FRAMES[spinner_phase % JOB_SPINNER_FRAMES.len()];
+        let kind_word = kind_label(job);
+        let kind_pad = " ".repeat(kind_col.saturating_sub(visible_width(kind_word)));
+        let mut left = format!("{marker} {kind_word}{kind_pad} {} · {}", job.job_id, job.title);
+        let timer = format_job_duration(job.runtime_seconds);
+        let timer_width = visible_width(&timer);
+        // Never exceed the terminal width: a wrapped strip line would shift
+        // the whole tail and flicker.
+        let max_left = cols.saturating_sub(timer_width).saturating_sub(2);
+        while visible_width(&left) > max_left && !left.is_empty() {
+            left.pop();
+        }
+        let left_width = visible_width(&left);
+        let pad = cols
+            .saturating_sub(left_width)
+            .saturating_sub(timer_width)
+            .max(1);
+        lines.push(format!(
+            "\x1b[2m{left}{}{timer}\x1b[0m",
+            " ".repeat(pad)
+        ));
+    }
+    lines
 }
 
 fn queued_prompt_lines(prompts: &[QueuedPrompt], mode: AgentMode, cols: usize) -> Vec<String> {
@@ -9401,16 +9709,201 @@ impl Drop for LiveRawMode {
     }
 }
 
-fn read_live_repl_input(
-    live: &mut LiveReplTail,
-    paths: &MiyuPaths,
-) -> Result<
-    Option<(
+/// Shared feed state between the remote REPL and its IPC poll thread.
+#[derive(Default)]
+struct SharedJobsFeed {
+    jobs: std::sync::Mutex<Vec<crate::tools::jobs::JobOverview>>,
+    /// Rendered wake-turn reports waiting to be printed into the scrollback.
+    reports: std::sync::Mutex<Vec<BackgroundReport>>,
+    /// Active daemon-initiated wake runs: (run_id, session_id, label).
+    wake_runs: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Wake runs already attached to (never re-follow), and turn ids that
+    /// were rendered live (their DB report must not print again).
+    followed_runs: std::sync::Mutex<std::collections::HashSet<String>>,
+    rendered_turns: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Clone)]
+struct BackgroundReport {
+    turn_id: String,
+    headline: String,
+    reply: String,
+}
+
+/// Source of background-command snapshots for the idle status strip.
+enum JobsFeed {
+    /// Remote REPL: snapshots pushed by the IPC poll thread.
+    Shared(std::sync::Arc<SharedJobsFeed>),
+    /// Direct REPL: read the in-process registry.
+    Local,
+}
+
+impl JobsFeed {
+    fn current(&self) -> Vec<crate::tools::jobs::JobOverview> {
+        match self {
+            JobsFeed::Shared(shared) => shared.jobs.lock().unwrap().clone(),
+            JobsFeed::Local => crate::tools::jobs::overview(),
+        }
+    }
+
+    fn take_reports(&self) -> Vec<BackgroundReport> {
+        match self {
+            JobsFeed::Shared(shared) => {
+                let mut reports = shared.reports.lock().unwrap();
+                let rendered = shared.rendered_turns.lock().unwrap();
+                let taken = reports
+                    .drain(..)
+                    .filter(|report| !rendered.contains(&report.turn_id))
+                    .collect();
+                taken
+            }
+            JobsFeed::Local => Vec::new(),
+        }
+    }
+
+    /// Next wake run in `session` that has not been followed yet; marks it
+    /// followed so the caller attaches exactly once.
+    fn claim_wake_run(&self, session: &str) -> Option<(String, String)> {
+        let JobsFeed::Shared(shared) = self else {
+            return None;
+        };
+        let wake_runs = shared.wake_runs.lock().unwrap();
+        let mut followed = shared.followed_runs.lock().unwrap();
+        for (run_id, run_session, label) in wake_runs.iter() {
+            if run_session == session && !followed.contains(run_id) {
+                followed.insert(run_id.clone());
+                return Some((run_id.clone(), label.clone()));
+            }
+        }
+        None
+    }
+}
+
+/// Poll the daemon for background commands while the remote REPL idles:
+/// 1s when commands are live, 3s when quiet — a unix-socket roundtrip
+/// costs microseconds either way.
+fn spawn_jobs_poll_thread(paths: MiyuPaths) -> std::sync::Arc<SharedJobsFeed> {
+    let shared = std::sync::Arc::new(SharedJobsFeed::default());
+    let feed = shared.clone();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        // Track per-session watermarks so wake replies print exactly once,
+        // and never replay history from before this REPL started.
+        let mut seen: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        // The store open can lose a race against daemon writes (SQLITE_BUSY);
+        // retry every cycle instead of deciding at startup forever.
+        let mut store: Option<StateStore> = None;
+        loop {
+            if store.is_none() {
+                store = StateStore::new(&paths).ok();
+            }
+            let (jobs, session_id, wake_runs) = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        fetch_jobs_overview(&paths),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Ok((Vec::new(), None, Vec::new())))
+                })
+                .unwrap_or_default();
+            *feed.jobs.lock().unwrap() = jobs;
+            *feed.wake_runs.lock().unwrap() = wake_runs;
+            if let (Some(store), Some(session_id)) = (store.as_ref(), session_id) {
+                let watermark = match seen.entry(session_id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let latest = store.latest_turn_seq(&session_id).unwrap_or(0);
+                        *entry.insert(latest)
+                    }
+                };
+                if let Ok(rows) = store.background_report_replies_after(&session_id, watermark) {
+                    for (seq, turn_id, display, reply) in rows {
+                        seen.insert(session_id.clone(), seq);
+                        if feed.rendered_turns.lock().unwrap().contains(&turn_id) {
+                            continue;
+                        }
+                        feed.reports.lock().unwrap().push(BackgroundReport {
+                            turn_id,
+                            headline: display,
+                            reply,
+                        });
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+    shared
+}
+
+type JobsOverviewSnapshot = (
+    Vec<crate::tools::jobs::JobOverview>,
+    Option<String>,
+    Vec<(String, String, String)>,
+);
+
+async fn fetch_jobs_overview(paths: &MiyuPaths) -> Result<JobsOverviewSnapshot> {
+    let mut stream = ipc::connect(&paths.ipc_socket()).await?;
+    ipc::send(&mut stream, &IpcRequest::new(IpcCommand::JobsOverview)).await?;
+    match ipc::receive::<IpcFrame>(&mut stream).await? {
+        Some(IpcFrame::AdminResult { state, data }) => {
+            let wake_runs = data
+                .get("wake_runs")
+                .and_then(serde_json::Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            Some((
+                                row.get("run_id")?.as_str()?.to_string(),
+                                row.get("session_id")?.as_str()?.to_string(),
+                                row.get("label")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok((
+                data.get("jobs")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                Some(state.session_id),
+                wake_runs,
+            ))
+        }
+        _ => Ok((Vec::new(), None, Vec::new())),
+    }
+}
+
+enum LiveReplOutcome {
+    Exit,
+    Submit(
         AgentMode,
         String,
         Vec<Option<crate::clipboard::PastedImage>>,
-    )>,
-> {
+    ),
+    /// A daemon-initiated wake turn is running in this session; the caller
+    /// should attach and render it live.
+    FollowWake { run_id: String, label: String },
+}
+
+fn read_live_repl_input(
+    live: &mut LiveReplTail,
+    paths: &MiyuPaths,
+    jobs_feed: &JobsFeed,
+    wake_session: Option<&str>,
+) -> Result<LiveReplOutcome> {
     let mut raw = if std::mem::take(&mut live.raw_mode_handoff) {
         LiveRawMode::adopt()
     } else {
@@ -9419,7 +9912,34 @@ fn read_live_repl_input(
     if !live.rendered {
         synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
     }
+    let mut last_key_at = Instant::now();
     loop {
+        if !event::poll(std::time::Duration::from_millis(80))? {
+            // Idle tick: structural changes redraw the whole tail; otherwise
+            // only the strip repaints. While the user is actively typing the
+            // animation pauses so the two repaint sources never interleave.
+            for report in jobs_feed.take_reports() {
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                    live.show_background_report(&report)
+                })?;
+            }
+            let typing = last_key_at.elapsed() < Duration::from_millis(350);
+            if typing {
+                continue;
+            }
+            if let Some(session) = wake_session {
+                if let Some((run_id, label)) = jobs_feed.claim_wake_run(session) {
+                    return Ok(LiveReplOutcome::FollowWake { run_id, label });
+                }
+            }
+            if live.set_jobs(jobs_feed.current()) {
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?;
+            } else {
+                live.tick_job_strip()?;
+            }
+            continue;
+        }
+        last_key_at = Instant::now();
         match live.editor.handle_event(event::read()?, paths, false)? {
             LiveEditorAction::None => {}
             LiveEditorAction::Redraw => {
@@ -9439,14 +9959,302 @@ fn read_live_repl_input(
                     live.commit_submission(&submission)
                 })?;
                 raw.keep_cursor_hidden();
-                return Ok(Some((mode, submission.content, submission.images)));
+                return Ok(LiveReplOutcome::Submit(
+                    mode,
+                    submission.content,
+                    submission.images,
+                ));
             }
             LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
                 synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
-                return Ok(None);
+                return Ok(LiveReplOutcome::Exit);
             }
         }
     }
+}
+
+/// Attach to a daemon-initiated wake turn and render it live: streaming
+/// content, reasoning, and tool activity, exactly like a user-started turn.
+/// ESC detaches (the turn keeps running; the DB report is suppressed because
+/// the turn was already rendered here). Typed submissions queue into the
+/// wake turn as follow-ups.
+async fn follow_wake_run(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+    run_id: &str,
+    label: &str,
+    jobs_feed: &JobsFeed,
+    jobs_shared: &std::sync::Arc<SharedJobsFeed>,
+) -> Result<()> {
+    let config = AppConfig::load_or_default(paths)?;
+    let mut stream = ipc::connect(&paths.ipc_socket()).await?;
+    ipc::send(
+        &mut stream,
+        &IpcRequest::new(IpcCommand::FollowRun {
+            run_id: run_id.to_string(),
+        }),
+    )
+    .await?;
+    let mut turn_id: Option<String> = match ipc::receive::<IpcFrame>(&mut stream).await? {
+        Some(IpcFrame::Accepted { turn_id, .. }) => turn_id,
+        // Run already finished — the DB report path will print it instead.
+        _ => return Ok(()),
+    };
+
+    let mut renderer = render::StreamRenderer::new(
+        render::ReasoningDisplayMode::from_config(&config.display.reasoning),
+        render::ToolCallDisplayMode::from_config(&config.display.tool_calls),
+        false,
+        config.display.readable_tool_names,
+        config.display.command_output_lines,
+    );
+    renderer.use_external_cursor_control();
+    renderer.use_buffered_output();
+    live.external_output_active = false;
+    // Print the header straight into the scrollback (not the live frame):
+    // it must survive the streaming render that follows.
+    {
+        live.suspend()?;
+        let mut stdout = io::stdout();
+        let header = if label.is_empty() {
+            crate::i18n::text("⚙ background task finished", "⚙ 后台任务完成").to_string()
+        } else {
+            format!("⚙ {label}")
+        };
+        queue!(stdout, Print(format!("\x1b[2m{header}\x1b[0m\r\n\r\n")))?;
+        stdout.flush()?;
+        live.output_cursor = cursor::position()?;
+        let output_cursor = live.output_cursor;
+        live.resume_at(output_cursor)?;
+    }
+    renderer.start_waiting()?;
+    live.apply_renderer_frame(&mut renderer)?;
+    let mut raw = LiveRawMode::start()?;
+
+    let mut spinner_tick = tokio::time::interval(Duration::from_millis(33));
+    spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spinner_tick.tick().await;
+    let mut input_tick = tokio::time::interval(Duration::from_millis(16));
+    input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    input_tick.tick().await;
+    let mut follow_strip_tick: u32 = 0;
+
+    'outer: loop {
+        let recv = ipc::receive::<IpcFrame>(&mut stream);
+        tokio::pin!(recv);
+        let frame = loop {
+            tokio::select! {
+                biased;
+                _ = input_tick.tick() => {
+                    if !event::poll(Duration::ZERO)? {
+                        continue;
+                    }
+                    match live.editor.handle_event(event::read()?, paths, true)? {
+                        LiveEditorAction::None => {}
+                        LiveEditorAction::Redraw if !live.external_output_active => {
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                                live.redraw()
+                            })?
+                        }
+                        LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
+                        LiveEditorAction::EmptySubmit => {}
+                        LiveEditorAction::Submit(submission) => {
+                            let Some(target_turn) = turn_id.as_deref() else {
+                                continue;
+                            };
+                            if let Ok(prompt) = persist_remote_queued_submission(
+                                paths,
+                                run_id,
+                                target_turn,
+                                &submission,
+                            )
+                            .await
+                            {
+                                live.editor.record_history(&submission.content);
+                                synchronized_terminal_update(
+                                    CursorAfterUpdate::Preserve,
+                                    || live.enqueue(prompt),
+                                )?;
+                            }
+                        }
+                        LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                            // Detach only: the wake turn keeps running.
+                            break 'outer;
+                        }
+                    }
+                }
+                frame = &mut recv => break frame?,
+                _ = spinner_tick.tick() => {
+                    // SpinnerTick 经 live 路径冲刷 chunk 缓冲，流式输出靠它。
+                    handle_live_agent_event(live, &mut renderer, AgentEvent::SpinnerTick)?;
+                    // 状态条是 live tail 的一部分，附着期间同样要持续刷新。
+                    follow_strip_tick = follow_strip_tick.wrapping_add(1);
+                    if follow_strip_tick % 8 == 0 && !live.external_output_active {
+                        if live.set_jobs(jobs_feed.current()) {
+                            synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                                live.redraw()
+                            })?;
+                        } else {
+                            live.tick_job_strip()?;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(IpcFrame::Event { kind, data, .. }) = frame else {
+            break;
+        };
+        match kind.as_str() {
+            "turn.started" => {
+                turn_id = Some(ipc_text(&data, "turn_id").to_string());
+            }
+            "assistant.delta" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::Chunk(ChatStreamChunk {
+                    kind: crate::llm::ChatStreamKind::Content,
+                    text: ipc_text(&data, "delta").to_string(),
+                }),
+            )?,
+            "reasoning.delta" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::Chunk(ChatStreamChunk {
+                    kind: crate::llm::ChatStreamKind::Reasoning,
+                    text: ipc_text(&data, "delta").to_string(),
+                }),
+            )?,
+            "reasoning.start" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningStart {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.reset" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningReset {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.part_start" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningPartStart {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.part_end" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningPartEnd {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "reasoning.title" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningTitle(ipc_text(&data, "title").to_string()),
+            )?,
+            "tool.started" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ToolCall {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
+                    name: ipc_text(&data, "name").to_string(),
+                    arguments: ipc_text(&data, "arguments").to_string(),
+                },
+            )?,
+            "tool.progress" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ToolProgress {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
+                    name: ipc_text(&data, "name").to_string(),
+                    message: ipc_text(&data, "message").to_string(),
+                },
+            )?,
+            "tool.output" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::CommandOutput {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
+                    name: ipc_text(&data, "name").to_string(),
+                    stream: if ipc_text(&data, "stream") == "stderr" {
+                        tools::CommandOutputStream::Stderr
+                    } else {
+                        tools::CommandOutputStream::Stdout
+                    },
+                    chunk: ipc_text(&data, "output").as_bytes().to_vec(),
+                },
+            )?,
+            "tool.finished" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ToolResult {
+                    call_id: ipc_text(&data, "tool_id").to_string(),
+                    name: ipc_text(&data, "name").to_string(),
+                    ok: data
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    output: ipc_text(&data, "output").to_string(),
+                },
+            )?,
+            "queue.consumed" => {
+                let prompt_ids: Vec<String> = data
+                    .get("prompt_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let consumed_mode = match ipc_text(&data, "mode") {
+                    "plan" => AgentMode::Plan,
+                    "chat" => AgentMode::Chat,
+                    _ => AgentMode::Normal,
+                };
+                renderer.prepare_for_external_output()?;
+                live.apply_renderer_frame(&mut renderer)?;
+                synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                    live.suspend()?;
+                    live.consume_queued(&prompt_ids, consumed_mode)
+                })?;
+            }
+            "generation.superseded" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ReasoningReset {
+                    received_at: Instant::now(),
+                },
+            )?,
+            "run.completed" | "run.failed" | "run.cancelled" => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Flush chunks still buffered when the terminal frame arrived — the
+    // final content burst lands right before run.completed.
+    live.flush_pending_chunks(&mut renderer)?;
+    renderer.finish()?;
+    live.apply_renderer_frame(&mut renderer)?;
+    raw.handoff();
+    live.raw_mode_handoff = true;
+    // Suppress the duplicate DB report for a turn that was rendered live.
+    if let Some(turn_id) = turn_id {
+        jobs_shared
+            .rendered_turns
+            .lock()
+            .unwrap()
+            .insert(turn_id);
+    }
+    Ok(())
 }
 
 fn handle_live_agent_event(
@@ -12427,11 +13235,13 @@ mod repl_input_tests {
             editor.handle_event(escape(), &paths, true).unwrap(),
             LiveEditorAction::Redraw
         ));
-        assert!(editor.input.is_empty());
+        // Arming the interrupt must not clear the typed draft.
+        assert_eq!(editor.input, "draft");
         assert!(matches!(
             editor.handle_event(escape(), &paths, true).unwrap(),
             LiveEditorAction::Interrupt
         ));
+        assert_eq!(editor.input, "draft");
 
         let clear = Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert!(matches!(
@@ -12447,6 +13257,10 @@ mod repl_input_tests {
             editor.handle_event(escape(), &paths, false).unwrap(),
             LiveEditorAction::Redraw
         ));
+        // Esc no longer clears drafts anywhere; empty the editor manually
+        // before asserting the empty-submit path.
+        assert_eq!(editor.input, "draft");
+        editor.clear();
 
         assert!(matches!(
             editor
@@ -12492,6 +13306,8 @@ mod repl_input_tests {
             rendered: false,
             external_output_active: true,
             raw_mode_handoff: false,
+            jobs: Vec::new(),
+            job_spinner: 0,
         };
         let mut renderer = render::StreamRenderer::new(
             render::ReasoningDisplayMode::Hidden,
@@ -12522,6 +13338,8 @@ mod repl_input_tests {
             rendered: false,
             external_output_active: false,
             raw_mode_handoff: false,
+            jobs: Vec::new(),
+            job_spinner: 0,
         };
 
         for (kind, text) in [
@@ -13110,7 +13928,7 @@ mod repl_input_tests {
         state.start_turn("turn_2", "second", 999999).unwrap();
 
         assert_eq!(
-            load_repl_input_history(&state).unwrap(),
+            load_repl_input_history(&state, &paths).unwrap(),
             vec!["first".to_string(), "second".to_string()]
         );
     }
@@ -13452,7 +14270,7 @@ pub(crate) fn build_tool_registry(
     } else {
         tools::ToolRegistry::new()
     };
-    if config.tools.enabled && config.skills.enabled && mode != AgentMode::Chat {
+    if config.tools.enabled && config.skills.enabled {
         tools::register_skills(&mut registry, config, paths)?;
         if mode == AgentMode::Normal {
             tools::register_skill_authoring(&mut registry, config.clone(), paths.clone());
@@ -13588,6 +14406,7 @@ mod remote_tool_image_tests {
             .contains("closed the connection without a response"));
 
         let unexpected = validate_ipc_command_response(Some(IpcFrame::Accepted {
+            turn_id: None,
             run_id: "run-test".to_string(),
         }))
         .unwrap_err();

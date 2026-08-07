@@ -1,7 +1,7 @@
 {
   "name": "run_command",
   "display_name": "运行命令",
-  "description": "运行 shell 命令或复杂 shell 脚本，用于测试、构建、检查和脚本化任务。编辑文件优先使用 apply_patch；不要用 shell heredoc/cat/tee 写源代码文件，除非用户明确要求。",
+  "description": "运行 shell 命令或复杂 shell 脚本，用于测试、构建、检查和脚本化任务。长时命令（构建、dev server、批处理）用 background=true 后台运行并附一个短 title：立即返回短 job_id，用 job_status 查询进度和输出、job_stop 停止；命令完成后系统会自动通知你跟进。编辑文件优先使用 apply_patch；不要用 shell heredoc/cat/tee 写源代码文件，除非用户明确要求。",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,7 +11,15 @@
       },
       "timeout_seconds": {
         "type": "integer",
-        "description": "可选超时时间，单位秒。"
+        "description": "可选超时时间，单位秒。background=true 时忽略。"
+      },
+      "background": {
+        "type": "boolean",
+        "description": "后台分离运行并立即返回短 job_id。适用于预计超过约 30 秒的命令。"
+      },
+      "title": {
+        "type": "string",
+        "description": "后台命令的短标题（不超过 16 字），用于界面状态行显示，例如“release 构建”。background=true 时建议提供。"
       }
     },
     "required": [

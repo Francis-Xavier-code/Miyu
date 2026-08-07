@@ -826,6 +826,24 @@ pub(crate) fn format_token_usage_inline(
     context_window: Option<usize>,
     cumulative_tokens: Option<u64>,
 ) -> String {
+    format_token_usage_inline_opts(
+        turn_tokens,
+        cached_tokens,
+        session_tokens,
+        context_window,
+        cumulative_tokens,
+        true,
+    )
+}
+
+pub(crate) fn format_token_usage_inline_opts(
+    turn_tokens: u64,
+    cached_tokens: u64,
+    session_tokens: u64,
+    context_window: Option<usize>,
+    cumulative_tokens: Option<u64>,
+    show_percent: bool,
+) -> String {
     let context_window = context_window.map(|value| value as u64);
     let context = context_window
         .map(format_compact_count)
@@ -839,11 +857,15 @@ pub(crate) fn format_token_usage_inline(
         "?".to_string()
     };
 
-    let mut session = format!(
-        "{}/{} ({usage_ratio})",
-        format_compact_count(session_tokens),
-        context,
-    );
+    let mut session = if show_percent {
+        format!(
+            "{}/{} ({usage_ratio})",
+            format_compact_count(session_tokens),
+            context,
+        )
+    } else {
+        format!("{}/{}", format_compact_count(session_tokens), context)
+    };
     if let Some(cumulative_tokens) = cumulative_tokens {
         session.push_str(&format!(" · Σ{}", format_compact_count(cumulative_tokens)));
     }
@@ -1391,6 +1413,21 @@ impl StreamRenderer {
         }
         if message == "__external_output__" {
             self.prepare_for_external_output()?;
+            return Ok(());
+        }
+        if let Some(text) = message.strip_prefix("__subagent_detach__") {
+            if self.tool_call_mode == ToolCallDisplayMode::Full {
+                self.release_transient_output()?;
+                let display_name = self.display_tool_name(name);
+                let stdout = &mut self.output;
+                writeln!(stdout, "{} {}: {text}", t("progress", "进度"), display_name)?;
+                stdout.flush()?;
+            } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                // Lands as the block's `↳` subject line, not the final `✓`
+                // stats line — detach is a fact about the call, not a result.
+                self.tool_stats_entry(name).subject = Some(text.to_string());
+                self.update_tool_summary_display()?;
+            }
             return Ok(());
         }
         if let Some(text) = message.strip_prefix("__subagent_stats__") {
@@ -2320,13 +2357,7 @@ fn is_silent_tool(name: &str) -> bool {
 
 fn is_subagent_tool(name: &str) -> bool {
     let name = tool_event_base_name(name);
-    matches!(
-        name,
-        "linux_input_method_diagnose"
-            | "deep_research_linux_game_compatibility"
-            | "deep_research"
-            | "task"
-    )
+    matches!(name, "deep_research" | "task")
 }
 
 fn tool_event_base_name(name: &str) -> &str {
@@ -2374,7 +2405,16 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         "write_file" | "edit_file" | "edit_string" | "trash_path" | "register_script" => {
             string_arg(&args, &["path"])
         }
-        "run_command" => string_arg(&args, &["command"]),
+        "run_command" => {
+            let command = string_arg(&args, &["command"])?;
+            Some(
+                if args.get("background").and_then(Value::as_bool) == Some(true) {
+                    format!("[后台] {command}")
+                } else {
+                    command
+                },
+            )
+        }
         "read_knowledge_base_file" | "edit_knowledge_base_file" | "remove_knowledge_base_file" => {
             string_arg(&args, &["file_name"])
         }
@@ -2408,10 +2448,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
                 .join(t(", ", "、"))
         }),
         "deep_research" => string_arg(&args, &["topic"]),
-        "deep_research_linux_game_compatibility" => string_arg(&args, &["game"]),
-        "linux_input_method_diagnose" | "check_issue" => {
-            string_arg(&args, &["target", "area", "issue", "symptom"])
-        }
+        "check_issue" => string_arg(&args, &["target", "area", "issue", "symptom"]),
         "get_weather" => string_arg(&args, &["location"])
             .or_else(|| Some(t("automatic location", "自动定位").to_string())),
         "get_exchange_rate" => {
@@ -2802,7 +2839,7 @@ impl MarkdownLineRenderer {
     }
 }
 
-fn render_markdown_line(line: &str) -> String {
+pub(crate) fn render_markdown_line(line: &str) -> String {
     let trimmed = line.trim_start();
     let indent = &line[..line.len() - trimmed.len()];
     if let Some(header) = render_header(trimmed) {
@@ -4827,8 +4864,8 @@ mod tests {
             ..ToolStats::default()
         };
         assert_eq!(
-            tool_status_text("linux_input_method_diagnose", &stats, true),
-            format!("linux_input_method_diagnose×1 {}", t("running", "运行中"))
+            tool_status_text("deep_research", &stats, true),
+            format!("deep_research×1 {}", t("running", "运行中"))
         );
         let stats = ToolStats {
             calls: 1,
@@ -4942,7 +4979,7 @@ mod tests {
             10,
         );
         renderer.tool_stats.insert(
-            "deep_research_linux_game_compatibility".to_string(),
+            "deep_research".to_string(),
             ToolStats {
                 calls: 1,
                 ok: 1,
@@ -4958,7 +4995,7 @@ mod tests {
             renderer.tool_summary_text(),
             format!(
                 "~ {}×1 ok\n✓ 工具调用 1 次　消耗词元 2.3K",
-                t("Linux game compatibility research", "Linux 游戏兼容性调查")
+                t("Deep research", "深度研究")
             )
         );
     }
@@ -5123,12 +5160,7 @@ mod tests {
 
     #[test]
     fn all_subagent_summaries_use_activity_prefix() {
-        for name in [
-            "task",
-            "deep_research",
-            "deep_research_linux_game_compatibility",
-            "linux_input_method_diagnose",
-        ] {
+        for name in ["task", "deep_research"] {
             let mut renderer = StreamRenderer::new(
                 ReasoningDisplayMode::Summary,
                 ToolCallDisplayMode::Summary,
@@ -5340,11 +5372,6 @@ mod tests {
             ("deep_research", "Deep research", "深度研究"),
             ("read_file", "Read file", "读取文件"),
             ("check_issue", "Check issue", "检查问题"),
-            (
-                "linux_input_method_diagnose",
-                "Input method diagnosis",
-                "输入法诊断",
-            ),
             ("check_os_info", "System information", "查看系统信息"),
             ("get_weather", "Weather", "天气查询"),
             ("get_exchange_rate", "Exchange rates", "汇率查询"),

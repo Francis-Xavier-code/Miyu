@@ -1,7 +1,7 @@
 {
   "name": "task",
   "display_name": "子代理",
-  "description": "启动子代理独立处理复杂任务。",
+  "description": "启动子代理独立处理复杂任务。 长任务可用 background=true 后台运行，完成后自动唤起。",
   "parameters": {
     "type": "object",
     "properties": {
@@ -34,6 +34,10 @@
           "strong"
         ],
         "description": "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 explore→cheap、general→balanced。未配置的档位回退主模型。"
+      },
+      "background": {
+        "type": "boolean",
+        "description": "后台分离运行子代理：立即返回 job_id，用 job_status 查询进度（日志即实时进度），完成后系统自动唤起你跟进。适合不应阻塞对话的长研究/长任务。"
       },
       "resume_id": {
         "type": "string",

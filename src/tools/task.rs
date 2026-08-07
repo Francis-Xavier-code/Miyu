@@ -25,9 +25,6 @@ const GENERAL_EXCLUDED: &[&str] = &[
     "task",
     "task_agent",
     "deep_research",
-    "linux_input_method_diagnose",
-    "deep_diagnose",
-    "deep_research_linux_game_compatibility",
     "load_skill",
     "create_skill",
     "update_skill",
@@ -165,6 +162,10 @@ pub fn register(
                     "type": "integer",
                     "description": t("Optional. Override the subagent's tool call budget. explore defaults to 30, general defaults to 50.", "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。")
                 },
+                "background": {
+                    "type": "boolean",
+                    "description": t("Run the subagent detached in the background: returns a job_id immediately; check with job_status (its log holds live progress) and you are woken automatically on completion. Use for long research/tasks that should not block the conversation.", "后台分离运行子代理：立即返回 job_id，用 job_status 查询（日志即实时进度），完成后自动唤起你跟进。适合不应阻塞对话的长任务。")
+                },
                 "resume_id": {
                     "type": "string",
                     "description": t("Optional. When a previous task failed with a resume_id in its error, pass it here to continue that subagent from its last completed tool round instead of starting over (process-local; lost on restart).", "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。")
@@ -222,11 +223,26 @@ fn main_pool_choice(config: &AppConfig) -> Option<(String, String)> {
         .map(|choice| (choice.provider_id, choice.model))
 }
 
-async fn run_task(
-    args: Value,
-    context: TaskContext,
-    progress: crate::tools::ToolProgress,
-) -> Result<String> {
+#[derive(Clone)]
+struct TaskParams {
+    description: String,
+    prompt: String,
+    sa_type: SubagentType,
+    resume_id: Option<String>,
+    max_steps: usize,
+    tier: ModelTier,
+}
+
+/// Session linkage captured while still inside the turn scope — a detached
+/// background subagent loses the task-locals, so the audit anchor must be
+/// resolved before spawning.
+#[derive(Clone)]
+struct AuditAnchor {
+    parent: Option<String>,
+    persona: String,
+}
+
+fn parse_task_params(args: &Value) -> Result<TaskParams> {
     let description = args
         .get("description")
         .and_then(Value::as_str)
@@ -261,14 +277,148 @@ async fn run_task(
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or_else(|| sa_type.default_max_steps());
-    let tool_timeout = sa_type.tool_timeout();
-    let total_timeout = sa_type.total_timeout();
-
     let tier = args
         .get("tier")
         .and_then(Value::as_str)
         .and_then(ModelTier::from_str)
         .unwrap_or_else(|| sa_type.default_tier());
+    Ok(TaskParams {
+        description,
+        prompt,
+        sa_type,
+        resume_id,
+        max_steps,
+        tier,
+    })
+}
+
+async fn run_task(
+    args: Value,
+    context: TaskContext,
+    progress: crate::tools::ToolProgress,
+) -> Result<String> {
+    let params = parse_task_params(&args)?;
+    let anchor = AuditAnchor {
+        parent: crate::tools::workspace::try_session().map(|session| session.to_string()),
+        persona: context.config.active_persona_scope(),
+    };
+    if args
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return spawn_background_task(context, params, anchor, progress).await;
+    }
+    run_task_core(context, progress, params, anchor).await
+}
+
+/// Detach the subagent run behind the shared background-job registry: its
+/// progress streams into the job log, and completion goes through the same
+/// wake path as background commands.
+async fn spawn_background_task(
+    context: TaskContext,
+    params: TaskParams,
+    anchor: AuditAnchor,
+    progress: crate::tools::ToolProgress,
+) -> Result<String> {
+    let description = params.description.clone();
+    crate::tools::jobs::spawn_background_subagent(None, &description, &progress, move |job_id, log_path| {
+        async move {
+            let bridge = spawn_subagent_log_bridge(log_path.clone());
+            let output = run_task_core(context, bridge, params, anchor).await;
+            let state_label = match &output {
+                Ok(json) => serde_json::from_str::<Value>(json)
+                    .ok()
+                    .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| "completed".to_string()),
+                Err(_) => "error".to_string(),
+            };
+            let tail = match &output {
+                Ok(json) => format!("\n===== 子代理结果 =====\n{json}\n"),
+                Err(error) => format!("\n===== 子代理失败 =====\n{error}\n"),
+            };
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| {
+                    use std::io::Write as _;
+                    file.write_all(tail.as_bytes())
+                });
+            tracing::debug!(job_id = %job_id, state = %state_label, "background subagent finished");
+            match state_label.as_str() {
+                "completed" | "budget_reached" => {
+                    crate::tools::jobs::JobState::Exited { code: Some(0) }
+                }
+                "timeout" => crate::tools::jobs::JobState::TimedOut,
+                _ => crate::tools::jobs::JobState::Exited { code: None },
+            }
+        }
+    })
+    .await
+}
+
+/// Bridge a detached subagent's progress stream into its job log so
+/// `job_status` reads live progress the same way it reads command output.
+fn spawn_subagent_log_bridge(log_path: std::path::PathBuf) -> crate::tools::ToolProgress {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            let crate::tools::ToolProgressEvent::Message(message) = event else {
+                continue;
+            };
+            let line = readable_subagent_log_line(&message);
+            if line.is_empty() {
+                continue;
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| {
+                    use std::io::Write as _;
+                    writeln!(file, "{line}")
+                });
+        }
+    });
+    crate::tools::ToolProgress::new(sender)
+}
+
+fn readable_subagent_log_line(message: &str) -> String {
+    if let Some(text) = message.strip_prefix("__subagent_reasoning__") {
+        let text = text.trim();
+        if text.is_empty() {
+            return String::new();
+        }
+        return format!("[思考] {text}");
+    }
+    if let Some(text) = message.strip_prefix("__subtool_call__") {
+        return format!("[工具] {}", text.trim());
+    }
+    if let Some(text) = message.strip_prefix("__subtool_result__") {
+        return format!("[结果] {}", text.trim());
+    }
+    if let Some(text) = message.strip_prefix("__subagent_stats__") {
+        return format!("[统计] {}", text.trim());
+    }
+    message.trim().to_string()
+}
+
+async fn run_task_core(
+    context: TaskContext,
+    progress: crate::tools::ToolProgress,
+    params: TaskParams,
+    anchor: AuditAnchor,
+) -> Result<String> {
+    let TaskParams {
+        description,
+        prompt,
+        sa_type,
+        resume_id,
+        max_steps,
+        tier,
+    } = params;
+    let tool_timeout = sa_type.tool_timeout();
+    let total_timeout = sa_type.total_timeout();
 
     let mode = ProgressMode::from_config(&context.config);
     let enabled = context.config.plugins.deep_research.show_progress;
@@ -348,6 +498,7 @@ async fn run_task(
                 }))?;
                 record_subagent_audit(
                     &context,
+                    &anchor,
                     &description,
                     &prompt,
                     &output,
@@ -370,6 +521,7 @@ async fn run_task(
                 }))?;
                 record_subagent_audit(
                     &context,
+                    &anchor,
                     &description,
                     &prompt,
                     &output,
@@ -407,6 +559,7 @@ async fn run_task(
     };
     record_subagent_audit(
         &context,
+        &anchor,
         &description,
         &prompt,
         &output,
@@ -422,6 +575,7 @@ async fn run_task(
 /// Best-effort: audit failures never fail the task itself.
 fn record_subagent_audit(
     context: &TaskContext,
+    anchor: &AuditAnchor,
     description: &str,
     prompt: &str,
     output: &str,
@@ -430,8 +584,8 @@ fn record_subagent_audit(
 ) {
     let outcome = (|| -> Result<()> {
         let store = crate::state::StateStore::new(&context.paths)?;
-        let parent = crate::tools::workspace::try_session();
-        let persona = context.config.active_persona_scope();
+        let parent = anchor.parent.clone();
+        let persona = anchor.persona.clone();
         let name: String = description.chars().take(40).collect();
         let record = store.create_session(&persona, &name, "subagent", parent.as_deref())?;
         let pinned = store.pinned(&record.session_id);

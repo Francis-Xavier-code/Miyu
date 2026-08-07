@@ -641,21 +641,22 @@ fn api_frame(action: &str, params: Value, echo: &str) -> String {
 // WebSocket endpoint
 // ---------------------------------------------------------------------------
 
-/// Daemon-initiated plain-text delivery into a bound QQ conversation,
-/// bypassing turn and plugin machinery entirely. Used for background-job
-/// completion broadcasts, where a synthetic model turn would need sender
-/// semantics the plugins are not built for.
-pub(crate) async fn send_plain_text(
+/// Background-job completion wake: a self-initiated model turn in a bound
+/// QQ conversation. There is no inbound event — reply targeting, affection
+/// and trigger judging all no-op — and the synthetic sender is the bot
+/// account itself, so the model reads the job result and reports it into
+/// the conversation in its own voice.
+pub(crate) async fn wake_conversation_for_job(
     state: &DaemonState,
     account_id: &str,
     conversation_kind: &str,
     conversation_id: &str,
-    text: &str,
+    content: String,
 ) -> Result<()> {
     let self_id: i64 = account_id
         .parse()
-        .context("invalid QQ account id for a plain-text send")?;
-    let handle = state
+        .context("invalid QQ account id for a job wake")?;
+    let conn = state
         .platforms
         .onebot
         .lock()
@@ -664,14 +665,62 @@ pub(crate) async fn send_plain_text(
         .context("the QQ account is not connected")?;
     let target_id: i64 = conversation_id
         .parse()
-        .context("invalid QQ conversation id for a plain-text send")?;
-    let message = json!([{ "type": "text", "data": { "text": text } }]);
-    let (action, params) = match conversation_kind {
-        "group" => ("send_group_msg", json!({ "group_id": target_id, "message": message })),
-        "private" => ("send_private_msg", json!({ "user_id": target_id, "message": message })),
+        .context("invalid QQ conversation id for a job wake")?;
+    let target = match conversation_kind {
+        "group" => Target::Group {
+            group_id: target_id,
+        },
+        "private" => Target::Private { user_id: target_id },
         other => bail!("unsupported QQ conversation kind: {other}"),
     };
-    handle.call_api(action, params).await.map(|_| ())
+    let config = state.manager.lock().unwrap().config.clone();
+    let event = json!({
+        "self_id": self_id,
+        "user_id": self_id,
+        "sender": { "nickname": "系统" },
+    });
+    let context = Arc::new(platform_turn_context(
+        state, conn, target, &event, config, None,
+    )?);
+    let session_id = resolve_onebot_session(state, &context, target, &event)?;
+    let conversation_kind_enum = match target {
+        Target::Private { .. } => PlatformConversationKind::Private,
+        Target::Group { .. } => PlatformConversationKind::Group,
+    };
+    // Run the normal turn preparation so plugins inject group history and
+    // context blocks — the wake turn should see the conversation exactly
+    // like an inbound turn would.
+    let prepared = context.prepare_turn(content).await;
+    let turn_system_context = vec![
+        "本轮由系统自动触发：一个后台任务刚刚结束。这不是任何群成员或用户发来的消息；\
+         请用 job_status 查看任务输出，然后以你自己的身份把结果自然地发到会话里。"
+            .to_string(),
+    ];
+    let profile = super::TurnProfile {
+        active_persona: Some(context.config.prompt.active_persona.clone()),
+        text_models: context.config.active_provider_models.clone(),
+        multimodal_models: context
+            .config
+            .qq_multimodal_model_pool(
+                conversation_kind_enum,
+                &context.conversation.conversation_id,
+            )
+            .map(<[_]>::to_vec),
+        system_context: prepared.system_context,
+        turn_system_context,
+        context_images: prepared.context_images,
+        image_cache_namespace: Some("qq".to_string()),
+        image_source_label: Some("QQ".to_string()),
+        memory_write_enabled: context.config.platforms.qq.memory.write_enabled,
+        suppress_session_history: context.conversation.kind == ConversationKind::Group
+            && context.plugin_enabled("real_context", true),
+        platform: Some(context.clone()),
+        followup: None,
+    };
+    let dispatch =
+        run_platform_turn(state, session_id, prepared.content, Vec::new(), profile).await?;
+    deliver_dispatch(state, &context, dispatch).await?;
+    Ok(())
 }
 
 pub(crate) async fn onebot_ws(
@@ -7342,6 +7391,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: Some(followup.clone()),
                 operation: crate::web::RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
 
@@ -7370,6 +7421,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: Some(newer.clone()),
                 operation: crate::web::RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
         assert_eq!(
@@ -7435,6 +7488,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: Some(followup.clone()),
                 operation: crate::web::RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
 
@@ -7777,6 +7832,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: crate::web::RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
 

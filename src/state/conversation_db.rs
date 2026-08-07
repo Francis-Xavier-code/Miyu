@@ -4274,6 +4274,48 @@ impl ConversationDb {
     }
 
     #[allow(dead_code)]
+    /// Completed background-command wake turns after `after_seq`, oldest
+    /// first: (seq, user display content, assistant reply).
+    pub fn background_report_replies_after(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+    ) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq, turn_id, display_content,
+                    CASE WHEN status = 'completed' THEN assistant_content
+                         WHEN length(trim(assistant_content)) > 0 THEN assistant_content
+                         ELSE '（自动跟进未能完成：模型请求失败或被中断，可用 job_status 查看任务输出）'
+                    END
+             FROM turns
+             WHERE session_id = ?1 AND seq > ?2 AND status IN ('completed', 'failed', 'interrupted')
+               AND user_content LIKE '<background-job-report>%'
+             ORDER BY seq ASC LIMIT 8",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, after_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Largest turn seq in a session (0 when empty).
+    pub fn latest_turn_seq(&self, session_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn has_running_turns(&self, session_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(

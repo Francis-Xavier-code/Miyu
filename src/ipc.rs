@@ -229,6 +229,17 @@ pub enum Command {
     Shutdown,
     ReloadConfig,
     GetStatus,
+    /// Lightweight poll for the REPL background-command status strip.
+    JobsOverview,
+    /// Attach to a running daemon-initiated turn (background-command wake)
+    /// and stream its event frames until it finishes.
+    FollowRun {
+        run_id: String,
+    },
+    /// Stop all running background commands of a session (REPL exit).
+    StopSessionJobs {
+        session_id: String,
+    },
     GetSessionState {
         target: SessionRef,
     },
@@ -338,6 +349,9 @@ pub enum Frame {
     },
     Accepted {
         run_id: String,
+        /// Present when attaching to an already-running turn (FollowRun).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     TurnUpdateAccepted {
         run_id: String,

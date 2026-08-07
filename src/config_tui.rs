@@ -243,7 +243,7 @@ fn plugin_row(state: &str, name: &str, description: &str, width: usize) -> Strin
     fixed + &truncate(description, remaining)
 }
 
-fn plugin_names() -> [(&'static str, &'static str, &'static str); 14] {
+fn plugin_names() -> [(&'static str, &'static str, &'static str); 13] {
     [
         (
             "web",
@@ -324,14 +324,6 @@ fn plugin_names() -> [(&'static str, &'static str, &'static str); 14] {
             t("PKGBUILD/AUR security review", "PKGBUILD/AUR 安全审查"),
         ),
         (
-            "deep_research_linux_game_compatibility",
-            t("Linux game compatibility", "Linux 游戏兼容"),
-            t(
-                "Proton/anti-cheat/compatibility lookup",
-                "Proton/反作弊/兼容性查询",
-            ),
-        ),
-        (
             "api_quota",
             t("LLM API quota", "大模型额度查询"),
             t(
@@ -356,13 +348,7 @@ fn plugin_enabled(config: &AppConfig, index: usize) -> bool {
         9 => config.plugins.man.enabled,
         10 => config.plugins.memory.enabled,
         11 => config.plugins.package_advisor.enabled,
-        12 => {
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .enabled
-        }
-        13 => config.plugins.api_quota.enabled,
+        12 => config.plugins.api_quota.enabled,
         _ => false,
     }
 }
@@ -382,13 +368,7 @@ fn toggle_plugin(config: &mut AppConfig, index: usize) {
         9 => config.plugins.man.enabled = value,
         10 => config.plugins.memory.enabled = value,
         11 => config.plugins.package_advisor.enabled = value,
-        12 => {
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .enabled = value
-        }
-        13 => config.plugins.api_quota.enabled = value,
+        12 => config.plugins.api_quota.enabled = value,
         _ => {}
     }
 }
@@ -1063,24 +1043,7 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
             t("Enabled", "启用"),
             config.plugins.package_advisor.enabled,
         )],
-        12 => vec![
-            Field::boolean(
-                t("Enabled", "启用"),
-                config
-                    .plugins
-                    .deep_research_linux_game_compatibility
-                    .enabled,
-            ),
-            Field::new(
-                t("Maximum subagent tool steps", "子代理最大工具次数"),
-                config
-                    .plugins
-                    .deep_research_linux_game_compatibility
-                    .max_tool_steps
-                    .to_string(),
-            ),
-        ],
-        13 => vec![Field::boolean(
+        12 => vec![Field::boolean(
             t("Enabled", "启用"),
             config.plugins.api_quota.enabled,
         )],
@@ -1250,16 +1213,6 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
             config.plugins.package_advisor.enabled = parse_bool_field(&fields[0].value)?;
         }
         12 => {
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .enabled = parse_bool_field(&fields[0].value)?;
-            config
-                .plugins
-                .deep_research_linux_game_compatibility
-                .max_tool_steps = fields[1].value.trim().parse::<usize>()?.clamp(1, 500);
-        }
-        13 => {
             config.plugins.api_quota.enabled = parse_bool_field(&fields[0].value)?;
         }
         _ => {

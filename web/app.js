@@ -9,8 +9,18 @@
   const MAX_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024;
   const COMMAND_OUTPUT_PREVIEW_ROWS = 8;
   const NEAR_BOTTOM_PX = 120;
-  const UI_SCALE = 1.1;
-  const ARTIFACT_TEXT_SCALE = 1.2 / UI_SCALE;
+  // Mirrors the CSS --ui-scale custom property; mobile drops it to 1 via a
+  // media query, so read it at runtime instead of hardcoding.
+  let UI_SCALE = 1.1;
+  function refreshUiScale() {
+    const raw = Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")
+    );
+    if (Number.isFinite(raw) && raw > 0) UI_SCALE = raw;
+  }
+  refreshUiScale();
+  window.addEventListener("resize", refreshUiScale);
+  const artifactTextScale = () => 1.2 / UI_SCALE;
   const DEFAULT_BOARD_TITLE = "今天想聊些什么？";
   const DEFAULT_BOARD_SUBTITLE = "从一个问题、计划或此刻的想法开始。";
   const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
@@ -144,10 +154,13 @@
     "session.deleted",
     "session.current_changed",
     "session.updated",
+    "job.started",
+    "job.finished",
+    "job.acknowledged",
     "resync_required"
   ];
 
-  const RUN_EVENTS = new Set(EVENT_NAMES.filter((name) => !name.startsWith("session.") && !["conversation.reset", "conversation.pop", "resync_required", "queue.added", "queue.removed"].includes(name)));
+  const RUN_EVENTS = new Set(EVENT_NAMES.filter((name) => !name.startsWith("session.") && !name.startsWith("job.") && !["conversation.reset", "conversation.pop", "resync_required", "queue.added", "queue.removed"].includes(name)));
 
   const elements = {
     body: document.body,
@@ -233,6 +246,7 @@
     promptGrid: document.getElementById("promptGrid"),
     jumpBottomButton: document.getElementById("jumpBottomButton"),
     composerDock: document.getElementById("composerDock"),
+    jobsStrip: document.getElementById("jobsStrip"),
     liveStopRail: document.getElementById("liveStopRail"),
     questionDock: document.getElementById("questionDock"),
     composerForm: document.getElementById("composerForm"),
@@ -277,6 +291,8 @@
   };
 
   const state = {
+    backgroundJobs: new Map(),
+    jobsStripOpen: localStorage.getItem("miyu.web.jobsStripOpen") === "1",
     bootId: null,
     latestEventId: 0,
     lastEventId: 0,
@@ -515,7 +531,7 @@
   function setChatFontSize(size, persist = true) {
     const selected = CHAT_FONT_SIZES.includes(size) ? size : "15px";
     document.documentElement.style.setProperty("--fs-chat", selected);
-    document.documentElement.style.setProperty("--fs-artifact-chat", `${Number.parseFloat(selected) * ARTIFACT_TEXT_SCALE}px`);
+    document.documentElement.style.setProperty("--fs-artifact-chat", `${Number.parseFloat(selected) * artifactTextScale()}px`);
     document.querySelectorAll("[data-chat-font]").forEach((button) => {
       const active = button.dataset.chatFont === selected;
       button.classList.toggle("active", active);
@@ -4707,6 +4723,29 @@
   }
 
   function createUserMessage(content, timestamp, attributes = {}) {
+    // 系统自动触发的后台任务跟进不是真实用户输入，渲染为居中系统事件而不是用户气泡。
+    const rawContent = String(content || "");
+    if (rawContent.startsWith("[后台任务完成]") || rawContent.startsWith("[后台命令完成]") || rawContent.startsWith("<background-job-report>")) {
+      const notice = document.createElement("div");
+      notice.className = "system-event";
+      if (attributes.turnId) notice.dataset.turnId = attributes.turnId;
+      const label = document.createElement("span");
+      let labelText = "";
+      if (rawContent.startsWith("[后台任务完成]")) {
+        labelText = rawContent.replace(/^\[后台任务完成\]\s*/, "");
+      } else if (rawContent.startsWith("[后台命令完成]")) {
+        const stripped = rawContent.replace(/^\[后台命令完成\]\s*/, "");
+        labelText = `命令完成 ${stripped.split(" · ").slice(0, 2).join(" · ")}`;
+      } else {
+        const inner = (rawContent.match(/「(.*?)」/)?.[1] || "").trim();
+        labelText = inner ? `任务完成 ${inner}` : "后台任务完成";
+      }
+      label.textContent = `⚙ ${labelText}`;
+      label.title = rawContent;
+      label.title = formatDateTime(timestamp);
+      notice.appendChild(label);
+      return notice;
+    }
     const article = document.createElement("article");
     article.className = "message user-message";
     article.dataset.role = "user";
@@ -5736,8 +5775,15 @@
     };
   }
 
+  function isJobFollowupContent(content) {
+    const raw = String(content || "");
+    return raw.startsWith("[后台任务完成]") || raw.startsWith("[后台命令完成]") || raw.startsWith("<background-job-report>");
+  }
+
   function renderQueueTray() {
-    const prompts = Array.isArray(state.queuedPrompts) ? state.queuedPrompts : [];
+    // 后台任务完成的自动跟进不是用户消息，不在排队托盘里显示。
+    const prompts = (Array.isArray(state.queuedPrompts) ? state.queuedPrompts : [])
+      .filter((prompt) => !isJobFollowupContent(prompt?.content) && !isJobFollowupContent(prompt?.display_content));
     elements.queueTray.replaceChildren();
     elements.queueTray.hidden = prompts.length === 0;
     for (const prompt of prompts) {
@@ -6263,7 +6309,10 @@
   function toolSubject(name, value) {
     const args = parsedToolArguments(value);
     const toolName = String(name || "");
-    if (toolName === "run_command") return compactLine(args.command || args.cmd);
+    if (toolName === "run_command") {
+      const line = compactLine(args.command || args.cmd);
+      return args.background === true ? `[后台] ${line}` : line;
+    }
     if (toolName === "read_file") {
       const path = compactPath(args.path);
       const offset = Number.isFinite(Number(args.offset)) && args.offset != null ? Number(args.offset) : null;
@@ -6645,6 +6694,10 @@
       let message = String(data?.message || "");
       if (message.startsWith("__tool_phase__")) {
         message = message.slice("__tool_phase__".length).replace(/^~\s*/, "").trim();
+      } else if (message.startsWith("__subagent_stats__")) {
+        message = message.slice("__subagent_stats__".length).trim();
+      } else if (message.startsWith("__subagent_detach__")) {
+        message = message.slice("__subagent_detach__".length).trim();
       }
       // 任何持续汇报进度的工具(插件子代理如深度研究/兼容性调查)都惰性获得实时进度面板,
       // 不再仅限内置 task 工具
@@ -7254,6 +7307,124 @@
     contentAdded();
   }
 
+  function jobStatusDisplay(status) {
+    const value = String(status || "");
+    if (value === "stopped") return "已中断";
+    if (value === "timed_out") return "已超时";
+    if (value === "exited(signal)") return "异常退出";
+    if (value === "exited(0)") return "完成";
+    const match = value.match(/^exited\((-?\d+)\)$/);
+    return match ? `退出码 ${match[1]}` : value;
+  }
+
+  function renderJobsStrip() {
+    const strip = elements.jobsStrip;
+    if (!strip) return;
+    const jobs = Array.from(state.backgroundJobs.values());
+    if (!jobs.length) {
+      strip.hidden = true;
+      strip.replaceChildren();
+      updateJumpButtonOffset();
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    const collapsible = jobs.length >= 3;
+    if (collapsible) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = state.jobsStripOpen ? "jobs-strip-toggle is-open" : "jobs-strip-toggle";
+      toggle.setAttribute("aria-expanded", String(state.jobsStripOpen));
+      const toggleMarker = document.createElement("span");
+      toggleMarker.className = "job-chip-marker is-spinning";
+      toggleMarker.textContent = "\u25cc";
+      const toggleText = document.createElement("span");
+      toggleText.textContent = (state.jobsStripOpen ? "\u25be " : "\u25b8 ") + "\u540e\u53f0\u4efb\u52a1 \u00d7" + jobs.length;
+      toggle.replaceChildren(toggleMarker, toggleText);
+      toggle.addEventListener("click", () => {
+        state.jobsStripOpen = !state.jobsStripOpen;
+        localStorage.setItem("miyu.web.jobsStripOpen", state.jobsStripOpen ? "1" : "0");
+        renderJobsStrip();
+      });
+      fragment.appendChild(toggle);
+    }
+    const showRows = !collapsible || state.jobsStripOpen;
+    for (const job of showRows ? jobs : []) {
+      const row = document.createElement("div");
+      row.className = "job-chip";
+      row.dataset.jobId = String(job.job_id);
+      const marker = document.createElement("span");
+      marker.className = "job-chip-marker is-spinning";
+      marker.textContent = "◌";
+      const label = document.createElement("span");
+      label.className = "job-chip-label";
+      const kindWord = job.kind === "subagent" ? "子代理" : "命令";
+      label.textContent = `${kindWord} ${job.job_id} · ${job.title}`;
+      label.title = label.textContent;
+      const time = document.createElement("span");
+      time.className = "job-chip-time";
+      const seconds = job.running
+        ? Math.max(0, Math.round(job.runtime_seconds + (Date.now() - job.receivedAt) / 1000))
+        : job.runtime_seconds;
+      time.textContent = formatJobDuration(seconds);
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "job-chip-stop";
+      stop.textContent = "✕";
+      stop.title = "停止该后台命令";
+      stop.addEventListener("click", async () => {
+        try {
+          await apiRequest(`/api/jobs/${encodeURIComponent(job.job_id)}`, { method: "DELETE" });
+        } catch (error) {
+          showToast(error.message || "停止失败", "error");
+        }
+      });
+      row.append(marker, label, time, stop);
+      fragment.appendChild(row);
+    }
+    strip.replaceChildren(fragment);
+    strip.hidden = false;
+    updateJumpButtonOffset();
+  }
+
+  function formatJobDuration(seconds) {
+    const value = Math.max(0, Math.floor(seconds));
+    if (value >= 3600) return `${Math.floor(value / 3600)}h ${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}m`;
+    if (value >= 60) return `${Math.floor(value / 60)}m ${String(value % 60).padStart(2, "0")}s`;
+    return `${value}s`;
+  }
+
+  async function seedJobsStrip() {
+    try {
+      const data = await apiRequest("/api/jobs");
+      state.backgroundJobs.clear();
+      for (const job of data?.jobs || []) {
+        state.backgroundJobs.set(String(job.job_id), { ...job, receivedAt: Date.now() });
+      }
+      renderJobsStrip();
+    } catch {
+      /* daemon may predate the jobs API */
+    }
+  }
+
+  setInterval(() => {
+    if (!state.backgroundJobs.size) return;
+    // 只更新计时文本：全量重建会重启 CSS 旋转动画，导致 spinner 每秒瞬移回原点。
+    let missing = false;
+    for (const job of state.backgroundJobs.values()) {
+      const row = elements.jobsStrip?.querySelector(`.job-chip[data-job-id="${CSS.escape(String(job.job_id))}"]`);
+      if (!row) {
+        missing = true;
+        continue;
+      }
+      const time = row.querySelector(".job-chip-time");
+      if (!time) continue;
+      const seconds = Math.max(0, Math.round(job.runtime_seconds + (Date.now() - job.receivedAt) / 1000));
+      time.textContent = formatJobDuration(seconds);
+    }
+    if (missing && (state.jobsStripOpen || state.backgroundJobs.size < 3)) renderJobsStrip();
+  }, 1000);
+  setTimeout(seedJobsStrip, 800);
+
   function appendRunNotice(live, message, error = false) {
     ensureLiveArticle(live);
     clearTypingIndicator(live);
@@ -7683,6 +7854,22 @@
         state.queuedPrompts.push(prompt);
         renderQueueTray();
       }
+      return;
+    }
+    if (name === "job.started") {
+      const job = data?.job;
+      if (job?.job_id) {
+        state.backgroundJobs.set(String(job.job_id), { ...job, receivedAt: Date.now() });
+        renderJobsStrip();
+      }
+      return;
+    }
+    if (name === "job.finished") {
+      if (state.backgroundJobs.delete(String(data?.job_id))) renderJobsStrip();
+      return;
+    }
+    if (name === "job.acknowledged") {
+      if (state.backgroundJobs.delete(String(data?.job_id))) renderJobsStrip();
       return;
     }
     if (name === "queue.removed") {

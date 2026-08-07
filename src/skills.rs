@@ -10,8 +10,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use yaml_rust2::scanner::{Scanner, Token, TokenType};
 use yaml_rust2::{Yaml, YamlLoader};
 
-const BUILTIN_CREATOR_RAW: &str = include_str!("skills/skill-creator.md");
-const BUILTIN_CREATOR_NAME: &str = "skill-creator";
+/// Skills compiled into the binary: (name, raw SKILL.md). A user skill of
+/// the same name in the persona/global directories overrides the built-in.
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("skill-creator", include_str!("skills/skill-creator.md")),
+    (
+        "linux-input-method-diagnose",
+        include_str!("skills/linux-input-method-diagnose.md"),
+    ),
+    (
+        "linux-game-compatibility",
+        include_str!("skills/linux-game-compatibility.md"),
+    ),
+];
 const DRAFT_MANIFEST: &str = "draft.json";
 const DRAFT_PACKAGE_DIR: &str = "package";
 const DRAFT_VERSION: u32 = 1;
@@ -189,12 +200,14 @@ pub fn discover(config: &AppConfig, paths: &MiyuPaths) -> Result<Vec<SkillEntry>
             }
         }
     }
-    if !seen.contains(BUILTIN_CREATOR_NAME) {
-        entries.push(SkillEntry {
-            metadata: parse_skill_metadata(BUILTIN_CREATOR_RAW, Some(BUILTIN_CREATOR_NAME))?,
-            source: SkillSource::BuiltIn,
-            directory: None,
-        });
+    for (name, raw) in BUILTIN_SKILLS {
+        if !seen.contains(*name) {
+            entries.push(SkillEntry {
+                metadata: parse_skill_metadata(raw, Some(name))?,
+                source: SkillSource::BuiltIn,
+                directory: None,
+            });
+        }
     }
     Ok(entries)
 }
@@ -210,7 +223,9 @@ pub fn catalog_fingerprint(config: &AppConfig, paths: &MiyuPaths) -> Result<[u8;
             hash_metadata(&mut hasher, &directory.join("SKILL.md"))?;
         }
     }
-    hasher.update(BUILTIN_CREATOR_RAW.as_bytes());
+    for (_, raw) in BUILTIN_SKILLS {
+        hasher.update(raw.as_bytes());
+    }
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -249,7 +264,12 @@ pub fn load(name: &str, config: &AppConfig, paths: &MiyuPaths) -> Result<LoadedS
             files,
         });
     }
-    let (metadata, body) = parse_skill_document(BUILTIN_CREATOR_RAW, Some(name))?;
+    let raw = BUILTIN_SKILLS
+        .iter()
+        .find(|(builtin_name, _)| *builtin_name == name)
+        .map(|(_, raw)| *raw)
+        .with_context(|| format!("skill not found: {name}"))?;
+    let (metadata, body) = parse_skill_document(raw, Some(name))?;
     Ok(LoadedSkill {
         metadata,
         body,
@@ -1606,22 +1626,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let config = AppConfig::default();
-        let global = paths.skills_dir.join(BUILTIN_CREATOR_NAME);
+        let global = paths.skills_dir.join(BUILTIN_SKILLS[0].0);
         let persona = config
             .active_persona_skills_dir(&paths)
-            .join(BUILTIN_CREATOR_NAME);
+            .join(BUILTIN_SKILLS[0].0);
         for (directory, description) in [(&global, "global"), (&persona, "persona")] {
             fs::create_dir_all(directory).unwrap();
             fs::write(
                 directory.join("SKILL.md"),
-                format!("---\nname: {BUILTIN_CREATOR_NAME}\ndescription: {description}\n---\n"),
+                format!(
+                    "---\nname: {}\ndescription: {description}\n---\n",
+                    BUILTIN_SKILLS[0].0
+                ),
             )
             .unwrap();
         }
         let entries = discover(&config, &paths).unwrap();
         let creator = entries
             .iter()
-            .find(|entry| entry.metadata.name == BUILTIN_CREATOR_NAME)
+            .find(|entry| entry.metadata.name == BUILTIN_SKILLS[0].0)
             .unwrap();
         assert_eq!(creator.source, SkillSource::Persona);
         assert_eq!(creator.metadata.description, "persona");

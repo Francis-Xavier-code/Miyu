@@ -7,7 +7,6 @@ mod ask_question;
 mod calculator;
 mod caniplayonlinux_query;
 mod clipboard;
-mod deep_diagnose;
 mod deep_research;
 mod deepseek_status;
 mod default_tools;
@@ -22,7 +21,6 @@ mod image_generation;
 pub mod jobs;
 mod kitty_image;
 pub mod knowledge_base;
-mod linux_game;
 mod load_tools;
 mod man;
 mod mcp;
@@ -128,6 +126,8 @@ fn readable_load_target_name(name: &str) -> String {
 fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "run_command" => t("Run command", "运行命令"),
+        "job_status" => t("Check background tasks", "查询后台任务"),
+        "job_stop" => t("Stop background task", "停止后台任务"),
         "apply_patch" => t("Apply patch", "应用补丁"),
         "apply_artifact_patch" => t("Edit preview file", "修改预览文件"),
         "create_artifact" => t("Create preview file", "创建预览文件"),
@@ -162,9 +162,6 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "update_meme" => t("Update meme", "更新表情包"),
         "delete_meme" => t("Delete meme", "删除表情包"),
         "deep_research" => t("Deep research", "深度研究"),
-        "deep_diagnose" | "linux_input_method_diagnose" => {
-            t("Input method diagnosis", "输入法诊断")
-        }
         "upload_knowledge_base_file" | "upload_text_to_knowledge_base" => {
             t("Import knowledge base", "导入知识库")
         }
@@ -224,10 +221,6 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "review_aur_package" => t("Review AUR package", "审查 AUR 包"),
         "install_aur_package" => t("Install AUR package", "安装 AUR 包"),
         "review_pkgbuild_directory" => t("Review PKGBUILD directory", "审查 PKGBUILD 目录"),
-        "deep_research_linux_game_compatibility" => {
-            t("Linux game compatibility research", "Linux 游戏兼容性调查")
-        }
-        "register_linux_game_evidence" => t("Register compatibility evidence", "登记兼容性证据"),
         "register_deep_research_topic_title" => t("Register research title", "注册研究标题"),
         "register_deep_research_reference" => t("Register reference", "注册引用来源"),
         "remove_deep_research_reference" => t("Remove reference", "移除引用来源"),
@@ -313,15 +306,6 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
         let research_tools = registry.clone();
         deep_research::register(&mut registry, config.clone(), paths.clone(), research_tools);
     }
-    if config.plugins.deep_diagnose.enabled {
-        let diagnosis_tools = registry.clone();
-        deep_diagnose::register(
-            &mut registry,
-            config.clone(),
-            paths.clone(),
-            diagnosis_tools,
-        );
-    }
     if config.plugins.vision.enabled {
         vision::register(&mut registry, config.clone(), paths.clone(), true);
     }
@@ -333,14 +317,6 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     }
     if config.plugins.package_advisor.enabled {
         package_advisor::register(&mut registry, paths.clone());
-    }
-    if config
-        .plugins
-        .deep_research_linux_game_compatibility
-        .enabled
-    {
-        let game_tools = registry.clone();
-        linux_game::register(&mut registry, config.clone(), paths.clone(), game_tools);
     }
     if config.plugins.diagnostics.enabled {
         diagnostics::register(&mut registry, config.clone());
@@ -450,14 +426,6 @@ pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry 
     if config.plugins.package_advisor.enabled {
         package_advisor::register(&mut registry, paths.clone());
     }
-    if config
-        .plugins
-        .deep_research_linux_game_compatibility
-        .enabled
-    {
-        let game_tools = registry.clone();
-        linux_game::register(&mut registry, config.clone(), paths.clone(), game_tools);
-    }
     if config.plugins.diagnostics.enabled {
         diagnostics::register(&mut registry, config.clone());
     }
@@ -532,6 +500,11 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     }
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
+    }
+    if config.skills.enabled {
+        if let Err(error) = skills::register_skills(&mut registry, config, paths) {
+            tracing::warn!(error = %error, "failed to register skills for restricted platform registry");
+        }
     }
     if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
@@ -624,6 +597,7 @@ mod tests {
                 ToolPermission::ReadOnly
             );
         }
+        assert!(registry.contains("load_skill"));
         assert!(registry.contains("load_tools"));
         let visible = registry.lazy_definitions(&Default::default());
         assert!(visible
@@ -666,7 +640,7 @@ mod tests {
         }
         assert!(normal.contains("load_skill"));
         assert!(plan.contains("load_skill"));
-        assert!(!chat.contains("load_skill"));
+        assert!(chat.contains("load_skill"));
     }
 
     #[test]

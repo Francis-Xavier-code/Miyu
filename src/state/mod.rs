@@ -456,6 +456,19 @@ impl StateStore {
         self.conv_db.list_local_sessions(persona, include_archived)
     }
 
+    pub fn background_report_replies_after(
+        &self,
+        session_id: &str,
+        after_seq: i64,
+    ) -> Result<Vec<(i64, String, String, String)>> {
+        self.conv_db
+            .background_report_replies_after(session_id, after_seq)
+    }
+
+    pub fn latest_turn_seq(&self, session_id: &str) -> Result<i64> {
+        self.conv_db.latest_turn_seq(session_id)
+    }
+
     pub fn is_platform_session(&self, session_id: &str) -> Result<bool> {
         self.conv_db.is_platform_session(session_id)
     }

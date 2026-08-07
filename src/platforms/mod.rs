@@ -1946,6 +1946,8 @@ pub(crate) async fn run_platform_turn(
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup,
                 operation: crate::web::RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
     }

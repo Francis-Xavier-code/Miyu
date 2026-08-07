@@ -22,7 +22,7 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     registry.register(ToolSpec::new_with_progress(
         "run_command",
         t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background job and return a job_id immediately.", "作为后台任务分离运行，立即返回 job_id。")}},"required":["command"],"additionalProperties":false}),
+        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
         move |args, progress| async move {
             run_command(args, allow_command_execution, progress).await
         },
@@ -50,7 +50,7 @@ pub fn register_readonly(registry: &mut ToolRegistry) {
     ));
     registry.register(ToolSpec::new(
         "check_os_info",
-        t("Check basic read-only OS, shell, desktop session, kernel, host, and package-manager context. For concrete Linux input method issues, prefer linux_input_method_diagnose.", "查看只读基础系统信息，包括 OS、shell、桌面会话、内核、主机和包管理器上下文。排查具体 Linux 输入法问题时优先使用 linux_input_method_diagnose。"),
+        t("Check basic read-only OS, shell, desktop session, kernel, host, and package-manager context. For concrete Linux input method issues, load the linux-input-method-diagnose skill.", "查看只读基础系统信息，包括 OS、shell、桌面会话、内核、主机和包管理器上下文。排查具体 Linux 输入法问题时先加载 linux-input-method-diagnose 技能。"),
         json!({"type":"object","properties":{},"additionalProperties":false}),
         |_| async move { check_os_info() },
     ));
@@ -127,7 +127,7 @@ fn check_os_info() -> Result<String> {
         "package_manager_guess": package_manager_guess,
         "notes": [
             "This tool is read-only and does not execute shell commands.",
-            "This only reports basic OS context. For concrete Linux input method issues, use linux_input_method_diagnose."
+            "This only reports basic OS context. For concrete Linux input method issues, load the linux-input-method-diagnose skill."
         ],
     }))?)
 }
@@ -467,7 +467,8 @@ async fn run_command(args: Value, allowed: bool, progress: ToolProgress) -> Resu
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return super::jobs::spawn_background(&command).await;
+        let title = args.get("title").and_then(Value::as_str);
+        return super::jobs::spawn_background(&command, title, &progress).await;
     }
     let timeout = args
         .get("timeout_seconds")

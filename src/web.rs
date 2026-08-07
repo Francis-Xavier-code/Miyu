@@ -394,6 +394,11 @@ pub(crate) struct RunInfo {
     pub(crate) supersede: Arc<crate::agent::TurnSupersedeSignal>,
     pub(crate) platform_followup: Option<Arc<platforms::PlatformFollowupRun>>,
     pub(crate) operation: RunOperation,
+    /// True for daemon-initiated background-command wake turns; lets REPL
+    /// clients discover and attach to them for live rendering.
+    pub(crate) job_wake: bool,
+    /// Display label for wake turns: "<job_id> · <title>".
+    pub(crate) job_wake_label: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1729,11 +1734,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let password = resolve_web_password(&args)?;
     AppConfig::init_files(&paths)?;
     let config = AppConfig::load_or_default(&paths)?;
-    tools::jobs::init(
-        &paths,
-        config.tools.background_job_limit,
-        config.tools.background_job_max_minutes,
-    );
+    tools::jobs::init(&paths, config.tools.background_job_max_minutes);
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
     let persona = config.active_persona_scope();
@@ -2025,6 +2026,48 @@ async fn handle_ipc_connection(
         IpcCommand::Shutdown => {
             ipc::send(&mut stream, &IpcFrame::Ack).await?;
             let _ = state.shutdown_tx.send(());
+        }
+        IpcCommand::JobsOverview => {
+            let wake_runs = {
+                let manager = state.manager.lock().unwrap();
+                manager
+                    .active_runs
+                    .iter()
+                    .filter(|(_, info)| info.job_wake)
+                    .map(|(run_id, info)| {
+                        json!({
+                            "run_id": run_id,
+                            "session_id": &*info.session_id,
+                            "label": info.job_wake_label,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            ipc::send(
+                &mut stream,
+                &IpcFrame::AdminResult {
+                    state: session_state(&state.manager, &state.state_store)?,
+                    data: json!({ "jobs": tools::jobs::overview(), "wake_runs": wake_runs }),
+                },
+            )
+            .await?;
+        }
+        IpcCommand::FollowRun { run_id } => {
+            follow_run(&state, &mut stream, run_id).await?;
+        }
+        IpcCommand::StopSessionJobs { session_id } => {
+            let stopped = tools::jobs::stop_session_jobs(&session_id).await;
+            state
+                .events
+                .publish("job.acknowledged", json!({ "session_id": session_id }));
+            ipc::send(
+                &mut stream,
+                &IpcFrame::AdminResult {
+                    state: session_state(&state.manager, &state.state_store)?,
+                    data: json!({ "stopped": stopped }),
+                },
+            )
+            .await?;
         }
         IpcCommand::GetStatus => {
             let qq_enabled = state.manager.lock().unwrap().config.platforms.qq.enabled;
@@ -3165,6 +3208,8 @@ async fn handle_ipc_turn(
                     supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                     platform_followup: None,
                     operation: RunOperation::Create,
+                    job_wake: false,
+                job_wake_label: None,
                 },
             );
             false
@@ -3211,6 +3256,7 @@ async fn handle_ipc_turn(
         stream,
         &IpcFrame::Accepted {
             run_id: run_id.clone(),
+            turn_id: None,
         },
     )
     .await?;
@@ -3259,6 +3305,88 @@ async fn handle_ipc_turn(
         .await?;
         if terminal {
             run_guard.finish();
+            break;
+        }
+    }
+    Ok(())
+}
+
+
+/// Attach a client to an already-running turn (background-command wake):
+/// forwards its event frames until terminal, without owning the run.
+async fn follow_run(
+    state: &DaemonState,
+    stream: &mut tokio::net::UnixStream,
+    run_id: String,
+) -> Result<()> {
+    let mut subscription = state.events.subscribe_after(state.events.latest_id());
+    let run_state = {
+        let manager = state.manager.lock().unwrap();
+        manager
+            .active_runs
+            .get(&run_id)
+            .map(|info| info.turn_id.clone())
+    };
+    let Some(turn_id) = run_state else {
+        ipc::send(stream, &IpcFrame::error("run is not active")).await?;
+        return Ok(());
+    };
+    ipc::send(
+        stream,
+        &IpcFrame::Accepted {
+            run_id: run_id.clone(),
+            turn_id,
+        },
+    )
+    .await?;
+    let mut last_id = 0u64;
+    loop {
+        let record = if let Some(record) = subscription.pending.pop_front() {
+            record
+        } else {
+            match subscription.receiver.recv().await {
+                Ok(record) => record,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    subscription.pending = state.events.replay_after(last_id);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        };
+        if record.kind == "resync_required" {
+            ipc::send(
+                stream,
+                &IpcFrame::error("Miyu core event history was exhausted"),
+            )
+            .await?;
+            break;
+        }
+        last_id = record.id;
+        let Ok(data) = serde_json::from_str::<Value>(&record.data) else {
+            continue;
+        };
+        if data.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
+            // The run may have finished before we saw a frame; stop when it
+            // is no longer active and nothing more will arrive for it.
+            if !state.manager.lock().unwrap().active_runs.contains_key(&run_id) {
+                break;
+            }
+            continue;
+        }
+        let terminal = matches!(
+            record.kind.as_str(),
+            "run.completed" | "run.failed" | "run.cancelled"
+        );
+        ipc::send(
+            stream,
+            &IpcFrame::Event {
+                id: record.id,
+                kind: record.kind,
+                data,
+            },
+        )
+        .await?;
+        if terminal {
             break;
         }
     }
@@ -3345,6 +3473,8 @@ fn router(state: DaemonState) -> Router {
             get(get_thinking_variants).put(set_thinking_variants),
         )
         .route("/api/conversation/reset", post(reset_conversation))
+        .route("/api/jobs", get(list_jobs_http))
+        .route("/api/jobs/{job_id}", delete(stop_job_http))
         // OneBot v11 reverse-WS endpoint: NapCat connects here as a WS
         // client. Gated by platforms.qq config, not web auth.
         .route("/ws", get(platforms::onebot::onebot_ws_on_web_port))
@@ -3357,12 +3487,52 @@ fn router(state: DaemonState) -> Router {
         .with_state(state)
 }
 
-async fn index_asset() -> Response {
-    text_asset(INDEX_HTML, "text/html; charset=utf-8")
+/// Strong validator shared by all build-embedded assets: the BUILD_ID
+/// changes on any frontend edit (build.rs rerun triggers), so a 304 can
+/// never pin a stale file.
+fn build_etag() -> &'static HeaderValue {
+    static ETAG_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
+        HeaderValue::from_str(concat!("\"", env!("MIYU_BUILD_ID"), "\""))
+            .expect("build id forms a valid header value")
+    });
+    &ETAG_VALUE
 }
 
-async fn styles_asset() -> Response {
-    text_asset(STYLES_CSS, "text/css; charset=utf-8")
+fn embedded_asset(
+    headers: &HeaderMap,
+    content: &'static [u8],
+    content_type: &'static str,
+) -> Response {
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .is_some_and(|value| value == build_etag())
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, build_etag().clone());
+        return response;
+    }
+    let mut response = finish_asset_response(content.into_response(), content_type);
+    response
+        .headers_mut()
+        .insert(axum::http::header::ETAG, build_etag().clone());
+    response
+}
+
+async fn index_asset(headers: HeaderMap) -> Response {
+    // Version the asset references so browsers and intermediaries can never
+    // serve a stale app.js/styles.css after an upgrade.
+    static VERSIONED_INDEX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        INDEX_HTML
+            .replace("href=\"/styles.css\"", concat!("href=\"/styles.css?v=", env!("MIYU_BUILD_ID"), "\""))
+            .replace("src=\"/app.js\"", concat!("src=\"/app.js?v=", env!("MIYU_BUILD_ID"), "\""))
+    });
+    embedded_asset(&headers, VERSIONED_INDEX.as_bytes(), "text/html; charset=utf-8")
+}
+
+async fn styles_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, STYLES_CSS.as_bytes(), "text/css; charset=utf-8")
 }
 
 /// Optional MD3 token override generated by matugen from the wallpaper.
@@ -3376,16 +3546,16 @@ async fn theme_css(State(state): State<DaemonState>) -> Response {
     }
 }
 
-async fn app_asset() -> Response {
-    text_asset(APP_JS, "application/javascript; charset=utf-8")
+async fn app_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, APP_JS.as_bytes(), "application/javascript; charset=utf-8")
 }
 
-async fn logo_asset() -> Response {
-    binary_asset(MIYU_LOGO, "image/png")
+async fn logo_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, MIYU_LOGO, "image/png")
 }
 
-async fn wallpaper_asset() -> Response {
-    binary_asset(MIYU_WALLPAPER, "image/png")
+async fn wallpaper_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, MIYU_WALLPAPER, "image/png")
 }
 
 async fn persona_avatar(
@@ -4723,6 +4893,8 @@ async fn redo_turn(
                     turn_id: turn_id.clone(),
                     input_id: candidate.input_id.clone(),
                 },
+                job_wake: false,
+                job_wake_label: None,
             },
         );
     }
@@ -4857,6 +5029,8 @@ async fn create_turn(
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
     }
@@ -4976,6 +5150,30 @@ async fn remove_queue_prompt(
         }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_jobs_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    Ok(Json(json!({ "jobs": tools::jobs::overview() })).into_response())
+}
+
+async fn stop_job_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    tools::jobs::stop_job(&job_id)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::NOT_FOUND, safe_error_message(&error)))?;
+    tools::jobs::acknowledge(&job_id);
+    state
+        .events
+        .publish("job.acknowledged", json!({ "job_id": job_id }));
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn cancel_run(
@@ -6999,6 +7197,12 @@ fn clear_actor_session_content(
 /// plain-text broadcast into the conversation — a self-initiated platform
 /// turn would need synthetic sender semantics the plugins aren't built for.
 fn install_background_job_hook(state: &DaemonState) {
+    let started_state = state.clone();
+    tools::jobs::set_started_hook(Arc::new(move |overview| {
+        started_state
+            .events
+            .publish("job.started", json!({ "job": overview }));
+    }));
     let hook_state = state.clone();
     tools::jobs::set_completion_hook(Arc::new(move |completion| {
         let state = hook_state.clone();
@@ -7009,25 +7213,65 @@ fn install_background_job_hook(state: &DaemonState) {
 }
 
 async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobCompletion) {
-    let Some(session_id) = completion.session_id.clone() else {
+    state.events.publish(
+        "job.finished",
+        json!({
+            "job_id": completion.job_id,
+            "title": completion.title,
+            "status": completion.state_label,
+            "runtime_seconds": completion.runtime_seconds,
+        }),
+    );
+    if !completion.wake_requested {
+        // The model stopped this command itself; clean the strips quietly.
+        tools::jobs::acknowledge(&completion.job_id);
+        state
+            .events
+            .publish("job.acknowledged", json!({ "job_id": completion.job_id }));
         return;
-    };
+    }
     let command_short = completion.command.chars().take(120).collect::<String>();
-    match state.state_store.is_platform_session(&session_id) {
-        Ok(true) => {
-            broadcast_job_completion_to_platform(&state, &session_id, &completion).await;
-        }
-        Ok(false) => {
-            wake_local_session_for_job(&state, session_id, &completion, &command_short);
-        }
-        Err(error) => {
-            tracing::warn!(
-                job_id = %completion.job_id,
-                error = %error,
-                "failed to resolve the session of a finished background job"
-            );
+    let mut pending_wake_run: Option<String> = None;
+    if let Some(session_id) = completion.session_id.clone() {
+        match state.state_store.is_platform_session(&session_id) {
+            Ok(true) => {
+                wake_platform_session_for_job(&state, &session_id, &completion).await;
+            }
+            Ok(false) => {
+                pending_wake_run =
+                    wake_local_session_for_job(&state, session_id, &completion, &command_short);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %completion.job_id,
+                    error = %error,
+                    "failed to resolve the session of a finished background command"
+                );
+            }
         }
     }
+    // Keep the finished job visible in UI strips until its wake turn is done
+    // (the report is what replaces the strip line); everything else clears
+    // right away.
+    if let Some(run_id) = pending_wake_run {
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        while std::time::Instant::now() < deadline {
+            let still_running = state
+                .manager
+                .lock()
+                .unwrap()
+                .active_runs
+                .contains_key(&run_id);
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    tools::jobs::acknowledge(&completion.job_id);
+    state
+        .events
+        .publish("job.acknowledged", json!({ "job_id": completion.job_id }));
 }
 
 fn wake_local_session_for_job(
@@ -7035,18 +7279,33 @@ fn wake_local_session_for_job(
     session_id: Arc<str>,
     completion: &tools::jobs::JobCompletion,
     command_short: &str,
-) {
+) -> Option<String> {
+    let noun = if completion.is_subagent {
+        "后台子代理"
+    } else {
+        "后台命令"
+    };
+    let action_hint = if completion.is_subagent {
+        "先用 job_status 读取日志（结尾的「子代理结果」段是最终结论，必要时用 offset 分页），然后向用户简要汇报；如果失败，指出原因并给出建议。"
+    } else {
+        "先用 job_status 读取输出（必要时用 offset 分页），然后向用户简要汇报结果；如果命令失败，指出原因并给出建议。"
+    };
     let content = format!(
-        "<background-job-report>后台任务已结束，请自主跟进：\n\
-         - job_id: {}\n- 命令: {}\n- 状态: {}（运行 {} 秒）\n\
-         先用 job_status 读取输出（必要时用 offset 分页），然后向用户简要汇报结果；\
-         如果任务失败，指出原因并给出建议。这是系统自动触发的跟进，不是用户消息。\
+        "<background-job-report>{noun}「{}」已执行完毕，请自主跟进：\n\
+         - job_id: {}\n- 任务: {}\n- 状态: {}（运行 {} 秒）\n\
+         {action_hint}这是系统自动触发的跟进，不是用户消息。\
          </background-job-report>",
-        completion.job_id, command_short, completion.state_label, completion.runtime_seconds
+        completion.title,
+        completion.job_id,
+        command_short,
+        completion.state_label,
+        completion.runtime_seconds
     );
     let display_content = format!(
-        "[后台任务完成] {} · {command_short}",
-        completion.state_label
+        "[后台任务完成] {}完成 {} · {}",
+        if completion.is_subagent { "子代理" } else { "命令" },
+        completion.job_id,
+        completion.title
     );
 
     // Mid-turn session: ride the queue so the model reacts within the
@@ -7070,7 +7329,7 @@ fn wake_local_session_for_job(
             // Turn is still starting; report on the next completion poll
             // rather than racing its queue setup.
             tracing::debug!(job_id = %completion.job_id, "job wake skipped: turn starting");
-            return;
+            return None;
         };
         let request = TurnUpdateRequest {
             run_id,
@@ -7090,7 +7349,7 @@ fn wake_local_session_for_job(
                 "job wake could not join the running turn"
             );
         }
-        return;
+        return None;
     }
 
     let run_id = random_id("run", 18);
@@ -7099,7 +7358,7 @@ fn wake_local_session_for_job(
         let mut manager = state.manager.lock().unwrap();
         if manager.admin_busy {
             tracing::debug!(job_id = %completion.job_id, "job wake skipped: admin busy");
-            return;
+            return None;
         }
         manager.active_runs.insert(
             run_id.clone(),
@@ -7113,6 +7372,13 @@ fn wake_local_session_for_job(
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: RunOperation::Create,
+                job_wake: true,
+                job_wake_label: Some(format!(
+                    "{}完成 {} · {}",
+                    if completion.is_subagent { "子代理" } else { "命令" },
+                    completion.job_id,
+                    completion.title
+                )),
             },
         );
     }
@@ -7134,10 +7400,12 @@ fn wake_local_session_for_job(
         .is_err()
     {
         finish_run(&state.manager, &run_id, None);
+        return None;
     }
+    Some(run_id)
 }
 
-async fn broadcast_job_completion_to_platform(
+async fn wake_platform_session_for_job(
     state: &DaemonState,
     session_id: &Arc<str>,
     completion: &tools::jobs::JobCompletion,
@@ -7158,37 +7426,37 @@ async fn broadcast_job_completion_to_platform(
                 .find(|binding| binding.session_id == **session_id)
         });
     let Some(binding) = binding else {
-        tracing::debug!(job_id = %completion.job_id, "job broadcast skipped: no platform binding");
+        tracing::debug!(job_id = %completion.job_id, "job wake skipped: no platform binding");
         return;
     };
-    let log_tail = std::fs::read(&completion.log_path)
-        .ok()
-        .map(|bytes| {
-            let start = bytes.len().saturating_sub(500);
-            String::from_utf8_lossy(&bytes[start..]).into_owned()
-        })
-        .unwrap_or_default();
-    let text = format!(
-        "[后台任务] {} 已结束（{}，{} 秒）\n命令：{}\n输出尾部：\n{}",
+    let noun = if completion.is_subagent {
+        "后台子代理"
+    } else {
+        "后台命令"
+    };
+    let content = format!(
+        "<background-job-report>{noun}「{}」已执行完毕：\n- job_id: {}\n- 任务: {}\n- 状态: {}（运行 {} 秒）\n\
+         请用 job_status 查看输出，并把结果自然地发到会话里。这是系统自动触发的跟进，不是用户消息。\
+         </background-job-report>",
+        completion.title,
         completion.job_id,
-        completion.state_label,
-        completion.runtime_seconds,
         completion.command.chars().take(200).collect::<String>(),
-        log_tail.trim()
+        completion.state_label,
+        completion.runtime_seconds
     );
-    if let Err(error) = crate::platforms::onebot::send_plain_text(
+    if let Err(error) = crate::platforms::onebot::wake_conversation_for_job(
         state,
         &binding.key.account_id,
         &binding.key.conversation_kind,
         &binding.key.conversation_id,
-        &text,
+        content,
     )
     .await
     {
         tracing::warn!(
             job_id = %completion.job_id,
             error = %error,
-            "failed to broadcast a background job result to QQ"
+            "failed to wake the model for a background command in QQ"
         );
     }
 }
@@ -9889,6 +10157,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
 
@@ -10068,6 +10338,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
         assert!(
@@ -10097,6 +10369,8 @@ mod tests {
                 supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                 platform_followup: None,
                 operation: RunOperation::Create,
+                job_wake: false,
+                job_wake_label: None,
             },
         );
         assert!(matches!(
@@ -10292,6 +10566,8 @@ mod tests {
                     supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                     platform_followup: None,
                     operation: RunOperation::Create,
+                    job_wake: false,
+                job_wake_label: None,
                 },
             )]),
             admin_busy: false,
@@ -10360,6 +10636,8 @@ mod tests {
                     supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
                     platform_followup: None,
                     operation: RunOperation::Create,
+                    job_wake: false,
+                job_wake_label: None,
                 },
             );
         }

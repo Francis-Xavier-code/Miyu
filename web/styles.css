@@ -4,7 +4,7 @@
   --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --serif: "Source Han Serif SC", "Noto Serif CJK SC", "Noto Serif SC", "Songti SC", "SimSun", Georgia, serif;
   --ui-scale: 1.1;
-  --artifact-content-scale: 1.090909;
+  --artifact-content-scale: calc(1.2 / var(--ui-scale));
   --sidebar-width: 252px;
 
   /* 窗边 r8 字号阶梯:正文 15 / UI 13 / meta 12 / micro 11 */
@@ -227,7 +227,7 @@ textarea:disabled {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   width: 100%;
-  height: 90.9091dvh;
+  height: calc(100dvh / var(--ui-scale));
   zoom: var(--ui-scale);
 }
 
@@ -1083,7 +1083,7 @@ textarea:disabled {
   z-index: 40;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
-  width: min(286px, calc(90.9091vw - 24px));
+  width: min(286px, calc(calc(100vw / var(--ui-scale)) - 24px));
   max-height: min(420px, 61.8182vh);
   overflow: hidden;
   border: 0;
@@ -1286,6 +1286,125 @@ textarea:disabled {
   padding: 3px 12px;
 }
 
+.system-event {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 0 18px;
+  color: var(--text-soft);
+  font-size: var(--fs-micro);
+}
+
+.system-event > span {
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 3px 12px;
+  max-width: 80%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobs-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 14px 0;
+  margin-bottom: 8px;
+}
+
+.jobs-strip-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  border: none;
+  background: var(--surface-2);
+  color: var(--text-soft);
+  font-size: var(--fs-micro);
+  border-radius: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.jobs-strip-toggle:hover {
+  color: var(--text);
+}
+
+/* 桌面端折叠头更醒目：手机端保持紧凑（836px 断点与整体缩放一致）。 */
+@media (min-width: 837px) {
+  .jobs-strip-toggle {
+    font-size: var(--fs-meta);
+    padding: 6px 14px;
+    color: var(--text);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent-soft) 30%, var(--surface-2));
+  }
+}
+
+.job-chip {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-soft);
+  font-size: var(--fs-micro);
+  padding: 4px 10px;
+}
+
+.job-chip.is-done .job-chip-marker {
+  color: var(--ok, #7fb069);
+}
+
+.job-chip.is-failed .job-chip-marker {
+  color: var(--danger, #d08080);
+}
+
+.job-chip-marker {
+  flex: none;
+  width: 1.2em;
+  text-align: center;
+}
+
+.job-chip-marker.is-spinning {
+  animation: job-chip-spin 0.8s linear infinite;
+}
+
+@keyframes job-chip-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.job-chip-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-chip-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.job-chip-stop {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: inherit;
+}
+
+.job-chip-stop:hover {
+  color: var(--text);
+}
+
+
 .message {
   width: 100%;
   min-width: 0;
@@ -1323,7 +1442,7 @@ textarea:disabled {
 .revision-editor textarea {
   width: 100%;
   min-height: 96px;
-  max-height: 36.3636vh;
+  max-height: calc(40vh / var(--ui-scale));
   resize: vertical;
   border: 1px solid var(--line-strong);
   border-radius: 8px 8px 3px 8px;
@@ -3342,7 +3461,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   left: 0;
   z-index: 8;
   display: grid;
-  width: min(320px, calc(90.9091vw - 36px));
+  width: min(320px, calc(calc(100vw / var(--ui-scale)) - 36px));
   max-height: min(360px, 50dvh);
   padding: 5px;
   overflow-y: auto;
@@ -3626,6 +3745,10 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
 }
 
 @media (max-width: 836px) {
+  :root {
+    --ui-scale: 1;
+  }
+
   .artifact-resize-handle {
     display: none;
   }
@@ -3946,7 +4069,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
 
 .question-dock {
   width: 100%;
-  max-height: min(45.4545dvh, max(0px, calc(var(--app-height, 90.9091dvh) - 220px)));
+  max-height: min(calc(50dvh / var(--ui-scale)), max(0px, calc(var(--app-height, calc(100dvh / var(--ui-scale))) - 220px)));
   margin-bottom: 8px;
   overflow-y: auto;
   scrollbar-color: var(--line-strong) transparent;
@@ -4766,7 +4889,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   z-index: 50;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  width: min(1040px, 89.0909vw);
+  width: min(1040px, calc(98vw / var(--ui-scale)));
   border-left: 0;
   background: var(--app-bg);
   box-shadow: var(--float-shadow);
@@ -5768,7 +5891,7 @@ textarea.config-input {
   z-index: 80;
   display: grid;
   width: auto;
-  max-width: calc(90.9091vw - 28px);
+  max-width: calc(calc(100vw / var(--ui-scale)) - 28px);
   transform: translateX(-50%);
   justify-items: center;
   pointer-events: none;
@@ -5776,7 +5899,7 @@ textarea.config-input {
 
 .toast {
   width: fit-content;
-  max-width: min(340px, calc(90.9091vw - 28px));
+  max-width: min(340px, calc(calc(100vw / var(--ui-scale)) - 28px));
   margin-top: 7px;
   padding: 10px 14px;
   border: 0;
@@ -5796,7 +5919,7 @@ textarea.config-input {
 }
 
 .reset-dialog {
-  width: min(440px, calc(90.9091vw - 32px));
+  width: min(440px, calc(calc(100vw / var(--ui-scale)) - 32px));
   padding: 0;
   border: 0;
   border-radius: 8px;
@@ -5892,7 +6015,7 @@ textarea.config-input {
   }
 
   .settings-drawer {
-    width: min(900px, 89.0909vw);
+    width: min(900px, calc(98vw / var(--ui-scale)));
   }
 }
 
@@ -5918,7 +6041,7 @@ textarea.config-input {
     top: 0;
     bottom: 0;
     left: 0;
-    width: min(78.1818vw, 320px);
+    width: min(calc(86vw / var(--ui-scale)), 320px);
     padding-top: env(safe-area-inset-top);
     box-shadow: var(--float-shadow);
     transform: translateX(-102%);
@@ -5943,7 +6066,7 @@ textarea.config-input {
 
   .main-stage {
     width: 100%;
-    height: var(--app-height, 90.9091dvh);
+    height: var(--app-height, calc(100dvh / var(--ui-scale)));
   }
 
   .topbar {
@@ -5986,8 +6109,8 @@ textarea.config-input {
     position: fixed;
     top: calc(62px + env(safe-area-inset-top));
     right: 8px;
-    width: min(286px, calc(90.9091vw - 16px));
-    max-height: min(430px, calc(90.9091dvh - 82px));
+    width: min(286px, calc(calc(100vw / var(--ui-scale)) - 16px));
+    max-height: min(430px, calc(calc(100dvh / var(--ui-scale)) - 82px));
   }
 
   .timeline {
@@ -6034,7 +6157,7 @@ textarea.config-input {
   }
 
   .tool-title .tool-summary {
-    max-width: 36.3636vw;
+    max-width: calc(40vw / var(--ui-scale));
   }
 
   .question-answer-summary,
@@ -6112,7 +6235,7 @@ textarea.config-input {
   }
 
   .settings-drawer {
-    width: min(720px, 90.9091vw);
+    width: min(720px, calc(100vw / var(--ui-scale)));
     padding-top: env(safe-area-inset-top);
   }
 
@@ -6279,7 +6402,7 @@ textarea.config-input {
   }
 
   .composer-dock.has-pending-question .question-dock {
-    max-height: max(0px, calc(var(--app-height, 90.9091dvh) - 88px));
+    max-height: max(0px, calc(var(--app-height, calc(100dvh / var(--ui-scale))) - 88px));
     margin-bottom: 0;
   }
 }
