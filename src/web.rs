@@ -95,6 +95,7 @@ pub(crate) struct DaemonState {
     boot_id: Arc<str>,
     pub(crate) web_port: u16,
     web_public: bool,
+    web_bind: IpAddr,
     pub(crate) paths: MiyuPaths,
     pub(crate) manager: Arc<Mutex<ManagerState>>,
     pub(crate) state_store: StateStore,
@@ -126,6 +127,7 @@ impl DaemonState {
             boot_id: Arc::from("boot-test"),
             web_port,
             web_public: false,
+            web_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             paths,
             manager,
             state_store,
@@ -172,6 +174,7 @@ impl DaemonState {
                 boot_id: Arc::from("boot-test"),
                 web_port,
                 web_public: false,
+            web_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 paths,
                 manager,
                 state_store,
@@ -1748,9 +1751,10 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     }
     let context = cold_context(&config, &state_store)?;
 
-    // Listen on all interfaces so the WebUI is reachable from the LAN;
-    // access URLs for every local address are printed below.
-    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    // Default binds all interfaces so the WebUI is reachable from the LAN;
+    // `--bind 127.0.0.1` restricts it to this machine. Access URLs matching
+    // the effective bind are printed below.
+    let bind_ip = args.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let listener = match tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, args.port)).await {
         Ok(listener) => listener,
         Err(error)
@@ -1771,7 +1775,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("binding Miyu WebUI to 0.0.0.0:{}", args.port));
+                .with_context(|| format!("binding Miyu WebUI to {bind_ip}:{}", args.port));
         }
     };
     let port = listener.local_addr()?.port();
@@ -1807,7 +1811,8 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         auth: WebAuth::new(password.as_deref()),
         boot_id,
         web_port: port,
-        web_public: true,
+        web_public: !bind_ip.is_loopback(),
+        web_bind: bind_ip,
         paths,
         manager,
         state_store,
@@ -1827,7 +1832,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     let app = router(state.clone());
-    let urls = ipc::web_access_urls(port);
+    let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
         println!("Miyu WebUI: {url}");
     }
@@ -2004,6 +2009,7 @@ async fn handle_ipc_connection(
                     pid: std::process::id(),
                     web_port: state.web_port,
                     web_public: state.web_public,
+                    web_bind: Some(state.web_bind),
                     build_id: ipc::BUILD_ID.to_string(),
                 },
             )
@@ -6175,6 +6181,7 @@ async fn run_turn_task(
 
     let result = match chat_outcome {
         TurnOutcome::Cancelled => {
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             finish_cancelled_run(
                 manager,
                 events,
@@ -6188,6 +6195,7 @@ async fn run_turn_task(
         }
         TurnOutcome::Finished(Err(error)) if question::is_question_cancelled(&error) => {
             questions.cancel_run(run_id);
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             finish_cancelled_run(
                 manager,
                 events,
@@ -6255,6 +6263,7 @@ async fn run_turn_task(
     };
     match overflow_outcome {
         OverflowOutcome::Cancelled => {
+            drop_cancelled_queue(&store, events, run_id, &session_id);
             let context =
                 current_context(agent).unwrap_or_else(|_| manager.lock().unwrap().context);
             finish_run(manager, run_id, updates_context().then_some(context));
@@ -6977,6 +6986,39 @@ fn clear_actor_session_content(
     Ok(())
 }
 
+/// An explicit cancel withdraws the follow-ups still queued behind the
+/// reply: the user aborted the exchange, so folding them into context would
+/// keep answering messages they no longer want processed. Published before
+/// `run.cancelled` so clients still draining the event stream can clear
+/// their queue bubbles.
+fn drop_cancelled_queue(store: &StateStore, events: &EventHub, run_id: &str, session_id: &str) {
+    match store.delete_queued_prompts() {
+        Ok(prompt_ids) => {
+            for prompt_id in prompt_ids {
+                events.publish(
+                    "queue.removed",
+                    json!({
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "prompt_id": prompt_id,
+                    }),
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "{}",
+                t(
+                    "failed to drop queued prompts for a cancelled turn",
+                    "无法丢弃已取消回复的排队消息"
+                )
+            );
+        }
+    }
+}
+
 fn finish_cancelled_run(
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
@@ -7078,9 +7120,11 @@ fn publish_completed(
     result: &ChatResult,
     context: ContextSnapshot,
 ) {
-    // Prefer the provider-reported context size (final request's prompt +
-    // completion) over the local BPE estimate when real usage is available.
-    let context_tokens = real_context_tokens(result).unwrap_or(context.tokens);
+    // Always the local estimate of the persisted context: provider-reported
+    // request usage measures what this turn consumed, not what the context
+    // holds now — the two diverge after post-turn compaction/pruning, and
+    // the footer meter must refresh with those rewrites.
+    let context_tokens = context.tokens;
     events.publish(
         "run.completed",
         json!({
@@ -7095,20 +7139,6 @@ fn publish_completed(
             "cumulative_tokens": context.cumulative_tokens,
         }),
     );
-}
-
-/// True provider-side context size after a completed turn: the final
-/// request's prompt+completion tokens, when the provider reported real usage.
-pub(crate) fn real_context_tokens(result: &ChatResult) -> Option<u64> {
-    if result.usage_estimated {
-        return None;
-    }
-    let usage = result
-        .last_request_usage
-        .as_ref()
-        .or(result.usage.as_ref())?;
-    let total = usage.prompt_tokens.saturating_add(usage.completion_tokens);
-    (total > 0).then_some(total)
 }
 
 fn current_context(agent: &Agent) -> Result<ContextSnapshot> {

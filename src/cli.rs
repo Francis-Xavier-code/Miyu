@@ -926,6 +926,10 @@ pub struct WebArgs {
     #[arg(long, default_value_t = ipc::DEFAULT_WEB_PORT)]
     pub port: u16,
 
+    /// WebUI 监听地址；默认 0.0.0.0（所有网卡），127.0.0.1 仅限本机访问。
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<std::net::IpAddr>,
+
     #[arg(short = 'p', long, num_args = 0, default_missing_value = "")]
     pub password: Option<String>,
 
@@ -1385,7 +1389,7 @@ async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
                     )
                 );
             }
-            for url in ipc::web_access_urls(info.web_port) {
+            for url in daemon_web_access_urls(&info) {
                 println!("Miyu WebUI: {url}");
             }
             return Ok(());
@@ -1400,14 +1404,18 @@ async fn run_web(paths: &MiyuPaths, mut args: WebArgs) -> Result<()> {
     }
     let launch = web_launch_config(paths, &args)?;
     let info = ipc::ensure_daemon(paths, launch.as_ref()).await?;
-    for url in ipc::web_access_urls(info.web_port) {
+    for url in daemon_web_access_urls(&info) {
         println!("Miyu WebUI: {url}");
     }
     Ok(())
 }
 
 fn web_launch_config(paths: &MiyuPaths, args: &WebArgs) -> Result<Option<ipc::DaemonLaunchConfig>> {
-    if !args.port_explicit && args.password.is_none() && args.password_file.is_none() {
+    if !args.port_explicit
+        && args.bind.is_none()
+        && args.password.is_none()
+        && args.password_file.is_none()
+    {
         return Ok(None);
     }
     let password_file = match args.password.as_deref() {
@@ -1432,7 +1440,15 @@ fn web_launch_config(paths: &MiyuPaths, args: &WebArgs) -> Result<Option<ipc::Da
     Ok(Some(ipc::DaemonLaunchConfig {
         port: args.port,
         password_file,
+        bind: args.bind,
     }))
+}
+
+fn daemon_web_access_urls(info: &ipc::DaemonInfo) -> Vec<String> {
+    let bind = info
+        .web_bind
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    ipc::web_access_urls_for(bind, info.web_port)
 }
 
 async fn run_daemon_command(paths: &MiyuPaths, args: DaemonArgs) -> Result<()> {
@@ -1531,7 +1547,7 @@ async fn print_daemon_status(paths: &MiyuPaths) -> Result<()> {
         info.pid,
     );
     for line in
-        daemon_web_status_lines(t("WebUI:", "WebUI："), &ipc::web_access_urls(info.web_port))
+        daemon_web_status_lines(t("WebUI:", "WebUI："), &daemon_web_access_urls(&info))
     {
         println!("{line}");
     }
@@ -3180,6 +3196,38 @@ fn run_persona_picker(paths: &MiyuPaths, argument: &str) -> Result<bool> {
         }
     );
     Ok(true)
+}
+
+/// One line per context watermark: absolute tokens left before each tier
+/// fires (soft notice / mechanical prune / compaction / forced compaction).
+/// Absolute values, not percentages — same reasoning as the cache accounting
+/// log line.
+fn compact_watermark_text(
+    context_tokens: usize,
+    window: usize,
+    context: &crate::config::ContextConfig,
+) -> String {
+    let tier = |label: &str, ratio: f32| -> String {
+        let threshold = (window as f32 * ratio).max(1.0) as usize;
+        if context_tokens >= threshold {
+            format!("{label} {}✓", t("reached", "已达"))
+        } else {
+            format!("{label} -{}", threshold - context_tokens)
+        }
+    };
+    format!(
+        "{}: {} / {} · {}",
+        t("Context watermarks", "上下文水位"),
+        context_tokens,
+        window,
+        [
+            tier(&t("notice", "提示"), context.compact_soft_ratio),
+            tier(&t("prune", "折叠"), context.compact_snip_ratio),
+            tier(&t("compact", "压缩"), context.trim_at_ratio),
+            tier(&t("force", "强制"), context.compact_force_ratio),
+        ]
+        .join(" · ")
+    )
 }
 
 fn usage_overview_text(
@@ -4947,6 +4995,16 @@ async fn try_run_remote_chat(
                         live.suspend()?;
                         live.consume_queued(&prompt_ids, consumed_mode)
                     })?;
+                }
+            }
+            "queue.removed" => {
+                if let Some(live) = live.as_deref_mut() {
+                    if let Some(prompt_id) = data.get("prompt_id").and_then(serde_json::Value::as_str)
+                    {
+                        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                            live.drop_queued(&[prompt_id.to_string()])
+                        })?;
+                    }
                 }
             }
             "generation.superseded" => {
@@ -7015,8 +7073,16 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/usage") && command_args_empty {
             let snapshot = state.usage_snapshot()?;
-            let context = Some((agent.effective_context_tokens()?, agent.context_window()));
-            println!("{}\n", usage_overview_text(&snapshot, context));
+            let context_tokens = agent.effective_context_tokens()?;
+            let context = Some((context_tokens, agent.context_window()));
+            println!("{}", usage_overview_text(&snapshot, context));
+            if let Some(window) = agent.context_window() {
+                println!(
+                    "{}",
+                    compact_watermark_text(context_tokens as usize, window, &config.context)
+                );
+            }
+            println!();
             continue;
         }
         if command.eq_ignore_ascii_case("/persona") {
@@ -7325,10 +7391,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                     cumulative_tokens =
                         cumulative_tokens.saturating_add(render::usage_total(usage));
                 }
-                let context_tokens = match crate::web::real_context_tokens(&result) {
-                    Some(tokens) => tokens,
-                    None => agent.effective_context_tokens()?,
-                };
+                let context_tokens = agent.effective_context_tokens()?;
                 footer.update_token_usage(
                     &result,
                     context_tokens,
@@ -7384,6 +7447,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 show_shortcut_hint = false;
             }
             Ok(None) => {
+                // An explicit cancel also withdraws the queued follow-ups;
+                // reloading afterwards clears their bubbles.
+                let _ = state.delete_queued_prompts();
                 if let Some(live) = live_repl.as_mut() {
                     synchronized_terminal_update(CursorAfterUpdate::Shown, || {
                         live.reload_queue(&state)
@@ -7396,6 +7462,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 footer.update_cumulative_tokens(cumulative_tokens);
             }
             Err(err) if crate::question::is_question_cancelled(&err) => {
+                let _ = state.delete_queued_prompts();
                 if let Some(live) = live_repl.as_mut() {
                     synchronized_terminal_update(CursorAfterUpdate::Shown, || {
                         live.reload_queue(&state)
@@ -9037,6 +9104,21 @@ impl LiveReplTail {
         write_committed_user_messages(&[("", mode)], true)?;
         let output_cursor = cursor::position()?;
         self.output_cursor = output_cursor;
+        self.resume_at(output_cursor)
+    }
+
+    /// Remove queued bubbles without committing them as sent messages —
+    /// the daemon dropped these prompts (explicit cancel), they were never
+    /// answered and never entered the conversation.
+    fn drop_queued(&mut self, prompt_ids: &[String]) -> Result<()> {
+        let ids = prompt_ids.iter().collect::<std::collections::HashSet<_>>();
+        if !self.queued.iter().any(|prompt| ids.contains(&prompt.prompt_id)) {
+            return Ok(());
+        }
+        let output_cursor = self.output_cursor;
+        self.suspend()?;
+        self.queued
+            .retain(|prompt| !ids.contains(&prompt.prompt_id));
         self.resume_at(output_cursor)
     }
 
@@ -11333,6 +11415,7 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 4100,
+                bind: None,
                 password: None,
                 password_file: None,
                 port_explicit: true,
@@ -11348,6 +11431,7 @@ mod repl_input_tests {
             cli.command,
             Some(Command::Web(WebArgs {
                 port: 8300,
+                bind: None,
                 password: None,
                 password_file: None,
                 port_explicit: false,
@@ -11394,6 +11478,7 @@ mod repl_input_tests {
         let paths = pop_test_paths(temp.path());
         let args = WebArgs {
             port: 9400,
+            bind: None,
             password: Some("very-secret".to_string()),
             password_file: None,
             port_explicit: false,
@@ -11425,6 +11510,7 @@ mod repl_input_tests {
         let paths = pop_test_paths(temp.path());
         let args = WebArgs {
             port: ipc::DEFAULT_WEB_PORT,
+            bind: None,
             password: None,
             password_file: None,
             port_explicit: false,
@@ -11441,6 +11527,7 @@ mod repl_input_tests {
         std::fs::write(&external, "file-secret\n").unwrap();
         let args = WebArgs {
             port: ipc::DEFAULT_WEB_PORT,
+            bind: None,
             password: None,
             password_file: Some(external.clone()),
             port_explicit: false,

@@ -2364,8 +2364,16 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         | "fcitx5_input_method_wiki_qurey" => string_arg(&args, &["query", "topic"]),
         "archwiki_query" | "query_moegirl" => string_arg(&args, &["title", "query"]),
         "search_knowledge_base_by_name" => string_arg(&args, &["file_name_query"]),
-        "read_file" | "write_file" | "edit_file" | "edit_string" | "trash_path"
-        | "register_script" => string_arg(&args, &["path"]),
+        "read_file" => {
+            let path = string_arg(&args, &["path"])?;
+            Some(match read_page_label(&args) {
+                Some(page) => format!("{path} ({page})"),
+                None => path,
+            })
+        }
+        "write_file" | "edit_file" | "edit_string" | "trash_path" | "register_script" => {
+            string_arg(&args, &["path"])
+        }
         "run_command" => string_arg(&args, &["command"]),
         "read_knowledge_base_file" | "edit_knowledge_base_file" | "remove_knowledge_base_file" => {
             string_arg(&args, &["file_name"])
@@ -2439,6 +2447,23 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         _ => None,
     }?;
     safe_inline_subject(&value)
+}
+
+/// Page label for a read_file call: `L<start>-<end>` when the range is
+/// bounded, `L<start>+` for an open tail. `None` for a plain full read so
+/// the common case stays a bare path.
+fn read_page_label(args: &Value) -> Option<String> {
+    let offset = args.get("offset").and_then(Value::as_u64);
+    let limit = args.get("limit").and_then(Value::as_u64);
+    let start = offset.unwrap_or(1).max(1);
+    match (offset, limit) {
+        (None, None) => None,
+        (_, Some(limit)) => Some(format!(
+            "L{start}-{}",
+            start.saturating_add(limit.saturating_sub(1))
+        )),
+        (Some(_), None) => Some(format!("L{start}+")),
+    }
 }
 
 fn string_arg(args: &Value, keys: &[&str]) -> Option<String> {
@@ -5213,6 +5238,27 @@ mod tests {
             )
             .as_deref(),
             Some(expected_load_tools_subject.as_str())
+        );
+    }
+
+    #[test]
+    fn read_file_subject_shows_the_page_range() {
+        assert_eq!(
+            tool_subject("read_file", r#"{"path":"/tmp/a.rs"}"#).as_deref(),
+            Some("/tmp/a.rs")
+        );
+        assert_eq!(
+            tool_subject("read_file", r#"{"path":"/tmp/a.rs","offset":2001,"limit":2000}"#)
+                .as_deref(),
+            Some("/tmp/a.rs (L2001-4000)")
+        );
+        assert_eq!(
+            tool_subject("read_file", r#"{"path":"/tmp/a.rs","limit":500}"#).as_deref(),
+            Some("/tmp/a.rs (L1-500)")
+        );
+        assert_eq!(
+            tool_subject("read_file", r#"{"path":"/tmp/a.rs","offset":300}"#).as_deref(),
+            Some("/tmp/a.rs (L300+)")
         );
     }
 

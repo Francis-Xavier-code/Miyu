@@ -46,6 +46,31 @@ pub struct PruneStats {
     pub saved_chars: usize,
 }
 
+/// Deterministic per-turn tool footprint. BTreeSet: sorted, deduplicated,
+/// byte-deterministic serialization (cache-purity requirement for anything
+/// that ends up in a rendered summary).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ToolFootprint {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub read: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub modified: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub memories: std::collections::BTreeSet<String>,
+}
+
+impl ToolFootprint {
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.modified.is_empty() && self.memories.is_empty()
+    }
+
+    pub fn merge(&mut self, other: ToolFootprint) {
+        self.read.extend(other.read);
+        self.modified.extend(other.modified);
+        self.memories.extend(other.memories);
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Turn {
@@ -2073,6 +2098,7 @@ impl ConversationDb {
             "DELETE FROM turn_journal_segments WHERE turn_id = ?1",
             params![turn_id],
         )?;
+        touch_session_last_request(&tx, turn_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -2120,6 +2146,7 @@ impl ConversationDb {
             "DELETE FROM turn_journal_segments WHERE turn_id = ?1",
             params![turn_id],
         )?;
+        touch_session_last_request(&tx, turn_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -2152,6 +2179,7 @@ impl ConversationDb {
              WHERE turn_id = ?2 AND revision = ?3 AND status = 'running'",
             params![now, turn_id, revision],
         )?;
+        touch_session_last_request(&tx, turn_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -2178,6 +2206,74 @@ impl ConversationDb {
         }
         tx.commit()?;
         Ok(restored)
+    }
+
+    /// Unions `delta` into the turn's stored footprint. Read-modify-write is
+    /// safe here: the turn is running and owned by exactly one process.
+    pub fn merge_turn_footprint(&self, turn_id: &str, delta: &ToolFootprint) -> Result<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<Option<String>> = conn
+            .query_row(
+                "SELECT tool_footprint FROM turns WHERE turn_id = ?1",
+                params![turn_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let mut footprint = existing
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<ToolFootprint>(json).ok())
+            .unwrap_or_default();
+        footprint.merge(delta.clone());
+        conn.execute(
+            "UPDATE turns SET tool_footprint = ?1 WHERE turn_id = ?2",
+            params![serde_json::to_string(&footprint)?, turn_id],
+        )?;
+        Ok(())
+    }
+
+    /// Merged footprint across the given turns (summary rows included — they
+    /// carry the accumulated footprint of everything they folded).
+    pub fn load_merged_footprint(
+        &self,
+        session_id: &str,
+        turn_ids: &[String],
+    ) -> Result<ToolFootprint> {
+        let conn = self.conn.lock().unwrap();
+        let mut merged = ToolFootprint::default();
+        let mut stmt = conn.prepare(
+            "SELECT tool_footprint FROM turns WHERE session_id = ?1 AND turn_id = ?2",
+        )?;
+        for turn_id in turn_ids {
+            let value: Option<Option<String>> = stmt
+                .query_row(params![session_id, turn_id], |row| row.get(0))
+                .optional()?;
+            if let Some(Some(json)) = value {
+                if let Ok(footprint) = serde_json::from_str::<ToolFootprint>(&json) {
+                    merged.merge(footprint);
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Unix seconds of this session's most recent completed/interrupted
+    /// request write-point. None on legacy sessions (cold-resume prune skips).
+    pub fn session_last_request_at(&self, session_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let value: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT last_request_at FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
     }
 
     pub fn append_tool_report(&self, turn_id: &str, report: &str) -> Result<()> {
@@ -3373,6 +3469,41 @@ impl ConversationDb {
         )? == 1)
     }
 
+    /// Hard-drop every still-queued prompt of a queue session and return
+    /// their ids. Unlike `discard_queued_prompts` this never folds prompts
+    /// into the conversation: it backs an explicit user cancel, where the
+    /// queued follow-ups are withdrawn rather than preserved as context.
+    pub fn delete_queued_prompts(
+        &self,
+        session_id: &str,
+        queue_session_id: &str,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prompt_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT prompt_id FROM queued_prompts
+                 WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2
+                 ORDER BY seq",
+            )?;
+            let prompt_ids = stmt
+                .query_map(params![session_id, queue_session_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            prompt_ids
+        };
+        if !prompt_ids.is_empty() {
+            tx.execute(
+                "DELETE FROM queued_prompts
+                 WHERE status = 'queued' AND session_id = ?1 AND queue_session_id = ?2",
+                params![session_id, queue_session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(prompt_ids)
+    }
+
     pub fn discard_stale_queued_prompts(
         &self,
         current_session_id: &str,
@@ -3848,6 +3979,7 @@ impl ConversationDb {
         summary: &str,
         token_total: Option<u64>,
         token_usage_estimated: bool,
+        footprint_json: Option<&str>,
     ) -> Result<()> {
         if summary.trim().is_empty() {
             bail!("compact returned an empty summary");
@@ -3929,9 +4061,9 @@ impl ConversationDb {
         let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         tx.execute(
-            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq, compact_hidden_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10, ?11)",
-            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq, hidden_json],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq, compact_hidden_json, tool_footprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10, ?11, ?12)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq, hidden_json, footprint_json],
         )?;
         tx.commit()?;
         Ok(())
@@ -4654,6 +4786,17 @@ fn consume_stale_queued_prompts_locked(
         )?;
     }
     Ok(prompts.len())
+}
+
+/// MAX() keeps the stamp monotonic even if a stale writer commits late; a
+/// wall-clock step backwards must never make an idle session look fresh.
+fn touch_session_last_request(tx: &Transaction<'_>, turn_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE sessions SET last_request_at = MAX(COALESCE(last_request_at, 0), ?1)
+         WHERE session_id = (SELECT session_id FROM turns WHERE turn_id = ?2)",
+        params![Utc::now().timestamp(), turn_id],
+    )?;
+    Ok(())
 }
 
 fn interrupted_projection_locked(

@@ -20,7 +20,8 @@ pub use conversation_db::{
     ImageAsset, ImageAssetData, PlatformAccessActor, PlatformAccessGrant, PlatformAccessGrantKey,
     PlatformMemeRefRecord, PlatformPluginScopeKey, PlatformSessionBinding,
     PlatformSessionBindingKey, PruneStats, QueuedPrompt, QueuedPromptAttachment, RedoCandidate,
-    RedoInputKind, RedoStart, SessionOverview, SessionRecord, Turn, TurnFollowup, TurnJournalEvent,
+    RedoInputKind, RedoStart, SessionOverview, SessionRecord, ToolFootprint, Turn, TurnFollowup,
+    TurnJournalEvent,
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
@@ -1301,6 +1302,13 @@ impl StateStore {
         )
     }
 
+    /// Explicit-cancel variant of queue cleanup: drop still-queued prompts
+    /// outright (no fold into context) and return the dropped ids.
+    pub fn delete_queued_prompts(&self) -> Result<Vec<String>> {
+        self.conv_db
+            .delete_queued_prompts(&self.session(), &self.queue_session_id)
+    }
+
     pub fn discard_queued_prompts(&self) -> Result<usize> {
         self.conv_db
             .discard_queued_prompts(&self.session(), &self.queue_session_id)
@@ -1428,6 +1436,10 @@ impl StateStore {
             .prune_stale_tool_reports(&self.session(), protect_recent, min_saved_chars)
     }
 
+    pub fn session_last_request_at(&self) -> Result<Option<i64>> {
+        self.conv_db.session_last_request_at(&self.session())
+    }
+
     pub fn replace_visible_with_summary(
         &self,
         fold_turn_ids: &[String],
@@ -1435,6 +1447,7 @@ impl StateStore {
         summary: &str,
         token_total: Option<u64>,
         token_usage_estimated: bool,
+        footprint_json: Option<&str>,
     ) -> Result<()> {
         self.conv_db.replace_visible_with_summary(
             &self.session(),
@@ -1443,7 +1456,23 @@ impl StateStore {
             summary,
             token_total,
             token_usage_estimated,
+            footprint_json,
         )
+    }
+
+    pub fn merge_turn_footprint(
+        &self,
+        turn_id: &str,
+        delta: &crate::state::ToolFootprint,
+    ) -> Result<()> {
+        self.conv_db.merge_turn_footprint(turn_id, delta)
+    }
+
+    pub fn load_merged_footprint(
+        &self,
+        turn_ids: &[String],
+    ) -> Result<crate::state::ToolFootprint> {
+        self.conv_db.load_merged_footprint(&self.session(), turn_ids)
     }
 
     pub fn oldest_evictable_visible_turns(&self, count: usize) -> Result<Vec<Turn>> {
@@ -2336,6 +2365,27 @@ mod tests {
             turn.followups[0].preceding_assistant_content.as_deref(),
             Some("answer")
         );
+    }
+
+    #[test]
+    fn cancelled_turn_cleanup_deletes_queued_prompts_without_folding() {
+        let (_temp, store) = test_store();
+        store
+            .start_turn("turn_1", "initial", std::process::id())
+            .unwrap();
+        store
+            .enqueue_prompt("q1", "排队消息", "排队消息", &[])
+            .unwrap();
+        store.interrupt_turn("turn_1").unwrap();
+
+        let dropped = store.delete_queued_prompts().unwrap();
+        assert_eq!(dropped, vec!["q1".to_string()]);
+        // Neither still queued nor folded into the turn as a follow-up.
+        assert!(store.load_queued_prompts().unwrap().is_empty());
+        let turn = store.load_turns().unwrap().remove(0);
+        assert!(turn.followups.is_empty());
+        // Idempotent on an already-empty queue.
+        assert!(store.delete_queued_prompts().unwrap().is_empty());
     }
 
     #[test]
@@ -3953,7 +4003,7 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true, None)
             .unwrap();
 
         let all = store.load_turns().unwrap();
@@ -3993,13 +4043,13 @@ mod tests {
         }
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false, None)
             .unwrap();
         store.start_turn("t3", "third", 999999).unwrap();
         store.complete_turn("t3", "reply", None).unwrap();
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false, None)
             .unwrap();
 
         assert_eq!(
@@ -4043,6 +4093,7 @@ mod tests {
                 "summary",
                 None,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4084,6 +4135,7 @@ mod tests {
                 "summary one",
                 None,
                 false,
+                None,
             )
             .unwrap();
         store.start_turn("t4", "fourth", 999999).unwrap();
@@ -4100,6 +4152,7 @@ mod tests {
                 "summary two",
                 None,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4179,7 +4232,7 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false, None)
             .is_err());
 
         let visible = store.load_visible_turns().unwrap();
@@ -4202,7 +4255,7 @@ mod tests {
         .unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false, None)
             .is_err());
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 1);
@@ -4273,7 +4326,7 @@ mod tests {
         store.undo_last_turn().unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
             .is_err());
         assert!(store.load_visible_turns().unwrap().is_empty());
     }
@@ -4288,7 +4341,7 @@ mod tests {
         store.complete_turn("t2", "reply", None).unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false)
+            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
             .is_err());
         assert_eq!(store.load_visible_turns().unwrap().len(), 2);
     }

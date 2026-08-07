@@ -4346,6 +4346,11 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   grid-template-columns: minmax(112px, max-content) minmax(158px, max-content);
 }
 
+/* 单模型时模型栏被隐藏，布局收成一列档位。 */
+.thinking-variant-layout.single-model {
+  grid-template-columns: minmax(158px, max-content);
+}
+
 .thinking-model-pane,
 .thinking-level-pane {
   min-width: 0;

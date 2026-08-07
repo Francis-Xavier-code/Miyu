@@ -705,6 +705,15 @@ pub struct RealContextIdentityMapping {
 #[serde(default)]
 pub struct RealContextPluginSettings {
     pub context_messages: usize,
+    /// Decision 4: fold messages that age out of the injection window into an
+    /// anchored summary instead of dropping them.
+    pub context_summary: bool,
+    /// Backlog size (messages beyond the live window) that queues one async
+    /// summarization pass.
+    pub context_summary_trigger_messages: usize,
+    /// Rendered summary block cap, in chars.
+    pub context_summary_max_chars: usize,
+    pub context_summary_timeout_seconds: u64,
     #[serde(alias = "group_member_page_size")]
     pub group_member_search_max_results: usize,
 
@@ -798,6 +807,10 @@ impl Default for RealContextPluginSettings {
     fn default() -> Self {
         Self {
             context_messages: 20,
+            context_summary: true,
+            context_summary_trigger_messages: 20,
+            context_summary_max_chars: 2000,
+            context_summary_timeout_seconds: 30,
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
@@ -911,6 +924,24 @@ impl RealContextPluginSettings {
 
     pub fn validate(&self) -> Result<()> {
         validate_real_context_count("context_messages", self.context_messages, 1, 200)?;
+        validate_real_context_count(
+            "context_summary_trigger_messages",
+            self.context_summary_trigger_messages,
+            5,
+            180,
+        )?;
+        validate_real_context_count(
+            "context_summary_max_chars",
+            self.context_summary_max_chars,
+            200,
+            20_000,
+        )?;
+        validate_real_context_count(
+            "context_summary_timeout_seconds",
+            self.context_summary_timeout_seconds as usize,
+            0,
+            600,
+        )?;
         validate_real_context_count(
             "group_member_search_max_results",
             self.group_member_search_max_results,
@@ -2450,6 +2481,13 @@ pub struct ContextConfig {
     /// its one-time prefix-cache reset.
     #[serde(default = "default_true")]
     pub prune_stale_tool_reports: bool,
+    /// Cold-resume prune: a session idle longer than this resumes against an
+    /// expired provider cache, so rewriting history at that moment costs no
+    /// extra misses — it only shrinks the full-price first request. Minutes;
+    /// 0 disables. Default 1440 (24h, conservative for DeepSeek; drop to ~5
+    /// for Anthropic ephemeral cache).
+    #[serde(default = "default_cold_prune_after_minutes")]
+    pub cold_prune_after_minutes: u64,
     /// Summarization requests fork the live conversation (same byte prefix,
     /// same tools + one appended instruction) so the provider prefix cache
     /// pays for re-reading the history — roughly a 10x input-cost saving on
@@ -3321,6 +3359,7 @@ impl Default for ContextConfig {
             compact_soft_ratio: default_compact_soft_ratio(),
             compact_snip_ratio: default_compact_snip_ratio(),
             prune_stale_tool_reports: true,
+            cold_prune_after_minutes: default_cold_prune_after_minutes(),
             compact_cache_reuse: true,
         }
     }
@@ -5615,6 +5654,10 @@ fn default_compact_soft_ratio() -> f32 {
 
 fn default_compact_snip_ratio() -> f32 {
     0.6
+}
+
+fn default_cold_prune_after_minutes() -> u64 {
+    1440
 }
 
 fn default_trim_batch_ratio() -> f32 {

@@ -8,7 +8,7 @@ use crate::platforms::access_control::{is_effective_admin, ONEBOT_PLATFORM};
 use crate::platforms::{
     ConversationKind, PlatformGroupMember, PlatformInboundEventKind, PlatformTurnContext,
 };
-use crate::tools::{ToolRegistry, ToolSpec};
+use crate::tools::{ToolProgress, ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use rand::rngs::OsRng;
@@ -822,6 +822,114 @@ pub(super) fn register_group_members(
     );
 }
 
+pub(super) fn register_group_avatar(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
+    registry.register(
+        ToolSpec::new(
+            "get_group_avatar",
+            t(
+                "Get the avatar URL of the current QQ group. Feed the returned avatar_url to vision_analyze to see the avatar. Member avatars are returned by get_group_members_info as avatar_url.",
+                "获取当前 QQ 群的群头像 URL。把返回的 avatar_url 交给 vision_analyze 即可查看头像内容。群成员的头像请使用 get_group_members_info 返回的 avatar_url。",
+            ),
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            move |_arguments| {
+                let context = context.clone();
+                async move {
+                    let group_id = context.conversation.conversation_id.clone();
+                    let avatar_url = crate::platforms::avatar::group_avatar_url(
+                        &group_id,
+                        crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+                    )
+                    .context("当前会话不是数字群号，无法构造群头像 URL")?;
+                    Ok(json!({
+                        "ok": true,
+                        "group_id": group_id,
+                        "avatar_url": avatar_url
+                    })
+                    .to_string())
+                }
+            },
+        )
+        .with_display_name(t("Query group avatar", "查询群头像")),
+    );
+}
+
+pub(super) fn register_avatar_download(
+    registry: &mut ToolRegistry,
+    context: Arc<PlatformTurnContext>,
+) {
+    registry.register(
+        ToolSpec::new_with_progress(
+            "download_avatar",
+            t(
+                "Download the avatar of the current QQ group or one of its members and emit it as an image. The host delivers emitted images automatically with your reply; do not resend the same image with send_message_to_user.",
+                "下载当前 QQ 群或指定群成员的 QQ 头像并发布为图片。宿主会随回复自动投递已发布的图片，不要再用 send_message_to_user 重发同一张图。",
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "pattern": "^[0-9]{5,20}$",
+                        "description": "群成员的 QQ 号；省略时下载当前群的群头像。只知道名字时先调用 get_group_members_info。"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            move |arguments, progress| {
+                let context = context.clone();
+                async move { download_avatar(arguments, context, progress).await }
+            },
+        )
+        .with_display_name(t("Download avatar", "下载头像")),
+    );
+}
+
+async fn download_avatar(
+    arguments: Value,
+    context: Arc<PlatformTurnContext>,
+    progress: ToolProgress,
+) -> Result<String> {
+    let dir = context.paths.cache_dir.join("qq-avatars");
+    let (url, alt, file_stem) = match optional_string(&arguments, "user_id")? {
+        Some(user_id) => {
+            let member = context
+                .group_member(&user_id)
+                .await?
+                .with_context(|| format!("群里没有 QQ 号为 {user_id} 的成员，只能下载当前群成员的头像"))?;
+            let url = crate::platforms::avatar::user_avatar_url(
+                &member.user_id,
+                crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+            )
+            .context("成员 QQ 号不是纯数字，无法构造头像 URL")?;
+            let alt = format!("群成员 {} 的头像", member.display_name());
+            (url, alt, format!("user-{}", member.user_id))
+        }
+        None => {
+            let group_id = context.conversation.conversation_id.clone();
+            let url = crate::platforms::avatar::group_avatar_url(
+                &group_id,
+                crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+            )
+            .context("当前会话不是数字群号，无法构造群头像 URL")?;
+            (url, format!("群 {group_id} 的群头像"), format!("group-{group_id}"))
+        }
+    };
+    let path = crate::platforms::avatar::download_avatar(&url, &dir, &file_stem).await?;
+    progress.report_image(path.clone(), alt.clone());
+    Ok(json!({
+        "ok": true,
+        "avatar_url": url,
+        "local_path": path.display().to_string(),
+        "alt": alt,
+        "note": "头像已发布为图片，宿主会自动随回复投递。"
+    })
+    .to_string())
+}
+
 fn group_member_query(arguments: &Value) -> Result<String> {
     arguments
         .get("query")
@@ -887,7 +995,11 @@ fn group_member_json(member: &PlatformGroupMember) -> Value {
         "nickname": member.nickname,
         "card": member.card,
         "role": member.role,
-        "title": member.title
+        "title": member.title,
+        "avatar_url": crate::platforms::avatar::user_avatar_url(
+            &member.user_id,
+            crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+        )
     })
 }
 

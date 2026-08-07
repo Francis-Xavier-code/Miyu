@@ -716,6 +716,13 @@
   function renderThinkingVariantMenu() {
     renderThinkingVariantModels();
     renderThinkingVariantLevels();
+    // 单模型（非混合池）没有可选的模型，跳过模型栏，点开即是档位单选。
+    const singleModel = state.thinkingVariantModels.length <= 1;
+    const modelPane = elements.thinkingModelList.closest(".thinking-model-pane");
+    if (modelPane) {
+      modelPane.hidden = singleModel;
+      modelPane.closest(".thinking-variant-layout")?.classList.toggle("single-model", singleModel);
+    }
     updateThinkingVariantTrigger();
     positionThinkingVariantPopover();
   }
@@ -6257,6 +6264,15 @@
     const args = parsedToolArguments(value);
     const toolName = String(name || "");
     if (toolName === "run_command") return compactLine(args.command || args.cmd);
+    if (toolName === "read_file") {
+      const path = compactPath(args.path);
+      const offset = Number.isFinite(Number(args.offset)) && args.offset != null ? Number(args.offset) : null;
+      const limit = Number.isFinite(Number(args.limit)) && args.limit != null ? Number(args.limit) : null;
+      if (offset === null && limit === null) return path;
+      const start = Math.max(offset ?? 1, 1);
+      const page = limit !== null ? `L${start}-${start + limit - 1}` : `L${start}+`;
+      return path ? `${path} (${page})` : page;
+    }
     if (["read", "write", "edit", "apply_patch", "print_image", "vision_analyze"].includes(toolName)) {
       return compactPath(args.filePath || args.file_path || args.path || args.image);
     }

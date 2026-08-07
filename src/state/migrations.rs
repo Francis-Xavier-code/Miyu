@@ -91,10 +91,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "tool_reports_archive",
         apply: apply_v14_tool_reports_archive,
     },
+    Migration {
+        version: 15,
+        name: "session_last_request_at",
+        apply: apply_v15_session_last_request_at,
+    },
+    Migration {
+        version: 16,
+        name: "turn_tool_footprint",
+        apply: apply_v16_turn_tool_footprint,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 14;
+pub const LATEST_VERSION: i64 = 16;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -747,6 +757,24 @@ fn apply_v13_compact_hidden_turns(conn: &Connection) -> Result<()> {
 /// first rewrite so the prune is reversible and auditable.
 fn apply_v14_tool_reports_archive(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "turns", "tool_reports_archive", "TEXT")
+}
+
+/// Unix seconds of the session's most recent completed/interrupted LLM turn.
+/// Drives cold-resume pruning: a session idle past the provider cache TTL
+/// resumes against a cold cache, so a history rewrite at that moment costs
+/// no extra misses — it only shrinks the full-price first request. NULL on
+/// legacy sessions means "unknown, skip".
+fn apply_v15_session_last_request_at(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "sessions", "last_request_at", "INTEGER")
+}
+
+/// Deterministic tool footprint per turn (JSON {read, modified, memories}):
+/// file paths and memory names are facts the code knows exactly, so the
+/// compactor appends them to summaries itself instead of trusting the LLM to
+/// not drop or misspell them. Summary rows carry the merged footprint for
+/// cross-compaction accumulation.
+fn apply_v16_turn_tool_footprint(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "tool_footprint", "TEXT")
 }
 
 fn add_column_if_missing(
