@@ -36,6 +36,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use vte::{Params as VteParams, Parser as VteParser, Perform as VtePerform};
 
+mod keyboard_enhancement;
+
+use keyboard_enhancement::KeyboardEnhancementState;
+
 const REPL_MAX_VISIBLE_INPUT_ROWS: u16 = 12;
 const REPL_PASTE_PLACEHOLDER_MIN_LINES: usize = 3;
 const REPL_PASTE_PLACEHOLDER_MIN_CHARS: usize = 150;
@@ -8188,7 +8192,14 @@ fn print_repl_help() {
         )
     );
     println!("  Enter       {}", t("send message", "发送消息"));
-    println!("  Ctrl+J      {}", t("insert newline", "插入换行"));
+    println!("  Shift+Enter {}", t("insert newline", "插入换行"));
+    println!(
+        "  Ctrl+J      {}",
+        t(
+            "insert newline, same as Shift+Enter",
+            "插入换行，与 Shift+Enter 相同"
+        )
+    );
     println!(
         "  Ctrl+V      {}",
         t(
@@ -8425,6 +8436,12 @@ impl LiveReplEditor {
                     } else {
                         self.cursor = repl_move_cursor_vertical("  ", &self.input, self.cursor, 1);
                     }
+                }
+                KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Shift+Enter 与 Ctrl+J 相同：在光标处插入换行，不提交
+                    insert_newline_at_cursor(&mut self.input, &mut self.cursor);
+                    self.history_clean_index = None;
+                    self.is_pasted = false;
                 }
                 KeyCode::Enter => {
                     return Ok(self
@@ -9626,31 +9643,52 @@ async fn persist_remote_queued_submission(
 struct LiveRawMode {
     show_cursor_on_drop: bool,
     restore_terminal_on_drop: bool,
+    keyboard_enhancement: KeyboardEnhancementState,
 }
 
 struct ReplCursorRestore;
 
 impl Drop for ReplCursorRestore {
     fn drop(&mut self) {
+        // 1. 会话级兜底：恢复括号粘贴与光标
+        // 2. 再关闭 raw mode；键盘增强由 LiveRawMode / 局部输入作用域负责 Pop
         let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
         let _ = terminal::disable_raw_mode();
     }
 }
 
 impl LiveRawMode {
+    /// 进入 live REPL 的 raw 输入模式，并尽量启用键盘增强协议。
+    ///
+    /// 参数: 无
+    ///
+    /// 返回:
+    /// - 成功时返回会在 Drop 时恢复终端的守卫对象
     fn start() -> Result<Self> {
         enable_live_raw_mode()?;
-        execute!(io::stdout(), EnableBracketedPaste)?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnableBracketedPaste) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error.into());
+        }
         Ok(Self {
             show_cursor_on_drop: true,
             restore_terminal_on_drop: true,
+            keyboard_enhancement: KeyboardEnhancementState::enable(&mut stdout),
         })
     }
 
+    /// 接管上一段 live 输入已启用的终端模式，避免重复 Push 键盘增强。
+    ///
+    /// 参数: 无
+    ///
+    /// 返回:
+    /// - 会在最终 Drop 时恢复终端的守卫对象
     fn adopt() -> Self {
         Self {
             show_cursor_on_drop: true,
             restore_terminal_on_drop: true,
+            keyboard_enhancement: KeyboardEnhancementState::assume_active(),
         }
     }
 
@@ -9660,6 +9698,8 @@ impl LiveRawMode {
 
     fn handoff(&mut self) {
         self.restore_terminal_on_drop = false;
+        // handoff 后由下一段 LiveRawMode::adopt 继续持有键盘增强状态
+        self.keyboard_enhancement = KeyboardEnhancementState::default();
     }
 }
 
@@ -9705,6 +9745,9 @@ impl Drop for LiveRawMode {
         } else {
             let _ = execute!(stdout, DisableBracketedPaste);
         }
+        // 1. 先 Pop 键盘增强协议
+        // 2. 再退出 raw mode
+        self.keyboard_enhancement.disable(&mut stdout);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -10315,6 +10358,7 @@ fn handle_live_agent_event(
                 live.apply_renderer_frame(renderer)?;
                 synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
                 handle_agent_event(renderer, event)?;
+                // 问题面板只关闭 raw mode 与括号粘贴，键盘增强仍由外层 LiveRawMode 持有
                 enable_live_raw_mode()?;
                 execute!(io::stdout(), EnableBracketedPaste)?;
                 synchronized_terminal_update(CursorAfterUpdate::Shown, || live.resume())?;
@@ -10478,11 +10522,22 @@ fn read_repl_input(
     }
     terminal::enable_raw_mode()?;
     execute!(stdout, EnableBracketedPaste)?;
+    let mut keyboard_enhancement = KeyboardEnhancementState::enable(&mut stdout);
     let (_, mut input_row) = cursor::position()?;
     let mut rendered_rows = 0u16;
     let mut is_pasted = false;
     let mut pasted_images: Vec<Option<crate::clipboard::PastedImage>> = Vec::new();
     let mut pasted_texts: Vec<Option<PastedText>> = Vec::new();
+    // 1. 局部退出时统一恢复终端协议
+    // 2. 避免多处 return 漏 Pop 键盘增强
+    let restore_terminal = |stdout: &mut io::Stdout,
+                            keyboard_enhancement: &mut KeyboardEnhancementState|
+     -> Result<()> {
+        execute!(stdout, DisableBracketedPaste)?;
+        keyboard_enhancement.disable(stdout);
+        terminal::disable_raw_mode()?;
+        Ok(())
+    };
     let render_repl_input = |stdout: &mut io::Stdout,
                              input_row: &mut u16,
                              rendered_rows: &mut u16,
@@ -10684,6 +10739,21 @@ fn read_repl_input(
                         is_pasted,
                     )?;
                 }
+                KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Shift+Enter 与 Ctrl+J 相同：在光标处插入换行，不提交
+                    insert_newline_at_cursor(&mut input, &mut cursor);
+                    history_clean_index = None;
+                    is_pasted = false;
+                    render_repl_input(
+                        &mut stdout,
+                        &mut input_row,
+                        &mut rendered_rows,
+                        mode,
+                        &input,
+                        cursor,
+                        is_pasted,
+                    )?;
+                }
                 KeyCode::Enter => {
                     let submitted_echo = strip_terminal_control_sequences(&input);
                     input = expand_pasted_text_placeholders(&submitted_echo, &pasted_texts);
@@ -10694,8 +10764,7 @@ fn read_repl_input(
                         mode,
                         &submitted_echo,
                     )?;
-                    execute!(stdout, DisableBracketedPaste)?;
-                    terminal::disable_raw_mode()?;
+                    restore_terminal(&mut stdout, &mut keyboard_enhancement)?;
                     return Ok(Some((mode, input, pasted_images)));
                 }
                 KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -10735,16 +10804,14 @@ fn read_repl_input(
                         continue;
                     }
                     move_after_repl_input(&mut stdout, input_row, rendered_rows)?;
-                    execute!(stdout, DisableBracketedPaste)?;
-                    terminal::disable_raw_mode()?;
+                    restore_terminal(&mut stdout, &mut keyboard_enhancement)?;
                     return Ok(None);
                 }
                 KeyCode::Char('d')
                     if modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
                 {
                     move_after_repl_input(&mut stdout, input_row, rendered_rows)?;
-                    execute!(stdout, DisableBracketedPaste)?;
-                    terminal::disable_raw_mode()?;
+                    restore_terminal(&mut stdout, &mut keyboard_enhancement)?;
                     return Ok(None);
                 }
                 KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -11192,8 +11259,8 @@ fn input_prompt_bar(mode: AgentMode) -> String {
 fn repl_shortcut_hint_line(mode: AgentMode, cols: usize) -> String {
     let bar = input_prompt_bar(mode);
     let text = t(
-        "Tab switch mode; Ctrl+J newline; Ctrl+V paste clipboard",
-        "Tab 切换模式；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
+        "Tab switch mode; Shift+Enter newline; Ctrl+J newline; Ctrl+V paste clipboard",
+        "Tab 切换模式；Shift+Enter 换行；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
     );
     let text_width = cols.saturating_sub(visible_width(&bar)).max(1);
     format!(
@@ -13289,6 +13356,40 @@ mod repl_input_tests {
         assert!(editor.history.is_empty());
         editor.record_history("ordinary prompt");
         assert_eq!(editor.history, ["ordinary prompt"]);
+    }
+
+    #[test]
+    fn live_editor_shift_enter_inserts_newline_without_submit() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = pop_test_paths(temp.path());
+        let mut editor = LiveReplEditor::new(AgentMode::Normal, Vec::new());
+        editor.input = "hello".to_string();
+        editor.cursor = 5;
+        assert!(matches!(
+            editor
+                .handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+                    &paths,
+                    false,
+                )
+                .unwrap(),
+            LiveEditorAction::Redraw
+        ));
+        assert_eq!(editor.input, "hello\n");
+        assert_eq!(editor.cursor, 6);
+
+        assert!(matches!(
+            editor
+                .handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+                    &paths,
+                    false,
+                )
+                .unwrap(),
+            LiveEditorAction::Redraw
+        ));
+        assert_eq!(editor.input, "hello\n\n");
+        assert_eq!(editor.cursor, 7);
     }
 
     #[test]
