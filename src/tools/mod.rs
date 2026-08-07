@@ -250,6 +250,7 @@ fn builtin_readable_group_name(group: &str) -> Option<&'static str> {
         "scripts" => t("Script tools", "脚本工具组"),
         "scripting" => t("Script management", "脚本管理工具组"),
         "shell" => t("Shell tools", "Shell 工具组"),
+        "shopping" => t("Shopping tools", "购物工具组"),
         "skills" => t("Skill tools", "技能工具组"),
         "systeminfo" => t("System information", "系统信息工具组"),
         "utility" => t("Utility tools", "实用工具组"),
@@ -483,6 +484,8 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
 /// Tools exposed to an untrusted messaging-platform conversation. This list
 /// deliberately excludes shell, filesystem, local-image inspection, memory,
 /// knowledge-base, MCP, scripts, and tools that persist arbitrary downloads.
+/// `generate_image` is the one Writes exception: it only saves its own API
+/// output under the plugin's output directory, never an arbitrary host path.
 pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     web::register_fetch(&mut registry);
@@ -500,6 +503,9 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     }
     if config.plugins.memes.enabled {
         memes::register_chat(&mut registry, config.clone(), paths.clone());
+    }
+    if config.plugins.image_generation.enabled {
+        image_generation::register(&mut registry, config.clone());
     }
     if config.skills.enabled {
         if let Err(error) = skills::register_skills(&mut registry, config, paths) {
@@ -592,6 +598,11 @@ mod tests {
             assert!(!names.iter().any(|name| name == forbidden), "{forbidden}");
         }
         for name in names {
+            // generate_image is the deliberate Writes exception: it only
+            // saves its own API output under the plugin's output directory.
+            if name == "generate_image" {
+                continue;
+            }
             assert_eq!(
                 registry.permission(&name).unwrap(),
                 ToolPermission::ReadOnly
@@ -599,6 +610,11 @@ mod tests {
         }
         assert!(registry.contains("load_skill"));
         assert!(registry.contains("load_tools"));
+        // With the plugin enabled, image generation is exposed to platforms.
+        let mut config = AppConfig::default();
+        config.plugins.image_generation.enabled = true;
+        let registry = restricted_platform_registry(&config, &paths);
+        assert!(registry.contains("generate_image"));
         let visible = registry.lazy_definitions(&Default::default());
         assert!(visible
             .iter()
