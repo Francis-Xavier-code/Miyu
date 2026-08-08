@@ -202,12 +202,8 @@ impl RealContextPlugin {
             runtime.prune(now);
             let session = runtime.session_mut(&session_key, now);
             session.decay_heat(now, settings.reply_restraint_recover_minutes);
-            let continuation = session.continuation_match(
-                &event.sender_id,
-                now,
-                settings.continuation_enable,
-                settings.continuation_max_turns,
-            );
+            let continuation =
+                session.continuation_match(&event.sender_id, now, settings.continuation_enable);
             let pending = session.pending.get(&event.sender_id).filter(|pending| {
                 now.duration_since(pending.started)
                     <= Duration::from_secs(settings.active_reply_supersede_window_seconds)
@@ -928,19 +924,12 @@ impl RealContextPlugin {
         let session_key = runtime_session_key(context);
         let mut runtime = self.runtime.lock().unwrap();
         let session = runtime.session_mut(&session_key, now);
-        let trigger = session
-            .pending
-            .remove(&sender_id)
-            .map(|pending| pending.trigger)
-            .or_else(|| {
-                context
-                    .plugin_value(TRIGGER_KEY)
-                    .and_then(|value| value.as_str().and_then(TriggerKind::parse))
-            })
-            .unwrap_or(TriggerKind::Direct);
+        // Consume any pending entry for this sender; the reply it was tracking
+        // has now landed.
+        session.pending.remove(&sender_id);
         session.last_reply = Some(now);
         session.increase_heat(now, settings);
-        session.mark_continuation(&sender_id, trigger, now, settings);
+        session.mark_continuation(&sender_id, now, settings);
     }
 }
 
@@ -1799,13 +1788,7 @@ impl SessionRuntime {
         self.heat_updated = now;
     }
 
-    fn continuation_match(
-        &mut self,
-        sender_id: &str,
-        now: Instant,
-        enabled: bool,
-        max_turns: u32,
-    ) -> bool {
+    fn continuation_match(&mut self, sender_id: &str, now: Instant, enabled: bool) -> bool {
         if !enabled {
             self.continuation = None;
             return false;
@@ -1813,10 +1796,11 @@ impl SessionRuntime {
         let Some(continuation) = self.continuation.as_ref() else {
             return false;
         };
-        if now > continuation.expires_at
-            || continuation.user_id != sender_id
-            || continuation.turns >= max_turns
-        {
+        // Only the clock and the speaker bound a continuation. There used to be
+        // a turn cap as well, which cut a conversation off mid-flow purely
+        // because it had gone on for a few exchanges — the window itself is
+        // what expresses "we are still talking".
+        if now > continuation.expires_at || continuation.user_id != sender_id {
             self.continuation = None;
             return false;
         }
@@ -1826,7 +1810,6 @@ impl SessionRuntime {
     fn mark_continuation(
         &mut self,
         sender_id: &str,
-        trigger: TriggerKind,
         now: Instant,
         settings: &RealContextPluginSettings,
     ) {
@@ -1834,23 +1817,13 @@ impl SessionRuntime {
             self.continuation = None;
             return;
         }
-        let turns = if trigger == TriggerKind::Continuation {
-            self.continuation
-                .as_ref()
-                .filter(|state| state.user_id == sender_id)
-                .map(|state| state.turns.saturating_add(1))
-                .unwrap_or(1)
-        } else {
-            0
-        };
-        if turns >= settings.continuation_max_turns {
-            self.continuation = None;
-            return;
-        }
+        // Every reply we actually send restarts the clock, including one the
+        // continuation window itself prompted: answering inside the window is
+        // exactly the evidence that the exchange is still live, so it should
+        // extend the window rather than count down against it.
         self.continuation = Some(Continuation {
             user_id: sender_id.to_string(),
             expires_at: now + Duration::from_secs(settings.continuation_window_seconds),
-            turns,
         });
     }
 }
@@ -1858,7 +1831,6 @@ impl SessionRuntime {
 struct Continuation {
     user_id: String,
     expires_at: Instant,
-    turns: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2811,25 +2783,53 @@ mod tests {
     }
 
     #[test]
-    fn continuation_window_is_inclusive_at_twelve_seconds() {
+    fn continuation_window_is_inclusive_at_its_boundary() {
         let settings = RealContextPluginSettings::default();
-        assert_eq!(settings.continuation_window_seconds, 12);
+        assert_eq!(settings.continuation_window_seconds, 15);
+        let window = Duration::from_secs(settings.continuation_window_seconds);
         let started = Instant::now();
         let mut session = SessionRuntime::new(started);
-        session.mark_continuation("30000", TriggerKind::Direct, started, &settings);
+        session.mark_continuation("30000", started, &settings);
 
-        assert!(session.continuation_match(
-            "30000",
-            started + Duration::from_secs(12),
-            true,
-            settings.continuation_max_turns,
-        ));
+        assert!(session.continuation_match("30000", started + window, true));
         assert!(!session.continuation_match(
             "30000",
-            started + Duration::from_secs(12) + Duration::from_nanos(1),
+            started + window + Duration::from_nanos(1),
             true,
-            settings.continuation_max_turns,
         ));
+    }
+
+    #[test]
+    fn replying_inside_the_window_keeps_extending_it() {
+        // The turn cap used to end a continuation after a few exchanges even
+        // while the user kept talking; now only silence closes it.
+        let settings = RealContextPluginSettings::default();
+        let window = Duration::from_secs(settings.continuation_window_seconds);
+        let mut now = Instant::now();
+        let mut session = SessionRuntime::new(now);
+        session.mark_continuation("30000", now, &settings);
+
+        for _ in 0..10 {
+            now += window - Duration::from_secs(1);
+            assert!(
+                session.continuation_match("30000", now, true),
+                "the window should still be open"
+            );
+            // A reply landed inside the window: restart the clock.
+            session.mark_continuation("30000", now, &settings);
+        }
+
+        // Silence past the window still closes it.
+        assert!(!session.continuation_match("30000", now + window + Duration::from_secs(1), true));
+    }
+
+    #[test]
+    fn a_different_speaker_does_not_inherit_the_window() {
+        let settings = RealContextPluginSettings::default();
+        let started = Instant::now();
+        let mut session = SessionRuntime::new(started);
+        session.mark_continuation("30000", started, &settings);
+        assert!(!session.continuation_match("40000", started, true));
     }
 
     #[tokio::test]

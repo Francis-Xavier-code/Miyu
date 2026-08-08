@@ -750,7 +750,6 @@ pub struct RealContextPluginSettings {
 
     pub continuation_enable: bool,
     pub continuation_window_seconds: u64,
-    pub continuation_max_turns: u32,
     pub continuation_boost_score: f64,
     pub takeover_direct_trigger_enable: bool,
     pub takeover_direct_trigger_boost_score: f64,
@@ -843,8 +842,7 @@ impl Default for RealContextPluginSettings {
             judge_should_reply_boost_score: 0.2,
             judge_should_reply_penalty_score: 0.2,
             continuation_enable: true,
-            continuation_window_seconds: 12,
-            continuation_max_turns: 3,
+            continuation_window_seconds: 15,
             continuation_boost_score: 0.1,
             takeover_direct_trigger_enable: true,
             takeover_direct_trigger_boost_score: 0.3,
@@ -1039,12 +1037,6 @@ impl RealContextPluginSettings {
             self.continuation_window_seconds as usize,
             1,
             86_400,
-        )?;
-        validate_real_context_count(
-            "continuation_max_turns",
-            self.continuation_max_turns as usize,
-            1,
-            100,
         )?;
         validate_real_context_count(
             "active_reply_reaction_timeout_seconds",
@@ -1345,8 +1337,11 @@ fn migrate_real_context_settings_map(settings: &mut serde_json::Map<String, serd
             .get("continuation_window_minutes")
             .and_then(serde_json::Value::as_u64)
         {
+            // 3 minutes was the old default, not a considered choice — carry
+            // those users onto the current default instead of pinning them to
+            // whatever it happened to be when the unit changed.
             let seconds = if minutes == 3 {
-                12
+                RealContextPluginSettings::default().continuation_window_seconds
             } else {
                 minutes.saturating_mul(60)
             };
@@ -6777,8 +6772,7 @@ mod tests {
         assert_eq!(settings.judge_max_concurrency, 4);
         assert_eq!(settings.judge_max_retries, 1);
         assert_eq!(settings.active_reply_supersede_window_seconds, 5);
-        assert_eq!(settings.continuation_window_seconds, 12);
-        assert_eq!(settings.continuation_max_turns, 3);
+        assert_eq!(settings.continuation_window_seconds, 15);
         assert!(settings.takeover_direct_trigger_enable);
         assert_eq!(settings.takeover_direct_trigger_boost_score, 0.3);
         assert!(settings.privileged_direct_trigger_skip_active_judgement);
@@ -6881,7 +6875,11 @@ mod tests {
                 .clone(),
         };
         let settings = RealContextPluginSettings::from_instance(&former_default).unwrap();
-        assert_eq!(settings.continuation_window_seconds, 12);
+        // The old default must land on the current one, whatever that is.
+        assert_eq!(
+            settings.continuation_window_seconds,
+            RealContextPluginSettings::default().continuation_window_seconds
+        );
         merge_real_context_settings(&mut former_default, &settings);
         assert!(!former_default
             .settings

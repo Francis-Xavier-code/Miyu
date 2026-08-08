@@ -5029,10 +5029,6 @@ fn edit_real_context_continuation(
                 settings.continuation_window_seconds.to_string(),
             ),
             Field::new(
-                t("Maximum continuation turns", "最大续聊次数"),
-                settings.continuation_max_turns.to_string(),
-            ),
-            Field::new(
                 t("Continuation boost", "续聊加分"),
                 settings.continuation_boost_score.to_string(),
             ),
@@ -5048,8 +5044,7 @@ fn edit_real_context_continuation(
         let parsed = (|| -> std::result::Result<(), String> {
             candidate.continuation_enable = real_context_bool(&fields, 0)?;
             candidate.continuation_window_seconds = real_context_value(&fields, 1)?;
-            candidate.continuation_max_turns = real_context_value(&fields, 2)?;
-            candidate.continuation_boost_score = real_context_value(&fields, 3)?;
+            candidate.continuation_boost_score = real_context_value(&fields, 2)?;
             candidate.validate().map_err(|error| error.to_string())
         })();
         match parsed {
