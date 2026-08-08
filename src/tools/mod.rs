@@ -174,7 +174,7 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "check_issue" => t("Check issue", "检查问题"),
         "check_os_info" => t("System information", "查看系统信息"),
         "read_clipboard" => t("Read clipboard", "读取剪贴板"),
-        "web_search" => t("Web search", "网页搜索"),
+        "web_search" => t("Web search", "网络搜索"),
         "web_fetch" => t("Fetch webpage", "读取网页"),
         "fcitx5_input_method_wiki_qurey" => t("Query Fcitx5 Wiki", "查询 Fcitx5 Wiki"),
         "search_web_images" => t("Search images", "搜索图片"),

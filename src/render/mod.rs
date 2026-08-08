@@ -4350,7 +4350,7 @@ mod tests {
             renderer.tool_summary_text(),
             format!(
                 "~ {}×1 {}\n  ↳ first subject",
-                t("Web search", "网页搜索"),
+                t("Web search", "网络搜索"),
                 t("running", "运行中")
             )
         );
@@ -4366,7 +4366,7 @@ mod tests {
             renderer.tool_summary_text(),
             format!(
                 "~ {}×1 {}\n  ↳ second subject",
-                t("Web search", "网页搜索"),
+                t("Web search", "网络搜索"),
                 t("running", "运行中")
             )
         );
@@ -5248,14 +5248,14 @@ mod tests {
             ToolStats {
                 calls: 1,
                 ok: 1,
-                subject: Some("网页搜索、天气查询".to_string()),
+                subject: Some("网络搜索、天气查询".to_string()),
                 ..ToolStats::default()
             },
         );
 
         assert_eq!(
             renderer.tool_summary_text(),
-            format!("~ {}×1 ok · 网页搜索、天气查询", t("Load", "加载"))
+            format!("~ {}×1 ok · 网络搜索、天气查询", t("Load", "加载"))
         );
         assert!(!renderer.tool_summary_text().contains("\n↳"));
     }
@@ -5301,7 +5301,7 @@ mod tests {
         );
         let expected_load_tools_subject = format!(
             "{}{}{}",
-            t("Web search", "网页搜索"),
+            t("Web search", "网络搜索"),
             t(", ", "、"),
             t("Weather", "天气查询")
         );
