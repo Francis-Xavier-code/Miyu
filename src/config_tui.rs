@@ -6494,7 +6494,22 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             t("Turns replayed when reopening the REPL", "重开 REPL 回放的轮数"),
             config.display.repl_replay_turns.to_string(),
         ),
+        Field::boolean(
+            t(
+                "Confirm deletions that cannot be undone",
+                "删除前确认（不可恢复的删除）",
+            ),
+            config.delete_guard.enabled,
+        ),
     ];
+    // The read-back below is by index, so an insert in the middle silently
+    // writes every later value into the wrong setting. This catches that in
+    // debug builds; new fields go on the end.
+    debug_assert_eq!(
+        fields.len(),
+        16,
+        "global settings fields changed: update the positional read-back below"
+    );
     run_form_without_buttons(stdout, t(" GLOBAL SETTINGS ", " 全局设置 "), &mut fields)?;
     config.tools.enabled = parse_bool_field(&fields[0].value)?;
     config.tools.max_rounds = fields[1].value.trim().parse::<usize>()?;
@@ -6521,6 +6536,7 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
         .trim()
         .parse::<usize>()?
         .min(MAX_REPL_REPLAY_TURNS);
+    config.delete_guard.enabled = parse_bool_field(&fields[15].value)?;
     Ok(())
 }
 
