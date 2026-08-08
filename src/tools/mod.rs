@@ -9,6 +9,7 @@ mod caniplayonlinux_query;
 mod clipboard;
 mod deep_research;
 mod deepseek_status;
+mod delete_guard;
 mod default_tools;
 mod diagnostics;
 mod edit_replace;
@@ -290,9 +291,13 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
 
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    default_tools::register(&mut registry, config.skills.allow_command_execution);
+    default_tools::register(
+        &mut registry,
+        config.skills.allow_command_execution,
+        config.delete_guard.enabled,
+    );
     jobs::register_management(&mut registry);
-    apply_patch::register(&mut registry);
+    apply_patch::register(&mut registry, config.delete_guard.enabled);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
     todowrite::register(&mut registry);

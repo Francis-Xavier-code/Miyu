@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
-pub fn register(registry: &mut ToolRegistry) {
+pub fn register(registry: &mut ToolRegistry, delete_guard: bool) {
     registry.register(ToolSpec::new_with_progress(
         "apply_patch",
         agent_text(
@@ -25,12 +25,19 @@ pub fn register(registry: &mut ToolRegistry) {
             "required": ["patchText"],
             "additionalProperties": false
         }),
-        |args, progress| async move {
+        move |args, progress| async move {
             progress.report(format!(
                 "__tool_phase__~ {}",
                 t("prepare patch", "准备修改")
             ));
             tokio::task::yield_now().await;
+            // Screened here rather than inside the apply loop: one dialog for
+            // the whole patch instead of one per file, and a refusal leaves the
+            // tree untouched rather than half-patched.
+            let doomed = patch_deletions(&args);
+            if !doomed.is_empty() {
+                super::delete_guard::screen_paths(doomed, delete_guard, &progress).await?;
+            }
             apply_patch(args, progress)
         },
     ).writes());
@@ -68,6 +75,28 @@ pub fn register_artifact(registry: &mut ToolRegistry, root: PathBuf, session_id:
             }
         },
     ).presentation());
+}
+
+/// Paths a patch would unlink. Parse failures yield nothing — the real apply
+/// reports the error properly a moment later.
+fn patch_deletions(args: &Value) -> Vec<PathBuf> {
+    let Some(patch_text) = args
+        .get("patchText")
+        .or_else(|| args.get("patch_text"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let Ok(operations) = parse_patch_with(patch_text, &path_arg) else {
+        return Vec::new();
+    };
+    operations
+        .into_iter()
+        .filter_map(|operation| match operation {
+            Operation::Delete { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect()
 }
 
 fn apply_patch(args: Value, progress: ToolProgress) -> Result<String> {

@@ -494,8 +494,10 @@ impl SubagentRunner {
 
                 let (output, ok) = match tokio::time::timeout(
                     Duration::from_secs(self.timeout_seconds.max(5)),
-                    self.tools
-                        .call(&call.function.name, &call.function.arguments),
+                    crate::tools::delete_guard::in_subagent(
+                        self.tools
+                            .call(&call.function.name, &call.function.arguments),
+                    ),
                 )
                 .await
                 {

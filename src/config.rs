@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    #[serde(default, skip_serializing_if = "DeleteGuardConfig::is_default")]
+    pub delete_guard: DeleteGuardConfig,
     #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
@@ -2571,7 +2573,30 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeleteGuardConfig {
+    /// Ask before a deletion that cannot be undone. On for everyone, including
+    /// existing installs: the prompt only appears for irreversible deletes,
+    /// and the model is supposed to reach for `trash_path` instead.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for DeleteGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl DeleteGuardConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SkillsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -2994,6 +3019,7 @@ impl Default for AppConfig {
             cache: CacheConfig::default(),
             mcp: McpConfig::default(),
             skills: SkillsConfig::default(),
+            delete_guard: DeleteGuardConfig::default(),
             display: DisplayConfig::default(),
             notifications: NotificationsConfig::default(),
             prompt: PromptConfig::default(),
