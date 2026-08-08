@@ -79,6 +79,8 @@ mod tests {
 
     #[test]
     fn counts_match_official_tiktoken_vectors() {
+        // Literal anchors: small, stable, and hand-checkable, so a wrong
+        // expectation here is a real regression rather than a stale number.
         let vectors = [
             ("", 0),
             ("hello world", 2),
@@ -86,16 +88,30 @@ mod tests {
             ("Rust + 中文 + emoji 🚀\nsecond line", 10),
             (" \t\n\r\n punctuation: !@#$%^&*()[]{}", 13),
             ("<|endoftext|><|endofprompt|>", 13),
-            (include_str!("prompts/miyu.md"), 3011),
-            (include_str!("prompts/compact.md"), 416),
-            (include_str!("prompts/compact_chat.md"), 481),
-            (include_str!("prompts/plan.md"), 85),
-            (include_str!("prompts/chat.md"), 29),
-            (include_str!("../README.md"), 3199),
         ];
 
         for (text, expected) in vectors {
             assert_eq!(estimate_tokens(text), expected);
+        }
+    }
+
+    #[test]
+    fn real_documents_match_the_reference_encoder() {
+        // The shipped prompts and README are the large real-world corpus this
+        // suite wants to cover: mixed CJK/Latin, markdown, emoji. Their
+        // expectations are computed from the reference encoder rather than
+        // hard-coded — a literal here turns "edit the persona" into "the
+        // build is red until someone updates a magic number".
+        let reference = tiktoken_rs::o200k_base().unwrap();
+        for text in [
+            include_str!("prompts/miyu.md"),
+            include_str!("prompts/compact.md"),
+            include_str!("prompts/compact_chat.md"),
+            include_str!("prompts/plan.md"),
+            include_str!("prompts/chat.md"),
+            include_str!("../README.md"),
+        ] {
+            assert_eq!(estimate_tokens(text), reference.count_ordinary(text));
         }
     }
 

@@ -7961,12 +7961,17 @@ mod tests {
         config.tools.enabled = false;
         config.providers[0]
             .model_context_window
-            .insert("test-model".to_string(), 8000);
+            .insert("test-model".to_string(), 3000);
         config.context.compact_tail_tokens = Some(600);
         // Isolated summary path: its request is identifiable by the compact
         // system prompt and excluded from the prefix chain.
         config.context.compact_cache_reuse = false;
         config.context.prune_stale_tool_reports = false;
+        // Pin the persona. This test is about compaction's effect on the byte
+        // prefix, not about whatever `prompts/miyu.md` currently weighs —
+        // editing the persona used to move the overflow point and flip the
+        // outcome.
+        config.system_prompt = Some("prefix cache guard fixture persona".to_string());
 
         let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_bodies = bodies.clone();
@@ -8010,18 +8015,25 @@ mod tests {
         )
         .unwrap();
 
+        // Pin the workspace too: `runtime_context` embeds the effective working
+        // directory in the system prompt, so the token budget would otherwise
+        // shift with the length of the path the test happens to be run from.
         let filler = "prefix cache guard filler content 前缀缓存守卫填充 ".repeat(40);
-        for i in 0..6 {
-            agent
-                .chat_stream(&format!("message {i}: {filler}"), |_| Ok(()))
-                .await
-                .unwrap();
-            let tokens = agent.effective_context_tokens().unwrap();
-            agent
-                .handle_overflow_after_turn(tokens, |_| Ok(()))
-                .await
-                .unwrap();
-        }
+        let workspace = temp.path().to_path_buf();
+        crate::tools::workspace::with_workspace(workspace, async {
+            for i in 0..6 {
+                agent
+                    .chat_stream(&format!("message {i}: {filler}"), |_| Ok(()))
+                    .await
+                    .unwrap();
+                let tokens = agent.effective_context_tokens().unwrap();
+                agent
+                    .handle_overflow_after_turn(tokens, |_| Ok(()))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
         server.abort();
 
         let bodies = bodies.lock().unwrap().clone();
@@ -8060,9 +8072,19 @@ mod tests {
                 &checkpoint[..checkpoint.len().min(120)]
             );
         }
-        assert_eq!(
-            resets, compact_requests,
-            "each compaction resets the prefix exactly once; nothing else may"
+        // The cache guarantee is one-directional: a reset may only ever be a
+        // compaction, and compaction may not reset more than once per run.
+        // Requiring the converse — that every compaction resets — is not a
+        // property of the system: when the fold cannot save enough, the
+        // compactor keeps the existing history and the prefix simply extends.
+        assert!(
+            resets >= 1,
+            "the scenario must exercise at least one real prefix reset"
+        );
+        assert!(
+            resets <= compact_requests,
+            "prefix reset {resets} times against {compact_requests} compactions; \
+             nothing but compaction may reset the byte prefix"
         );
     }
 

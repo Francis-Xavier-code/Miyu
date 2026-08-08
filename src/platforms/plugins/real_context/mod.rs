@@ -2870,7 +2870,15 @@ mod tests {
     #[tokio::test]
     async fn muted_bot_suppresses_direct_group_trigger_while_unknown_fails_open() {
         let plugin = RealContextPlugin::new();
-        let settings = RealContextPluginSettings::default();
+        // The availability check this test is about lives on the path taken
+        // when active judgement is *not* running. `takeover_direct_trigger_enable`
+        // defaults to true, which sends a direct trigger through the full
+        // judgement flow instead — so with plain defaults the branch below is
+        // never reached and the assertions pass or fail for unrelated reasons.
+        let settings = RealContextPluginSettings {
+            takeover_direct_trigger_enable: false,
+            ..RealContextPluginSettings::default()
+        };
         let event = inbound_event();
         let (_temp, muted_context) = availability_context(BotSendAvailability::Muted);
         let mut muted = TriggerDecision {
