@@ -14,6 +14,45 @@ const PENDING_PLACEHOLDER: &str = "<system-reminder>上一轮prompt正在由另�
 const INTERRUPTED_TEXT: &str =
     "<system-reminder>上一轮prompt已被中断，除非用户重新要求否则不要处理上一轮的prompt</system-reminder>";
 
+/// Budget for a finished turn's display transcript. Generous enough for a
+/// normal turn's prose plus a handful of tool blocks, small enough that a
+/// session's worth of them stays cheap to load.
+const REPLAY_JOURNAL_MAX_CHARS: usize = 8 * 1024;
+/// Per-entry clamp so one runaway tool result cannot eat the whole budget.
+const REPLAY_ENTRY_MAX_CHARS: usize = 2 * 1024;
+
+/// One entry of a finished turn's display transcript, in stream order.
+///
+/// Reconstructed from the live journal just before it is dropped, so the
+/// interleaving of prose and tool blocks survives — which is the whole point,
+/// since `assistant_content` alone would flatten a turn into one paragraph.
+/// Command output tails are deliberately absent: they are the bulky part and
+/// the settled block reads fine without them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReplayEntry {
+    Text {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        #[serde(default)]
+        arguments: String,
+    },
+    ToolResult {
+        name: String,
+        ok: bool,
+        #[serde(default)]
+        output: String,
+    },
+}
+
+/// `app_state` key prefixes for the two persona-scoped session pointers. The
+/// terminal lane (shell-hook, `miyu new`/`session`) and the REPL lane move
+/// independently; one-shot `ask` turns use neither.
+const CURRENT_SESSION_POINTER: &str = "current_session_persona";
+const REPL_SESSION_POINTER: &str = "repl_session_persona";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStatus {
     Running,
@@ -533,8 +572,11 @@ impl ConversationDb {
         Ok(())
     }
 
-    pub fn persona_current_session(&self, persona: &str) -> Result<Option<String>> {
-        let key = format!("current_session_persona:{persona}");
+    /// Reads a persona-scoped session pointer, returning `None` when it points
+    /// at something the caller must not land on (wrong persona, non-user kind,
+    /// archived, or already deleted). Callers fall back and heal the pointer.
+    fn persona_session_pointer(&self, prefix: &str, persona: &str) -> Result<Option<String>> {
+        let key = format!("{prefix}:{persona}");
         let conn = self.conn.lock().unwrap();
         let session_id = conn
             .query_row(
@@ -548,15 +590,20 @@ impl ConversationDb {
         };
         let valid = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND persona = ?2 AND kind = 'user' AND archived = 0)",
-                params![session_id, persona],
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND persona = ?2 AND kind = ?3 AND archived = 0)",
+                params![session_id, persona, super::USER_SESSION_KIND],
                 |row| row.get::<_, bool>(0),
             )?;
         Ok(valid.then_some(session_id))
     }
 
-    pub fn set_persona_current_session(&self, persona: &str, session_id: &str) -> Result<()> {
-        let key = format!("current_session_persona:{persona}");
+    fn set_persona_session_pointer(
+        &self,
+        prefix: &str,
+        persona: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let key = format!("{prefix}:{persona}");
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO app_state (key, value) VALUES (?1, ?2)
@@ -564,6 +611,25 @@ impl ConversationDb {
             params![key, session_id],
         )?;
         Ok(())
+    }
+
+    pub fn persona_current_session(&self, persona: &str) -> Result<Option<String>> {
+        self.persona_session_pointer(CURRENT_SESSION_POINTER, persona)
+    }
+
+    pub fn set_persona_current_session(&self, persona: &str, session_id: &str) -> Result<()> {
+        self.set_persona_session_pointer(CURRENT_SESSION_POINTER, persona, session_id)
+    }
+
+    /// The REPL's own lane. Kept apart from the current-session pointer so a
+    /// REPL reopens where it left off while shell-hook keeps using the
+    /// terminal session it was on.
+    pub fn repl_session(&self, persona: &str) -> Result<Option<String>> {
+        self.persona_session_pointer(REPL_SESSION_POINTER, persona)
+    }
+
+    pub fn set_repl_session(&self, persona: &str, session_id: &str) -> Result<()> {
+        self.set_persona_session_pointer(REPL_SESSION_POINTER, persona, session_id)
     }
 
     /// Claims persona-less sessions (schema-v2 migrated rows) for the given
@@ -1667,6 +1733,31 @@ impl ConversationDb {
         Ok(deleted)
     }
 
+    /// Deletes abandoned one-shot sessions older than the retention window. A
+    /// `miyu ask` turn deletes its own session; anything still here was
+    /// orphaned by a client that died mid-turn (Ctrl+C, SIGKILL).
+    pub fn delete_ask_sessions_older_than(&self, hours: i64) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // queued_prompts.session_id arrived via ALTER and has no cascading FK,
+        // so its rows have to go first (same reason as `delete_session`).
+        tx.execute(
+            "DELETE FROM queued_prompts WHERE session_id IN (
+                 SELECT session_id FROM sessions
+                 WHERE kind = ?1
+                   AND datetime(updated_at) < datetime('now', '-' || ?2 || ' hours'))",
+            params![super::ASK_SESSION_KIND, hours],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM sessions
+             WHERE kind = ?1
+               AND datetime(updated_at) < datetime('now', '-' || ?2 || ' hours')",
+            params![super::ASK_SESSION_KIND, hours],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     fn update_session_field(
         &self,
         session_id: &str,
@@ -2094,6 +2185,10 @@ impl ConversationDb {
         if affected != 1 {
             bail!("turn changed before it could be completed");
         }
+        // Snapshot the display transcript before the journal goes: the tables
+        // below are load-bearing for in-flight turn recovery, so they keep
+        // being wiped on completion exactly as before.
+        store_replay_journal(&tx, turn_id)?;
         tx.execute(
             "DELETE FROM turn_journal_segments WHERE turn_id = ?1",
             params![turn_id],
@@ -5189,6 +5284,162 @@ fn attach_turn_children_locked(conn: &Connection, turns: &mut [Turn]) -> Result<
     attach_followups_locked(conn, turns)?;
     attach_turn_attachments_locked(conn, turns)?;
     attach_turn_journal_events_locked(conn, turns)
+}
+
+impl ConversationDb {
+    /// Display transcripts of the last `limit` visible turns of a session,
+    /// oldest first. Turns finished before this column existed simply come
+    /// back with an empty transcript, and the caller falls back to the plain
+    /// prompt/reply pair.
+    pub fn session_replay(&self, session_id: &str, limit: usize) -> Result<Vec<TurnReplay>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            // The `LIKE` marks daemon-synthesized background-job wake turns.
+            // They are not user prompts and must not be replayed as one — same
+            // test the wake-report poller uses.
+            "SELECT display_content, assistant_content, replay_journal,
+                    user_content LIKE '<background-job-report>%'
+               FROM turns
+              WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0
+                AND status = 'completed'
+              ORDER BY seq DESC
+              LIMIT ?2",
+        )?;
+        let mut rows = stmt
+            .query_map(params![session_id, limit as i64], |row| {
+                Ok(TurnReplay {
+                    display_content: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    assistant_content: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    entries: row
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default(),
+                    is_job_wake: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+}
+
+/// One replayable turn: the prompt echo plus either its ordered transcript or,
+/// for turns predating the transcript column, just the final reply.
+#[derive(Clone, Debug, Default)]
+pub struct TurnReplay {
+    /// What the user saw as the prompt — or, for a wake turn, the
+    /// `[后台任务完成] …` headline.
+    pub display_content: String,
+    pub assistant_content: String,
+    pub entries: Vec<ReplayEntry>,
+    /// Daemon-synthesized follow-up to a finished background job, not a
+    /// prompt anybody typed.
+    pub is_job_wake: bool,
+}
+
+/// Folds the live journal of a just-finished turn into `turns.replay_journal`.
+/// Everything only the live view needed — reasoning, progress ticks, command
+/// output blobs — is dropped; what is left is the ordered prose/tool sequence
+/// the REPL redraws when the session is reopened.
+fn store_replay_journal(tx: &Transaction, turn_id: &str) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT kind, call_id, name, text_payload, ok
+           FROM turn_journal_events
+          WHERE turn_id = ?1
+            AND kind IN ('assistant_content', 'tool_call', 'tool_result')
+          ORDER BY event_id",
+    )?;
+    let rows = stmt
+        .query_map(params![turn_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut entries: Vec<ReplayEntry> = Vec::new();
+    let mut call_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut text = String::new();
+    let flush_text = |entries: &mut Vec<ReplayEntry>, text: &mut String| {
+        if !text.trim().is_empty() {
+            entries.push(ReplayEntry::Text {
+                text: truncate_chars_owned(text, REPLAY_ENTRY_MAX_CHARS),
+            });
+        }
+        text.clear();
+    };
+    for (kind, call_id, name, payload, ok) in rows {
+        match kind.as_str() {
+            "assistant_content" => text.push_str(payload.as_deref().unwrap_or_default()),
+            "tool_call" => {
+                flush_text(&mut entries, &mut text);
+                let Some(name) = name else { continue };
+                if let Some(call_id) = call_id {
+                    call_names.insert(call_id, name.clone());
+                }
+                entries.push(ReplayEntry::ToolCall {
+                    name,
+                    arguments: truncate_chars_owned(
+                        payload.as_deref().unwrap_or_default(),
+                        REPLAY_ENTRY_MAX_CHARS,
+                    ),
+                });
+            }
+            "tool_result" => {
+                flush_text(&mut entries, &mut text);
+                let name = call_id
+                    .as_deref()
+                    .and_then(|id| call_names.get(id).cloned())
+                    .or(name)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                entries.push(ReplayEntry::ToolResult {
+                    name,
+                    ok: ok.unwrap_or(1) != 0,
+                    output: truncate_chars_owned(
+                        payload.as_deref().unwrap_or_default(),
+                        REPLAY_ENTRY_MAX_CHARS,
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    flush_text(&mut entries, &mut text);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // Whole-turn budget: drop the oldest entries, so what survives is the tail
+    // the user was actually looking at when the turn ended.
+    let mut encoded = serde_json::to_string(&entries)?;
+    while encoded.len() > REPLAY_JOURNAL_MAX_CHARS && entries.len() > 1 {
+        entries.remove(0);
+        encoded = serde_json::to_string(&entries)?;
+    }
+    tx.execute(
+        "UPDATE turns SET replay_journal = ?1 WHERE turn_id = ?2",
+        params![encoded, turn_id],
+    )?;
+    Ok(())
+}
+
+fn truncate_chars_owned(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(max).collect();
+    format!("{kept}…")
 }
 
 fn attach_turn_journal_events_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {

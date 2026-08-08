@@ -941,12 +941,20 @@ impl RunEventMapper {
                 );
                 self.active_tools.push(tool);
             }
+            // `name` is the raw tool name, matching `tool.started` — it used to
+            // be the readable one here alone, which is an easy way to wire a
+            // consumer to the wrong field. `tool_name` stays as an alias for
+            // browsers still running a cached asset.
             AgentEvent::ToolPreparing { name } => self.publish(
                 "tool.preparing",
                 json!({
                     "run_id": self.run_id,
-                    "name": tools::readable_tool_name(&name),
-                    "tool_name": name,
+                    "name": &name,
+                    "tool_name": &name,
+                    "display_name": tools::readable_tool_name(&name),
+                    // Sent so the WebUI label tracks the backend list instead
+                    // of keeping its own copy in sync.
+                    "phase": tools::preparing_phase(&name),
                 }),
             ),
             AgentEvent::ToolProgress {
@@ -1741,9 +1749,13 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     state_store.adopt_sessions_for_persona(&persona)?;
     ensure_local_current_session(&state_store, &persona)?;
     // Subagent audit sessions are kept for a week, cleaned at startup and
-    // then daily while the daemon runs.
+    // then daily while the daemon runs. One-shot `ask` sessions delete
+    // themselves as their turn ends, so the hour-old survivors swept here are
+    // strictly orphans from a client that died mid-turn.
     const SUBAGENT_AUDIT_RETENTION_DAYS: i64 = 7;
+    const ASK_SESSION_RETENTION_HOURS: i64 = 1;
     let _ = state_store.delete_subagent_sessions_older_than(SUBAGENT_AUDIT_RETENTION_DAYS);
+    let _ = state_store.delete_ask_sessions_older_than(ASK_SESSION_RETENTION_HOURS);
     {
         let store = state_store.clone();
         tokio::spawn(async move {
@@ -1752,6 +1764,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
             loop {
                 interval.tick().await;
                 let _ = store.delete_subagent_sessions_older_than(SUBAGENT_AUDIT_RETENTION_DAYS);
+                let _ = store.delete_ask_sessions_older_than(ASK_SESSION_RETENTION_HOURS);
             }
         });
     }
@@ -2089,6 +2102,32 @@ async fn handle_ipc_connection(
                             }
                         }
                     }),
+                },
+            )
+            .await?;
+        }
+        IpcCommand::GetReplSession => {
+            let persona = active_persona_scope(&state);
+            let store = &state.state_store;
+            // A stale pointer (session deleted or archived elsewhere) must not
+            // strand the REPL: fall back to the terminal session and heal the
+            // pointer so the next start is a plain read.
+            let session_id = store
+                .repl_session(&persona)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| store.session_id().to_string());
+            let target = ipc::SessionRef::Id { id: session_id };
+            let session_id = match resolve_available_local_session_ref(&state, &target) {
+                Ok(record) => record.session_id,
+                Err(_) => store.session_id().to_string(),
+            };
+            let _ = store.set_repl_session(&persona, &session_id);
+            ipc::send(
+                &mut stream,
+                &IpcFrame::AdminResult {
+                    state: session_state_for(&state, &session_id)?,
+                    data: json!({}),
                 },
             )
             .await?;
@@ -2570,20 +2609,39 @@ async fn handle_session_command(
                 .collect();
             Ok(json!({ "current": &*current, "sessions": sessions }))
         }
-        IpcCommand::CreateSession { name, switch } => {
+        IpcCommand::CreateSession { name, switch, kind } => {
+            // Whitelisted: `ask` is the only non-user kind a client may mint,
+            // and it is deliberately unswitchable — subagent audit sessions and
+            // anything else stay daemon-internal.
+            let kind = match kind.as_deref() {
+                None | Some(crate::state::USER_SESSION_KIND) => crate::state::USER_SESSION_KIND,
+                Some(crate::state::ASK_SESSION_KIND) if !switch => crate::state::ASK_SESSION_KIND,
+                Some(_) => {
+                    return Err(t("unsupported session kind", "不支持的会话类型").to_string())
+                }
+            };
             // No explicit name: leave it empty; the session is auto-named
             // from the first prompt when its first turn completes.
             let name = name.map(|name| name.trim().to_string()).unwrap_or_default();
             let record = store
-                .create_session(&persona, &name, "user", None)
+                .create_session(&persona, &name, kind, None)
                 .map_err(|error| safe_error_message(&error))?;
-            state.events.publish(
-                "session.created",
-                json!({ "session_id": record.session_id, "name": record.name }),
-            );
+            if kind == crate::state::USER_SESSION_KIND {
+                state.events.publish(
+                    "session.created",
+                    json!({ "session_id": record.session_id, "name": record.name }),
+                );
+            }
             if switch {
                 switch_session_via_actor(state, record.session_id.clone()).await?;
             }
+            Ok(json!({ "session": session_record_json(&record) }))
+        }
+        IpcCommand::SetReplSession { target } => {
+            let record = resolve_available_local_session_ref(state, &target)?;
+            store
+                .set_repl_session(&persona, &record.session_id)
+                .map_err(|error| safe_error_message(&error))?;
             Ok(json!({ "session": session_record_json(&record) }))
         }
         IpcCommand::SwitchSession { target } => {
@@ -2640,7 +2698,8 @@ async fn handle_session_command(
             Ok(json!({}))
         }
         IpcCommand::DeleteSession { target } => {
-            let record = resolve_local_session_ref(state, &target)?;
+            // Accepts `ask` too: a one-shot turn deletes its own session here.
+            let record = resolve_local_session_ref_with_kinds(state, &target, TURN_TARGET_KINDS)?;
             reserve_admin_for_session(&state.manager, &record.session_id)
                 .map_err(|error| error.message)?;
             if &*store.session_id() == record.session_id.as_str() {
@@ -2810,6 +2869,7 @@ async fn create_session_http(
         IpcCommand::CreateSession {
             name: request.name,
             switch: request.switch,
+            kind: None,
         },
     )
     .await
@@ -3005,6 +3065,18 @@ fn resolve_local_session_ref(
     state: &DaemonState,
     target: &ipc::SessionRef,
 ) -> std::result::Result<crate::state::SessionRecord, String> {
+    resolve_local_session_ref_with_kinds(state, target, &[crate::state::USER_SESSION_KIND])
+}
+
+/// Same, but for the two callers that must also reach one-shot `ask` sessions
+/// (running their turn, then deleting them). `SessionRef::Name` still cannot
+/// find those — the DB lookup filters to user sessions — so only the client
+/// holding the freshly minted id can address one.
+fn resolve_local_session_ref_with_kinds(
+    state: &DaemonState,
+    target: &ipc::SessionRef,
+    kinds: &[&str],
+) -> std::result::Result<crate::state::SessionRecord, String> {
     let store = &state.state_store;
     let persona = active_persona_scope(state);
     let record = match target {
@@ -3024,7 +3096,7 @@ fn resolve_local_session_ref(
     let is_platform = store
         .is_platform_session(&record.session_id)
         .map_err(|error| safe_error_message(&error))?;
-    if record.persona != persona || record.kind != "user" || is_platform {
+    if record.persona != persona || !kinds.contains(&record.kind.as_str()) || is_platform {
         return Err(t("session not found", "找不到该会话").to_string());
     }
     Ok(record)
@@ -3040,6 +3112,12 @@ fn resolve_available_local_session_ref(
     }
     Ok(record)
 }
+
+/// Turn targets and deletions additionally accept one-shot `ask` sessions.
+const TURN_TARGET_KINDS: &[&str] = &[
+    crate::state::USER_SESSION_KIND,
+    crate::state::ASK_SESSION_KIND,
+];
 
 /// Most recently updated other unarchived user session, or a fresh default
 /// session when none is left.
@@ -3138,7 +3216,8 @@ fn session_overview_json(overview: &crate::state::SessionOverview, current: &str
 }
 
 /// Resolves an optional turn-target session id: validates existence and that
-/// it is a user session; `None` falls back to the global current session.
+/// it is a user or one-shot session; `None` falls back to the global current
+/// session.
 fn resolve_turn_session(
     state: &DaemonState,
     session_id: Option<String>,
@@ -3146,10 +3225,14 @@ fn resolve_turn_session(
     match session_id {
         None => Ok(state.state_store.session_id()),
         Some(session_id) => {
-            let record = resolve_available_local_session_ref(
+            let record = resolve_local_session_ref_with_kinds(
                 state,
                 &ipc::SessionRef::Id { id: session_id },
+                TURN_TARGET_KINDS,
             )?;
+            if record.archived {
+                return Err(t("session is archived", "会话已归档").to_string());
+            }
             Ok(record.session_id.into())
         }
     }
@@ -9801,6 +9884,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_sessions_are_mintable_runnable_and_deletable_but_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let terminal = state.state_store.session_id().to_string();
+
+        let data = handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: Some("一次性对话".to_string()),
+                switch: false,
+                kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let ask_id = data["session"]["session_id"].as_str().unwrap().to_string();
+
+        // Minting it must not move the terminal lane, and it must not surface
+        // in the session list.
+        assert_eq!(&*state.state_store.session_id(), terminal.as_str());
+        let listed = handle_session_command(
+            &state,
+            IpcCommand::ListSessions {
+                include_archived: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session_id"] != ask_id.as_str()));
+
+        // A turn may target it; switching to it may not.
+        assert_eq!(
+            resolve_turn_session(&state, Some(ask_id.clone())).unwrap(),
+            ask_id.clone().into()
+        );
+        assert!(handle_session_command(
+            &state,
+            IpcCommand::SwitchSession {
+                target: ipc::SessionRef::Id { id: ask_id.clone() },
+            },
+        )
+        .await
+        .is_err());
+
+        // Other kinds are not mintable over IPC, and `ask` may not be created
+        // as the session to switch into.
+        assert!(handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: None,
+                switch: false,
+                kind: Some("subagent".to_string()),
+            },
+        )
+        .await
+        .is_err());
+        assert!(handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: None,
+                switch: true,
+                kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+            },
+        )
+        .await
+        .is_err());
+
+        // Deleting it is the teardown a one-shot turn performs.
+        handle_session_command(
+            &state,
+            IpcCommand::DeleteSession {
+                target: ipc::SessionRef::Id { id: ask_id.clone() },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(state.state_store.session_record(&ask_id).unwrap().is_none());
+        assert!(resolve_turn_session(&state, Some(ask_id)).is_err());
+    }
+
+    #[tokio::test]
+    async fn repl_session_lane_resumes_and_heals_without_moving_the_terminal_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let terminal = state.state_store.session_id().to_string();
+        let repl = state
+            .state_store
+            .create_session(&persona, "repl lane", crate::state::USER_SESSION_KIND, None)
+            .unwrap();
+
+        handle_session_command(
+            &state,
+            IpcCommand::SetReplSession {
+                target: ipc::SessionRef::Id {
+                    id: repl.session_id.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.state_store.repl_session(&persona).unwrap().as_deref(),
+            Some(repl.session_id.as_str())
+        );
+        assert_eq!(&*state.state_store.session_id(), terminal.as_str());
+
+        // A deleted REPL session must not strand the next REPL: the pointer
+        // falls back to the terminal session and is healed in place.
+        state.state_store.delete_session(&repl.session_id).unwrap();
+        assert!(state.state_store.repl_session(&persona).unwrap().is_none());
+
+        // One-shot sessions are not a valid REPL lane either.
+        let ask = state
+            .state_store
+            .create_session(&persona, "一次性对话", crate::state::ASK_SESSION_KIND, None)
+            .unwrap();
+        assert!(handle_session_command(
+            &state,
+            IpcCommand::SetReplSession {
+                target: ipc::SessionRef::Id {
+                    id: ask.session_id.clone(),
+                },
+            },
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn ipc_session_list_excludes_platform_owned_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
@@ -9888,6 +10114,7 @@ mod tests {
             IpcCommand::CreateSession {
                 name: Some("repl local".to_string()),
                 switch: false,
+                kind: None,
             },
         )
         .await

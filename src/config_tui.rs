@@ -6,6 +6,7 @@ use crate::config::{
     ProviderModelChoice, QqMemeCollectorPluginSettings, QqMessageHistoryPluginSettings,
     RealContextIdentityMapping, RealContextPluginSettings, MAX_COMMAND_OUTPUT_LINES,
     MAX_PLATFORM_COMMAND_PREFIX_CHARS, MAX_PLATFORM_SESSION_QUEUED, MAX_PLATFORM_SESSION_RUNNING,
+    MAX_REPL_REPLAY_TURNS,
     QQ_MEME_COLLECTOR_PLUGIN_ID, QQ_MESSAGE_HISTORY_PLUGIN_ID, REAL_CONTEXT_PLUGIN_ID,
 };
 use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
@@ -6493,6 +6494,11 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             config.context.on_overflow.clone(),
         )
         .choices(&["compact", "pop"]),
+        // Appended rather than inserted: the read-back below is positional.
+        Field::new(
+            t("Turns replayed when reopening the REPL", "重开 REPL 回放的轮数"),
+            config.display.repl_replay_turns.to_string(),
+        ),
     ];
     run_form_without_buttons(stdout, t(" GLOBAL SETTINGS ", " 全局设置 "), &mut fields)?;
     config.tools.enabled = parse_bool_field(&fields[0].value)?;
@@ -6515,6 +6521,11 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
     config.display.show_token_usage = parse_bool_field(&fields[11].value)?;
     config.display.mixed_model_endpoint_display = parse_mixed_endpoint_display(&fields[12].value);
     config.context.on_overflow = fields[13].value.trim().to_string();
+    config.display.repl_replay_turns = fields[14]
+        .value
+        .trim()
+        .parse::<usize>()?
+        .min(MAX_REPL_REPLAY_TURNS);
     Ok(())
 }
 

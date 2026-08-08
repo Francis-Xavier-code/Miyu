@@ -5271,10 +5271,11 @@ where
             on_event(AgentEvent::ReasoningPartEnd { received_at })?;
         }
         ChatStreamKind::ToolCall => {
-            if matches!(
-                chunk.text.as_str(),
-                "apply_patch" | "apply_artifact_patch" | "ask_question"
-            ) {
+            // The chunk carries only the tool name, emitted the moment it is
+            // decoded — the arguments are still streaming behind it. That is
+            // exactly the window a long patch or file write spends looking
+            // frozen, so the hint goes up here rather than at ToolCall.
+            if crate::tools::preparing_phase(&chunk.text).is_some() {
                 on_event(AgentEvent::ToolPreparing {
                     name: chunk.text.clone(),
                 })?;
@@ -5510,7 +5511,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_stream_announces_patch_and_question_preparation() {
+    fn tool_call_stream_announces_preparation_for_slow_argument_tools() {
         let mut filter = ReasoningTitleFilter::default();
         let mut prepared = Vec::new();
         let mut streamed = Vec::new();
@@ -5524,12 +5525,18 @@ mod tests {
             }
             Ok(())
         };
-        for name in [
+        let names = [
             "apply_patch",
             "apply_artifact_patch",
+            "write_file",
+            "edit_string",
+            "run_command",
+            "task",
             "ask_question",
+            // Arguments arrive in one chunk: a hint here would only flicker.
             "read_file",
-        ] {
+        ];
+        for name in names {
             emit_filtered_chunk(
                 ChatStreamChunk {
                     kind: ChatStreamKind::ToolCall,
@@ -5542,17 +5549,17 @@ mod tests {
         }
         assert_eq!(
             prepared,
-            ["apply_patch", "apply_artifact_patch", "ask_question"]
-        );
-        assert_eq!(
-            streamed,
             [
                 "apply_patch",
                 "apply_artifact_patch",
-                "ask_question",
-                "read_file"
+                "write_file",
+                "edit_string",
+                "run_command",
+                "task",
+                "ask_question"
             ]
         );
+        assert_eq!(streamed, names);
     }
 
     #[test]

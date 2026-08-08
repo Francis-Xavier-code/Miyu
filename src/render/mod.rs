@@ -1077,7 +1077,7 @@ impl StreamRenderer {
             return Ok(());
         }
         self.reasoning_title = Some(title);
-        self.ensure_waiting_phase(self.reasoning_live_text())
+        self.ensure_waiting_phase(self.reasoning_live_text(), SpinnerStyle::Scanner)
     }
 
     pub fn start_reasoning_part(&mut self, received_at: std::time::Instant) -> Result<()> {
@@ -1208,7 +1208,7 @@ impl StreamRenderer {
             self.finalize_tools_summary()?;
             self.record_reasoning_text(&text);
             self.mode = Some(ChatStreamKind::Reasoning);
-            self.ensure_waiting_phase(self.reasoning_live_text())?;
+            self.ensure_waiting_phase(self.reasoning_live_text(), SpinnerStyle::Scanner)?;
             return Ok(());
         }
         self.stop_waiting()?;
@@ -1282,13 +1282,13 @@ impl StreamRenderer {
         if self.plain {
             return Ok(());
         }
-        let phase = match name {
-            "apply_patch" => t("~ Preparing patch", "~ 准备修改"),
-            "ask_question" => t("~ Preparing question", "~ 准备问题"),
-            _ => return Ok(()),
+        let Some(phase) = crate::tools::preparing_phase(name) else {
+            return Ok(());
         };
         self.release_transient_output()?;
-        self.ensure_waiting_phase(phase.to_string())
+        // Braille + the dim tool palette: this is a tool starting up, not the
+        // model thinking, and the scanner/green pair reads as the latter.
+        self.ensure_waiting_phase(format!("~ {phase}"), SpinnerStyle::Braille)
     }
 
     pub fn write_tool_result(&mut self, name: &str, ok: bool, output: &str) -> Result<()> {
@@ -1424,7 +1424,9 @@ impl StreamRenderer {
             } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
                 // Lands as the block's `↳` subject line, not the final `✓`
                 // stats line — detach is a fact about the call, not a result.
-                self.tool_stats_entry(name).subject = Some(text.to_string());
+                let stats = self.tool_stats_entry(name);
+                stats.subject = Some(text.to_string());
+                stats.detached = true;
                 self.update_tool_summary_display()?;
             }
             return Ok(());
@@ -2073,7 +2075,7 @@ impl StreamRenderer {
         }
     }
 
-    fn ensure_waiting_phase(&mut self, phase: String) -> Result<()> {
+    fn ensure_waiting_phase(&mut self, phase: String, style: SpinnerStyle) -> Result<()> {
         if self.command_display.is_some() {
             return Ok(());
         }
@@ -2081,11 +2083,11 @@ impl StreamRenderer {
             if self.summary_line_active {
                 self.clear_summary_lines()?;
             }
-            self.render_summary_line(&phase, SummaryStyle::Reasoning)?;
+            self.render_summary_line(&phase, summary_style_for(style))?;
             return Ok(());
         }
         if self.wait_spinner.is_none() {
-            self.wait_spinner = Some(WaitSpinner::start(phase, SpinnerStyle::Scanner));
+            self.wait_spinner = Some(WaitSpinner::start(phase, style));
             self.last_tick = None;
             self.tick_spinner()?;
         } else {
@@ -2250,6 +2252,10 @@ struct ToolStats {
     final_progress: Option<String>,
     started_at: Option<std::time::Instant>,
     elapsed: Option<std::time::Duration>,
+    /// The subagent handed itself off to the background. Its call returned at
+    /// once, so the elapsed timer would only ever read `0s` — and worse, imply
+    /// the work finished instantly. The job strip tracks it from here on.
+    detached: bool,
     seq: usize,
 }
 
@@ -2269,6 +2275,15 @@ impl ToolStats {
 enum SummaryStyle {
     Reasoning,
     Tool,
+}
+
+/// The still-line equivalent of a spinner style, for terminals that cannot
+/// animate — so a phase keeps its identity (thinking vs tool) either way.
+fn summary_style_for(style: SpinnerStyle) -> SummaryStyle {
+    match style {
+        SpinnerStyle::Scanner => SummaryStyle::Reasoning,
+        SpinnerStyle::Braille => SummaryStyle::Tool,
+    }
 }
 
 fn style_summary_text(text: &str, style: SummaryStyle) -> String {
@@ -2309,7 +2324,7 @@ fn tool_status_text(name: &str, stats: &ToolStats, subagent: bool) -> String {
     } else {
         format!("{name}×{calls} ok:{}", stats.ok)
     };
-    if subagent {
+    if subagent && !stats.detached {
         if let Some(elapsed) = stats.elapsed() {
             return format!("{text} · {}", format_elapsed(elapsed));
         }
@@ -4855,6 +4870,31 @@ mod tests {
     }
 
     #[test]
+    fn detached_subagents_drop_the_meaningless_elapsed_timer() {
+        let finished = ToolStats {
+            calls: 1,
+            ok: 1,
+            elapsed: Some(std::time::Duration::from_secs(12)),
+            ..ToolStats::default()
+        };
+        assert_eq!(
+            tool_status_text("子代理", &finished, true),
+            "子代理×1 ok · 12s"
+        );
+
+        // Handing off to the background returns immediately, so the timer only
+        // ever read `0s` — which looked like the work had finished instantly.
+        let detached = ToolStats {
+            calls: 1,
+            ok: 1,
+            elapsed: Some(std::time::Duration::from_millis(3)),
+            detached: true,
+            ..ToolStats::default()
+        };
+        assert_eq!(tool_status_text("子代理", &detached, true), "子代理×1 ok");
+    }
+
+    #[test]
     fn tool_status_subagent_tool_keeps_count_suffix() {
         let stats = ToolStats {
             calls: 1,
@@ -5730,6 +5770,42 @@ mod tests {
         assert!(phase.ends_with("1.2s"));
         renderer.prepare_for_external_output().unwrap();
         assert!(renderer.preparing_question_started_at.is_none());
+    }
+
+    #[test]
+    fn tool_preparing_announces_every_slow_argument_tool() {
+        let phase_for = |name: &str| {
+            let mut renderer = StreamRenderer::new(
+                ReasoningDisplayMode::Summary,
+                ToolCallDisplayMode::Summary,
+                false,
+                true,
+                10,
+            );
+            renderer.use_external_cursor_control();
+            renderer.use_buffered_output();
+            // No TTY under test, so the spinner degrades to a summary line —
+            // which is gated on the same flag a real terminal would set.
+            renderer.live_summary = true;
+            renderer.write_tool_preparing(name).unwrap();
+            String::from_utf8_lossy(&renderer.take_output_frame()).into_owned()
+        };
+
+        // apply_artifact_patch used to fall through the label match and render
+        // nothing even though the backend announced it.
+        for name in ["apply_patch", "apply_artifact_patch", "write_file"] {
+            let phase = phase_for(name);
+            assert!(
+                phase.contains(t("~ Preparing edit", "~ 准备编辑")),
+                "{name}"
+            );
+            // Dim tool palette, not the green the model's thinking uses: a
+            // tool is starting up here.
+            assert!(phase.contains("\x1b[2m"), "{name}");
+            assert!(!phase.contains("\x1b[38;5;10m"), "{name}");
+        }
+        assert!(phase_for("run_command").contains(t("~ Preparing command", "~ 准备执行")));
+        assert!(phase_for("read_file").is_empty());
     }
 
     #[test]

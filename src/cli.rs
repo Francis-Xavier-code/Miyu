@@ -19,7 +19,8 @@ use chrono::{DateTime, Local};
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::cursor::{self, Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
 use crossterm::style::{Color, Print, Stylize};
@@ -338,6 +339,9 @@ pub struct Cli {
     #[arg(long)]
     pub session: Option<String>,
 
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
+    pub continue_session: bool,
+
     #[arg(long, hide = true)]
     pub shell_intercept: bool,
 
@@ -495,6 +499,12 @@ fn localize_top_args(command: clap::Command) -> clap::Command {
                 "纯文本输出模式（无颜色、无 TUI）；适合管道重定向",
             ))
         })
+        .mut_arg("continue_session", |arg| {
+            arg.help(t(
+                "Send this one-shot message to the terminal session instead of a throwaway one",
+                "把这条一次性消息发进终端会话，而不是用完即弃的临时会话",
+            ))
+        })
         .mut_arg("message", |arg| {
             arg.help(t(
                 "Message to send; omitted to enter REPL",
@@ -591,8 +601,8 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         ),
         (
             "session",
-            "List sessions, or switch to one",
-            "列出会话，或切换到指定会话",
+            "List sessions, or switch to one (Ctrl+D deletes in the picker)",
+            "列出会话，或切换到指定会话（菜单内 Ctrl+D 删除）",
         ),
         ("rename", "Rename the current session", "重命名当前会话"),
         ("archive", "Archive the current session", "归档当前会话"),
@@ -1254,6 +1264,11 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         run_init(&paths, InitKind::FirstRun)?;
     }
 
+    // Captured before `cli.command` is moved out: one-shot entry points below
+    // need them to pick the session their turn lands in.
+    let session_arg = cli.session.clone();
+    let continue_session = cli.continue_session;
+
     match cli.command {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
         Some(Command::DaemonWorker(args)) => {
@@ -1262,17 +1277,14 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
-            let session_override = match cli.session.as_deref() {
-                Some(arg) => Some(resolve_session_id_for_turn(&paths, arg).await?),
-                None => None,
-            };
+            let session = one_shot_session(&paths, session_arg.as_deref(), continue_session).await?;
             run_chat_with_options(
                 &paths,
                 join_message(args.message),
                 None,
                 cli.stdout,
                 mode,
-                session_override,
+                session,
             )
             .await
         }
@@ -1363,23 +1375,20 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         None => {
             let message = join_message(cli.message);
             if message.is_empty() && io::stdin().is_terminal() {
-                if cli.session.is_some() {
+                if session_arg.is_some() || continue_session {
                     bail!(
                         "{}",
                         t(
-                            "--session only applies to one-shot commands; use /session inside the REPL",
-                            "--session 仅用于一次性命令；REPL 内请使用 /session 切换"
+                            "--session and --continue only apply to one-shot commands; use /session inside the REPL",
+                            "--session 与 --continue 仅用于一次性命令；REPL 内请使用 /session 切换"
                         )
                     );
                 }
                 run_repl(&paths, mode).await
             } else {
-                let session_override = match cli.session.as_deref() {
-                    Some(arg) => Some(resolve_session_id_for_turn(&paths, arg).await?),
-                    None => None,
-                };
-                run_chat_with_options(&paths, message, None, cli.stdout, mode, session_override)
-                    .await
+                let session =
+                    one_shot_session(&paths, session_arg.as_deref(), continue_session).await?;
+                run_chat_with_options(&paths, message, None, cli.stdout, mode, session).await
             }
         }
     }
@@ -3779,12 +3788,71 @@ fn inline_fuzzy_lines(item_count: usize) -> u16 {
 /// as `inline_pop_select` (editor suspended, cooked mode on entry). `lines`
 /// are the rendered rows and `search` the parallel fuzzy-match texts.
 /// Returns the selected index, or `None` when cancelled.
+/// What an inline picker returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineSelectOutcome {
+    Cancelled,
+    Chosen(usize),
+    /// Ctrl+D on a row, confirmed in place. The caller does the deletion and
+    /// reopens the picker on the refreshed list.
+    Deleted(usize),
+}
+
+/// A picker keystroke, resolved away from the draw loop so the delete
+/// confirmation flow is testable without a terminal. Every printable character
+/// is search input, which is why deletion needs a modifier key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineSelectKey {
+    Cancel,
+    Accept,
+    Up,
+    Down,
+    Backspace,
+    DeleteRequest,
+    Char(char),
+    Ignore,
+}
+
+fn inline_select_key(code: KeyCode, modifiers: KeyModifiers, deletable: bool) -> InlineSelectKey {
+    let control = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Char('c') if control => InlineSelectKey::Cancel,
+        KeyCode::Char('d') if control && deletable => InlineSelectKey::DeleteRequest,
+        KeyCode::Delete if deletable => InlineSelectKey::DeleteRequest,
+        KeyCode::Esc => InlineSelectKey::Cancel,
+        KeyCode::Enter => InlineSelectKey::Accept,
+        KeyCode::Up | KeyCode::Char('k') if !control => InlineSelectKey::Up,
+        KeyCode::Down | KeyCode::Char('j') if !control => InlineSelectKey::Down,
+        KeyCode::Backspace => InlineSelectKey::Backspace,
+        KeyCode::Char(ch) if !control => InlineSelectKey::Char(ch),
+        _ => InlineSelectKey::Ignore,
+    }
+}
+
 fn inline_single_select(
     title: &str,
     lines: &[String],
     search: &[String],
     initial_selected: usize,
 ) -> Result<Option<usize>> {
+    match inline_single_select_deletable(title, lines, search, initial_selected, None)? {
+        InlineSelectOutcome::Chosen(index) => Ok(Some(index)),
+        // Unreachable without delete labels, but folding it into `None` keeps
+        // callers that never opted in from having to care.
+        InlineSelectOutcome::Cancelled | InlineSelectOutcome::Deleted(_) => Ok(None),
+    }
+}
+
+/// Fuzzy picker. Passing `delete_labels` (one per row, used in the inline
+/// confirmation) enables Ctrl+D deletion and returns `Deleted` once the user
+/// confirms; the caller performs the deletion and decides whether to reopen.
+fn inline_single_select_deletable(
+    title: &str,
+    lines: &[String],
+    search: &[String],
+    initial_selected: usize,
+    delete_labels: Option<&[String]>,
+) -> Result<InlineSelectOutcome> {
     let menu_lines = inline_fuzzy_lines(lines.len());
     reserve_inline_fuzzy_space(menu_lines)?;
     let mut session = InlineRawMode::start()?;
@@ -3794,6 +3862,10 @@ fn inline_single_select(
     let mut scroll = 0usize;
     let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
     let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
+    let deletable = delete_labels.is_some();
+    // Index awaiting a y/N answer. Confirming inside the picker keeps the
+    // drawing intact instead of tearing it down for a separate prompt.
+    let mut confirming: Option<usize> = None;
     loop {
         let matches = fuzzy_matches(&matcher, search, &query);
         if selected >= matches.len() {
@@ -3801,6 +3873,11 @@ fn inline_single_select(
         }
         let visible = matches.len().min(menu_lines.saturating_sub(2) as usize);
         scroll = inline_fuzzy_scroll(selected, scroll, visible);
+        let confirm_label = confirming.and_then(|index| {
+            delete_labels
+                .and_then(|labels| labels.get(index))
+                .map(String::as_str)
+        });
         draw_inline_single(
             &mut session.stdout,
             anchor_y,
@@ -3811,41 +3888,56 @@ fn inline_single_select(
             &matches,
             selected,
             scroll,
+            deletable,
+            confirm_label,
         )?;
-        if let Event::Key(KeyEvent {
+        let Event::Key(KeyEvent {
             code, modifiers, ..
         }) = event::read()?
-        {
-            match code {
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
-                    return Ok(None);
-                }
-                KeyCode::Esc => {
-                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
-                    return Ok(None);
-                }
-                KeyCode::Enter => {
-                    let choice = matches.get(selected).map(|(_, index)| *index);
-                    clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
-                    return Ok(choice);
-                }
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1).min(matches.len().saturating_sub(1));
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                    selected = 0;
-                    scroll = 0;
-                }
-                KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                    query.push(ch);
-                    selected = 0;
-                    scroll = 0;
-                }
-                _ => {}
+        else {
+            continue;
+        };
+        if let Some(index) = confirming {
+            // Only an explicit yes deletes; every other key backs out.
+            let confirmed = matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            confirming = None;
+            if confirmed {
+                clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                return Ok(InlineSelectOutcome::Deleted(index));
             }
+            continue;
+        }
+        match inline_select_key(code, modifiers, deletable) {
+            InlineSelectKey::Cancel => {
+                clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                return Ok(InlineSelectOutcome::Cancelled);
+            }
+            InlineSelectKey::Accept => {
+                let choice = matches.get(selected).map(|(_, index)| *index);
+                clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                return Ok(match choice {
+                    Some(index) => InlineSelectOutcome::Chosen(index),
+                    None => InlineSelectOutcome::Cancelled,
+                });
+            }
+            InlineSelectKey::DeleteRequest => {
+                confirming = matches.get(selected).map(|(_, index)| *index);
+            }
+            InlineSelectKey::Up => selected = selected.saturating_sub(1),
+            InlineSelectKey::Down => {
+                selected = (selected + 1).min(matches.len().saturating_sub(1));
+            }
+            InlineSelectKey::Backspace => {
+                query.pop();
+                selected = 0;
+                scroll = 0;
+            }
+            InlineSelectKey::Char(ch) => {
+                query.push(ch);
+                selected = 0;
+                scroll = 0;
+            }
+            InlineSelectKey::Ignore => {}
         }
     }
 }
@@ -3861,6 +3953,8 @@ fn draw_inline_single(
     matches: &[(i64, usize)],
     selected: usize,
     scroll: usize,
+    deletable: bool,
+    confirm_label: Option<&str>,
 ) -> Result<()> {
     let (cols, _) = terminal::size().unwrap_or((80, 24));
     let bar = inline_fuzzy_bar();
@@ -3874,12 +3968,11 @@ fn draw_inline_single(
             Clear(ClearType::CurrentLine)
         )?;
     }
-    queue!(
-        stdout,
-        MoveTo(0, anchor_y),
-        Print(&bar),
-        Print(inline_single_header(title, query, width)),
-    )?;
+    let header = match confirm_label {
+        Some(label) => inline_single_confirm_header(label, width),
+        None => inline_single_header(title, query, width),
+    };
+    queue!(stdout, MoveTo(0, anchor_y), Print(&bar), Print(header))?;
     if matches.is_empty() {
         queue!(
             stdout,
@@ -3905,7 +3998,7 @@ fn draw_inline_single(
         stdout,
         MoveTo(0, anchor_y + menu_lines.saturating_sub(1)),
         Print(&bar),
-        Print(inline_single_help_line(width))
+        Print(inline_single_help_line(width, deletable))
     )?;
     stdout.flush()?;
     Ok(())
@@ -3937,11 +4030,27 @@ fn inline_single_item_line(item: &str, selected: bool, width: usize) -> String {
     }
 }
 
-fn inline_single_help_line(width: usize) -> String {
-    let line = t(
-        "type search · j/k move · Enter select · Esc cancel",
-        "输入搜索 · j/k 移动 · Enter 选择 · Esc 取消",
-    );
+fn inline_single_confirm_header(label: &str, width: usize) -> String {
+    let line = if is_zh() {
+        format!("删除「{label}」？y/N")
+    } else {
+        format!("delete \"{label}\"? y/N")
+    };
+    format!("\x1b[1m\x1b[31m{}\x1b[0m", truncate_visible_width(&line, width))
+}
+
+fn inline_single_help_line(width: usize, deletable: bool) -> String {
+    let line = if deletable {
+        t(
+            "type search · j/k move · Enter select · Ctrl+D delete · Esc cancel",
+            "输入搜索 · j/k 移动 · Enter 选择 · Ctrl+D 删除 · Esc 取消",
+        )
+    } else {
+        t(
+            "type search · j/k move · Enter select · Esc cancel",
+            "输入搜索 · j/k 移动 · Enter 选择 · Esc 取消",
+        )
+    };
     format!("\x1b[2m{}\x1b[0m", truncate_visible_width(line, width))
 }
 
@@ -4150,7 +4259,17 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
     let (clean_message, pasted_images) = extract_image_placeholders(&message);
 
     let result = if pasted_images.is_empty() {
-        run_chat_with_options(paths, clean_message, None, false, AgentMode::Normal, None).await
+        // shell-hook keeps landing in the terminal session: that lane is the
+        // whole point of typing natural language at the prompt.
+        run_chat_with_options(
+            paths,
+            clean_message,
+            None,
+            false,
+            AgentMode::Normal,
+            TurnSession::Current,
+        )
+        .await
     } else {
         run_chat_with_images(paths, clean_message, pasted_images).await
     };
@@ -4436,20 +4555,117 @@ async fn append_stdin_if_piped(message: String) -> String {
     }
 }
 
+/// Which session a one-shot CLI turn lands in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TurnSession {
+    /// The terminal session — what shell-hook and `miyu new`/`session` drive.
+    Current,
+    /// An explicit `--session` target, resolved to a session id.
+    Explicit(String),
+    /// A throwaway session created for this turn and deleted right after, so a
+    /// quick question never lands in a conversation the user cares about.
+    Ephemeral,
+}
+
+/// Picks the session for `miyu ask` / a bare `miyu '<message>'`. Both default
+/// to a throwaway session; `--session` and `--continue` opt back into a real
+/// one (clap already rejects passing both).
+async fn one_shot_session(
+    paths: &MiyuPaths,
+    session_arg: Option<&str>,
+    continue_session: bool,
+) -> Result<TurnSession> {
+    if let Some(arg) = session_arg {
+        return Ok(TurnSession::Explicit(
+            resolve_session_id_for_turn(paths, arg).await?,
+        ));
+    }
+    if continue_session {
+        return Ok(TurnSession::Current);
+    }
+    Ok(TurnSession::Ephemeral)
+}
+
+/// Named rather than left blank on purpose: a row that leaks past the sweep is
+/// recognisable, and a non-empty name also skips the daemon's auto-title LLM
+/// call (`maybe_auto_name_session`) for a session about to be deleted.
+fn ephemeral_session_name() -> String {
+    t("One-shot", "一次性对话").to_string()
+}
+
+async fn create_ephemeral_session(paths: &MiyuPaths) -> Result<String> {
+    let (_, data) = session_admin(
+        paths,
+        IpcCommand::CreateSession {
+            name: Some(ephemeral_session_name()),
+            switch: false,
+            kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+        },
+    )
+    .await?;
+    data.get("session")
+        .and_then(|session| session.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Miyu core returned an invalid response"))
+}
+
+/// Tears a throwaway session down. Background jobs go first so nothing is left
+/// pointing at a session that is about to disappear. Best effort: a daemon
+/// that has gone away leaves a row the startup sweep collects.
+async fn discard_ephemeral_session(paths: &MiyuPaths, session_id: &str) {
+    let _ = send_ipc_admin(
+        paths,
+        IpcCommand::StopSessionJobs {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await;
+    let _ = send_ipc_admin(
+        paths,
+        IpcCommand::DeleteSession {
+            target: crate::ipc::SessionRef::Id {
+                id: session_id.to_string(),
+            },
+        },
+    )
+    .await;
+}
+
+/// Deletes the throwaway session however the direct-mode turn unwinds — error,
+/// cancelled question, or early return.
+struct EphemeralSessionGuard {
+    state: StateStore,
+    session_id: String,
+}
+
+impl Drop for EphemeralSessionGuard {
+    fn drop(&mut self) {
+        let _ = self.state.delete_session(&self.session_id);
+    }
+}
+
 async fn run_chat_with_options(
     paths: &MiyuPaths,
     message: String,
     show_reasoning: Option<bool>,
     plain: bool,
     mode: AgentMode,
-    session_override: Option<String>,
+    session: TurnSession,
 ) -> Result<()> {
     let message = append_stdin_if_piped(message).await;
     if message.is_empty() {
         return run_repl(paths, mode).await;
     }
     if !direct_mode_requested() {
-        match try_run_remote_chat(
+        let session_override = match &session {
+            TurnSession::Current => None,
+            TurnSession::Explicit(session_id) => Some(session_id.clone()),
+            TurnSession::Ephemeral => Some(create_ephemeral_session(paths).await?),
+        };
+        // Not `?`-through: the throwaway session has to be torn down on the
+        // failure path too, otherwise a cancelled turn leaves it behind.
+        let outcome = try_run_remote_chat(
             paths,
             None,
             &message,
@@ -4460,8 +4676,13 @@ async fn run_chat_with_options(
             session_override.clone(),
             None,
         )
-        .await
-        {
+        .await;
+        if session == TurnSession::Ephemeral {
+            if let Some(session_id) = &session_override {
+                discard_ephemeral_session(paths, session_id).await;
+            }
+        }
+        match outcome {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -4473,6 +4694,23 @@ async fn run_chat_with_options(
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    // Direct mode has no daemon to mint the throwaway session, so it makes its
+    // own and pins the turn to it.
+    let (state, _ephemeral_guard) = if session == TurnSession::Ephemeral {
+        let record = state.create_session(
+            &config.active_persona_scope(),
+            &ephemeral_session_name(),
+            crate::state::ASK_SESSION_KIND,
+            None,
+        )?;
+        let guard = EphemeralSessionGuard {
+            state: state.clone(),
+            session_id: record.session_id.clone(),
+        };
+        (state.pinned(&record.session_id), Some(guard))
+    } else {
+        (state, None)
+    };
     let memory_organizer = MemoryOrganizer::spawn()?;
     let memory_organizer_handle = memory_organizer.handle();
     memory_organizer_handle.wake(config.clone(), paths.clone(), state.clone());
@@ -4894,6 +5132,12 @@ async fn try_run_remote_chat(
                 &mut renderer,
                 AgentEvent::ReasoningTitle(ipc_text(&data, "title").to_string()),
             )?,
+            "tool.preparing" => handle_agent_event(
+                &mut renderer,
+                AgentEvent::ToolPreparing {
+                    name: ipc_text(&data, "name").to_string(),
+                },
+            )?,
             "tool.started" => handle_agent_event(
                 &mut renderer,
                 AgentEvent::ToolCall {
@@ -4976,6 +5220,16 @@ async fn try_run_remote_chat(
                         data.get("questions").cloned().unwrap_or_default(),
                     )?,
                 };
+                notify_if_unfocused(
+                    &config,
+                    live.as_deref().map(|live| live.editor.focused),
+                    t("Miyu is waiting on you", "Miyu 在等你回答"),
+                    request
+                        .questions
+                        .first()
+                        .map(|prompt| prompt.question.as_str())
+                        .unwrap_or_default(),
+                );
                 match crate::question_tui::ask(&request)? {
                     crate::question::QuestionResponse::Answered(answers) => {
                         send_ipc_command(
@@ -5092,6 +5346,7 @@ async fn try_run_remote_chat(
         }
     };
     renderer.finish()?;
+    let focused = live.as_deref().map(|live| live.editor.focused);
     if let Some(live) = live {
         live.apply_renderer_frame(&mut renderer)?;
         if let Some(raw) = raw.as_mut() {
@@ -5127,6 +5382,14 @@ async fn try_run_remote_chat(
         last_request_usage: None,
         responses_continuation: None,
     };
+    if config.notifications.on_turn_complete {
+        notify_if_unfocused(
+            &config,
+            focused,
+            t("Miyu finished replying", "Miyu 回复完成"),
+            &result.content,
+        );
+    }
     print_mixed_model_endpoint(show_mixed_model_endpoint(&config, false), &result, None);
     let context_tokens = completion
         .get("context_tokens")
@@ -5226,8 +5489,9 @@ fn display_session_name(name: &str) -> &str {
     }
 }
 
-fn apply_repl_session_switch(
+async fn apply_repl_session_switch(
     paths: &MiyuPaths,
+    config: &AppConfig,
     state: &ipc::SessionState,
     active_session_id: &mut String,
     history: &mut Vec<String>,
@@ -5255,8 +5519,34 @@ fn apply_repl_session_switch(
         ),
     )?;
     synchronized_terminal_update(CursorAfterUpdate::Shown, || live_repl.reload_queue(&store))?;
+    // Rebuild rather than reset: the target session may pin its own model
+    // pool, so provider/model/thinking have to be re-derived alongside the
+    // token numbers. `refresh_footer` repaints straight away — merely storing
+    // the footer left the previous session's numbers on screen until the next
+    // turn finished.
     *cumulative_tokens = state.cumulative_tokens;
-    footer.reset_token_usage(state.context_tokens, state.context_window);
+    let session_config = footer_config_for_session(paths, config, &state.session_id);
+    *footer = ReplFooterStatus::from_config(
+        &session_config,
+        state.context_tokens,
+        (*cumulative_tokens > 0).then_some(*cumulative_tokens),
+    );
+    let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
+    footer.update_thinking_variant(client.thinking_variant_summary().as_deref());
+    footer.update_context_window(state.context_window);
+    live_repl.refresh_footer(footer.clone())?;
+    // Every REPL session change funnels through here, so this is the one place
+    // the REPL lane needs to be remembered. Best effort: losing the write only
+    // means the next REPL starts on the terminal session.
+    let _ = send_ipc_admin(
+        paths,
+        IpcCommand::SetReplSession {
+            target: crate::ipc::SessionRef::Id {
+                id: state.session_id.clone(),
+            },
+        },
+    )
+    .await;
     Ok(())
 }
 
@@ -5368,10 +5658,23 @@ fn session_initial_selection(
         .unwrap_or(0)
 }
 
+/// What the interactive session picker came back with.
+enum SessionPick {
+    Cancelled,
+    Switch(crate::ipc::SessionRef),
+    /// Deletion confirmed inside the picker. `index` is where the cursor sat,
+    /// so the caller can reopen the refreshed list at the same spot.
+    Delete {
+        session_id: String,
+        index: usize,
+    },
+}
+
 fn select_session_target(
     entries: &[SessionListEntry],
     active_session_id: Option<&str>,
-) -> Result<Option<crate::ipc::SessionRef>> {
+    cursor: Option<usize>,
+) -> Result<SessionPick> {
     let lines = entries
         .iter()
         .map(|entry| session_select_line(entry, active_session_id))
@@ -5380,15 +5683,31 @@ fn select_session_target(
         .iter()
         .map(session_select_search)
         .collect::<Vec<_>>();
-    Ok(inline_single_select(
-        t("Select session", "选择会话"),
-        &lines,
-        &search,
-        session_initial_selection(entries, active_session_id),
-    )?
-    .map(|index| crate::ipc::SessionRef::Id {
-        id: entries[index].id.clone(),
-    }))
+    let labels = entries
+        .iter()
+        .map(|entry| display_session_name(&entry.name).to_string())
+        .collect::<Vec<_>>();
+    let initial = cursor
+        .map(|index| index.min(entries.len().saturating_sub(1)))
+        .unwrap_or_else(|| session_initial_selection(entries, active_session_id));
+    Ok(
+        match inline_single_select_deletable(
+            t("Select session", "选择会话"),
+            &lines,
+            &search,
+            initial,
+            Some(&labels),
+        )? {
+            InlineSelectOutcome::Cancelled => SessionPick::Cancelled,
+            InlineSelectOutcome::Chosen(index) => SessionPick::Switch(crate::ipc::SessionRef::Id {
+                id: entries[index].id.clone(),
+            }),
+            InlineSelectOutcome::Deleted(index) => SessionPick::Delete {
+                session_id: entries[index].id.clone(),
+                index,
+            },
+        },
+    )
 }
 
 /// Resolves a user-typed `/session` / `/delete` argument into a session ref:
@@ -5546,6 +5865,79 @@ async fn repl_fallback_session_state(
     .await
 }
 
+/// Runs the interactive session picker inside the REPL, servicing Ctrl+D
+/// deletions in place. Returns the session state to switch to — a fallback
+/// session when the REPL's own session was one of the ones deleted, so backing
+/// out never strands the REPL on a session that no longer exists.
+async fn repl_pick_session(
+    paths: &MiyuPaths,
+    live: &mut LiveReplTail,
+    active_session_id: &str,
+) -> Result<Option<ipc::SessionState>> {
+    let mut cursor = None;
+    let mut lost_active = false;
+    loop {
+        let Some((_, data)) = repl_ipc_admin(
+            paths,
+            live,
+            IpcCommand::ListSessions {
+                include_archived: false,
+            },
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let entries = session_list_entries(&data);
+        if entries.is_empty() {
+            repl_note(
+                live,
+                &format!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话")),
+            )?;
+            // Deleting the last session leaves the daemon to mint a fresh one.
+            return if lost_active {
+                repl_fallback_session_state(paths, live).await
+            } else {
+                Ok(None)
+            };
+        }
+        match select_session_target(&entries, Some(active_session_id), cursor)? {
+            SessionPick::Cancelled => {
+                return if lost_active {
+                    repl_fallback_session_state(paths, live).await
+                } else {
+                    Ok(None)
+                };
+            }
+            SessionPick::Switch(target) => {
+                return repl_get_session_state(paths, live, target).await;
+            }
+            SessionPick::Delete { session_id, index } => {
+                let was_active = session_id == active_session_id;
+                let deleted = repl_ipc_admin(
+                    paths,
+                    live,
+                    IpcCommand::DeleteSession {
+                        target: crate::ipc::SessionRef::Id { id: session_id },
+                    },
+                )
+                .await?;
+                if deleted.is_none() {
+                    return if lost_active {
+                        repl_fallback_session_state(paths, live).await
+                    } else {
+                        Ok(None)
+                    };
+                }
+                lost_active |= was_active;
+                // The rows below shift up, so holding the index parks the
+                // cursor on the next session instead of jumping to the top.
+                cursor = Some(index);
+            }
+        }
+    }
+}
+
 async fn repl_active_or_default_state(
     paths: &MiyuPaths,
     active_session_id: &str,
@@ -5641,13 +6033,60 @@ async fn run_session_new(paths: &MiyuPaths, args: SessionNameArgs) -> Result<()>
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string);
-    let (state, _) = session_admin(paths, IpcCommand::CreateSession { name, switch: true }).await?;
+    let (state, _) = session_admin(
+        paths,
+        IpcCommand::CreateSession {
+            name,
+            switch: true,
+            kind: None,
+        },
+    )
+    .await?;
     println!(
         "{}: {}",
         t("created and switched to session", "已创建并切换到会话"),
         display_session_name(&state.session_name)
     );
     Ok(())
+}
+
+/// Runs the interactive session picker, servicing Ctrl+D deletions in place
+/// and reopening on the refreshed list until the user picks one or backs out.
+async fn cli_pick_session(
+    paths: &MiyuPaths,
+    mut entries: Vec<SessionListEntry>,
+) -> Result<Option<crate::ipc::SessionRef>> {
+    let mut cursor = None;
+    loop {
+        match select_session_target(&entries, None, cursor)? {
+            SessionPick::Cancelled => return Ok(None),
+            SessionPick::Switch(target) => return Ok(Some(target)),
+            SessionPick::Delete { session_id, index } => {
+                session_admin(
+                    paths,
+                    IpcCommand::DeleteSession {
+                        target: crate::ipc::SessionRef::Id { id: session_id },
+                    },
+                )
+                .await?;
+                let (_, data) = session_admin(
+                    paths,
+                    IpcCommand::ListSessions {
+                        include_archived: false,
+                    },
+                )
+                .await?;
+                entries = session_list_entries(&data);
+                if entries.is_empty() {
+                    print_session_list(&entries);
+                    return Ok(None);
+                }
+                // The rows below shift up, so holding the index parks the
+                // cursor on the next session instead of jumping to the top.
+                cursor = Some(index);
+            }
+        }
+    }
 }
 
 async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
@@ -5675,10 +6114,10 @@ async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Resu
             print_session_list(&entries);
             return Ok(());
         }
-        let Some(target) = select_session_target(&entries, None)? else {
-            return Ok(());
-        };
-        target
+        match cli_pick_session(paths, entries).await? {
+            Some(target) => target,
+            None => return Ok(()),
+        }
     };
     let (state, _) = session_admin(paths, IpcCommand::SwitchSession { target }).await?;
     println!(
@@ -6140,7 +6579,10 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let paths = &refreshed;
     initialize_models_cache(paths);
     let mut config = AppConfig::load_or_default(paths)?;
-    let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetStatus).await?;
+    // The REPL resumes its own lane rather than the terminal session, so
+    // reopening a REPL lands back where the last one left off while shell-hook
+    // keeps talking to whatever session it was on.
+    let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetReplSession).await?;
     let mut active_session_id = daemon_state.session_id.clone();
     let history_state = StateStore::new(paths)?.pinned(&active_session_id);
     let mut history = load_repl_input_history(&history_state, paths)?;
@@ -6186,6 +6628,24 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
         });
     }
 
+    // Redraw the tail of the session we just resumed. The tail is not on
+    // screen yet (`rendered == false`), so `apply_output_frame` writes the
+    // frame raw and re-reads the cursor — no layout budget applies and the
+    // frame can be arbitrarily long.
+    if config.display.repl_replay_turns > 0 {
+        let replay_store = StateStore::new(paths)?.pinned(&active_session_id);
+        match replay_store.session_replay(config.display.repl_replay_turns) {
+            Ok(replays) if !replays.is_empty() => {
+                let (cols, _) = terminal::size().unwrap_or((80, 24));
+                let frame =
+                    session_replay_frame(&replays, mode, &config, usize::from(cols.max(1)))?;
+                live_repl.apply_output_frame(&frame)?;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(error = %error, "session replay unavailable"),
+        }
+    }
+
     loop {
         // Keep the poll thread's session filter in step with /new & /session.
         *jobs_shared.repl_session.lock().unwrap() = Some(active_session_id.clone());
@@ -6197,6 +6657,39 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             Some(&active_session_id),
         )? {
             LiveReplOutcome::Exit => break,
+            LiveReplOutcome::StopJobs => {
+                let stopped = match repl_ipc_admin(
+                    paths,
+                    &mut live_repl,
+                    IpcCommand::StopSessionJobs {
+                        session_id: active_session_id.clone(),
+                    },
+                )
+                .await?
+                {
+                    Some((_, data)) => data
+                        .get("stopped")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                // Drop the strip now instead of waiting out the ~1s jobs poll:
+                // every job of this session was just stopped, so an empty strip
+                // is the truth.
+                live_repl.set_jobs(Vec::new());
+                repl_note(
+                    &mut live_repl,
+                    &format!(
+                        "\x1b[2m{}\x1b[0m\n",
+                        if is_zh() {
+                            format!("已停止 {stopped} 个后台任务")
+                        } else {
+                            format!("stopped {stopped} background task(s)")
+                        }
+                    ),
+                )?;
+                continue;
+            }
             LiveReplOutcome::FollowWake { run_id, label } => {
                 if let Err(error) = follow_wake_run(
                     paths,
@@ -6273,6 +6766,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         IpcCommand::CreateSession {
                             name: (!name.is_empty()).then(|| name.to_string()),
                             switch: false,
+                            kind: None,
                         },
                     )
                     .await?
@@ -6307,66 +6801,45 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     };
                     apply_repl_session_switch(
                         paths,
+                        &config,
                         &state,
                         &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
                         &mut cumulative_tokens,
-                    )?;
+                    )
+                    .await?;
                 }
                 ReplSlashCommand::Session => {
                     let arg = command_args.trim();
-                    let target = if arg.is_empty() {
-                        let Some((_, data)) = repl_ipc_admin(
-                            paths,
-                            &mut live_repl,
-                            IpcCommand::ListSessions {
-                                include_archived: false,
-                            },
-                        )
-                        .await?
-                        else {
-                            continue;
-                        };
-                        let entries = session_list_entries(&data);
-                        if entries.is_empty() {
-                            repl_note(
-                                &mut live_repl,
-                                &format!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话")),
-                            )?;
-                            continue;
+                    let state = if arg.is_empty() {
+                        match repl_pick_session(paths, &mut live_repl, &active_session_id).await? {
+                            Some(state) => state,
+                            None => continue,
                         }
-                        let Some(target) =
-                            select_session_target(&entries, Some(&active_session_id))?
-                        else {
-                            continue;
-                        };
-                        target
                     } else {
-                        match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
-                            Some(target) => target,
+                        let target =
+                            match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
+                                Some(target) => target,
+                                None => continue,
+                            };
+                        match repl_get_session_state(paths, &mut live_repl, target).await? {
+                            Some(state) => state,
                             None => continue,
                         }
                     };
-                    let Some((state, _)) = repl_ipc_admin(
-                        paths,
-                        &mut live_repl,
-                        IpcCommand::GetSessionState { target },
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
                     apply_repl_session_switch(
                         paths,
+                        &config,
                         &state,
                         &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
                         &mut cumulative_tokens,
-                    )?;
+                    )
+                    .await?;
                 }
                 ReplSlashCommand::Rename => {
                     let name = command_args.trim().to_string();
@@ -6427,13 +6900,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     };
                     apply_repl_session_switch(
                         paths,
+                        &config,
                         &state,
                         &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
                         &mut cumulative_tokens,
-                    )?;
+                    )
+                    .await?;
                 }
                 ReplSlashCommand::Delete => {
                     let arg = command_args.trim();
@@ -6491,13 +6966,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         };
                         apply_repl_session_switch(
                             paths,
+                            &config,
                             &state,
                             &mut active_session_id,
                             &mut history,
                             &mut live_repl,
                             &mut footer,
                             &mut cumulative_tokens,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 ReplSlashCommand::Workspace => {
@@ -6695,13 +7172,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     if changed {
                         apply_repl_session_switch(
                             paths,
+                            &config,
                             &state,
                             &mut active_session_id,
                             &mut history,
                             &mut live_repl,
                             &mut footer,
                             &mut cumulative_tokens,
-                        )?;
+                        )
+                        .await?;
                     }
                     cumulative_tokens = state.cumulative_tokens;
                     footer = ReplFooterStatus::from_config(
@@ -6754,13 +7233,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             if changed {
                                 apply_repl_session_switch(
                                     paths,
+                                    &config,
                                     &state,
                                     &mut active_session_id,
                                     &mut history,
                                     &mut live_repl,
                                     &mut footer,
                                     &mut cumulative_tokens,
-                                )?;
+                                )
+                                .await?;
                             }
                             cumulative_tokens = state.cumulative_tokens;
                             footer = ReplFooterStatus::from_config(
@@ -7074,13 +7555,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 {
                     apply_repl_session_switch(
                         paths,
+                        &config,
                         &state,
                         &mut active_session_id,
                         &mut history,
                         &mut live_repl,
                         &mut footer,
                         &mut cumulative_tokens,
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -7126,6 +7609,14 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     tools::jobs::init(paths, config.tools.background_job_max_minutes);
     let state = StateStore::new(paths)?;
     state.init_files()?;
+    // Same lane as the remote REPL: resume where the last REPL was, not where
+    // shell-hook happens to be pointing.
+    let persona = config.active_persona_scope();
+    if let Ok(Some(session_id)) = state.repl_session(&persona) {
+        state.adopt_session(&session_id);
+    } else {
+        let _ = state.set_repl_session(&persona, &state.session_id());
+    }
     apply_session_model_override(&state, &mut config);
     let memory_organizer = MemoryOrganizer::spawn()?;
     let memory_organizer_handle = memory_organizer.handle();
@@ -7166,6 +7657,16 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             live.set_footer(footer.clone());
             let input = match read_live_repl_input(live, paths, &JobsFeed::Local, None)? {
                 LiveReplOutcome::Exit | LiveReplOutcome::FollowWake { .. } => None,
+                // Direct mode owns its jobs in-process, so stop them here
+                // rather than through the daemon.
+                LiveReplOutcome::StopJobs => {
+                    for job in crate::tools::jobs::overview() {
+                        if job.running {
+                            let _ = crate::tools::jobs::stop_job(&job.job_id).await;
+                        }
+                    }
+                    continue;
+                }
                 LiveReplOutcome::Submit(next_mode, input, images) => {
                     Some((next_mode, input, images))
                 }
@@ -8249,6 +8750,14 @@ fn print_repl_help() {
         "  Esc Esc     {}",
         t("interrupt running reply", "中断当前回复")
     );
+    println!(
+        "  Ctrl+C      {}",
+        t(
+            "clear the draft, else interrupt the reply, else stop background tasks, else exit",
+            "先清空输入；输入为空则中断回复；再无回复则停止后台任务；都没有则退出"
+        )
+    );
+    println!("  Ctrl+D      {}", t("exit", "退出"));
 }
 
 struct LiveReplEditor {
@@ -8262,6 +8771,11 @@ struct LiveReplEditor {
     pasted_images: Vec<Option<crate::clipboard::PastedImage>>,
     pasted_texts: Vec<Option<PastedText>>,
     escape_armed_until: Option<Instant>,
+    /// Whether the terminal window currently has focus, per the terminal's own
+    /// focus reporting. Starts `true`: a terminal that never reports focus
+    /// leaves this pinned, and notifications stay quiet rather than firing on
+    /// every turn.
+    focused: bool,
 }
 
 struct LiveSubmission {
@@ -8299,6 +8813,7 @@ impl LiveReplEditor {
             pasted_images: Vec::new(),
             pasted_texts: Vec::new(),
             escape_armed_until: None,
+            focused: true,
         }
     }
 
@@ -8360,6 +8875,16 @@ impl LiveReplEditor {
                 ..
             }) => return Ok(LiveEditorAction::None),
             Event::Resize(_, _) => return Ok(LiveEditorAction::Redraw),
+            // Focus reporting gates notifications: no popup while you are
+            // looking at the window.
+            Event::FocusGained => {
+                self.focused = true;
+                return Ok(LiveEditorAction::None);
+            }
+            Event::FocusLost => {
+                self.focused = false;
+                return Ok(LiveEditorAction::None);
+            }
             Event::Paste(text) => {
                 insert_pasted_text_at_cursor(
                     &mut self.input,
@@ -8965,11 +9490,17 @@ fn synchronized_terminal_update<T>(
     }
 }
 
+/// Places the tail below the output. `was_anchored` says the tail was already
+/// pinned to the bottom: without it a tail that *shrinks* (a background job
+/// strip or a queue bubble going away) would spring back up to the output
+/// cursor, leaving blank rows under the input box until later output pushed it
+/// down again — the input visibly bouncing.
 fn live_tail_placement(
     output_col: u16,
     output_row: u16,
     total_rows: u16,
     terminal_rows: u16,
+    was_anchored: bool,
 ) -> LiveTailPlacement {
     let terminal_rows = terminal_rows.max(1);
     let last_row = terminal_rows.saturating_sub(2);
@@ -8978,18 +9509,39 @@ fn live_tail_placement(
     let overflow = natural_end.saturating_sub(last_row);
     let output_row = output_row.saturating_sub(overflow);
     let natural_start = output_row.saturating_add(u16::from(output_col > 0));
-    let anchored = overflow > 0 || natural_end == last_row;
+    let anchored = was_anchored || overflow > 0 || natural_end == last_row;
     let anchored_start = last_row.saturating_add(1).saturating_sub(total_rows);
     let tail_start = if anchored {
         natural_start.max(anchored_start)
     } else {
         natural_start
     };
+    // `output_row` is deliberately left where the output actually ended, even
+    // when the tail re-anchors below it. It is the contract between the
+    // renderer's byte frames and the terminal — the wait spinner erases itself
+    // by moving relative to that cursor — so nudging it down to hug the tail
+    // leaves orphaned spinner frames in the scrollback.
     LiveTailPlacement {
         output_row,
         tail_start,
         overflow,
         anchored,
+    }
+}
+
+/// Where a streaming output frame should leave the tail.
+///
+/// Normally the tail follows the output cursor. A tail already pinned to the
+/// bottom stays pinned instead: output fills the rows above it (the frame sets
+/// a scroll region so it cannot reach the tail). Letting it slide back up is
+/// what made the input box bounce — the rows a finished job strip freed would
+/// be reclaimed on the very next frame, then handed back a line of output
+/// later.
+fn live_tail_next_start(current_start: u16, desired_tail: u16, max_tail: u16) -> u16 {
+    if current_start >= max_tail {
+        max_tail
+    } else {
+        desired_tail.min(max_tail)
     }
 }
 
@@ -9144,7 +9696,20 @@ impl LiveReplTail {
             .saturating_add(queue_gap)
             .saturating_add(editor_rows)
             .saturating_add(job_rows);
-        let placement = live_tail_placement(output_col, output_row, total_rows, terminal_rows);
+        // Derived from what is on screen rather than stored: the tail was
+        // pinned to the bottom exactly when its bottom edge sat on the last
+        // usable row. `suspend()` leaves both values untouched, so they are
+        // still the previous frame's truth here, and a terminal resize simply
+        // falls back to natural placement.
+        let was_anchored = self.tail_rows > 0
+            && self.tail_start.saturating_add(self.tail_rows) == terminal_rows.saturating_sub(1);
+        let placement = live_tail_placement(
+            output_col,
+            output_row,
+            total_rows,
+            terminal_rows,
+            was_anchored,
+        );
         if placement.overflow > 0 {
             let mut stdout = io::stdout();
             queue!(stdout, MoveTo(0, terminal_rows.saturating_sub(1)))?;
@@ -9240,7 +9805,7 @@ impl LiveReplTail {
             .unwrap_or(0);
         let desired_tail = natural_tail.max(occupied_tail);
         let max_tail = max_live_tail_start(terminal_rows, self.tail_rows);
-        let next_tail = desired_tail.min(max_tail);
+        let next_tail = live_tail_next_start(self.tail_start, desired_tail, max_tail);
         let shift = i32::from(next_tail) - i32::from(self.tail_start);
         let frame_margin = if shift < 0 {
             self.tail_start
@@ -9392,11 +9957,7 @@ impl LiveReplTail {
             stdout,
             Print(format!(
                 "\x1b[2m⚙ {}\x1b[0m\r\n\r\n",
-                report
-                    .headline
-                    .strip_prefix("[后台任务完成] ")
-                    .or_else(|| report.headline.strip_prefix("[后台命令完成] "))
-                    .unwrap_or(&report.headline)
+                job_wake_headline(&report.headline)
             ))
         )?;
         for line in report.reply.lines() {
@@ -9591,6 +10152,94 @@ fn committed_user_messages_text(
     output
 }
 
+/// Strips the bracketed prefix off a background-job wake headline, leaving
+/// `子代理完成 82bea3 · 标题`. The older `[后台命令完成] ` spelling still shows
+/// up in sessions recorded before the rename.
+fn job_wake_headline(headline: &str) -> &str {
+    headline
+        .strip_prefix("[后台任务完成] ")
+        .or_else(|| headline.strip_prefix("[后台命令完成] "))
+        .unwrap_or(headline)
+}
+
+/// Fires a desktop notification unless the REPL window has focus.
+///
+/// `focused` is `None` when there is no live tail — a one-shot `miyu ask` has
+/// no window to be away from, so it stays quiet.
+fn notify_if_unfocused(config: &AppConfig, focused: Option<bool>, title: &str, body: &str) {
+    if !config.notifications.enabled || focused != Some(false) {
+        return;
+    }
+    crate::notify::notify(title, &crate::notify::clip_body(body, 120));
+}
+
+/// Redraws finished turns of a session as one ANSI frame.
+///
+/// Feeds the stored transcript back through the same `StreamRenderer` a live
+/// turn uses, so tool blocks and prose come out identical — and re-wrapped for
+/// the terminal's *current* width, which a saved byte transcript could not do.
+/// Turns older than the transcript column fall back to prompt + final reply.
+fn session_replay_frame(
+    replays: &[crate::state::TurnReplay],
+    mode: AgentMode,
+    config: &AppConfig,
+    cols: usize,
+) -> Result<Vec<u8>> {
+    use crate::state::ReplayEntry;
+    let mut frame = Vec::new();
+    for replay in replays {
+        if replay.is_job_wake {
+            // A background job woke the session; live rendering shows a dim
+            // `⚙` notice, never a user bubble. Mirror that.
+            frame.extend_from_slice(
+                format!(
+                    "\n\x1b[2m⚙ {}\x1b[0m\n\n",
+                    job_wake_headline(&replay.display_content)
+                )
+                .as_bytes(),
+            );
+        } else if !replay.display_content.trim().is_empty() {
+            frame.extend_from_slice(
+                committed_user_messages_text(&[(&replay.display_content, mode)], true, cols)
+                    .as_bytes(),
+            );
+        }
+        let mut renderer = render::StreamRenderer::new(
+            render::ReasoningDisplayMode::Hidden,
+            render::ToolCallDisplayMode::from_config(&config.display.tool_calls),
+            false,
+            config.display.readable_tool_names,
+            config.display.command_output_lines,
+        );
+        renderer.use_external_cursor_control();
+        renderer.use_buffered_output();
+        if replay.entries.is_empty() {
+            renderer.write_chunk(ChatStreamChunk {
+                kind: crate::llm::ChatStreamKind::Content,
+                text: replay.assistant_content.clone(),
+            })?;
+        } else {
+            for entry in &replay.entries {
+                match entry {
+                    ReplayEntry::Text { text } => renderer.write_chunk(ChatStreamChunk {
+                        kind: crate::llm::ChatStreamKind::Content,
+                        text: text.clone(),
+                    })?,
+                    ReplayEntry::ToolCall { name, arguments } => {
+                        renderer.write_tool_call(name, arguments)?
+                    }
+                    ReplayEntry::ToolResult { name, ok, output } => {
+                        renderer.write_tool_result(name, *ok, output)?
+                    }
+                }
+            }
+        }
+        renderer.finish()?;
+        frame.extend_from_slice(&renderer.take_output_frame());
+    }
+    Ok(frame)
+}
+
 fn queued_prompt_attachments(
     images: &[Option<crate::clipboard::PastedImage>],
 ) -> Vec<QueuedPromptAttachment> {
@@ -9685,7 +10334,7 @@ impl Drop for ReplCursorRestore {
     fn drop(&mut self) {
         // 1. 会话级兜底：恢复括号粘贴与光标
         // 2. 再关闭 raw mode；键盘增强由 LiveRawMode / 局部输入作用域负责 Pop
-        let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange, Show);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -9704,6 +10353,9 @@ impl LiveRawMode {
             let _ = terminal::disable_raw_mode();
             return Err(error.into());
         }
+        // Focus reporting is advisory: terminals that ignore it simply never
+        // send the events, and the editor stays on its "focused" default.
+        let _ = execute!(stdout, EnableFocusChange);
         Ok(Self {
             show_cursor_on_drop: true,
             restore_terminal_on_drop: true,
@@ -9774,9 +10426,9 @@ impl Drop for LiveRawMode {
         }
         let mut stdout = io::stdout();
         if self.show_cursor_on_drop {
-            let _ = execute!(stdout, DisableBracketedPaste, Show);
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
         } else {
-            let _ = execute!(stdout, DisableBracketedPaste);
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange);
         }
         // 1. 先 Pop 键盘增强协议
         // 2. 再退出 raw mode
@@ -9987,6 +10639,9 @@ enum LiveReplOutcome {
     /// A daemon-initiated wake turn is running in this session; the caller
     /// should attach and render it live.
     FollowWake { run_id: String, label: String },
+    /// Ctrl+C on an empty line while this session has background work: stop
+    /// the work and stay in the REPL. Pressing it again then exits.
+    StopJobs,
 }
 
 fn read_live_repl_input(
@@ -10055,6 +10710,14 @@ fn read_live_repl_input(
                     submission.content,
                     submission.images,
                 ));
+            }
+            // Ctrl+C rung 3: the draft was empty and no reply is running, but
+            // this session still has background work — stop that before the
+            // press is allowed to mean "quit". `live.jobs` holds only running
+            // jobs of this session, refreshed on every idle tick. Ctrl+D
+            // (`Exit`) always quits outright.
+            LiveEditorAction::Interrupt if !live.jobs.is_empty() => {
+                return Ok(LiveReplOutcome::StopJobs);
             }
             LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
                 synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
@@ -10247,6 +10910,13 @@ async fn follow_wake_run(
                 live,
                 &mut renderer,
                 AgentEvent::ReasoningTitle(ipc_text(&data, "title").to_string()),
+            )?,
+            "tool.preparing" => handle_live_agent_event(
+                live,
+                &mut renderer,
+                AgentEvent::ToolPreparing {
+                    name: ipc_text(&data, "name").to_string(),
+                },
             )?,
             "tool.started" => handle_live_agent_event(
                 live,
@@ -11970,8 +12640,8 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         name: "/session",
         command: ReplSlashCommand::Session,
         arg_hint: "[name|index]",
-        help_en: "list sessions, or switch to one",
-        help_zh: "列出会话，或切换到指定会话",
+        help_en: "list sessions, or switch to one (Ctrl+D deletes in the picker)",
+        help_zh: "列出会话，或切换到指定会话（菜单内 Ctrl+D 删除）",
     },
     ReplCommandSpec {
         name: "/rename",
@@ -12332,6 +13002,144 @@ mod repl_input_tests {
                 .to_vec()
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn one_shot_turns_default_to_a_throwaway_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let paths = MiyuPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.jsonc"),
+            skills_dir: root.join("config/skills"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            pictures_dir: root.join("pictures"),
+            fish_hook_file: root.join("fish"),
+            bash_hook_file: root.join("bash"),
+            zsh_hook_file: root.join("zsh"),
+            scripts_dir: root.join("scripts"),
+            system_scripts_dir: root.join("system-scripts"),
+        };
+
+        // Neither flag: `miyu ask` / `miyu '<message>'` must not touch a real
+        // conversation. `--continue` opts back into the terminal session.
+        // Both resolve without contacting the daemon.
+        assert_eq!(
+            one_shot_session(&paths, None, false).await.unwrap(),
+            TurnSession::Ephemeral
+        );
+        assert_eq!(
+            one_shot_session(&paths, None, true).await.unwrap(),
+            TurnSession::Current
+        );
+    }
+
+    #[test]
+    fn continue_and_session_flags_are_mutually_exclusive() {
+        let cli = parse_args(["miyu", "-c", "hello"].map(OsString::from).to_vec()).unwrap();
+        assert!(cli.continue_session);
+        assert_eq!(cli.message, vec!["hello".to_string()]);
+
+        let cli = parse_args(
+            ["miyu", "--session", "2", "hello"]
+                .map(OsString::from)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!cli.continue_session);
+        assert_eq!(cli.session.as_deref(), Some("2"));
+
+        assert!(parse_args(
+            ["miyu", "-c", "--session", "2", "hello"]
+                .map(OsString::from)
+                .to_vec()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replayed_job_wake_turns_are_not_drawn_as_user_prompts() {
+        let config = AppConfig::default();
+        let wake = crate::state::TurnReplay {
+            display_content: "[后台任务完成] 子代理完成 82bea3 · 后台测试A".to_string(),
+            assistant_content: "跑完了。".to_string(),
+            entries: Vec::new(),
+            is_job_wake: true,
+        };
+        let typed = crate::state::TurnReplay {
+            display_content: "帮我改一下 README".to_string(),
+            assistant_content: "改好了。".to_string(),
+            entries: Vec::new(),
+            is_job_wake: false,
+        };
+
+        let frame = session_replay_frame(&[wake], AgentMode::Normal, &config, 80).unwrap();
+        let frame = String::from_utf8_lossy(&frame);
+        // Dim ⚙ notice with the bracketed prefix stripped, exactly like the
+        // live path — never the user bubble's bar.
+        assert!(frame.contains("⚙ 子代理完成 82bea3 · 后台测试A"));
+        assert!(!frame.contains("[后台任务完成]"));
+        assert!(!frame.contains(&submitted_echo_bar(AgentMode::Normal)));
+
+        let frame = session_replay_frame(&[typed], AgentMode::Normal, &config, 80).unwrap();
+        let frame = String::from_utf8_lossy(&frame);
+        assert!(frame.contains(&submitted_echo_bar(AgentMode::Normal)));
+        assert!(!frame.contains('⚙'));
+    }
+
+    #[test]
+    fn picker_keys_reach_delete_only_through_a_modifier() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let plain = KeyModifiers::NONE;
+        let control = KeyModifiers::CONTROL;
+
+        // Every printable character is search input, so a bare `d` must never
+        // be a shortcut — deletion needs Ctrl+D (or the Delete key).
+        assert_eq!(
+            inline_select_key(KeyCode::Char('d'), plain, true),
+            InlineSelectKey::Char('d')
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Char('d'), control, true),
+            InlineSelectKey::DeleteRequest
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Delete, plain, true),
+            InlineSelectKey::DeleteRequest
+        );
+
+        // Pickers that did not opt in stay exactly as they were.
+        assert_eq!(
+            inline_select_key(KeyCode::Char('d'), control, false),
+            InlineSelectKey::Ignore
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Delete, plain, false),
+            InlineSelectKey::Ignore
+        );
+
+        assert_eq!(
+            inline_select_key(KeyCode::Char('c'), control, true),
+            InlineSelectKey::Cancel
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Esc, plain, true),
+            InlineSelectKey::Cancel
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Enter, plain, true),
+            InlineSelectKey::Accept
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Char('j'), plain, true),
+            InlineSelectKey::Down
+        );
+        assert_eq!(
+            inline_select_key(KeyCode::Char('k'), plain, true),
+            InlineSelectKey::Up
+        );
     }
 
     #[test]
@@ -13310,7 +14118,7 @@ mod repl_input_tests {
         assert_eq!(max_live_tail_start(6, 5), 0);
         assert_eq!(max_live_tail_start(24, 5), 18);
         assert_eq!(
-            live_tail_placement(0, 4, 5, 24),
+            live_tail_placement(0, 4, 5, 24, false),
             LiveTailPlacement {
                 output_row: 4,
                 tail_start: 4,
@@ -13319,7 +14127,7 @@ mod repl_input_tests {
             }
         );
         assert_eq!(
-            live_tail_placement(0, 20, 5, 24),
+            live_tail_placement(0, 20, 5, 24, false),
             LiveTailPlacement {
                 output_row: 18,
                 tail_start: 18,
@@ -13328,7 +14136,7 @@ mod repl_input_tests {
             }
         );
         assert_eq!(
-            live_tail_placement(0, 6, 5, 24),
+            live_tail_placement(0, 6, 5, 24, false),
             LiveTailPlacement {
                 output_row: 6,
                 tail_start: 6,
@@ -13336,7 +14144,69 @@ mod repl_input_tests {
                 anchored: false,
             }
         );
-        assert_eq!(live_tail_placement(0, 6, 5, 30).tail_start, 6);
+        assert_eq!(live_tail_placement(0, 6, 5, 30, false).tail_start, 6);
+    }
+
+    #[test]
+    fn anchored_tail_stays_at_the_bottom_when_it_shrinks() {
+        // A job strip pushed a bottom-anchored 5-row tail to 7 rows, scrolling
+        // the screen twice, so output now ends at row 16. The strip goes away.
+        let shrunk = live_tail_placement(0, 16, 5, 24, true);
+        assert_eq!(
+            shrunk,
+            LiveTailPlacement {
+                // Stays where the output really ended: the renderer's spinner
+                // erases itself relative to this cursor.
+                output_row: 16,
+                tail_start: 18,
+                overflow: 0,
+                anchored: true,
+            }
+        );
+        // Bottom edge back on the last usable row, where it was before.
+        assert_eq!(shrunk.tail_start + 5, 24 - 1);
+
+        // Without the anchor the tail hugs the output cursor as before: a
+        // conversation that has not filled the screen is untouched.
+        assert_eq!(
+            live_tail_placement(0, 16, 5, 24, false),
+            LiveTailPlacement {
+                output_row: 16,
+                tail_start: 16,
+                overflow: 0,
+                anchored: false,
+            }
+        );
+
+        // Growing while anchored still scrolls rather than double-counting.
+        assert_eq!(
+            live_tail_placement(0, 18, 7, 24, true),
+            LiveTailPlacement {
+                output_row: 16,
+                tail_start: 16,
+                overflow: 2,
+                anchored: true,
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_output_never_drags_an_anchored_tail_back_up() {
+        // 24 rows, 5-row tail → anchored at 18. Output ends two rows above it
+        // because a job strip just went away; the frame must leave the tail
+        // alone and fill the gap instead of reclaiming those rows.
+        let max_tail = max_live_tail_start(24, 5);
+        assert_eq!(max_tail, 18);
+        assert_eq!(live_tail_next_start(18, 16, max_tail), 18);
+        // Still pinned once the gap is closed.
+        assert_eq!(live_tail_next_start(18, 18, max_tail), 18);
+        // And it never runs past the anchor.
+        assert_eq!(live_tail_next_start(18, 21, max_tail), 18);
+
+        // A tail that had not reached the bottom keeps following the output.
+        assert_eq!(live_tail_next_start(10, 12, max_tail), 12);
+        assert_eq!(live_tail_next_start(10, 8, max_tail), 8);
+        assert_eq!(live_tail_next_start(10, 30, max_tail), 18);
     }
 
     #[test]

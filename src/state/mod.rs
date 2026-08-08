@@ -20,12 +20,20 @@ pub use conversation_db::{
     ImageAsset, ImageAssetData, PlatformAccessActor, PlatformAccessGrant, PlatformAccessGrantKey,
     PlatformMemeRefRecord, PlatformPluginScopeKey, PlatformSessionBinding,
     PlatformSessionBindingKey, PruneStats, QueuedPrompt, QueuedPromptAttachment, RedoCandidate,
-    RedoInputKind, RedoStart, SessionOverview, SessionRecord, ToolFootprint, Turn, TurnFollowup,
+    RedoInputKind, RedoStart, ReplayEntry, SessionOverview, SessionRecord, ToolFootprint, Turn,
+    TurnFollowup, TurnReplay,
     TurnJournalEvent,
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
 pub use usage::UsageSnapshot;
+
+/// The only session kind users can list, name, switch to, or bind a platform
+/// to. Everything else is infrastructure and stays out of the session list.
+pub const USER_SESSION_KIND: &str = "user";
+/// Backs a one-shot `miyu ask` / `miyu '<message>'` turn: created just before
+/// the turn, deleted right after, and invisible to every listing in between.
+pub const ASK_SESSION_KIND: &str = "ask";
 
 type PlatformAccessSubjects = HashSet<String>;
 type PlatformAccessKinds = HashMap<String, PlatformAccessSubjects>;
@@ -415,6 +423,16 @@ impl StateStore {
             .set_persona_current_session(persona, session_id)
     }
 
+    /// Session the REPL was last on, or `None` when that pointer is unset or
+    /// stale (deleted, archived, or another persona's).
+    pub fn repl_session(&self, persona: &str) -> Result<Option<String>> {
+        self.conv_db.repl_session(persona)
+    }
+
+    pub fn set_repl_session(&self, persona: &str, session_id: &str) -> Result<()> {
+        self.conv_db.set_repl_session(persona, session_id)
+    }
+
     /// Claims persona-less sessions (schema-v2 migrated rows) for the active
     /// persona scope.
     pub fn adopt_sessions_for_persona(&self, persona: &str) -> Result<()> {
@@ -696,6 +714,10 @@ impl StateStore {
 
     pub fn delete_subagent_sessions_older_than(&self, days: i64) -> Result<usize> {
         self.conv_db.delete_subagent_sessions_older_than(days)
+    }
+
+    pub fn delete_ask_sessions_older_than(&self, hours: i64) -> Result<usize> {
+        self.conv_db.delete_ask_sessions_older_than(hours)
     }
 
     pub fn init_files(&self) -> Result<()> {
@@ -1409,6 +1431,12 @@ impl StateStore {
 
     pub fn load_visible_turns(&self) -> Result<Vec<Turn>> {
         self.conv_db.load_visible_turns(&self.session())
+    }
+
+    /// Display transcripts of this session's last `limit` turns, for redrawing
+    /// a reopened REPL.
+    pub fn session_replay(&self, limit: usize) -> Result<Vec<conversation_db::TurnReplay>> {
+        self.conv_db.session_replay(&self.session(), limit)
     }
 
     pub fn load_visible_turns_excluding(&self, exclude_turn_id: &str) -> Result<Vec<Turn>> {
@@ -3339,6 +3367,164 @@ mod tests {
         }
         assert_eq!(store.delete_subagent_sessions_older_than(7).unwrap(), 1);
         assert!(store.session_record(&audit.session_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn finished_turns_keep_a_replayable_transcript() {
+        let (_temp, store) = test_store();
+        store.init_files().unwrap();
+        store.start_turn("t1", "改一下 README", 999_999).unwrap();
+        let db = store.conv_db();
+        for (kind, call_id, name, payload, ok) in [
+            ("assistant_content", None, None, Some("这就去改。"), None),
+            (
+                "tool_call",
+                Some("c1"),
+                Some("edit_string"),
+                Some("{\"path\":\"README.md\"}"),
+                None,
+            ),
+            (
+                "tool_result",
+                Some("c1"),
+                None,
+                Some("1 处替换"),
+                Some(true),
+            ),
+            ("tool_progress", Some("c1"), None, Some("忽略我"), None),
+            ("assistant_content", None, None, Some("改好了。"), None),
+        ] {
+            db.append_turn_journal_event("t1", 0, 0, kind, call_id, name, payload, None, ok)
+                .unwrap();
+        }
+        store.complete_turn("t1", "改好了。", None).unwrap();
+
+        let replays = store.session_replay(5).unwrap();
+        assert_eq!(replays.len(), 1);
+        let entries = &replays[0].entries;
+        assert_eq!(replays[0].display_content, "改一下 README");
+        // Prose and tool blocks keep their original interleaving, and the
+        // live-only progress ticks are gone.
+        assert_eq!(
+            entries,
+            &vec![
+                ReplayEntry::Text {
+                    text: "这就去改。".to_string()
+                },
+                ReplayEntry::ToolCall {
+                    name: "edit_string".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                },
+                ReplayEntry::ToolResult {
+                    name: "edit_string".to_string(),
+                    ok: true,
+                    output: "1 处替换".to_string(),
+                },
+                ReplayEntry::Text {
+                    text: "改好了。".to_string()
+                },
+            ]
+        );
+
+        // A turn without a stored transcript still replays its reply.
+        store.start_turn("t2", "再问一句", 999_999).unwrap();
+        store.complete_turn("t2", "好的。", None).unwrap();
+        let replays = store.session_replay(5).unwrap();
+        assert_eq!(replays.len(), 2);
+        assert!(replays[1].entries.is_empty());
+        assert_eq!(replays[1].assistant_content, "好的。");
+        // Oldest first, so the caller can print them top to bottom.
+        assert_eq!(replays[0].display_content, "改一下 README");
+        assert!(replays.iter().all(|replay| !replay.is_job_wake));
+
+        // A background-job wake turn is daemon-synthesized: the replay must be
+        // able to tell it apart so it is not drawn as something the user typed.
+        store
+            .start_turn_with_display(
+                "t3",
+                "<background-job-report>子代理「后台测试A」已执行完毕</background-job-report>",
+                "[后台任务完成] 子代理完成 82bea3 · 后台测试A",
+                999_999,
+                None,
+            )
+            .unwrap();
+        store.complete_turn("t3", "跑完了。", None).unwrap();
+        let replays = store.session_replay(5).unwrap();
+        assert_eq!(replays.len(), 3);
+        assert!(replays[2].is_job_wake);
+        assert_eq!(
+            replays[2].display_content,
+            "[后台任务完成] 子代理完成 82bea3 · 后台测试A"
+        );
+    }
+
+    #[test]
+    fn one_shot_sessions_stay_invisible_and_stale_ones_are_swept() {
+        let (temp, store) = test_store();
+        store.init_files().unwrap();
+        let user = store
+            .create_session("miyu", "real", USER_SESSION_KIND, None)
+            .unwrap();
+        let ask = store
+            .create_session("miyu", "一次性对话", ASK_SESSION_KIND, None)
+            .unwrap();
+
+        // Never listed, never findable by name — only the client holding the
+        // freshly minted id can address it.
+        let listed = store.list_sessions("miyu", true).unwrap();
+        assert!(listed
+            .iter()
+            .any(|overview| overview.record.session_id == user.session_id));
+        assert!(listed
+            .iter()
+            .all(|overview| overview.record.session_id != ask.session_id));
+        assert!(store
+            .find_local_session_by_name("miyu", "一次性对话")
+            .unwrap()
+            .is_none());
+
+        // Fresh one-shot survives the sweep; an hour-old orphan does not.
+        assert_eq!(store.delete_ask_sessions_older_than(1).unwrap(), 0);
+        {
+            use rusqlite::params;
+            let backdated = (chrono::Utc::now() - chrono::Duration::hours(4)).to_rfc3339();
+            let db_path = temp.path().join("state").join("conversation.db");
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute("UPDATE sessions SET updated_at = ?1", params![backdated])
+                .unwrap();
+        }
+        assert_eq!(store.delete_ask_sessions_older_than(1).unwrap(), 1);
+        assert!(store.session_record(&ask.session_id).unwrap().is_none());
+        // The equally backdated user session is untouched.
+        assert!(store.session_record(&user.session_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn repl_session_pointer_is_separate_and_drops_when_stale() {
+        let (_temp, store) = test_store();
+        store.init_files().unwrap();
+        let terminal = store.session_id().to_string();
+        let repl = store
+            .create_session("miyu", "repl lane", USER_SESSION_KIND, None)
+            .unwrap();
+
+        assert!(store.repl_session("miyu").unwrap().is_none());
+        store.set_repl_session("miyu", &repl.session_id).unwrap();
+        assert_eq!(
+            store.repl_session("miyu").unwrap().as_deref(),
+            Some(repl.session_id.as_str())
+        );
+        // Moving the REPL lane must not drag the terminal lane along.
+        assert_eq!(&*store.session_id(), terminal.as_str());
+
+        // Archived, then deleted: both make the pointer stale rather than
+        // returning a session the REPL must not land on.
+        store.set_session_archived(&repl.session_id, true).unwrap();
+        assert!(store.repl_session("miyu").unwrap().is_none());
+        store.set_session_archived(&repl.session_id, false).unwrap();
+        assert!(store.repl_session("miyu").unwrap().is_some());
+        store.delete_session(&repl.session_id).unwrap();
+        assert!(store.repl_session("miyu").unwrap().is_none());
     }
 
     #[test]

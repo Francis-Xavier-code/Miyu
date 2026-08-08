@@ -1200,6 +1200,33 @@ impl PlatformTurnContext {
         Ok(member)
     }
 
+    /// Membership as the server sees it *now*, skipping both the per-turn cache
+    /// and the platform's roster cache. Destructive actions validate through
+    /// this so a member who already left is refused here instead of failing
+    /// deep inside the bridge.
+    pub(crate) async fn group_member_fresh(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<PlatformGroupMember>> {
+        let member = self.adapter.group_member_fresh(user_id).await?;
+        let mut cache = self.group_member_cache.lock().unwrap();
+        match member.as_ref() {
+            Some(member) => {
+                cache.insert(member.user_id.clone(), member.clone());
+            }
+            None => {
+                cache.remove(user_id);
+            }
+        }
+        Ok(member)
+    }
+
+    /// Drops a member from the per-turn cache — used when a leave/kick notice
+    /// arrives so later lookups in the same turn cannot resurrect them.
+    pub(crate) fn forget_group_member(&self, user_id: &str) {
+        self.group_member_cache.lock().unwrap().remove(user_id);
+    }
+
     pub(crate) async fn bot_group_role(&self) -> types::BotGroupRole {
         self.adapter
             .bot_group_role()

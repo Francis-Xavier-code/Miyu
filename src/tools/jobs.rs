@@ -636,7 +636,7 @@ fn job_snapshot(job_id: &str) -> Option<JobEntry> {
     jobs().lock().unwrap().get(job_id).cloned()
 }
 
-fn read_log_slice(path: &PathBuf, offset: u64) -> (String, u64, u64, bool) {
+fn read_log_slice(path: &PathBuf, offset: u64, budget: usize) -> (String, u64, u64, bool) {
     let Ok(bytes) = std::fs::read(path) else {
         return (String::new(), offset, 0, false);
     };
@@ -644,12 +644,95 @@ fn read_log_slice(path: &PathBuf, offset: u64) -> (String, u64, u64, bool) {
     let start = offset.min(size) as usize;
     let mut end = bytes.len();
     let mut truncated = false;
-    if end - start > MAX_STATUS_OUTPUT_CHARS {
-        end = start + MAX_STATUS_OUTPUT_CHARS;
+    if end - start > budget {
+        end = start + budget;
         truncated = true;
     }
     let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
     (slice, end as u64, size, truncated)
+}
+
+/// Job ids a call is asking about: the `job_ids` array first, then a scalar
+/// `job_id`, de-duplicated while keeping the caller's order. Shared by
+/// `job_status` and `job_stop` — a plain `dedup()` only drops *adjacent*
+/// repeats, so `["a","b","a"]` used to slip two `a`s through.
+fn requested_job_ids(args: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = args
+        .get("job_ids")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(single) = args
+        .get("job_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        ids.push(single.to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+/// Rejects ids owned by another session, mirroring the `all=true` escape
+/// hatch both job tools offer.
+fn ensure_jobs_visible(ids: &[String], current: Option<&str>, all: bool, verb: &str) -> Result<()> {
+    let jobs = jobs().lock().unwrap();
+    for id in ids {
+        if let Some(job) = jobs.get(id) {
+            if !job_visible(job, current, all) {
+                bail!("后台任务 {id} 属于其他会话；如确需{verb}请传 all=true");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Blocks until any of `ids` reaches a terminal state or the wait elapses.
+async fn wait_for_any_finished(ids: &[String], wait: u64) {
+    if wait == 0 || ids.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    while Instant::now() < deadline {
+        let finished = {
+            let jobs = jobs().lock().unwrap();
+            ids.iter()
+                .any(|id| jobs.get(id).map(|job| job.state.is_terminal()).unwrap_or(true))
+        };
+        if finished {
+            return;
+        }
+        tokio::time::sleep(STATUS_POLL).await;
+    }
+}
+
+fn job_detail_json(job: &JobEntry, offset: u64, budget: usize) -> Value {
+    let (content, next, size, truncated) = read_log_slice(&job.log_path, offset, budget);
+    json!({
+        "job_id": job.job_id,
+        "status": job.state.label(),
+        "running": !job.state.is_terminal(),
+        "command": truncate_command(&job.command),
+        "runtime_seconds": job.finished.unwrap_or_else(Instant::now)
+            .duration_since(job.started).as_secs(),
+        "output": {
+            "offset": offset,
+            "content": content,
+            "next_offset": next,
+            "log_size": size,
+            "truncated": truncated,
+        },
+    })
 }
 
 /// Session-scoped visibility: a tool call only sees jobs of its own turn
@@ -666,11 +749,7 @@ fn job_visible(job: &JobEntry, current: Option<&str>, all: bool) -> bool {
 }
 
 async fn job_status(args: Value) -> Result<String> {
-    let job_id = args
-        .get("job_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let ids = requested_job_ids(&args);
     let wait = args
         .get("wait_seconds")
         .and_then(Value::as_u64)
@@ -680,7 +759,31 @@ async fn job_status(args: Value) -> Result<String> {
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let current = super::workspace::try_session();
 
-    let Some(job_id) = job_id else {
+    if ids.len() > 1 {
+        // Batch: same per-job shape as the single-id form, wrapped in `jobs`.
+        // The log budget is split across the requested ids so asking about
+        // five jobs cannot drag back five full logs.
+        ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
+        wait_for_any_finished(&ids, wait).await;
+        let budget = (MAX_STATUS_OUTPUT_CHARS / ids.len()).max(1);
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match job_snapshot(id) {
+                Some(job) => rows.push(job_detail_json(&job, offset, budget)),
+                None => rows.push(json!({
+                    "job_id": id,
+                    "ok": false,
+                    "error": format!("后台命令 {id} 不存在；后台命令随宿主进程重启而清空"),
+                })),
+            }
+        }
+        return Ok(serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "jobs": rows,
+        }))?);
+    }
+
+    let Some(job_id) = ids.first().map(String::as_str) else {
         // No job_id: list this session's jobs (all=true lists every
         // session's). With wait_seconds, block until ANY watched job that
         // was running at call time finishes (or the wait elapses) — one
@@ -737,14 +840,7 @@ async fn job_status(args: Value) -> Result<String> {
         }))?);
     };
 
-    {
-        let jobs = jobs().lock().unwrap();
-        if let Some(job) = jobs.get(job_id) {
-            if !job_visible(job, current.as_deref(), all) {
-                bail!("后台任务 {job_id} 属于其他会话；如确需查看请传 all=true");
-            }
-        }
-    }
+    ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut job = job_snapshot(job_id).with_context(|| {
         format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空")
@@ -754,23 +850,12 @@ async fn job_status(args: Value) -> Result<String> {
         job = job_snapshot(job_id).context("job disappeared while waiting")?;
     }
 
-    let (content, next, size, truncated) = read_log_slice(&job.log_path, offset);
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "job_id": job.job_id,
-        "status": job.state.label(),
-        "running": !job.state.is_terminal(),
-        "command": truncate_command(&job.command),
-        "runtime_seconds": job.finished.unwrap_or_else(Instant::now)
-            .duration_since(job.started).as_secs(),
-        "output": {
-            "offset": offset,
-            "content": content,
-            "next_offset": next,
-            "log_size": size,
-            "truncated": truncated,
-        },
-    }))?)
+    // Single id keeps the flat shape it always had.
+    let mut detail = job_detail_json(&job, offset, MAX_STATUS_OUTPUT_CHARS);
+    if let Some(map) = detail.as_object_mut() {
+        map.insert("ok".to_string(), json!(true));
+    }
+    Ok(serde_json::to_string_pretty(&detail)?)
 }
 
 /// Stop every running job bound to `session_id`; returns how many were
@@ -782,18 +867,15 @@ pub async fn stop_session_jobs(session_id: &str) -> usize {
         .unwrap()
         .values()
         .filter(|job| {
-            job.state == JobState::Running
-                && job.session_id.as_deref() == Some(session_id)
+            job.state == JobState::Running && job.session_id.as_deref() == Some(session_id)
         })
         .map(|job| job.job_id.clone())
         .collect::<Vec<_>>();
-    let mut stopped = 0;
-    for job_id in targets {
-        if stop_job(&job_id).await.is_ok() {
-            stopped += 1;
-        }
-    }
-    stopped
+    // Concurrent: serial stops used to add up, and with a stubborn child each
+    // one held the caller for the whole grace period.
+    let outcomes =
+        futures_util::future::join_all(targets.iter().map(|job_id| stop_job(job_id))).await;
+    outcomes.into_iter().filter(Result::is_ok).count()
 }
 
 /// Host-initiated stop (WebUI strip ✕ button); same semantics as job_stop.
@@ -802,51 +884,25 @@ pub async fn stop_job(job_id: &str) -> Result<()> {
 }
 
 async fn job_stop(args: Value) -> Result<String> {
-    let mut ids: Vec<String> = args
-        .get("job_ids")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(single) = args
-        .get("job_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        ids.push(single.to_string());
-    }
-    ids.dedup();
+    let ids = requested_job_ids(&args);
     if ids.is_empty() {
         bail!("job_id 或 job_ids 至少提供一个；usage: job_stop({{\"job_ids\":[\"abc123\"]}})");
     }
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let current = super::workspace::try_session();
-    for id in &ids {
-        let jobs = jobs().lock().unwrap();
-        if let Some(job) = jobs.get(id) {
-            if !job_visible(job, current.as_deref(), all) {
-                bail!("后台任务 {id} 属于其他会话；如确需停止请传 all=true");
-            }
-        }
-    }
+    ensure_jobs_visible(&ids, current.as_deref(), all, "停止")?;
     if ids.len() > 1 {
-        let mut results = Vec::new();
-        for id in ids {
-            match stop_one(&id).await {
-                Ok(status) => results.push(json!({ "job_id": id, "ok": true, "status": status })),
-                Err(error) => {
-                    results.push(json!({ "job_id": id, "ok": false, "error": error.to_string() }))
-                }
-            }
-        }
+        // Concurrent for the same reason as `stop_session_jobs`; per-id errors
+        // still stay per-id rather than aborting the batch.
+        let outcomes = futures_util::future::join_all(ids.iter().map(|id| stop_one(id))).await;
+        let results = ids
+            .iter()
+            .zip(outcomes)
+            .map(|(id, outcome)| match outcome {
+                Ok(status) => json!({ "job_id": id, "ok": true, "status": status }),
+                Err(error) => json!({ "job_id": id, "ok": false, "error": error.to_string() }),
+            })
+            .collect::<Vec<_>>();
         return Ok(serde_json::to_string_pretty(&json!({
             "ok": true,
             "results": results,
@@ -885,14 +941,21 @@ async fn stop_one(job_id: &str) -> Result<String> {
     match &job.kind {
         JobKind::Command { pid } => {
             let pid = *pid;
+            // SIGTERM goes out synchronously so a well-behaved child is
+            // already dying when this returns. Only the grace period and the
+            // SIGKILL escalation are detached — waiting them out inline is
+            // what made Ctrl+C feel frozen, and it bought nothing: the job was
+            // marked terminal above and has already left `overview()`.
             signal_process_group(pid, libc::SIGTERM);
-            let deadline = Instant::now() + STOP_GRACE;
-            while process_alive(pid) && Instant::now() < deadline {
-                tokio::time::sleep(STATUS_POLL).await;
-            }
-            if process_alive(pid) {
-                signal_process_group(pid, libc::SIGKILL);
-            }
+            tokio::spawn(async move {
+                let deadline = Instant::now() + STOP_GRACE;
+                while process_alive(pid) && Instant::now() < deadline {
+                    tokio::time::sleep(STATUS_POLL).await;
+                }
+                if process_alive(pid) {
+                    signal_process_group(pid, libc::SIGKILL);
+                }
+            });
         }
         JobKind::Subagent { abort } => abort.abort(),
     }
@@ -943,14 +1006,19 @@ pub fn register_status(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_status",
             t(
-                "Check background jobs of the current session. Without job_id lists this session's jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset. wait_seconds is capped at 30. Pass all=true to see other sessions' jobs.",
-                "查询本会话的后台任务。不带 job_id 列出本会话全部任务（此时 wait_seconds 表示等待任意一条运行中任务结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出。wait_seconds 上限 30 秒。跨会话查询需传 all=true。",
+                "Check background jobs of the current session. Without an id lists this session's jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset; with job_ids returns the same per-job detail for several at once, sharing the log budget. wait_seconds is capped at 30. Pass all=true to see other sessions' jobs.",
+                "查询本会话的后台任务。不带 id 列出本会话全部任务（此时 wait_seconds 表示等待任意一条运行中任务结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出；带 job_ids 一次返回多条任务的同样明细（日志额度在这些任务间均分）。wait_seconds 上限 30 秒。跨会话查询需传 all=true。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "job_id": { "type": "string", "description": "后台任务 id；省略则列出本会话全部任务。" },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "任务未结束时最多阻塞等待多少秒再返回。" },
+                    "job_id": { "type": "string", "description": "单个后台任务 id；与 job_ids 都省略则列出本会话全部任务。" },
+                    "job_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "一次查询多个后台任务 id。"
+                    },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "任务未结束时最多阻塞等待多少秒再返回；多 id 时等待其中任意一条结束。" },
                     "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" },
                     "all": { "type": "boolean", "description": "true 时不限本会话，查询全部会话的后台任务。" }
                 },
@@ -1009,6 +1077,103 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("hello"));
+    }
+
+    #[test]
+    fn requested_ids_merge_both_forms_and_drop_repeats() {
+        assert_eq!(
+            requested_job_ids(&json!({"job_ids": [" a ", "b", "a", ""], "job_id": "b"})),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(requested_job_ids(&json!({})).is_empty());
+        // Caller order survives — a plain sort would reshuffle the report.
+        assert_eq!(
+            requested_job_ids(&json!({"job_ids": ["z", "a"]})),
+            vec!["z".to_string(), "a".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_returns_without_waiting_out_the_grace_period() {
+        shared_init();
+        // `sh -c 'trap "" TERM; sleep 30'` ignores SIGTERM, so the old inline
+        // grace wait would hold the caller for the full STOP_GRACE per job.
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let spawned: Value = serde_json::from_str(
+                &spawn_background("trap '' TERM; sleep 30", Some("顽固任务"), &test_progress())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            ids.push(spawned["job_id"].as_str().unwrap().to_string());
+        }
+
+        let started = std::time::Instant::now();
+        let stopped = stop_session_jobs_for_test(&ids).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(stopped, 2);
+        // Two stubborn jobs used to cost 2 × STOP_GRACE; the escalation now
+        // runs detached, so the caller is back essentially immediately.
+        assert!(
+            elapsed < STOP_GRACE,
+            "stopping blocked for {elapsed:?}, expected well under {STOP_GRACE:?}"
+        );
+        for id in &ids {
+            assert!(job_snapshot(id).unwrap().state.is_terminal());
+        }
+    }
+
+    /// `stop_session_jobs` filters by session id, which these tests do not
+    /// have; drive the same concurrent path over explicit ids instead.
+    async fn stop_session_jobs_for_test(ids: &[String]) -> usize {
+        futures_util::future::join_all(ids.iter().map(|id| stop_job(id)))
+            .await
+            .into_iter()
+            .filter(Result::is_ok)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn job_status_reports_several_ids_at_once() {
+        shared_init();
+        let mut ids = Vec::new();
+        for marker in ["alpha", "beta"] {
+            let spawned: Value = serde_json::from_str(
+                &spawn_background(&format!("echo {marker}"), Some(marker), &test_progress())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            ids.push(spawned["job_id"].as_str().unwrap().to_string());
+        }
+
+        let status: Value = serde_json::from_str(
+            &job_status(json!({"job_ids": ids, "wait_seconds": 10}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let rows = status["jobs"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, marker) in rows.iter().zip(["alpha", "beta"]) {
+            assert!(row["output"]["content"].as_str().unwrap().contains(marker));
+        }
+
+        // A single id keeps the flat shape callers already parse.
+        let single: Value = serde_json::from_str(
+            &job_status(json!({"job_id": ids[0], "wait_seconds": 10}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(single["job_id"], ids[0].as_str());
+        assert!(single["jobs"].is_null());
+        assert!(single["output"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("alpha"));
     }
 
     #[tokio::test]

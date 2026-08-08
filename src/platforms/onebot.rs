@@ -484,12 +484,39 @@ impl ConnectionHandle {
                 .map(str::trim)
                 .find(|value| !value.is_empty())
                 .unwrap_or("no error detail returned");
+            let detail = sanitize_api_detail(detail);
             bail!(
                 "OneBot API {action} failed: status={status}, retcode={retcode}, detail={detail}"
             );
         }
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
     }
+}
+
+/// Bridges sometimes splice raw protocol bytes into their error strings — a
+/// failed kick comes back with the target's protobuf-encoded UID embedded.
+/// Those bytes are unreadable, unhelpful, and go straight into the model's
+/// context, so strip the unprintables and cap the length.
+fn sanitize_api_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 200;
+    let mut cleaned = String::with_capacity(detail.len());
+    let mut last_was_space = false;
+    for ch in detail.chars() {
+        let printable = !ch.is_control() && ch != '\u{fffd}';
+        if printable {
+            cleaned.push(ch);
+            last_was_space = ch == ' ';
+        } else if !last_was_space && !cleaned.is_empty() {
+            cleaned.push(' ');
+            last_was_space = true;
+        }
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() > MAX_DETAIL_CHARS {
+        let kept: String = cleaned.chars().take(MAX_DETAIL_CHARS).collect();
+        return format!("{kept}…");
+    }
+    cleaned.to_string()
 }
 
 #[derive(Clone, Default)]
@@ -1394,6 +1421,15 @@ struct FileRef {
     file_id: Option<String>,
     name: String,
     url: Option<String>,
+}
+
+/// A conversation no other test shares. The delivered-image ledger is
+/// process-global and keyed by conversation, so tests that reuse one account id
+/// leak digests into each other and fail depending on scheduling order.
+#[cfg(test)]
+fn unique_test_conversation(target: Target) -> PlatformConversation {
+    static NEXT_ACCOUNT: AtomicI64 = AtomicI64::new(10_000);
+    platform_conversation(target, NEXT_ACCOUNT.fetch_add(1, AtomicOrdering::Relaxed))
 }
 
 fn platform_conversation(target: Target, self_id: i64) -> PlatformConversation {
@@ -4948,26 +4984,14 @@ impl PlatformAdapter for OneBotAdapter {
         &'a self,
         user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<PlatformGroupMember>>> {
-        Box::pin(async move {
-            let Target::Group { group_id } = self.target else {
-                bail!("group member lookup requires a group conversation");
-            };
-            if user_id.trim().is_empty() {
-                return Ok(None);
-            }
-            let data = self
-                .connection()
-                .call_api(
-                    "get_group_member_info",
-                    json!({
-                        "group_id": group_id,
-                        "user_id": onebot_id_value(user_id),
-                        "no_cache": false,
-                    }),
-                )
-                .await?;
-            Ok(parse_group_member(&data, group_id))
-        })
+        self.group_member_lookup(user_id, false)
+    }
+
+    fn group_member_fresh<'a>(
+        &'a self,
+        user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PlatformGroupMember>>> {
+        self.group_member_lookup(user_id, true)
     }
 
     fn bot_group_role<'a>(&'a self) -> BoxFuture<'a, Result<BotGroupRole>> {
@@ -5091,6 +5115,35 @@ impl PlatformAdapter for OneBotAdapter {
 }
 
 impl OneBotAdapter {
+    /// `no_cache` asks NapCat to re-read the roster from the server instead of
+    /// answering from its own copy, which can still list members who left.
+    fn group_member_lookup<'a>(
+        &'a self,
+        user_id: &'a str,
+        no_cache: bool,
+    ) -> BoxFuture<'a, Result<Option<PlatformGroupMember>>> {
+        Box::pin(async move {
+            let Target::Group { group_id } = self.target else {
+                bail!("group member lookup requires a group conversation");
+            };
+            if user_id.trim().is_empty() {
+                return Ok(None);
+            }
+            let data = self
+                .connection()
+                .call_api(
+                    "get_group_member_info",
+                    json!({
+                        "group_id": group_id,
+                        "user_id": onebot_id_value(user_id),
+                        "no_cache": no_cache,
+                    }),
+                )
+                .await?;
+            Ok(parse_group_member(&data, group_id))
+        })
+    }
+
     fn connection(&self) -> ConnectionHandle {
         self.registry
             .lock()
@@ -6565,7 +6618,7 @@ mod tests {
         let (handle, mut frames) = test_connection(None);
         let target = Target::Group { group_id: 42 };
         let context = Arc::new(PlatformTurnContext::new(
-            platform_conversation(target, 10_000),
+            unique_test_conversation(target),
             "7".to_string(),
             "seven".to_string(),
             false,
@@ -6617,7 +6670,7 @@ mod tests {
         let (handle, mut frames) = test_connection(None);
         let target = Target::Private { user_id: 7 };
         let context = Arc::new(PlatformTurnContext::new(
-            platform_conversation(target, 10_000),
+            unique_test_conversation(target),
             "7".to_string(),
             "seven".to_string(),
             false,
@@ -6690,7 +6743,7 @@ mod tests {
         let (handle, mut frames) = test_connection(None);
         let target = Target::Private { user_id: 7 };
         let context = Arc::new(PlatformTurnContext::new(
-            platform_conversation(target, 10_000),
+            unique_test_conversation(target),
             "7".to_string(),
             "seven".to_string(),
             false,
@@ -6809,7 +6862,7 @@ mod tests {
         let (handle, mut frames) = test_connection(None);
         let target = Target::Private { user_id: 7 };
         let context = Arc::new(PlatformTurnContext::new(
-            platform_conversation(target, 10_000),
+            unique_test_conversation(target),
             "7".to_string(),
             "seven".to_string(),
             false,
@@ -8075,6 +8128,22 @@ mod tests {
         let data = caller.await.unwrap().unwrap();
         assert_eq!(data["nickname"], "Miyu");
         assert!(handle.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn api_error_detail_drops_raw_protocol_bytes() {
+        // Verbatim shape of a failed kick: NapCat splices the target's
+        // protobuf-encoded UID into the wording.
+        let raw = "kick member failed: \u{8}\u{0}\u{12}\u{18}u_GnsZB8HSJVKfjWNjMqYqbA";
+        let cleaned = sanitize_api_detail(raw);
+        assert_eq!(cleaned, "kick member failed: u_GnsZB8HSJVKfjWNjMqYqbA");
+        assert!(!cleaned.chars().any(char::is_control));
+
+        assert_eq!(sanitize_api_detail("  spaced  "), "spaced");
+        let long = "x".repeat(500);
+        let clipped = sanitize_api_detail(&long);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().count(), 201);
     }
 
     #[tokio::test]

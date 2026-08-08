@@ -6585,8 +6585,12 @@
     return (toolId && live.tools.get(toolId)) || createTool(live, data);
   }
 
-  function preparingToolLabel(name) {
-    if (name === "apply_patch" || name === "apply_artifact_patch") return "准备修改";
+  // The backend sends the phase text; the local map is only a fallback for a
+  // daemon older than this asset.
+  function preparingToolLabel(name, phase) {
+    if (phase) return String(phase);
+    if (name === "apply_patch" || name === "apply_artifact_patch") return "准备编辑";
+    if (name === "run_command") return "准备执行";
     if (name === "ask_question") return "准备问题";
     return "准备工具";
   }
@@ -6610,7 +6614,7 @@
     tag.className = "tool-preparing-tag";
     tag.dataset.toolName = name;
     const label = document.createElement("span");
-    label.textContent = preparingToolLabel(name);
+    label.textContent = preparingToolLabel(name, data?.phase);
     tag.append(makeIconSlot("loader-circle", "is-spinning"), label);
     live.blocks.appendChild(tag);
     live.preparingTool = tag;

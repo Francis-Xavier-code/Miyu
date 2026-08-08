@@ -425,6 +425,17 @@ pub(crate) trait PlatformAdapter: Send + Sync {
         Box::pin(async { anyhow::bail!("group member lookup is not supported by this platform") })
     }
 
+    /// Same lookup, but asks the platform to skip its own roster cache.
+    /// Destructive actions validate through this: a stale roster is how
+    /// already-departed members used to pass validation and then fail at the
+    /// API. Platforms without a cache distinction just reuse `group_member`.
+    fn group_member_fresh<'a>(
+        &'a self,
+        user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<PlatformGroupMember>>> {
+        self.group_member(user_id)
+    }
+
     fn bot_group_role<'a>(&'a self) -> BoxFuture<'a, Result<BotGroupRole>> {
         Box::pin(async { Ok(BotGroupRole::Unknown) })
     }

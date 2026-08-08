@@ -101,10 +101,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_tool_footprint",
         apply: apply_v16_turn_tool_footprint,
     },
+    Migration {
+        version: 17,
+        name: "turn_replay_journal",
+        apply: apply_v17_turn_replay_journal,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 16;
+pub const LATEST_VERSION: i64 = 17;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -775,6 +780,14 @@ fn apply_v15_session_last_request_at(conn: &Connection) -> Result<()> {
 /// cross-compaction accumulation.
 fn apply_v16_turn_tool_footprint(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "turns", "tool_footprint", "TEXT")
+}
+
+/// Display transcript of a finished turn (JSON: ordered text / tool-call /
+/// tool-result records). The live journal tables are wiped when a turn
+/// completes because they carry whole command logs; this keeps just enough,
+/// in order, for the REPL to redraw a reopened session the way it looked.
+fn apply_v17_turn_replay_journal(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "replay_journal", "TEXT")
 }
 
 fn add_column_if_missing(

@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const MAX_COMMAND_OUTPUT_LINES: usize = 1_000;
+/// Replay redraws whole turns, so a large value floods the screen on startup.
+pub const MAX_REPL_REPLAY_TURNS: usize = 20;
 const CURRENT_CONFIG_VERSION: u32 = 2;
 const LEGACY_DEFAULT_TEMPERATURE: f32 = 0.7;
 
@@ -35,6 +37,8 @@ pub struct AppConfig {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     #[serde(default)]
     pub prompt: PromptConfig,
     #[serde(default)]
@@ -2233,6 +2237,29 @@ pub struct DisplayConfig {
     pub mixed_model_endpoint_display: String,
     #[serde(default = "default_command_output_lines")]
     pub command_output_lines: usize,
+    /// How many finished turns a reopened REPL redraws; 0 disables replay.
+    #[serde(default = "default_repl_replay_turns")]
+    pub repl_replay_turns: usize,
+}
+
+/// Desktop notifications. Both kinds are suppressed while the REPL window has
+/// focus — if you are looking at the terminal, a popup is only noise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Notify when a reply finishes and Miyu is waiting on you again.
+    #[serde(default = "default_true")]
+    pub on_turn_complete: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_turn_complete: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2259,6 +2286,8 @@ struct RawDisplayConfig {
     mixed_model_endpoint_display: Option<String>,
     #[serde(default)]
     command_output_lines: Option<usize>,
+    #[serde(default)]
+    repl_replay_turns: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for DisplayConfig {
@@ -2297,6 +2326,9 @@ impl<'de> Deserialize<'de> for DisplayConfig {
             command_output_lines: raw
                 .command_output_lines
                 .unwrap_or_else(default_command_output_lines),
+            repl_replay_turns: raw
+                .repl_replay_turns
+                .unwrap_or_else(default_repl_replay_turns),
         })
     }
 }
@@ -2968,6 +3000,7 @@ impl Default for AppConfig {
             mcp: McpConfig::default(),
             skills: SkillsConfig::default(),
             display: DisplayConfig::default(),
+            notifications: NotificationsConfig::default(),
             prompt: PromptConfig::default(),
             plugins: PluginsConfig::default(),
             memory: MemoryConfig::default(),
@@ -3001,6 +3034,7 @@ impl Default for DisplayConfig {
             show_token_usage: false,
             mixed_model_endpoint_display: default_mixed_model_endpoint_display(),
             command_output_lines: default_command_output_lines(),
+            repl_replay_turns: default_repl_replay_turns(),
         }
     }
 }
@@ -3825,6 +3859,9 @@ impl AppConfig {
         match self.context.on_overflow.as_str() {
             "pop" | "compact" => {}
             value => bail!("context.on_overflow must be 'pop' or 'compact', got: {value}"),
+        }
+        if self.display.repl_replay_turns > MAX_REPL_REPLAY_TURNS {
+            bail!("display.repl_replay_turns must be between 0 and {MAX_REPL_REPLAY_TURNS}");
         }
         if self.display.command_output_lines > MAX_COMMAND_OUTPUT_LINES {
             bail!("display.command_output_lines must be between 0 and {MAX_COMMAND_OUTPUT_LINES}");
@@ -5314,6 +5351,10 @@ fn default_tool_call_display() -> String {
 
 fn default_command_output_lines() -> usize {
     10
+}
+
+fn default_repl_replay_turns() -> usize {
+    3
 }
 
 fn default_mixed_model_endpoint_display() -> String {

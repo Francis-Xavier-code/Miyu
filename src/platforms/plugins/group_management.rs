@@ -19,6 +19,9 @@ const ROLE_KEY: &str = "qq_group_management.bot_role";
 const OFFENDERS_KEY: &str = "offender_history";
 const KICKS_KEY: &str = "kick_history";
 const MAX_TARGETS: usize = 32;
+/// QQ caps a mute at 30 days; anything longer is rejected by the server, so
+/// catch it here where the message can explain itself.
+const MAX_BAN_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 fn settings(context: &PlatformTurnContext) -> Result<Settings> {
     context
@@ -155,12 +158,23 @@ impl GroupManagementPlugin {
         registry.register(
             ToolSpec::new(
                 "qq_group_manage_with_log",
-                "Mute or unmute one or more members in the current QQ group and record the action. duration=0 un-mutes.",
+                "Mute or unmute one or more members in the current QQ group and record the action. duration_seconds is in SECONDS (1 hour = 3600, 24 hours = 86400); 0 un-mutes.",
                 json!({
                     "type": "object",
                     "properties": {
                         "user_id": { "type": "string", "description": "Optional QQ id or multiple QQ ids separated by spaces/commas. Falls back to mentions/reply." },
-                        "duration": { "type": ["integer", "null"], "minimum": 0 },
+                        "duration_seconds": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "maximum": MAX_BAN_SECONDS,
+                            "description": "禁言秒数，不是分钟也不是小时：10 分钟=600，1 小时=3600，24 小时=86400，最长 30 天=2592000；0 表示解禁。"
+                        },
+                        "duration": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "maximum": MAX_BAN_SECONDS,
+                            "description": "Deprecated alias of duration_seconds (also seconds)."
+                        },
                         "reason": { "type": "string" },
                         "confirmation_token": { "type": "string" }
                     },
@@ -193,11 +207,11 @@ impl GroupManagementPlugin {
             ToolSpec::new(
                 name,
                 if blacklist {
-                    "Kick one member from the current QQ group and reject future join requests."
+                    "Kick one or more members from the current QQ group and reject their future join requests. Pass every target in a single call; the result reports each target separately."
                 } else {
-                    "Kick one member from the current QQ group without blacklisting."
+                    "Kick one or more members from the current QQ group without blacklisting. Pass every target in a single call; the result reports each target separately."
                 },
-                reason_schema(),
+                kick_schema(),
                 move |args| {
                     let plugin = plugin.clone();
                     let context = context.clone();
@@ -228,7 +242,7 @@ impl GroupManagementPlugin {
                     "properties": {
                         "special_title": { "type": "string" },
                         "user_id": { "type": "string" },
-                        "duration": { "type": "integer", "default": -1 },
+                        "duration": { "type": "integer", "default": -1, "description": "头衔有效期秒数；-1 表示永久。" },
                         "reason": { "type": "string" },
                         "confirmation_token": { "type": "string" }
                     },
@@ -309,10 +323,24 @@ impl GroupManagementPlugin {
 
     async fn ban(&self, args: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
         let settings = settings(&context)?;
+        // The parameter has always been seconds, but it used to be spelled
+        // `duration` with no unit anywhere — models read it as minutes and a
+        // "24 hour" mute came out as 24 minutes. The explicit name wins; the
+        // old one still works.
         let duration = args
-            .get("duration")
+            .get("duration_seconds")
             .and_then(Value::as_u64)
+            .or_else(|| args.get("duration").and_then(Value::as_u64))
             .unwrap_or(settings.default_duration_seconds);
+        if duration > MAX_BAN_SECONDS {
+            return json_result(
+                false,
+                &format!(
+                    "禁言时长上限 {MAX_BAN_SECONDS} 秒（30 天），收到 {duration} 秒；注意该参数的单位是秒"
+                ),
+                Value::Null,
+            );
+        }
         let reason = bounded_reason(&args, &settings)?;
         let targets = resolve_targets(&args, &context)?;
         if let Some(prompt) = require_ai_confirmation(
@@ -336,7 +364,7 @@ impl GroupManagementPlugin {
                     .await,
             );
         }
-        Ok(aggregate_ban_results(results).to_string())
+        Ok(aggregate_target_results(results).to_string())
     }
 
     async fn ban_one(
@@ -421,6 +449,10 @@ impl GroupManagementPlugin {
         }
         let mut result = external_operation_result(json!({ "record": record }), audit_errors);
         result["user_id"] = json!(user_id);
+        // Echo the duration in words so a unit mix-up is visible in the result
+        // instead of only on the victim's client.
+        result["duration_seconds"] = json!(duration);
+        result["duration_text"] = json!(humanize_seconds(duration));
         result
     }
 
@@ -433,10 +465,9 @@ impl GroupManagementPlugin {
         let settings = settings(&context)?;
         let reason = bounded_reason(&args, &settings)?;
         let targets = resolve_targets(&args, &context)?;
-        if targets.len() != 1 {
-            return json_result(false, "踢人操作必须且只能指定一个目标", Value::Null);
+        if targets.is_empty() {
+            return json_result(false, "没有解析出踢人目标", Value::Null);
         }
-        let user_id = &targets[0];
         let action = if blacklist {
             "qq_group_manage_kick_black_with_log"
         } else {
@@ -445,15 +476,36 @@ impl GroupManagementPlugin {
         if let Some(prompt) = require_ai_confirmation(
             &context,
             action,
-            &json!({ "arguments": args, "target": user_id, "blacklist": blacklist }),
+            &json!({ "arguments": args, "targets": targets, "blacklist": blacklist }),
         )
         .await?
         {
             return Ok(prompt);
         }
-        let member = match validate_target(&context, user_id, true).await {
+        // Sequential on purpose: kicks are destructive and the bridge throttles
+        // them anyway. Per-target results carry their own retry verdict, so one
+        // failure no longer sinks the whole call.
+        let mut results = Vec::with_capacity(targets.len());
+        for target in &targets {
+            results.push(
+                self.kick_one(&context, &settings, target, blacklist, &reason)
+                    .await,
+            );
+        }
+        Ok(aggregate_target_results(results).to_string())
+    }
+
+    async fn kick_one(
+        &self,
+        context: &PlatformTurnContext,
+        settings: &Settings,
+        user_id: &str,
+        blacklist: bool,
+        reason: &str,
+    ) -> Value {
+        let member = match validate_target(context, user_id, true).await {
             Ok(member) => member,
-            Err(error) => return json_result(false, &error.to_string(), Value::Null),
+            Err(error) => return failure_for_target(error, user_id),
         };
         tracing::info!(
             action = if blacklist { "kick_blacklist" } else { "kick" },
@@ -462,25 +514,25 @@ impl GroupManagementPlugin {
             "recording QQ group management intent"
         );
         if let Err(error) = context.set_group_kick(user_id, blacklist).await {
-            return json_result(false, &error.to_string(), Value::Null);
+            return failure_for_target(error, user_id);
         }
         let record = KickRecord {
             record_id: record_id(),
             group_id: context.conversation.conversation_id.clone(),
-            user_id: user_id.clone(),
+            user_id: user_id.to_string(),
             user_name: member.display_name().to_string(),
             kicked_at: now_unix(),
             operator_id: context.sender_id.clone(),
-            reason: reason.clone(),
+            reason: reason.to_string(),
             reject_add_request: blacklist,
             source: "llm_tool".to_string(),
         };
         let mut audit_errors = Vec::new();
-        if let Err(error) = append_kick(&context, &record, settings.max_kick_history_per_group) {
+        if let Err(error) = append_kick(context, &record, settings.max_kick_history_per_group) {
             audit_errors.push(format!("kick history: {error}"));
         }
         if let Err(error) = record_real_context(
-            &context,
+            context,
             &record.record_id,
             if blacklist {
                 "踢出并拉黑"
@@ -488,14 +540,14 @@ impl GroupManagementPlugin {
                 "踢出"
             },
             &member,
-            &reason,
+            reason,
             None,
         )
         .await
         {
             audit_errors.push(format!("real context: {error}"));
         }
-        Ok(external_operation_result(json!({ "record": record }), audit_errors).to_string())
+        external_operation_result(json!({ "record": record }), audit_errors)
     }
 
     async fn title(&self, args: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
@@ -699,9 +751,14 @@ impl PlatformPlugin for Arc<GroupManagementPlugin> {
                     )
                     .await?;
                 }
-                PlatformInboundEventKind::GroupDecrease
-                    if event.notice_sub_type.as_deref() == Some("kick") =>
-                {
+                PlatformInboundEventKind::GroupDecrease => {
+                    // Whoever left is gone regardless of how: drop them from
+                    // the per-turn roster cache so a later kick/mute in this
+                    // same turn cannot validate against a stale entry.
+                    context.forget_group_member(&event.sender_id);
+                    if event.notice_sub_type.as_deref() != Some("kick") {
+                        return Ok(());
+                    }
                     let record = KickRecord {
                         record_id: record_id(),
                         group_id: context.conversation.conversation_id.clone(),
@@ -741,8 +798,10 @@ async fn validate_target(
     if user_id == context.conversation.account_id {
         bail!("不能对 Miyu 自身执行该操作");
     }
+    // Fresh lookup on purpose: this gate exists to stop kicks/mutes aimed at
+    // members who already left, and a cached roster cannot answer that.
     let member = context
-        .group_member(user_id)
+        .group_member_fresh(user_id)
         .await?
         .context("目标不在当前群中")?;
     if protect_managers && matches!(member.role.as_str(), "owner" | "admin") {
@@ -753,6 +812,14 @@ async fn validate_target(
 
 fn resolve_targets(args: &Value, context: &PlatformTurnContext) -> Result<Vec<String>> {
     let mut values = Vec::new();
+    if let Some(list) = args.get("user_ids").and_then(Value::as_array) {
+        values.extend(
+            list.iter()
+                .filter_map(Value::as_str)
+                .flat_map(split_ids)
+                .collect::<Vec<_>>(),
+        );
+    }
     if let Some(explicit) = args
         .get("user_id")
         .and_then(Value::as_str)
@@ -760,11 +827,15 @@ fn resolve_targets(args: &Value, context: &PlatformTurnContext) -> Result<Vec<St
         .filter(|v| !v.is_empty())
     {
         values.extend(split_ids(explicit));
-    } else if let Some(event) = context.inbound_event() {
-        values.extend(event.mentioned_user_ids.iter().cloned());
-        if values.is_empty() {
-            if let Some(replied) = event.replied_message.as_ref() {
-                values.push(replied.sender_id.clone());
+    } else if values.is_empty() {
+        // Neither form given: fall back to who was mentioned, then to whoever
+        // wrote the replied-to message.
+        if let Some(event) = context.inbound_event() {
+            values.extend(event.mentioned_user_ids.iter().cloned());
+            if values.is_empty() {
+                if let Some(replied) = event.replied_message.as_ref() {
+                    values.push(replied.sender_id.clone());
+                }
             }
         }
     }
@@ -785,6 +856,29 @@ fn split_ids(value: &str) -> Vec<String> {
         .filter(|part| (5..=12).contains(&part.len()))
         .map(str::to_string)
         .collect()
+}
+
+/// Renders a mute duration the way a person would say it, so the model can
+/// sanity-check its own arithmetic against what it intended.
+fn humanize_seconds(seconds: u64) -> String {
+    if seconds == 0 {
+        return "解禁".to_string();
+    }
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let (hours, rest) = (rest / 3_600, rest % 3_600);
+    let (minutes, secs) = (rest / 60, rest % 60);
+    let mut parts = Vec::new();
+    for (value, unit) in [
+        (days, "天"),
+        (hours, "小时"),
+        (minutes, "分钟"),
+        (secs, "秒"),
+    ] {
+        if value > 0 {
+            parts.push(format!("{value}{unit}"));
+        }
+    }
+    parts.join("")
 }
 
 fn valid_id(value: &str) -> bool {
@@ -998,6 +1092,27 @@ async fn record_real_context(
         .await
 }
 
+/// Kick takes a real array so batching is discoverable from the schema rather
+/// than buried in prose — the scalar form stays for single targets and for
+/// falling back to mentions/reply.
+fn kick_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "user_ids": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "pattern": "^[1-9][0-9]{4,11}$" },
+                "description": "QQ ids to kick. Prefer this over repeating the tool once per member."
+            },
+            "user_id": { "type": "string", "description": "Single QQ id, or several separated by spaces/commas. Falls back to mentions/reply when omitted." },
+            "reason": { "type": "string" },
+            "confirmation_token": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn reason_schema() -> Value {
     json!({ "type": "object", "properties": { "user_id": { "type": "string" }, "reason": { "type": "string" }, "confirmation_token": { "type": "string" } }, "additionalProperties": false })
 }
@@ -1067,7 +1182,13 @@ fn external_operation_result(data: Value, audit_errors: Vec<String>) -> Value {
     })
 }
 
-fn aggregate_ban_results(results: Vec<Value>) -> Value {
+/// Partial-success envelope shared by the batched admin actions.
+///
+/// The per-target retry verdict is the important part: without it the model
+/// cannot tell a hopeless failure from a transient one and hammers the same
+/// target again — which is exactly what a batch kick against departed members
+/// used to do.
+fn aggregate_target_results(results: Vec<Value>) -> Value {
     let mut successful_target_ids = Vec::new();
     let mut failed_target_ids = Vec::new();
     let mut audit_failed_count = 0usize;
@@ -1135,6 +1256,66 @@ mod tests {
         assert!(valid_id("12345"));
         assert!(!valid_id("1234"));
         assert!(!valid_id("12a45"));
+    }
+
+    #[test]
+    fn mute_duration_is_spelled_in_seconds_and_reads_back_in_words() {
+        assert_eq!(humanize_seconds(0), "解禁");
+        assert_eq!(humanize_seconds(600), "10分钟");
+        assert_eq!(humanize_seconds(3_600), "1小时");
+        // The exact case that shipped as 24 minutes: 24h must be 86400, and a
+        // 1440 that a model meant as "minutes" must read back as 24 minutes so
+        // the mistake is visible in the result.
+        assert_eq!(humanize_seconds(86_400), "1天");
+        assert_eq!(humanize_seconds(1_440), "24分钟");
+        assert_eq!(humanize_seconds(MAX_BAN_SECONDS), "30天");
+        assert_eq!(humanize_seconds(90), "1分钟30秒");
+    }
+
+    #[test]
+    fn kick_targets_accept_an_array_and_still_fall_back_to_a_scalar() {
+        // The array form is what the schema now advertises; the scalar and its
+        // space/comma splitting stay for single targets and older habits.
+        let ids = |value: &Value| -> Vec<String> {
+            value
+                .get("user_ids")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .flat_map(split_ids)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            ids(&json!({ "user_ids": ["12345", "678901"] })),
+            vec!["12345".to_string(), "678901".to_string()]
+        );
+        assert_eq!(split_ids("12345 678901"), vec!["12345", "678901"]);
+    }
+
+    #[test]
+    fn batch_results_tell_the_model_which_targets_may_be_retried() {
+        let aggregate = aggregate_target_results(vec![
+            external_operation_result(json!({ "record": { "user_id": "12345" } }), Vec::new()),
+            failure_for_target(anyhow::anyhow!("目标不在当前群中"), "678901"),
+        ]);
+        assert_eq!(aggregate["success_count"], 1);
+        assert_eq!(aggregate["failed_count"], 1);
+        // Mixed outcome: the successes must never be retried, the failure may
+        // be retried on its own. Without this the model re-kicked the same
+        // dead target over and over.
+        assert_eq!(aggregate["do_not_retry"], false);
+        assert_eq!(aggregate["do_not_retry_successful_targets"], true);
+        assert_eq!(aggregate["retry_failed_targets_only"], true);
+        assert_eq!(aggregate["failed_target_ids"], json!(["678901"]));
+
+        let all_good = aggregate_target_results(vec![external_operation_result(
+            json!({ "record": { "user_id": "12345" } }),
+            Vec::new(),
+        )]);
+        assert_eq!(all_good["do_not_retry"], true);
     }
 
     #[test]

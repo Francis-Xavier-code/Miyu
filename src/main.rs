@@ -15,6 +15,7 @@ mod llm;
 mod logging;
 mod memory;
 mod models_cache;
+mod notify;
 mod paths;
 mod platforms;
 mod prompts;

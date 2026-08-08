@@ -123,6 +123,31 @@ fn readable_load_target_name(name: &str) -> String {
     readable_tool_name(name)
 }
 
+/// Phase text for the "still receiving arguments" hint, or `None` for tools
+/// that stream too fast to be worth one.
+///
+/// The tool name is decoded from the stream well before its arguments finish,
+/// so this is what keeps a multi-kilobyte patch or file write from looking
+/// frozen. Deliberately a short list: flashing a hint for a `read_file` whose
+/// arguments arrive in one chunk is noise. `task` is absent because subagents
+/// already get their own timed block.
+pub fn preparing_phase(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "apply_patch"
+        | "apply_artifact_patch"
+        | "create_artifact"
+        | "write_file"
+        | "edit_file"
+        | "edit_string" => t("Preparing edit", "准备编辑"),
+        "run_command" => t("Preparing command", "准备执行"),
+        // A subagent brief is long, and its own timed block only appears once
+        // the arguments have all arrived.
+        "task" | "deep_research" => t("Preparing task", "准备任务"),
+        "ask_question" => t("Preparing question", "准备问题"),
+        _ => return None,
+    })
+}
+
 fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "run_command" => t("Run command", "运行命令"),
@@ -536,6 +561,43 @@ mod tests {
             zsh_hook_file: root.join("config/shell/zsh-hook.zsh"),
             scripts_dir: root.join("config/scripts"),
             system_scripts_dir: root.join("system-scripts"),
+        }
+    }
+
+    #[test]
+    fn preparing_phase_covers_the_slow_argument_tools_only() {
+        for name in [
+            "apply_patch",
+            "apply_artifact_patch",
+            "create_artifact",
+            "write_file",
+            "edit_file",
+            "edit_string",
+        ] {
+            assert_eq!(
+                preparing_phase(name),
+                Some(crate::i18n::text("Preparing edit", "准备编辑")),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            preparing_phase("run_command"),
+            Some(crate::i18n::text("Preparing command", "准备执行"))
+        );
+        for name in ["task", "deep_research"] {
+            assert_eq!(
+                preparing_phase(name),
+                Some(crate::i18n::text("Preparing task", "准备任务")),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            preparing_phase("ask_question"),
+            Some(crate::i18n::text("Preparing question", "准备问题"))
+        );
+        // Arguments arrive in one chunk: a hint would only flicker.
+        for name in ["read_file", "grep", "list_directory"] {
+            assert_eq!(preparing_phase(name), None, "{name}");
         }
     }
 

@@ -297,6 +297,16 @@ pub enum Command {
         name: Option<String>,
         #[serde(default)]
         switch: bool,
+        /// `user` (default) or `ask`; anything else is rejected. `ask` sessions
+        /// back one-shot turns and stay out of every listing.
+        #[serde(default)]
+        kind: Option<String>,
+    },
+    /// Session the REPL was last on. Falls back to the current session and
+    /// heals the stored pointer when it has gone stale.
+    GetReplSession,
+    SetReplSession {
+        target: SessionRef,
     },
     SwitchSession {
         target: SessionRef,
