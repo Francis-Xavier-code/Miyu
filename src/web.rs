@@ -2547,6 +2547,18 @@ async fn handle_ipc_connection(
                 ipc::send(&mut stream, &IpcFrame::error("active run not found")).await?;
             }
         }
+        IpcCommand::CloseQuestion { question_id } => {
+            let _ = state.questions.close(&question_id, |run_id| {
+                state.events.publish(
+                    "question.closed",
+                    json!({
+                        "run_id": run_id,
+                        "question_id": question_id,
+                    }),
+                );
+            });
+            ipc::send(&mut stream, &IpcFrame::Ack).await?
+        }
         IpcCommand::AnswerQuestion {
             question_id,
             answers,

@@ -288,6 +288,12 @@ pub enum Command {
         question_id: String,
         answers: QuestionAnswers,
     },
+    /// Resolve a question without an answer, when the client cannot present it
+    /// at all. Distinct from `Cancel`: the turn keeps going and the tool that
+    /// asked simply learns nobody answered.
+    CloseQuestion {
+        question_id: String,
+    },
     ListSessions {
         #[serde(default)]
         include_archived: bool,

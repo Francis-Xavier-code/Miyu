@@ -5550,11 +5550,23 @@ async fn try_run_remote_chat(
                         .await?;
                         renderer.start_waiting()?;
                     }
-                    // The terminal question UI maps its close gestures to Cancelled;
-                    // Closed is resolved by the WebUI broker and is unreachable here.
+                    // Nobody could be shown the panel — no tty, or it failed to
+                    // open. That is not the user calling the turn off, so the
+                    // question is resolved and the turn carries on; the tool
+                    // that asked finds out that nobody answered and can say so.
+                    crate::question::QuestionResponse::Unavailable(_) => {
+                        let _ = send_ipc_command(
+                            paths,
+                            IpcCommand::CloseQuestion {
+                                question_id: ipc_text(&data, "question_id").to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    // The terminal question UI maps its close gestures to
+                    // Cancelled; that one really is "stop this turn".
                     crate::question::QuestionResponse::Closed
-                    | crate::question::QuestionResponse::Cancelled
-                    | crate::question::QuestionResponse::Unavailable(_) => {
+                    | crate::question::QuestionResponse::Cancelled => {
                         let _ = send_ipc_command(
                             paths,
                             IpcCommand::Cancel {
