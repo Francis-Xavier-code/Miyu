@@ -5530,7 +5530,15 @@ async fn try_run_remote_chat(
                         .map(|prompt| prompt.question.as_str())
                         .unwrap_or_default(),
                 );
-                match crate::question_tui::ask(&request)? {
+                // A panel that cannot be shown is not a reason to abort the
+                // turn: fall through to the same path a closed panel takes, so
+                // the daemon gets an answer instead of the run dying on an
+                // error the user cannot act on. The direct-mode handler has
+                // always done this; this branch used to propagate instead.
+                let asked = crate::question_tui::ask(&request).unwrap_or_else(|err| {
+                    crate::question::QuestionResponse::Unavailable(err.to_string())
+                });
+                match asked {
                     crate::question::QuestionResponse::Answered(answers) => {
                         send_ipc_command(
                             paths,
