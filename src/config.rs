@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_COMMAND_OUTPUT_LINES: usize = 1_000;
 /// Replay redraws whole turns, so a large value floods the screen on startup.
 pub const MAX_REPL_REPLAY_TURNS: usize = 20;
-const CURRENT_CONFIG_VERSION: u32 = 2;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 const LEGACY_DEFAULT_TEMPERATURE: f32 = 0.7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

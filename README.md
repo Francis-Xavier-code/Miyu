@@ -108,6 +108,24 @@ miyu -c '记住我在写 Miyu 的会话模块'
 
 删除会话不必先切过去：`miyu session` 或 REPL 的 `/session` 弹出菜单后，在目标行按 `Ctrl+D` 确认即可，删完菜单会刷新并留在原处。
 
+### 搬到另一台机器
+
+`miyu export` 把当前安装打成一个 `.tar.gz`（权限 0600），`miyu import` 在新机器上还原：
+
+```bash
+miyu export                      # 配置、会话历史、记忆、知识库原文、用户资源
+miyu export --index --platforms  # 额外带上向量索引与平台聊天历史
+miyu export --no-secrets         # 清空 API key 与令牌，导入后自行补填
+miyu export --dry-run            # 只看清单与体积，不写文件
+
+miyu daemon stop                 # daemon 占着数据库，导入前必须停
+miyu import miyu-export-*.tar.gz
+```
+
+默认**不含**知识库向量索引（很大，且 `miyu kb embed` 可重建）、缓存、日志和其他一次性的本机状态。密钥默认带上并在导出时警告——归档是明文的，别随手发出去。
+
+目标目录已有配置或会话历史时导入会被拒绝；`--force` 会先把现有安装导出成 `miyu-backup-<时间>.tar.gz` 再覆盖。导入后按提示重装 shell 集成、跑 `miyu kb reindex`（知识库记的是旧机器的绝对路径），未带 `--index` 时再跑一次 `miyu kb embed`。
+
 ### 重要配置调整
 
 运行 `miyu config` 命令打开配置 TUI。

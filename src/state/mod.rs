@@ -2,6 +2,12 @@ mod conversation_db;
 mod migrations;
 mod usage;
 
+/// Newest `conversation.db` schema this build can open — the gate an import
+/// checks before restoring a database written by a newer Miyu.
+pub fn latest_schema_version() -> i64 {
+    migrations::LATEST_VERSION
+}
+
 use crate::llm::Usage;
 use crate::memory::EvictedTurn;
 use crate::paths::MiyuPaths;

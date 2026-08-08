@@ -622,6 +622,16 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Manage the unified Miyu background service",
             "管理 Miyu 统一后台服务",
         ),
+        (
+            "export",
+            "Pack this installation into a portable archive",
+            "把当前安装打包成可移植归档",
+        ),
+        (
+            "import",
+            "Restore an installation from an exported archive",
+            "从导出的归档恢复安装",
+        ),
     ];
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
@@ -638,8 +648,66 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         .mut_subcommand("config", localize_config_command)
         .mut_subcommand("reset", localize_reset_command)
         .mut_subcommand("web", localize_web_command)
-        .mut_subcommand("daemon", localize_daemon_command);
+        .mut_subcommand("daemon", localize_daemon_command)
+        .mut_subcommand("export", localize_export_command)
+        .mut_subcommand("import", localize_import_command);
     command
+}
+
+fn localize_export_command(command: clap::Command) -> clap::Command {
+    command
+        .mut_arg("output", |arg| {
+            arg.help(t(
+                "Archive path to write; omit to name it after this host and time",
+                "要写入的归档路径；省略则按主机名与时间自动命名",
+            ))
+        })
+        .mut_arg("all", |arg| {
+            arg.help(t(
+                "Include everything portable, index and platform history included",
+                "包含全部可移植数据，含向量索引与平台历史",
+            ))
+        })
+        .mut_arg("index", |arg| {
+            arg.help(t(
+                "Include the knowledge-base vector index (large; rebuildable with `miyu kb embed`)",
+                "包含知识库向量索引（很大；可用 miyu kb embed 重建）",
+            ))
+        })
+        .mut_arg("platforms", |arg| {
+            arg.help(t(
+                "Include chat-platform history",
+                "包含通讯平台的聊天历史",
+            ))
+        })
+        .mut_arg("no_secrets", |arg| {
+            arg.help(t(
+                "Blank out API keys and tokens (you must refill them after importing)",
+                "清空 API key 与访问令牌（导入后需要自行补填）",
+            ))
+        })
+        .mut_arg("dry_run", |arg| {
+            arg.help(t(
+                "Print what would be packed without writing an archive",
+                "只打印将要打包的内容，不实际写归档",
+            ))
+        })
+        .mut_arg("force", |arg| {
+            arg.help(t("Overwrite an existing archive", "覆盖已存在的归档文件"))
+        })
+}
+
+fn localize_import_command(command: clap::Command) -> clap::Command {
+    command
+        .mut_arg("archive", |arg| {
+            arg.help(t("Archive produced by `miyu export`", "miyu export 生成的归档"))
+        })
+        .mut_arg("force", |arg| {
+            arg.help(t(
+                "Overwrite existing data (the current installation is backed up first)",
+                "覆盖已有数据（覆盖前会先备份当前安装）",
+            ))
+        })
 }
 
 fn localize_ask_command(command: clap::Command) -> clap::Command {
@@ -902,6 +970,8 @@ pub enum Command {
     History(HistoryArgs),
     Pop(PopArgs),
     Kb(KbArgs),
+    Export(ExportArgs),
+    Import(ImportArgs),
     UpdateDefaultKb,
     Memory(MemoryArgs),
     Skills(SkillsArgs),
@@ -1046,6 +1116,32 @@ pub struct HistoryArgs {
 pub struct PopArgs {
     #[arg(value_parser = parse_positive_pop_count)]
     pub count: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Where to write the archive; defaults to a host- and time-stamped name
+    /// in the current directory.
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub index: bool,
+    #[arg(long)]
+    pub platforms: bool,
+    #[arg(long)]
+    pub no_secrets: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    pub archive: PathBuf,
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1259,6 +1355,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
                 | Some(Command::ZshInit)
                 | Some(Command::RemoveShellHook)
                 | Some(Command::Paths)
+                | Some(Command::Import(_))
         )
     {
         run_init(&paths, InitKind::FirstRun)?;
@@ -1318,6 +1415,8 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
             initialize_models_cache(&paths);
             run_models(&paths, args).await
         }
+        Some(Command::Export(args)) => run_export(&paths, args),
+        Some(Command::Import(args)) => run_import(&paths, args).await,
         Some(Command::ListModels) => {
             initialize_models_cache(&paths);
             run_list_models(&paths)
@@ -3346,6 +3445,207 @@ fn usage_overview_text(
         ));
     }
     lines.join("\n")
+}
+
+/// Suggested archive name when the user did not pick one.
+fn default_export_name() -> String {
+    let host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "miyu".to_string());
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    format!("miyu-export-{host}-{stamp}.tar.gz")
+}
+
+fn readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// `t` for messages built at runtime — the static version cannot take a `format!`.
+fn owned(en: String, zh: String) -> String {
+    if crate::i18n::is_zh() {
+        zh
+    } else {
+        en
+    }
+}
+
+fn run_export(paths: &MiyuPaths, args: ExportArgs) -> Result<()> {
+    let output = args
+        .output
+        .unwrap_or_else(|| PathBuf::from(default_export_name()));
+    let options = crate::transfer::export::ExportOptions {
+        all: args.all,
+        index: args.index,
+        platforms: args.platforms,
+        no_secrets: args.no_secrets,
+        dry_run: args.dry_run,
+        force: args.force,
+    };
+    let report = crate::transfer::export::export(paths, &output, &options)?;
+
+    if options.dry_run {
+        for (unit, bytes) in &report.by_unit {
+            println!("  {:>10}  {unit}", readable_bytes(*bytes));
+        }
+    }
+
+    let count = report.entries;
+    let size = readable_bytes(report.bytes);
+    println!(
+        "{}",
+        match &report.archive {
+            None => owned(
+                format!("Dry run: {count} files, {size} would be packed."),
+                format!("试运行：将打包 {count} 个文件，共 {size}。"),
+            ),
+            Some(path) => {
+                let path = path.display();
+                owned(
+                    format!("Exported {count} files ({size}) to {path}"),
+                    format!("已导出 {count} 个文件（{size}）到 {path}"),
+                )
+            }
+        }
+    );
+
+    // The archive is plaintext-credentialed unless asked otherwise; the user
+    // needs to know that before they put it on a USB stick or a chat app.
+    if report.secrets_included && report.archive.is_some() {
+        eprintln!(
+            "{}",
+            t(
+                "Warning: this archive contains API keys and access tokens in plain text. Keep it private, or re-export with --no-secrets.",
+                "警告：归档内含明文 API key 与访问令牌。请妥善保管，或改用 --no-secrets 重新导出。",
+            )
+        );
+    }
+    if !options.all && !options.index {
+        println!(
+            "{}",
+            t(
+                "The knowledge-base vector index was left out; run `miyu kb embed` after importing (or re-export with --index).",
+                "未包含知识库向量索引；导入后请运行 miyu kb embed（或改用 --index 重新导出）。",
+            )
+        );
+    }
+    Ok(())
+}
+
+async fn run_import(paths: &MiyuPaths, args: ImportArgs) -> Result<()> {
+    // The daemon holds conversation.db's WAL open; replacing the file under it
+    // would leave both the old process and the new database inconsistent.
+    if crate::ipc::daemon_info(paths).await.is_some() {
+        anyhow::bail!(
+            "{}",
+            t(
+                "the Miyu daemon is running and holds the database open; stop it first with `miyu daemon stop`",
+                "Miyu daemon 正在运行并占用数据库；请先执行 miyu daemon stop",
+            )
+        );
+    }
+
+    let options = crate::transfer::import::ImportOptions { force: args.force };
+    let report = crate::transfer::import::import(paths, &args.archive, &options)?;
+
+    if let Some(backup) = &report.backup {
+        let path = backup.display();
+        println!(
+            "{}",
+            owned(
+                format!("Backed up the previous installation to {path}"),
+                format!("已把覆盖前的安装备份到 {path}"),
+            )
+        );
+    }
+    let restored = report.restored;
+    println!(
+        "{}",
+        owned(
+            format!("Restored {restored} files."),
+            format!("已恢复 {restored} 个文件。"),
+        )
+    );
+    if !report.unknown_units.is_empty() {
+        // A newer Miyu wrote data this build has no name for. It is on disk;
+        // say so rather than let it look like it vanished.
+        let units = report
+            .unknown_units
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{}",
+            owned(
+                format!(
+                    "Restored data this version does not recognise \
+                     (written by a newer Miyu): {units}"
+                ),
+                format!("恢复了本版本不认识的数据（由更新版本的 Miyu 写入）：{units}"),
+            )
+        );
+    }
+    if report.cleared_workspaces > 0 {
+        let cleared = report.cleared_workspaces;
+        println!(
+            "{}",
+            owned(
+                format!(
+                    "Cleared {cleared} session workspace(s) pointing at \
+                     directories this machine does not have."
+                ),
+                format!("已清除 {cleared} 个指向本机不存在目录的会话工作区。"),
+            )
+        );
+    }
+
+    println!("\n{}", t("Next steps:", "接下来需要手动完成："));
+    println!(
+        "  {}",
+        t(
+            "reinstall the shell integration: `miyu fish-init` / `bash-init` / `zsh-init`",
+            "重装 shell 集成：miyu fish-init / bash-init / zsh-init",
+        )
+    );
+    println!(
+        "  {}",
+        t(
+            "`miyu kb reindex` — the knowledge base records absolute paths from the old machine",
+            "miyu kb reindex —— 知识库记录的是旧机器上的绝对路径",
+        )
+    );
+    if !report.index_included {
+        println!(
+            "  {}",
+            t(
+                "`miyu kb embed` — the vector index was not in the archive",
+                "miyu kb embed —— 归档中不含向量索引",
+            )
+        );
+    }
+    if !report.secrets_included {
+        println!(
+            "  {}",
+            t(
+                "refill API keys and access tokens: `miyu config`",
+                "补填 API key 与访问令牌：miyu config",
+            )
+        );
+    }
+    Ok(())
 }
 
 fn run_list_models(paths: &MiyuPaths) -> Result<()> {
