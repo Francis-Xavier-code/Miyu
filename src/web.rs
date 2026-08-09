@@ -6262,7 +6262,14 @@ async fn run_turn_task(
             config.clone(),
             &paths,
             store.clone(),
-            resources.client.clone(),
+            // A platform turn buffers a whole round and posts it as one
+            // message, so a stream that dies mid-round showed the group
+            // nothing and can be retried on another endpoint — or the same
+            // one — without anybody seeing a false start.
+            resources
+                .client
+                .clone()
+                .with_buffered_delivery(platform_context.is_some()),
             active_tools,
             mode,
             audience,

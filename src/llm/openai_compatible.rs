@@ -28,6 +28,9 @@ static LLM_SCHEDULER: LazyLock<Mutex<LlmScheduler>> =
 
 const TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_SEND_ATTEMPTS: usize = 3;
+/// Attempts a request gets before giving up, however few endpoints exist. With
+/// several endpoints these are failovers; with one they are plain retries.
+const MIN_ENDPOINT_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const HTTP_STATUS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -705,6 +708,10 @@ pub struct OpenAiCompatibleClient {
     endpoints: Arc<Vec<LlmEndpoint>>,
     thinking_variants: HashMap<String, String>,
     reasoning_visibility: ReasoningVisibility,
+    /// True when partial output never reaches a person mid-request — platform
+    /// turns buffer a round and post it as one message. Nothing is committed
+    /// until the round ends, so a dropped stream can be retried invisibly.
+    buffered_delivery: bool,
     detailed_reasoning_summary: bool,
     request_timeouts: Option<RequestTimeouts>,
     /// Per-clone completion cap. Auxiliary callers (compaction summaries)
@@ -901,6 +908,7 @@ impl OpenAiCompatibleClient {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
+            buffered_delivery: false,
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
@@ -960,6 +968,7 @@ impl OpenAiCompatibleClient {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
+            buffered_delivery: false,
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
@@ -998,6 +1007,7 @@ impl OpenAiCompatibleClient {
             endpoints: Arc::new(vec![endpoint]),
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
+            buffered_delivery: false,
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
@@ -1017,6 +1027,14 @@ impl OpenAiCompatibleClient {
             windows.push(window);
         }
         Ok(windows.into_iter().min())
+    }
+
+    /// Marks a client whose caller collects output and delivers it in one
+    /// piece. A truncated stream can then be retried without the person
+    /// seeing the false start.
+    pub fn with_buffered_delivery(mut self, buffered: bool) -> Self {
+        self.buffered_delivery = buffered;
+        self
     }
 
     pub fn for_subagent_output(mut self, full: bool) -> Self {
@@ -1075,6 +1093,7 @@ impl OpenAiCompatibleClient {
             endpoints: self.endpoints.clone(),
             thinking_variants: self.thinking_variants.clone(),
             reasoning_visibility: self.reasoning_visibility,
+            buffered_delivery: self.buffered_delivery,
             detailed_reasoning_summary: self.detailed_reasoning_summary,
             request_timeouts: self.request_timeouts,
             max_tokens_override: self.max_tokens_override,
@@ -1470,6 +1489,20 @@ impl OpenAiCompatibleClient {
             );
             order = (0..endpoints.len()).collect();
         }
+        // A dropped stream or a 5xx is a moment in time, not a verdict on the
+        // endpoint. Tying the number of attempts to the number of configured
+        // endpoints meant someone with a single model got no retry at all,
+        // which is backwards: they are the ones with nowhere else to go. Pad
+        // the attempt list by cycling so every setup gets the same budget.
+        // Errors that a retry cannot fix still stop on the first attempt —
+        // `endpoint_failover_allowed` returns before the next one is tried.
+        if !order.is_empty() && order.len() < MIN_ENDPOINT_ATTEMPTS {
+            let cycle: Vec<usize> = order.clone();
+            while order.len() < MIN_ENDPOINT_ATTEMPTS {
+                order.extend(cycle.iter().copied());
+            }
+            order.truncate(MIN_ENDPOINT_ATTEMPTS);
+        }
         tracing::debug!(
             request_id,
             endpoint_count = order.len(),
@@ -1500,6 +1533,7 @@ impl OpenAiCompatibleClient {
             );
             let mut attempt_committed = false;
             let result = {
+                let buffered = buffered || self.buffered_delivery;
                 let mut attempt_on_chunk = |chunk: ChatStreamChunk| {
                     if !buffered {
                         attempt_committed |=
@@ -2076,6 +2110,28 @@ impl OpenAiCompatibleClient {
                 &mut tool_calls,
                 &mut *on_chunk,
             )?;
+        }
+        // Reaching here means the socket closed without `[DONE]` — the loop
+        // above returns early on that marker. A provider that ends this way
+        // still has to have said it was finished somewhere, and `finish_reason`
+        // is the only other place it can say so (llama.cpp's Responses
+        // endpoint, for one, never sends `[DONE]`). With neither signal the
+        // response is a truncated fragment, and returning it as a completed
+        // turn is how an empty reply reaches the user with nothing logged.
+        //
+        // Reported as a transport failure so the existing machinery retries it
+        // across endpoints and resets the partial reasoning already streamed.
+        // Retrying is safe here: tool calls execute after this returns, so a
+        // truncated turn has run nothing yet.
+        if finish_reason.is_none() {
+            return Err(anyhow::anyhow!(t(
+                "the response stream ended before the model said it was done",
+                "模型还没说完，响应流就提前结束了"
+            ))
+            .context(TransportFailure {
+                stage: "chat.stream",
+                kind: TransportFailureKind::Other,
+            }));
         }
         flush_buffer(
             &reasoning,
@@ -3876,6 +3932,15 @@ fn clean_response_content(content: String) -> (String, Option<String>) {
     split_tagged_reasoning(clean_plain_text(content))
 }
 
+fn is_empty_error(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Null => true,
+        _ => false,
+    }
+}
+
 fn provider_error_text(value: &Value) -> String {
     value
         .get("message")
@@ -3984,7 +4049,10 @@ where
             clean_plain_text(data.to_string())
         )
     })?;
-    if let Some(error) = response.error {
+    // An empty `error` is not one: some gateways send `{"error":""}` alongside
+    // the terminal usage event, and failing the turn over it would turn a
+    // normal completion into a spurious error.
+    if let Some(error) = response.error.filter(|error| !is_empty_error(error)) {
         bail!(
             "{}: {}",
             t(
@@ -3998,7 +4066,9 @@ where
         *usage = Some(next_usage);
     }
     for choice in response.choices {
-        if let Some(next_finish_reason) = choice.finish_reason {
+        // An empty string is "absent", not an end signal: some gateways send
+        // `"finish_reason": ""` on ordinary chunks.
+        if let Some(next_finish_reason) = choice.finish_reason.filter(|reason| !reason.is_empty()) {
             tracing::debug!(
                 finish_reason = %next_finish_reason,
                 "{}",
@@ -6447,6 +6517,7 @@ mod tests {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Hidden,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: Some(RequestTimeouts {
                 response_header: Duration::from_millis(20),
@@ -6492,6 +6563,249 @@ mod tests {
 
         let message = format!("{error:#}");
         assert!(message.contains("response stream was idle"), "{message}");
+        server.await.unwrap();
+    }
+
+    /// Writes an SSE body and then hangs up without `[DONE]`, the way a proxy
+    /// that drops the connection mid-generation does.
+    async fn write_truncated_sse_response(stream: &mut tokio::net::TcpStream, body: &str) {
+        // No Content-Length and no terminating chunk: the peer sees the socket
+        // close, which is exactly the "graceful close mid-stream" case.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_stops_before_any_end_signal_is_not_a_completion() {
+        // The failure this reproduces: the model was still emitting reasoning
+        // when the connection went away, so there is no content, no tool call,
+        // no `[DONE]` and no finish_reason. Accepting that as a finished turn
+        // is what made a QQ reply vanish silently.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..MAX_SEND_ATTEMPTS {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                read_http_headers(&mut stream).await;
+                write_truncated_sse_response(
+                    &mut stream,
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"在想第一步\"}}]}\n\n",
+                )
+                .await;
+            }
+        });
+
+        let mut provider = test_provider("truncated-stream-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+
+        let outcome = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await;
+
+        let error = outcome.expect_err("a truncated stream must not read as a finished turn");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ended before") || message.contains("提前结束"),
+            "the error should name the truncation: {message}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_error_field_does_not_fail_the_turn() {
+        // Some gateways send `{"error":""}` next to the terminal usage event.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_http_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    "data: {\"error\":\"\",\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("empty-error-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+
+        let result = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .expect("an empty error field is not an error");
+        assert_eq!(result.content, "hi");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_real_error_field_still_fails_the_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_http_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"error\":{\"message\":\"上游炸了\"},\"choices\":[]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("real-error-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .expect_err("an in-band error must not be dressed up as a completion");
+        assert!(format!("{error:#}").contains("上游炸了"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lone_endpoint_still_gets_retried() {
+        // Attempts used to equal endpoints, so the person with a single model
+        // — the one with nowhere else to go — got no retry at all.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // First connection dies mid-stream; the second answers properly.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_truncated_sse_response(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想了一半\"}}]}\n\n",
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_http_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"第二次成功\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("lone-endpoint-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+        assert_eq!(client.endpoints.len(), 1, "the point is a single endpoint");
+
+        let result = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .expect("a single endpoint should still be retried");
+        assert_eq!(result.content, "第二次成功");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_delivery_lets_a_committed_attempt_be_retried() {
+        // A platform turn collects a whole round before posting it, so content
+        // streamed before the drop reached nobody and retrying is invisible.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            // Content, not just reasoning: this is what used to pin the turn
+            // to the failed attempt.
+            write_truncated_sse_response(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"半句\"}}]}\n\n",
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_http_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"完整回复\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("buffered-delivery-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider).with_buffered_delivery(true);
+
+        let result = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .expect("buffered delivery means the false start was never seen");
+        assert_eq!(result.content, "完整回复");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_on_finish_reason_alone_is_a_completion() {
+        // Some OpenAI-compatible servers never send `[DONE]` (llama.cpp's
+        // Responses endpoint, for one). A finish_reason is end enough.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut stream).await;
+            write_truncated_sse_response(
+                &mut stream,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done thinking\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let mut provider = test_provider("no-done-marker-test", &url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "test-model".to_string();
+        let client = test_client(provider);
+
+        let result = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .expect("finish_reason without [DONE] is a normal completion");
+        assert_eq!(result.content, "done thinking");
         server.await.unwrap();
     }
 
@@ -6634,6 +6948,7 @@ mod tests {
             endpoints: Arc::new(vec![original_endpoint.clone()]),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -6667,6 +6982,7 @@ mod tests {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -6801,6 +7117,7 @@ mod tests {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -6884,6 +7201,7 @@ mod tests {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -7109,6 +7427,7 @@ mod tests {
             endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -7283,6 +7602,7 @@ mod tests {
             endpoints: Arc::new(vec![endpoint]),
             thinking_variants: HashMap::new(),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
@@ -7670,6 +7990,7 @@ mod tests {
                 "high".to_string(),
             )]),
             reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
