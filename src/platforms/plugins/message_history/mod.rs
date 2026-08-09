@@ -6,7 +6,7 @@ use crate::config::{QqMessageHistoryPluginSettings, QQ_MESSAGE_HISTORY_PLUGIN_ID
 use crate::paths::MiyuPaths;
 use crate::platforms::{
     ConversationKind, OutboundBody, OutboundMessage, OutboundSegment, PlatformInboundEvent,
-    PlatformInboundEventKind, PlatformTurnContext, SendReceipt,
+    PlatformInboundEventKind, PlatformMediaKind, PlatformTurnContext, SendReceipt,
 };
 use crate::tools::ToolRegistry;
 use anyhow::Result;
@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{
-    AccountKey, ConversationKey, GroupKey, HistoryStore, NewHistoryMessage, NewRecall,
-    SanitizedContent,
+    AccountKey, ConversationKey, GroupKey, HistoryStore, MediaKind, MediaPlaceholder,
+    NewHistoryMessage, NewRecall, SanitizedContent,
 };
 
 pub(super) const PLUGIN_ID: &str = QQ_MESSAGE_HISTORY_PLUGIN_ID;
@@ -135,7 +135,22 @@ impl MessageHistoryPlugin {
         let store = store_for_paths(paths);
         match event.kind {
             PlatformInboundEventKind::Message => {
-                let mut content = SanitizedContent::new(event.text.clone(), Vec::new());
+                // Media has to survive into history, or an image-only message
+                // renders later as "[无文字内容]" and the model cannot tell that
+                // a picture was ever posted — nor can it be handed a
+                // `context_image_N` id to look at.
+                let media = event
+                    .media
+                    .iter()
+                    .map(|media| {
+                        MediaPlaceholder::new(
+                            media_kind(media.kind),
+                            media.name.clone().or_else(|| media.id.clone()),
+                            None::<String>,
+                        )
+                    })
+                    .collect();
+                let mut content = SanitizedContent::new(event.text.clone(), media);
                 content.mentioned_user_ids = event.mentioned_user_ids.clone();
                 content.mentioned_users = event.mentioned_users.clone();
                 store
@@ -408,6 +423,19 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// Emoji becomes a sticker rather than an image on purpose: only `Image` earns
+/// a `context_image_N` id, and a face sticker is not worth a vision call.
+fn media_kind(kind: PlatformMediaKind) -> MediaKind {
+    match kind {
+        PlatformMediaKind::Image => MediaKind::Image,
+        PlatformMediaKind::Emoji => MediaKind::Sticker,
+        PlatformMediaKind::File => MediaKind::File,
+        PlatformMediaKind::Audio => MediaKind::Audio,
+        PlatformMediaKind::Video => MediaKind::Video,
+        PlatformMediaKind::Other => MediaKind::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,7 +513,21 @@ mod tests {
             .unwrap();
         assert_eq!(page.messages.len(), 1);
         assert_eq!(page.messages[0].content.text, "hello");
-        assert!(page.messages[0].content.media.is_empty());
+        // Media must survive into history: without it an image-only message
+        // renders as "[无文字内容]" later and never earns a context_image id,
+        // so the model cannot be told which picture is being asked about.
+        let media = &page.messages[0].content.media;
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].kind, MediaKind::Image);
+        assert_eq!(media[0].label.as_deref(), Some("photo.png"));
+    }
+
+    #[test]
+    fn a_face_sticker_is_not_an_image() {
+        // Only Image earns a context_image id downstream; mapping Emoji to
+        // Image would offer the model face stickers to run vision on.
+        assert_eq!(media_kind(PlatformMediaKind::Emoji), MediaKind::Sticker);
+        assert_eq!(media_kind(PlatformMediaKind::Image), MediaKind::Image);
     }
 
     #[test]
