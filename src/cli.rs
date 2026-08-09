@@ -161,17 +161,24 @@ impl ReplFooterStatus {
         self.token_usage.context_window = context_window;
     }
 
-    fn update_cumulative_tokens(&mut self, cumulative_tokens: u64) {
-        self.token_usage.cumulative_tokens = (cumulative_tokens > 0).then_some(cumulative_tokens);
+    /// Returns whether anything actually moved, so an idle tick only forces a
+    /// redraw when the numbers changed.
+    fn update_cumulative_tokens(&mut self, cumulative: TurnTokens) -> bool {
+        let meter = meter_cumulative(cumulative);
+        let changed = self.token_usage.cumulative_tokens != meter.cumulative_tokens
+            || self.token_usage.cumulative_prompt_tokens != meter.cumulative_prompt_tokens
+            || self.token_usage.cumulative_cached_tokens != meter.cumulative_cached_tokens;
+        self.token_usage.cumulative_tokens = meter.cumulative_tokens;
+        self.token_usage.cumulative_prompt_tokens = meter.cumulative_prompt_tokens;
+        self.token_usage.cumulative_cached_tokens = meter.cumulative_cached_tokens;
+        changed
     }
 
     fn reset_token_usage(&mut self, session_tokens: u64, context_window: Option<usize>) {
-        self.token_usage = ReplTokenUsage {
-            turn_tokens: 0,
-            cached_tokens: 0,
+        self.token_usage = render::TokenMeter {
             session_tokens,
             context_window,
-            cumulative_tokens: None,
+            ..Default::default()
         };
     }
 
@@ -194,23 +201,45 @@ fn short_model_name(model: &str, provider: &str) -> String {
         .to_string()
 }
 
+/// crossterm asks the terminal where the cursor is (`ESC[6n`) and gives up if
+/// the reply does not arrive within a fixed wait. Over a laggy SSH link that
+/// wait expires routinely, and every `?` on it used to take the whole REPL
+/// down with "The cursor position could not be read within a normal duration".
+/// The answer is only ever used to re-anchor a redraw, so a stale one costs a
+/// single imperfect frame — losing the session costs the session.
+fn cursor_position_or(fallback: (u16, u16)) -> (u16, u16) {
+    cursor::position().unwrap_or(fallback)
+}
+
+fn cursor_row_or(fallback: u16) -> u16 {
+    cursor_position_or((0, fallback)).1
+}
+
+fn cursor_col_or(fallback: u16) -> u16 {
+    cursor_position_or((fallback, 0)).0
+}
+
 fn repl_footer_line(mode: AgentMode, footer: &ReplFooterStatus, cols: usize) -> String {
     let cols = cols.max(1);
     let bar = input_prompt_bar(mode);
     let bar_width = visible_width(&bar);
-    let usage = footer.token_usage;
+    // The footer carries only the two standing gauges — how much context is
+    // left, and what the session has cost. The per-turn figure is transient and
+    // already has its own home in the `Token:` line printed after each reply;
+    // keeping it here cost 14 columns and pushed the whole footer past 80.
+    let usage = render::TokenMeter {
+        turn_tokens: 0,
+        ..footer.token_usage
+    };
     // Narrow terminals: drop the cumulative total first, then the percent,
     // so the core context meter survives as long as possible.
     let mut right_plain = String::new();
     for (with_cumulative, with_percent) in [(true, true), (false, true), (false, false)] {
-        right_plain = render::format_token_usage_inline_opts(
-            usage.turn_tokens,
-            usage.cached_tokens,
-            usage.session_tokens,
-            usage.context_window,
-            usage.cumulative_tokens.filter(|_| with_cumulative),
-            with_percent,
-        );
+        let meter = render::TokenMeter {
+            cumulative_tokens: usage.cumulative_tokens.filter(|_| with_cumulative),
+            ..usage
+        };
+        right_plain = render::format_token_usage_inline_opts(&meter, with_percent);
         let left_room = cols
             .saturating_sub(bar_width)
             .saturating_sub(visible_width(&right_plain));
@@ -5483,7 +5512,7 @@ async fn try_run_remote_chat(
                 if let Some(live) = live.as_deref_mut() {
                     if live.external_output_active {
                         live.external_output_active = false;
-                        live.output_cursor = cursor::position()?;
+                        live.output_cursor = cursor_position_or(live.output_cursor);
                         live.resume_at(live.output_cursor)?;
                         live.apply_renderer_frame(&mut renderer)?;
                     }
@@ -5578,7 +5607,7 @@ async fn try_run_remote_chat(
                 }
                 if let Some(live) = live.as_deref_mut() {
                     live.external_output_active = false;
-                    live.output_cursor = cursor::position()?;
+                    live.output_cursor = cursor_position_or(live.output_cursor);
                     live.resume_at(live.output_cursor)?;
                 }
             }
@@ -7611,7 +7640,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         live_repl.editor.cursor = live_repl.editor.input.chars().count();
                         live_repl.editor.history_clean_index = None;
                     }
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
                     footer.update_context_window(state.context_window);
                     footer.update_cumulative_tokens(cumulative_tokens);
@@ -7677,7 +7706,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     } else {
                         repl_note(&mut live_repl, &repl_nothing_to_pop_text())?;
                     }
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
                     footer.update_context_window(state.context_window);
                     footer.update_cumulative_tokens(cumulative_tokens);
@@ -7861,9 +7890,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 if let Ok((state, _)) =
                     repl_active_or_default_state(paths, &active_session_id).await
                 {
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
-                    footer.update_cumulative_tokens(state.cumulative_tokens);
+                    footer.update_cumulative_tokens(state_cumulative(&state));
                     footer.update_context_window(state.context_window);
                 }
             }
@@ -8411,7 +8440,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 }
                 // An interrupted turn is persisted and will be replayed into
                 // the next request, so the context meter must reflect it.
-                cumulative_tokens = state.session_cumulative_tokens().unwrap_or(cumulative_tokens);
+                cumulative_tokens = state
+                    .session_cumulative_token_totals()
+                    .unwrap_or(cumulative_tokens);
                 footer.update_session_tokens(agent.effective_context_tokens()?);
                 footer.update_cumulative_tokens(cumulative_tokens);
             }
@@ -8422,7 +8453,9 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                         live.reload_queue(&state)
                     })?;
                 }
-                cumulative_tokens = state.session_cumulative_tokens().unwrap_or(cumulative_tokens);
+                cumulative_tokens = state
+                    .session_cumulative_token_totals()
+                    .unwrap_or(cumulative_tokens);
                 footer.update_session_tokens(agent.effective_context_tokens()?);
                 footer.update_cumulative_tokens(cumulative_tokens);
                 continue;
@@ -9886,7 +9919,7 @@ impl LiveReplTail {
             footer,
             jobs: Vec::new(),
             job_spinner: 0,
-            output_cursor: cursor::position()?,
+            output_cursor: cursor_position_or((0, 0)),
             tail_start: 0,
             tail_rows: 0,
             input_cursor: (0, 0),
@@ -9979,7 +10012,7 @@ impl LiveReplTail {
     }
 
     fn resume(&mut self) -> Result<()> {
-        self.resume_at(cursor::position()?)
+        self.resume_at(cursor_position_or(self.output_cursor))
     }
 
     fn resume_at(&mut self, (output_col, output_row): (u16, u16)) -> Result<()> {
@@ -10077,7 +10110,7 @@ impl LiveReplTail {
         // editor with the cursor hidden and then exited early). This is
         // the single convergence point for every editor redraw, so an
         // unconditional Show here prevents a permanently invisible cursor.
-        self.input_cursor = cursor::position()?;
+        self.input_cursor = cursor_position_or(self.input_cursor);
         if !job_lines.is_empty() {
             let mut stdout = io::stdout();
             let mut job_row = input_row.saturating_add(rendered_rows);
@@ -10108,7 +10141,7 @@ impl LiveReplTail {
         if !self.rendered {
             io::stdout().write_all(frame)?;
             io::stdout().flush()?;
-            self.output_cursor = cursor::position()?;
+            self.output_cursor = cursor_position_or(self.output_cursor);
             return Ok(());
         }
 
@@ -10254,7 +10287,7 @@ impl LiveReplTail {
             &[(submission.display_content.as_str(), self.editor.mode)],
             true,
         )?;
-        self.output_cursor = cursor::position()?;
+        self.output_cursor = cursor_position_or(self.output_cursor);
         Ok(())
     }
 
@@ -10263,7 +10296,7 @@ impl LiveReplTail {
         self.editor.clear();
         self.suspend()?;
         write_committed_user_messages(&[("", mode)], true)?;
-        let output_cursor = cursor::position()?;
+        let output_cursor = cursor_position_or(self.output_cursor);
         self.output_cursor = output_cursor;
         self.resume_at(output_cursor)
     }
@@ -10285,7 +10318,7 @@ impl LiveReplTail {
         }
         queue!(stdout, Print("\r\n"))?;
         stdout.flush()?;
-        self.output_cursor = cursor::position()?;
+        self.output_cursor = cursor_position_or(self.output_cursor);
         let output_cursor = self.output_cursor;
         self.resume_at(output_cursor)
     }
@@ -10317,7 +10350,7 @@ impl LiveReplTail {
         write_committed_user_messages(&consumed, true)?;
         self.queued
             .retain(|prompt| !ids.contains(&prompt.prompt_id));
-        let output_cursor = cursor::position()?;
+        let output_cursor = cursor_position_or(self.output_cursor);
         self.output_cursor = output_cursor;
         self.resume_at(output_cursor)
     }
@@ -10436,7 +10469,7 @@ fn write_committed_user_messages(messages: &[(&str, AgentMode)], leading_gap: bo
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let (col, _) = cursor::position()?;
+    let col = cursor_col_or(0);
     if col > 0 {
         writeln!(stdout)?;
     }
@@ -10874,9 +10907,15 @@ fn spawn_jobs_poll_thread(paths: MiyuPaths) -> std::sync::Arc<SharedJobsFeed> {
                 })
                 .unwrap_or_default();
             let mut jobs = jobs;
-            retain_session_jobs(&mut jobs, feed.repl_session.lock().unwrap().as_deref());
+            let repl_session = { feed.repl_session.lock().unwrap().clone() };
+            retain_session_jobs(&mut jobs, repl_session.as_deref());
             *feed.jobs.lock().unwrap() = jobs;
             *feed.wake_runs.lock().unwrap() = wake_runs;
+            if let (Some(store), Some(session)) = (store.as_ref(), repl_session.as_deref()) {
+                if let Ok(totals) = store.pinned(session).session_cumulative_token_totals() {
+                    *feed.cumulative.lock().unwrap() = Some(totals);
+                }
+            }
             if let (Some(store), Some(session_id)) = (store.as_ref(), session_id) {
                 let watermark = match seen.entry(session_id.clone()) {
                     std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -10998,7 +11037,10 @@ fn read_live_repl_input(
                     return Ok(LiveReplOutcome::FollowWake { run_id, label });
                 }
             }
-            if live.set_jobs(jobs_feed.current()) {
+            let cumulative_changed = jobs_feed
+                .cumulative()
+                .is_some_and(|totals| live.footer.update_cumulative_tokens(totals));
+            if live.set_jobs(jobs_feed.current()) || cumulative_changed {
                 synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?;
             } else {
                 live.tick_job_strip()?;
@@ -11097,7 +11139,7 @@ async fn follow_wake_run(
         };
         queue!(stdout, Print(format!("\x1b[2m{header}\x1b[0m\r\n\r\n")))?;
         stdout.flush()?;
-        live.output_cursor = cursor::position()?;
+        live.output_cursor = cursor_position_or(live.output_cursor);
         let output_cursor = live.output_cursor;
         live.resume_at(output_cursor)?;
     }
@@ -11553,7 +11595,7 @@ fn read_repl_input(
     let mut history_index = history.len();
     let mut history_clean_index: Option<usize> = None;
     let plain_prefix = "  ";
-    let (cursor_col, _) = cursor::position()?;
+    let cursor_col = cursor_col_or(0);
     if cursor_col != 0 {
         writeln!(stdout)?;
         stdout.flush()?;
@@ -11561,7 +11603,7 @@ fn read_repl_input(
     terminal::enable_raw_mode()?;
     execute!(stdout, EnableBracketedPaste)?;
     let mut keyboard_enhancement = KeyboardEnhancementState::enable(&mut stdout);
-    let (_, mut input_row) = cursor::position()?;
+    let mut input_row = cursor_row_or(0);
     let mut rendered_rows = 0u16;
     let mut is_pasted = false;
     let mut pasted_images: Vec<Option<crate::clipboard::PastedImage>> = Vec::new();
@@ -14335,9 +14377,66 @@ mod repl_input_tests {
     }
 
     #[test]
+    fn an_idle_tick_only_redraws_when_the_cumulative_actually_moved() {
+        let config = AppConfig::default();
+        let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
+        let totals = TurnTokens {
+            total: 32_808,
+            prompt: 29_035,
+            cache_read: 17_664,
+        };
+        assert!(footer.update_cumulative_tokens(totals));
+        // The jobs poll republishes the same Σ every second; redrawing the
+        // whole tail on each of those would fight the strip animation.
+        assert!(!footer.update_cumulative_tokens(totals));
+
+        // A background subagent finishing moves only the cache halves — the
+        // total can stay put when its usage was estimated, so equality has to
+        // consider all three.
+        assert!(footer.update_cumulative_tokens(TurnTokens {
+            cache_read: 20_000,
+            ..totals
+        }));
+    }
+
+    #[test]
+    fn the_footer_leaves_the_per_turn_figure_to_the_token_line() {
+        let config = AppConfig::default();
+        let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
+        footer.set_token_usage_with_cache(
+            TurnTokens {
+                total: 21_224,
+                prompt: 16_139,
+                cache_read: 6_528,
+            },
+            21_700,
+            Some(1_000_000),
+            TurnTokens {
+                total: 180_100,
+                prompt: 47_538,
+                cache_read: 11_392,
+            },
+        );
+
+        let line =
+            strip_terminal_control_sequences(&repl_footer_line(AgentMode::Normal, &footer, 80));
+        // Two standing gauges only. Carrying the turn figure as well cost 14
+        // columns and pushed the whole footer past 80.
+        assert!(line.contains("21.7k/1M(2.2%)"), "{line}");
+        assert!(line.contains("Σ180.1k(C24%)"), "{line}");
+        assert!(!line.contains("21.2k"), "{line}");
+        assert!(!line.contains("C40%"), "{line}");
+        assert!(
+            visible_width(&line) <= 80,
+            "footer must fit 80 columns: {} — {line}",
+            visible_width(&line)
+        );
+    }
+
+    #[test]
     fn footer_variant_always_uses_the_fixed_primary_color() {
         let config = AppConfig::default();
-        let mut footer = ReplFooterStatus::from_config(&config, 0, None);
+        let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
         footer.update_thinking_variant(Some("high"));
 
         for mode in [AgentMode::Normal, AgentMode::Plan, AgentMode::Chat] {
