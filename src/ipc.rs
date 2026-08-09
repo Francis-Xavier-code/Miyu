@@ -250,10 +250,17 @@ pub enum Command {
     GetSessionState {
         target: SessionRef,
     },
+    /// Re-initializes one conversation: history, queue, per-session usage and
+    /// the recall caches that belong to it. Only ever sent by the first-party
+    /// frontends (CLI, REPL, WebUI) — platform sessions are rejected upstream
+    /// and clear themselves through `ClearSessionContent`.
     ResetConversation {
-        all: bool,
         target: SessionRef,
     },
+    /// Erases everything the persona accumulated: memory, every session's
+    /// contents, group-chat contexts and auto-generated skills. Configuration
+    /// is untouched. Irreversible; every frontend confirms before sending it.
+    WipePersona,
     Undo {
         target: SessionRef,
     },
@@ -1415,14 +1422,12 @@ mod tests {
     #[test]
     fn admin_commands_round_trip_with_explicit_state() {
         let request = Request::new(Command::ResetConversation {
-            all: true,
             target: SessionRef::Id {
                 id: "sess_local".to_string(),
             },
         });
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["command"], "reset_conversation");
-        assert_eq!(value["all"], true);
         assert_eq!(value["target"]["kind"], "id");
         assert_eq!(value["target"]["id"], "sess_local");
         assert_eq!(PROTOCOL_VERSION, 3);

@@ -2757,32 +2757,6 @@ async fn execute_builtin_command(
                 return None;
             } else if scope.is_none() {
                 commands::reset_usage_message(&context.config.platforms)
-            } else if scope == Some(commands::ResetScope::All) {
-                match reset_platform_persona_state(state, &context.config).await {
-                    Ok(_) => t(
-                        "All active conversations, QQ contexts, memory, and generated skills for the current persona have been cleared.",
-                        "当前人格的全部活动会话、QQ 上下文、记忆和自动技能已清空。",
-                    )
-                    .to_string(),
-                    Err(PlatformPersonaResetError::Busy) => t(
-                        "Miyu is busy. Try resetting all conversations again shortly.",
-                        "Miyu 正忙，请稍后重试重置全部会话。",
-                    )
-                    .to_string(),
-                    Err(PlatformPersonaResetError::Unavailable) => t(
-                        "The reset service is temporarily unavailable.",
-                        "重置服务暂时不可用。",
-                    )
-                    .to_string(),
-                    Err(PlatformPersonaResetError::Internal(error)) => {
-                        tracing::warn!(target: "miyu::qq", %error, "{}", t("resetting all QQ persona conversations failed", "重置 QQ 人格的全部会话失败"));
-                        t(
-                            "All conversations could not be reset. Check the daemon logs for details.",
-                            "无法重置全部会话，请查看 daemon 日志。",
-                        )
-                        .to_string()
-                    }
-                }
             } else {
                 match resolve_onebot_session(state, context, target, event) {
                     Err(error) => {
@@ -2847,6 +2821,42 @@ async fn execute_builtin_command(
                                 .to_string()
                             }
                         }
+                    }
+                }
+            }
+        }
+        commands::ParsedPlatformCommand::Wipe { confirmed } => {
+            let descriptor = commands::descriptor(commands::WIPE_COMMAND_ID)
+                .expect("the wipe command descriptor is registered");
+            if !commands::is_allowed(&context.config.platforms, descriptor, context.is_admin) {
+                return None;
+            }
+            if !confirmed {
+                commands::wipe_confirm_message(&context.config.platforms)
+            } else {
+                match reset_platform_persona_state(state, &context.config).await {
+                    Ok(_) => t(
+                        "Memory, every conversation's contents, group-chat contexts and generated skills for the current persona have been erased.",
+                        "当前人格的记忆、全部会话内容、群聊上下文和自动技能已抹掉。",
+                    )
+                    .to_string(),
+                    Err(PlatformPersonaResetError::Busy) => t(
+                        "Miyu is busy. Try again shortly.",
+                        "Miyu 正忙，请稍后重试。",
+                    )
+                    .to_string(),
+                    Err(PlatformPersonaResetError::Unavailable) => t(
+                        "The wipe service is temporarily unavailable.",
+                        "抹除服务暂时不可用。",
+                    )
+                    .to_string(),
+                    Err(PlatformPersonaResetError::Internal(error)) => {
+                        tracing::warn!(target: "miyu::qq", %error, "{}", t("wiping the QQ persona state failed", "抹除 QQ 人格状态失败"));
+                        t(
+                            "The wipe could not be completed. Check the daemon logs for details.",
+                            "抹除未能完成，请查看 daemon 日志。",
+                        )
+                        .to_string()
                     }
                 }
             }
@@ -7776,7 +7786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_all_clears_active_persona_state_and_preserves_archived_local_sessions() {
+    async fn wipe_clears_active_persona_state_and_preserves_archived_local_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let (state, actor_join) =
             DaemonState::for_test_with_actor(test_paths(temp.path()), 8300).unwrap();
@@ -7837,12 +7847,30 @@ mod tests {
             &context,
             target,
             &event,
-            commands::ParsedPlatformCommand::Reset {
-                scope: Some(commands::ResetScope::All),
-            },
+            commands::ParsedPlatformCommand::Wipe { confirmed: false },
         )
         .await
-        .expect("authorized reset all returns a response");
+        .expect("an unconfirmed wipe answers with what it would erase");
+        let asked = format!("{:?}", response.body);
+        assert!(asked.contains("confirm"), "{asked}");
+        // Nothing may be gone yet: the word `confirm` is the only dialog box a
+        // chat platform gets.
+        assert!(!state
+            .state_store
+            .pinned(&active.session_id)
+            .load_turns()
+            .unwrap()
+            .is_empty());
+
+        let response = execute_builtin_command(
+            &state,
+            &context,
+            target,
+            &event,
+            commands::ParsedPlatformCommand::Wipe { confirmed: true },
+        )
+        .await
+        .expect("a confirmed wipe returns a response");
 
         assert!(matches!(response.body, OutboundBody::Segments(_)));
         assert!(state

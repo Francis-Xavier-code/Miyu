@@ -531,8 +531,6 @@ pub(crate) enum ActorCommand {
     },
     ResetConversation {
         session_id: Arc<str>,
-        all: bool,
-        reset_shared_state: bool,
         reply: oneshot::Sender<std::result::Result<(), AdminFailure>>,
     },
     ResetPersonaState {
@@ -2263,8 +2261,7 @@ async fn handle_ipc_connection(
                 }
             }
         }
-        IpcCommand::ResetConversation { all, target } => {
-            let reset_shared_state = matches!(&target, ipc::SessionRef::Current);
+        IpcCommand::ResetConversation { target } => {
             let target_record = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record,
                 Err(message) => {
@@ -2280,8 +2277,6 @@ async fn handle_ipc_connection(
                 .actor_tx
                 .send(ActorCommand::ResetConversation {
                     session_id: session_id.clone(),
-                    all,
-                    reset_shared_state,
                     reply,
                 })
                 .is_err()
@@ -2306,6 +2301,35 @@ async fn handle_ipc_connection(
                 Err(_) => {
                     release_admin(&state.manager);
                     anyhow::bail!("Miyu core stopped while resetting the conversation");
+                }
+            }
+        }
+        IpcCommand::WipePersona => {
+            let config = state.manager.lock().unwrap().config.clone();
+            let current = state.state_store.session_id().to_string();
+            match reset_platform_persona_state(&state, &config).await {
+                Ok(sessions) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::AdminResult {
+                            state: session_state_for(&state, &current)?,
+                            data: json!({ "sessions": sessions }),
+                        },
+                    )
+                    .await?;
+                }
+                Err(PlatformPersonaResetError::Busy) => {
+                    ipc::send(
+                        &mut stream,
+                        &IpcFrame::coded_error(ipc::ErrorCode::Busy, ipc::ADMIN_BUSY_MESSAGE),
+                    )
+                    .await?;
+                }
+                Err(PlatformPersonaResetError::Unavailable) => {
+                    anyhow::bail!("Miyu core worker is unavailable");
+                }
+                Err(PlatformPersonaResetError::Internal(message)) => {
+                    ipc::send(&mut stream, &IpcFrame::error(message)).await?;
                 }
             }
         }
@@ -5550,8 +5574,6 @@ async fn reset_conversation(
         .actor_tx
         .send(ActorCommand::ResetConversation {
             session_id: session_id.into(),
-            all: false,
-            reset_shared_state: false,
             reply,
         })
         .is_err()
@@ -5820,12 +5842,7 @@ async fn actor_loop(
                 release_admin(&manager);
                 let _ = reply.send(result);
             }
-            ActorCommand::ResetConversation {
-                session_id,
-                all,
-                reset_shared_state,
-                reply,
-            } => {
+            ActorCommand::ResetConversation { session_id, reply } => {
                 let result = reset_actor_conversation(
                     &mut agent,
                     &config,
@@ -5834,8 +5851,6 @@ async fn actor_loop(
                     &manager,
                     &events,
                     &session_id,
-                    all,
-                    reset_shared_state,
                 );
                 release_admin(&manager);
                 let _ = reply.send(result);
@@ -7165,23 +7180,24 @@ fn reset_actor_conversation(
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
     session_id: &str,
-    all: bool,
-    reset_shared_state: bool,
 ) -> std::result::Result<(), AdminFailure> {
+    // "Reset" means the conversation starts over, so everything scoped to it
+    // goes: history, per-session usage, and the recall caches that only make
+    // sense against that history. This used to be gated on a flag that was
+    // really asking "did the caller address the session as `Current`?" — an
+    // implementation detail of each frontend, which left `/reset` and the
+    // WebUI clearing strictly less than `miyu reset`. Platform sessions never
+    // reach this command (both entry points reject them) and clear themselves
+    // through `ClearSessionContent`, so there is nothing left for a flag to
+    // protect.
     let mut reset = || -> Result<Option<ContextSnapshot>> {
         let store = state_store.pinned(session_id);
         store.clear_session_content()?;
-        if reset_shared_state {
-            store.reset_conversation_usage()?;
-            let memory = MemoryStore::new(config, paths);
-            if all {
-                memory.reset_all(false)?;
-            } else {
-                memory.clear_evicted_context()?;
-                memory.clear_pending_events()?;
-            }
-            tools::clear_aur_review_state(paths)?;
-        }
+        store.reset_conversation_usage()?;
+        let memory = MemoryStore::new(config, paths);
+        memory.clear_evicted_context()?;
+        memory.clear_pending_events()?;
+        tools::clear_aur_review_state(paths)?;
         if &*state_store.session_id() == session_id {
             if let Some(agent) = agent.as_mut() {
                 agent.reset_memory()?;

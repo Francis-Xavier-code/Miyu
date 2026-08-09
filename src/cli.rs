@@ -622,8 +622,13 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         ("skills", "Manage assistant skills", "管理助手 skills"),
         (
             "reset",
-            "Clear current conversation history",
-            "清空当前会话历史",
+            "Start the current conversation over",
+            "重新开始当前会话",
+        ),
+        (
+            "wipe",
+            "Erase memory, all conversations, group contexts and generated skills",
+            "抹掉记忆、所有会话内容、群聊上下文和自动技能",
         ),
         (
             "new",
@@ -677,7 +682,6 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         .mut_subcommand("memory", localize_memory_command)
         .mut_subcommand("skills", localize_skills_command)
         .mut_subcommand("config", localize_config_command)
-        .mut_subcommand("reset", localize_reset_command)
         .mut_subcommand("web", localize_web_command)
         .mut_subcommand("daemon", localize_daemon_command)
         .mut_subcommand("export", localize_export_command)
@@ -795,15 +799,6 @@ fn localize_config_command(command: clap::Command) -> clap::Command {
         .mut_subcommand("paths", |subcommand| {
             subcommand.about(t("Show configuration paths", "显示配置路径"))
         })
-}
-
-fn localize_reset_command(command: clap::Command) -> clap::Command {
-    command.mut_arg("scope", |arg| {
-        arg.help(t(
-            "all also clears long-term memory",
-            "all 同时清空长期记忆",
-        ))
-    })
 }
 
 fn localize_web_command(command: clap::Command) -> clap::Command {
@@ -1006,7 +1001,8 @@ pub enum Command {
     UpdateDefaultKb,
     Memory(MemoryArgs),
     Skills(SkillsArgs),
-    Reset(ResetArgs),
+    Reset,
+    Wipe(WipeArgs),
     New(SessionNameArgs),
     Session(SessionTargetArgs),
     Rename(SessionRenameArgs),
@@ -1044,8 +1040,10 @@ pub struct MessageArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ResetArgs {
-    pub scope: Option<String>,
+pub struct WipeArgs {
+    /// 跳过确认（供 shell hook 等非交互场景使用）。
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -1473,27 +1471,22 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::UpdateDefaultKb) => run_update_default_kb(&paths).await,
         Some(Command::Memory(args)) => run_memory(&paths, args),
         Some(Command::Skills(args)) => run_skills(&paths, args),
-        Some(Command::Reset(args)) => {
-            let all = match args.scope.as_deref() {
-                None => false,
-                Some("all") => true,
-                Some(scope) => bail!("{}: {scope}", t("unknown reset scope", "未知 reset 范围")),
-            };
+        Some(Command::Reset) => {
             if ipc::daemon_info(&paths).await.is_some() {
                 send_ipc_admin(
                     &paths,
                     IpcCommand::ResetConversation {
-                        all,
                         target: crate::ipc::SessionRef::Current,
                     },
                 )
                 .await?;
-                print_reset_message(all);
             } else {
-                run_reset(&paths, args.scope.as_deref()).await?;
+                run_reset(&paths).await?;
             }
+            print_reset_message();
             Ok(())
         }
+        Some(Command::Wipe(args)) => run_wipe(&paths, args.yes).await,
         Some(Command::New(args)) => run_session_new(&paths, args).await,
         Some(Command::Session(args)) => run_session_command(&paths, args).await,
         Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
@@ -6140,6 +6133,14 @@ fn session_list_line(index: usize, entry: &SessionListEntry, ansi: bool) -> Stri
     }
 }
 
+/// Repaints the queued-prompt strip from the store. A reset deletes those rows
+/// underneath the REPL, so without this the strip keeps showing prompts that no
+/// longer exist.
+fn reload_repl_queue(live: &mut LiveReplTail, paths: &MiyuPaths, session_id: &str) -> Result<()> {
+    let store = StateStore::new(paths)?.pinned(session_id);
+    synchronized_terminal_update(CursorAfterUpdate::Shown, || live.reload_queue(&store))
+}
+
 fn confirm_inline(live: &mut LiveReplTail, prompt: &str) -> Result<bool> {
     live.apply_output_frame(format!("{prompt} [y/N] ").as_bytes())?;
     let mut answer = String::new();
@@ -7787,32 +7788,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             ),
                         )?;
                     }
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
                     footer.update_context_window(state.context_window);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::Reset => {
-                    let scope = command_args.trim();
-                    let all = if scope.is_empty() {
-                        false
-                    } else if scope.eq_ignore_ascii_case("all") {
-                        true
-                    } else {
-                        repl_note(
-                            &mut live_repl,
-                            &format!(
-                                "\x1b[2m{}: {scope}\x1b[0m\n",
-                                t("unknown reset scope", "未知 reset 范围")
-                            ),
-                        )?;
-                        continue;
-                    };
                     let Some((state, _)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
                         IpcCommand::ResetConversation {
-                            all,
                             target: crate::ipc::SessionRef::Id {
                                 id: active_session_id.clone(),
                             },
@@ -7824,22 +7809,49 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     };
                     live_repl.editor.input.clear();
                     live_repl.editor.cursor = 0;
+                    // The footer numbers are only half of it: the loop's own Σ
+                    // accumulator has to go too, or the next config reload
+                    // rebuilds the footer from the pre-reset total. The queue
+                    // rows were deleted in the store, so the strip has to be
+                    // reloaded rather than left showing them.
+                    cumulative_tokens = TurnTokens::default();
                     footer.reset_token_usage(state.context_tokens, state.context_window);
-                    let note = if all {
-                        format!(
-                            "\x1b[2m{}\x1b[0m\n",
-                            t(
-                                "cleared all active conversations, QQ contexts, memory, and generated skills for the current persona",
-                                "已清空当前人格的全部活动会话、QQ 上下文、记忆和自动技能"
-                            )
-                        )
-                    } else {
-                        format!(
+                    reload_repl_queue(&mut live_repl, paths, &active_session_id)?;
+                    repl_note(
+                        &mut live_repl,
+                        &format!(
                             "\x1b[2m{}\x1b[0m\n",
                             t("cleared current conversation history", "已清空当前会话历史")
-                        )
+                        ),
+                    )?;
+                }
+                ReplSlashCommand::Wipe => {
+                    repl_note(
+                        &mut live_repl,
+                        &format!("\x1b[2m{}\x1b[0m\n", wipe_summary()),
+                    )?;
+                    if !confirm_inline(&mut live_repl, t("wipe everything?", "确认全部抹掉？"))?
+                    {
+                        repl_note(
+                            &mut live_repl,
+                            &format!("\x1b[2m{}\x1b[0m\n", t("cancelled", "已取消")),
+                        )?;
+                        continue;
+                    }
+                    let Some((state, _)) =
+                        repl_ipc_admin(paths, &mut live_repl, IpcCommand::WipePersona).await?
+                    else {
+                        continue;
                     };
-                    repl_note(&mut live_repl, &note)?;
+                    live_repl.editor.input.clear();
+                    live_repl.editor.cursor = 0;
+                    cumulative_tokens = TurnTokens::default();
+                    footer.reset_token_usage(state.context_tokens, state.context_window);
+                    reload_repl_queue(&mut live_repl, paths, &active_session_id)?;
+                    repl_note(
+                        &mut live_repl,
+                        &format!("\x1b[2m{}\x1b[0m\n", print_wipe_message()),
+                    )?;
                 }
             }
             continue;
@@ -8293,22 +8305,26 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             continue;
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
-            run_reset(paths, None).await?;
+            run_reset(paths).await?;
             if let Some(live) = live_repl.as_mut() {
                 live.queued.clear();
             }
-            cumulative_tokens = 0;
+            cumulative_tokens = TurnTokens::default();
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
             continue;
         }
-        if command.eq_ignore_ascii_case("/reset") && command_args.trim().eq_ignore_ascii_case("all")
-        {
-            run_reset(paths, Some("all")).await?;
+        if command.eq_ignore_ascii_case("/wipe") {
+            println!("{}", wipe_summary());
+            if !confirm_stdin(t("wipe everything?", "确认全部抹掉？"))? {
+                println!("{}", t("cancelled", "已取消"));
+                continue;
+            }
+            run_wipe(paths, true).await?;
             if let Some(live) = live_repl.as_mut() {
                 live.queued.clear();
             }
             agent.reset_memory()?;
-            cumulative_tokens = 0;
+            cumulative_tokens = TurnTokens::default();
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
             continue;
         }
@@ -12999,6 +13015,7 @@ enum ReplSlashCommand {
     Pop,
     Compact,
     Reset,
+    Wipe,
     History,
     Clear,
     Help,
@@ -13119,9 +13136,16 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
     ReplCommandSpec {
         name: "/reset",
         command: ReplSlashCommand::Reset,
-        arg_hint: "[all]",
-        help_en: "clear current conversation history; all also clears memory",
-        help_zh: "清空当前会话历史；all 同时清空记忆",
+        arg_hint: "",
+        help_en: "start this conversation over",
+        help_zh: "重新开始当前会话",
+    },
+    ReplCommandSpec {
+        name: "/wipe",
+        command: ReplSlashCommand::Wipe,
+        arg_hint: "",
+        help_en: "erase memory, every conversation, group contexts and generated skills",
+        help_zh: "抹掉记忆、所有会话内容、群聊上下文和自动技能",
     },
     ReplCommandSpec {
         name: "/history",
@@ -15185,6 +15209,27 @@ mod repl_input_tests {
     }
 
     #[test]
+    fn wipe_is_its_own_command_not_a_suffix_on_reset() {
+        // `/reset` and `/reset all` differed by one word and by everything
+        // else: one starts a conversation over, the other erased memory, every
+        // session and the generated skills. They answer under separate names
+        // now, and `/wipe` is far enough from `/w…` prefixes to be typed on
+        // purpose.
+        assert!(matches!(
+            parse_repl_input("/wipe"),
+            ReplInput::Slash(ReplSlashCommand::Wipe, "")
+        ));
+        assert!(matches!(
+            parse_repl_input("/reset"),
+            ReplInput::Slash(ReplSlashCommand::Reset, "")
+        ));
+        assert!(matches!(
+            parse_repl_input("/reset all"),
+            ReplInput::Slash(ReplSlashCommand::Reset, "all")
+        ));
+    }
+
+    #[test]
     fn partial_slash_command_resolves_unique_match() {
         assert_eq!(resolve_repl_command("/model"), "/models");
         assert_eq!(resolve_repl_command("/compa"), "/compact");
@@ -15696,16 +15741,46 @@ fn skill_dir(paths: &MiyuPaths, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-async fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
-    let all = match scope {
-        None => false,
-        Some("all") => true,
-        Some(scope) => bail!("{}: {scope}", t("unknown reset scope", "未知 reset 范围")),
-    };
+async fn run_reset(paths: &MiyuPaths) -> Result<()> {
     let config = AppConfig::load_or_default(paths)?;
     let state = StateStore::new(paths)?;
     let memory = MemoryStore::new(&config, paths);
-    if all {
+    state.reset_conversation()?;
+    memory.clear_evicted_context()?;
+    memory.clear_pending_events()?;
+    tools::clear_aur_review_state(paths)?;
+    Ok(())
+}
+
+fn wipe_summary() -> &'static str {
+    t(
+        "This erases everything Miyu has accumulated: memory, every conversation's contents, group-chat contexts, and auto-generated skills. It cannot be undone.",
+        "这会抹掉 Miyu 积累的一切：记忆、所有会话的内容、群聊上下文、自动生成的技能。不可撤销。",
+    )
+}
+
+async fn run_wipe(paths: &MiyuPaths, assume_yes: bool) -> Result<()> {
+    if !assume_yes {
+        if !io::stdin().is_terminal() {
+            bail!(
+                "{}",
+                t(
+                    "wipe needs a terminal to confirm; pass --yes to run it unattended",
+                    "wipe 需要在终端确认；非交互场景请加 --yes"
+                )
+            );
+        }
+        println!("{}", wipe_summary());
+        if !confirm_stdin(t("wipe everything?", "确认全部抹掉？"))? {
+            println!("{}", t("cancelled", "已取消"));
+            return Ok(());
+        }
+    }
+    if ipc::daemon_info(paths).await.is_some() {
+        send_ipc_admin(paths, IpcCommand::WipePersona).await?;
+    } else {
+        let config = AppConfig::load_or_default(paths)?;
+        let state = StateStore::new(paths)?;
         let persona = config.active_persona_scope();
         let bindings = state.platform_session_bindings(&persona, "onebot")?;
         let plugins = crate::platforms::plugins::PlatformPluginRegistry::built_in()?;
@@ -15718,26 +15793,22 @@ async fn run_reset(paths: &MiyuPaths, scope: Option<&str>) -> Result<()> {
             .await?;
         state.reset_persona_contexts(&persona, "onebot")?;
         state.reset_conversation_usage()?;
-        memory.reset_all(true)?;
-    } else {
-        state.reset_conversation()?;
-        memory.clear_evicted_context()?;
-        memory.clear_pending_events()?;
+        MemoryStore::new(&config, paths).reset_all(true)?;
+        tools::clear_aur_review_state(paths)?;
     }
-    tools::clear_aur_review_state(paths)?;
-    print_reset_message(all);
+    println!("{}", print_wipe_message());
     Ok(())
 }
 
-fn print_reset_message(all: bool) {
-    let message = if all {
-        t(
-            "cleared all active conversations, QQ contexts, memory, and generated skills for the current persona",
-            "已清空当前人格的全部活动会话、QQ 上下文、记忆和自动技能",
-        )
-    } else {
-        t("cleared current conversation history", "已清空当前会话历史")
-    };
+fn print_wipe_message() -> &'static str {
+    t(
+        "erased all conversations, QQ contexts, memory, and generated skills for the current persona",
+        "已抹掉当前人格的全部会话内容、QQ 上下文、记忆和自动技能",
+    )
+}
+
+fn print_reset_message() {
+    let message = t("cleared current conversation history", "已清空当前会话历史");
     println!("\x1b[2m{message}\x1b[0m\n");
 }
 
