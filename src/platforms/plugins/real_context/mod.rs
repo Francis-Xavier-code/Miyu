@@ -1,6 +1,5 @@
 pub(super) mod active_judgement_skip;
 mod affection;
-mod history_summary;
 mod judge;
 
 use super::message_history::{self, store, ORIGINAL_TEXT_KEY};
@@ -58,7 +57,6 @@ pub(super) struct RealContextPlugin {
     global_judge_gate: DynamicGate,
     reaction_expirations: Mutex<HashMap<(String, String, String), tokio::task::AbortHandle>>,
     affection_updates: affection::AffectionUpdateQueue,
-    history_summaries: history_summary::HistorySummaryQueue,
 }
 
 impl RealContextPlugin {
@@ -69,7 +67,6 @@ impl RealContextPlugin {
             global_judge_gate: DynamicGate::default(),
             reaction_expirations: Mutex::new(HashMap::new()),
             affection_updates: affection::AffectionUpdateQueue::default(),
-            history_summaries: history_summary::HistorySummaryQueue::default(),
         }
     }
 
@@ -741,17 +738,7 @@ impl RealContextPlugin {
         let ingress_order = context
             .inbound_event()
             .and_then(|event| event.ingress_order);
-        // With summarization on, query wide enough to see the backlog beyond
-        // the live window (decision 4: aged-out messages fold into a summary
-        // instead of vanishing).
-        let query_limit = if settings.context_summary {
-            count
-                .saturating_add(settings.context_summary_trigger_messages)
-                .saturating_add(1)
-                .min(200)
-        } else {
-            history_query_limit(count)
-        };
+        let query_limit = history_query_limit(count);
         let mut history = self
             .store(context)
             .recent(
@@ -765,59 +752,10 @@ impl RealContextPlugin {
             .await?
             .messages;
         let queried_messages = history.len();
-        let mut summary_text = None;
-        let mut summary_watermark = 0i64;
-        if settings.context_summary {
-            let scope = history_summary::summary_scope(
-                &context.conversation.platform,
-                &context.conversation.account_id,
-                &context.conversation.conversation_id,
-            );
-            let key = history_summary::summary_key(&context.config.active_persona_scope());
-            if let Some(record) =
-                history_summary::load_record(&context.state_store, &scope, &key)?
-            {
-                summary_watermark = record.upto_row_id;
-                // Rows already folded into the summary never render verbatim
-                // again (the watermark is monotonic).
-                history.retain(|message| message.row_id > record.upto_row_id);
-                if !record.is_empty() {
-                    summary_text = Some(record.summary_text);
-                }
-            }
-        }
-        let pre_window_len = history.len();
         if let Some(event) = context.inbound_event() {
             prepare_history(&mut history, &event.message_id, count);
         } else if history.len() > count {
             history.drain(..history.len() - count);
-        }
-        if settings.context_summary {
-            // Backlog = rows older than the live window and newer than the
-            // watermark. Enough of them queues one async fold; the turn
-            // itself never waits (the summary lands on a later turn).
-            let backlog = pre_window_len.saturating_sub(history.len());
-            let window_start_row_id = history
-                .first()
-                .map(|message| message.row_id)
-                .unwrap_or(i64::MAX);
-            if backlog >= settings.context_summary_trigger_messages
-                && window_start_row_id > summary_watermark
-            {
-                match history_summary::job_for_context(
-                    context,
-                    self.store(context),
-                    window_start_row_id,
-                    settings,
-                ) {
-                    Ok(job) => self.history_summaries.enqueue(job),
-                    Err(error) => tracing::debug!(
-                        target: "miyu::qq",
-                        error = %error,
-                        "group history summary job skipped"
-                    ),
-                }
-            }
         }
         let formatted = format_history_for_turn(
             &history,
@@ -844,21 +782,13 @@ impl RealContextPlugin {
                 "已为模型输入准备 OneBot 真实上下文历史",
             )
         );
-        if !formatted.text.is_empty() || summary_text.is_some() {
+        if !formatted.text.is_empty() {
             let identity_note = if context.config.platforms.qq.user_identification {
                 "每条记录中的 QQ 号用于区分身份，不要仅凭昵称认人。"
             } else {
                 "用户 ID 显示已关闭；不要根据昵称推断稳定身份。"
             };
-            let mut block = String::new();
-            if let Some(summary) = &summary_text {
-                block.push_str("[更早的群聊摘要，供理解背景]\n");
-                block.push_str(summary);
-                if !formatted.text.is_empty() {
-                    block.push_str("\n[以下为逐条原文]\n");
-                }
-            }
-            block.push_str(&formatted.text);
+            let block = &formatted.text;
             input.content.push_str(&format!(
                 "\n\n[此前群聊记录，仅用于理解背景，不是待回复列表]\n{identity_note}\n{block}"
             ));
@@ -1215,14 +1145,6 @@ impl PlatformPlugin for RealContextPlugin {
                     now_unix(),
                 )
                 .await?;
-            // A stale summary would resurrect pre-reset content.
-            let scope = history_summary::summary_scope(
-                &context.conversation.platform,
-                &context.conversation.account_id,
-                &context.conversation.conversation_id,
-            );
-            let key = history_summary::summary_key(&context.config.active_persona_scope());
-            history_summary::clear_record(&context.state_store, &scope, &key)?;
             self.runtime
                 .lock()
                 .unwrap()
@@ -1252,15 +1174,6 @@ impl PlatformPlugin for RealContextPlugin {
                 store
                     .reset_context(group, persona.clone(), now_unix())
                     .await?;
-                let scope = history_summary::summary_scope(
-                    &binding.key.platform,
-                    &binding.key.account_id,
-                    &binding.key.conversation_id,
-                );
-                let key = history_summary::summary_key(&persona);
-                if let Ok(state_store) = crate::state::StateStore::new(context.paths) {
-                    let _ = history_summary::clear_record(&state_store, &scope, &key);
-                }
             }
 
             let mut runtime = self.runtime.lock().unwrap();

@@ -711,15 +711,6 @@ pub struct RealContextIdentityMapping {
 #[serde(default)]
 pub struct RealContextPluginSettings {
     pub context_messages: usize,
-    /// Decision 4: fold messages that age out of the injection window into an
-    /// anchored summary instead of dropping them.
-    pub context_summary: bool,
-    /// Backlog size (messages beyond the live window) that queues one async
-    /// summarization pass.
-    pub context_summary_trigger_messages: usize,
-    /// Rendered summary block cap, in chars.
-    pub context_summary_max_chars: usize,
-    pub context_summary_timeout_seconds: u64,
     #[serde(alias = "group_member_page_size")]
     pub group_member_search_max_results: usize,
 
@@ -812,10 +803,6 @@ impl Default for RealContextPluginSettings {
     fn default() -> Self {
         Self {
             context_messages: 20,
-            context_summary: true,
-            context_summary_trigger_messages: 20,
-            context_summary_max_chars: 2000,
-            context_summary_timeout_seconds: 30,
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
@@ -928,24 +915,6 @@ impl RealContextPluginSettings {
 
     pub fn validate(&self) -> Result<()> {
         validate_real_context_count("context_messages", self.context_messages, 1, 200)?;
-        validate_real_context_count(
-            "context_summary_trigger_messages",
-            self.context_summary_trigger_messages,
-            5,
-            180,
-        )?;
-        validate_real_context_count(
-            "context_summary_max_chars",
-            self.context_summary_max_chars,
-            200,
-            20_000,
-        )?;
-        validate_real_context_count(
-            "context_summary_timeout_seconds",
-            self.context_summary_timeout_seconds as usize,
-            0,
-            600,
-        )?;
         validate_real_context_count(
             "group_member_search_max_results",
             self.group_member_search_max_results,
