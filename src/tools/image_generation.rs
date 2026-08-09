@@ -75,21 +75,24 @@ async fn generate_image(
     };
     let printed = should_render_terminal && print_error.is_none();
     let path_text = path.display().to_string();
+    // The reply used to be told to quote the absolute path back. On a chat
+    // platform that put the host's home directory in front of strangers — and
+    // bought nothing, because the image itself is delivered as its own
+    // attachment, independent of the text.
     Ok(json!({
         "status": "ok",
         "path": path_text,
-        "final_response_must_include_path": path.display().to_string(),
         "bytes": bytes.len(),
         "printed": printed,
         "print_error": print_error,
-        "assistant_instruction": if printed {
-            "The generated image has already been emitted to the host and printed in the terminal. In your final response, include the exact local image path from final_response_must_include_path. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it."
-        } else {
-            "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. In your final response, include the exact local image path from final_response_must_include_path."
-        }
+        "assistant_instruction": if printed { PRINTED_INSTRUCTION } else { EMITTED_INSTRUCTION }
     })
     .to_string())
 }
+
+const PRINTED_INSTRUCTION: &str = "The generated image has already been emitted to the host and printed in the terminal. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it. Do not put the local file path in your reply.";
+
+const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply.";
 
 async fn request_image(
     plugin: &ImageGenerationPluginConfig,
@@ -285,5 +288,32 @@ fn preview(value: &str, limit: usize) -> String {
         normalized
     } else {
         format!("{}...", normalized.chars().take(limit).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reply_is_never_asked_to_quote_the_local_path() {
+        // It used to be: the result carried `final_response_must_include_path`
+        // and both instructions ordered the model to repeat it. On a chat
+        // platform that published the host's home directory, and it bought
+        // nothing — the image rides as its own attachment, not as text.
+        for instruction in [PRINTED_INSTRUCTION, EMITTED_INSTRUCTION] {
+            assert!(
+                instruction.contains("Do not put the local file path in your reply"),
+                "{instruction}"
+            );
+            assert!(
+                !instruction.contains("include the exact local image path"),
+                "{instruction}"
+            );
+            assert!(
+                !instruction.contains("final_response_must_include_path"),
+                "{instruction}"
+            );
+        }
     }
 }
