@@ -27,6 +27,12 @@ pub struct ChatMessage {
     /// same tool loop. Never serialized into OpenAI-style JSON directly.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub thinking_signature: Option<String>,
+    /// Marks a block built by [`ChatMessage::turn_context`]: the transient tail
+    /// that gets fossilized into the turn record. Not part of the wire format
+    /// and not persisted — it only has to survive from construction until the
+    /// tail is sliced off, and reloaded fossils are replayed as stored.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub transient_context: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +93,7 @@ impl ChatMessage {
             tool_calls: None,
             reasoning_content: None,
             thinking_signature: None,
+            transient_context: false,
         }
     }
 
@@ -94,6 +101,33 @@ impl ChatMessage {
         Self {
             content: Some(ChatContent::Text(content.into())),
             ..Self::base("system")
+        }
+    }
+
+    /// A context block that rides inside the conversation rather than heading
+    /// it: runtime stamp, associative memory, hints, fossilized transient tail.
+    ///
+    /// Deliberately the `user` role, not `system`. Provider chat templates
+    /// gather every `system` message to the front of the rendered prompt, so
+    /// adding one *anywhere* mid-conversation shifts that front block and
+    /// invalidates the whole prefix cache behind it. Measured against DeepSeek
+    /// with a byte-identical prefix, single variable, same instant:
+    ///
+    /// | second request appends      | prefix cache hit |
+    /// |----------------------------|------------------|
+    /// | assistant + user           | 99%              |
+    /// | system + assistant + user  | 0%               |
+    /// | user(same text) + assistant + user | 99%      |
+    ///
+    /// Position made no difference — a `system` message appended at the very
+    /// end killed it just the same. The blocks carry their own XML-ish framing
+    /// (`<runtime …/>`, `<system-reminder>`, `<associative-memory>`), so the
+    /// model still reads them as context rather than as the user speaking.
+    pub fn turn_context(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(ChatContent::Text(content.into())),
+            transient_context: true,
+            ..Self::base("user")
         }
     }
 

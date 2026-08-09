@@ -1846,7 +1846,9 @@ impl Agent {
         if !self.turn_system_context.is_empty() {
             // Trusted transport/control tail (v7 §三): host-derived per-message
             // context lands after the user message, before untrusted blocks.
-            messages.push(ChatMessage::system(self.turn_system_context.join("\n\n")));
+            messages.push(ChatMessage::turn_context(
+                self.turn_system_context.join("\n\n"),
+            ));
         }
         messages.extend(prepared.hints);
         if self.mode != AgentMode::Chat {
@@ -1859,14 +1861,14 @@ impl Agent {
                 // front stays byte-identical for provider prefix caches. It
                 // lands after `replay_start`, so redo checkpoints freeze the
                 // recalled snapshot (decision 6).
-                messages.push(ChatMessage::system(
+                messages.push(ChatMessage::turn_context(
                     self.memory.format_association(&association),
                 ));
             }
         }
         if self.mode != AgentMode::Plan {
             if let Some(reminder) = memes::auto_meme_reminder(&self.config, &input) {
-                messages.push(ChatMessage::system(reminder));
+                messages.push(ChatMessage::turn_context(reminder));
             }
         }
         // v7 append-only fossilization ("注入了就别删"): archive the transient
@@ -2055,7 +2057,7 @@ impl Agent {
                     }
                 )
             };
-            hints.push(ChatMessage::system(hint));
+            hints.push(ChatMessage::turn_context(hint));
         }
         if !path_images.is_empty() && vision_tool_available {
             let list = path_images
@@ -2064,7 +2066,7 @@ impl Agent {
                 .map(|(index, path)| format!("  [Image {}] {}", index + 1, path))
                 .collect::<Vec<_>>()
                 .join("\n");
-            hints.push(ChatMessage::system(format!(
+            hints.push(ChatMessage::turn_context(format!(
                 "用户粘贴了 {} 张本地图片路径：\n{}\n你可以使用 vision_analyze 工具读取并分析这些图片。",
                 path_images.len(),
                 list
@@ -2077,7 +2079,7 @@ impl Agent {
                 .map(|image| image.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            hints.push(ChatMessage::system(format!(
+            hints.push(ChatMessage::turn_context(format!(
                 "此前群聊记录中有可按需查看的历史图片：{ids}。你尚未看到这些图片的实际内容；只有回答确实依赖图片时，才使用 vision_analyze，并把对应 ID 作为 image 参数。不得根据图片占位符猜测内容。"
             )));
         }
@@ -2845,11 +2847,11 @@ impl Agent {
                     continuation_context = Some((
                         index,
                         vec![
-                            ChatMessage::system(continuation_system_prompt(
+                            ChatMessage::turn_context(continuation_system_prompt(
                                 &self.system_prompt,
                                 self.mode,
                             )),
-                            ChatMessage::system(runtime_context(self.mode)),
+                            ChatMessage::turn_context(runtime_context(self.mode)),
                         ],
                     ));
                 }
@@ -3406,11 +3408,11 @@ impl Agent {
                         continuation_context = Some((
                             index,
                             vec![
-                                ChatMessage::system(continuation_system_prompt(
+                                ChatMessage::turn_context(continuation_system_prompt(
                                     &self.system_prompt,
                                     self.mode,
                                 )),
-                                ChatMessage::system(runtime_context(self.mode)),
+                                ChatMessage::turn_context(runtime_context(self.mode)),
                             ],
                         ));
                     }
@@ -3488,7 +3490,7 @@ impl Agent {
         // cache reuse at the end of the stored history (verified byte-level
         // against DeepSeek prefix caching).
         messages.push(ChatMessage::plain("user", current_input));
-        messages.push(ChatMessage::system(runtime_context(self.mode)));
+        messages.push(ChatMessage::turn_context(runtime_context(self.mode)));
         Ok(messages)
     }
 
@@ -3501,9 +3503,8 @@ impl Agent {
         // system messages that followed the user message in the live
         // request, byte-identical and in order, so this turn renders
         // as a pure extension of what the provider already cached.
-        messages.extend(turn.context_messages.iter().cloned());
-        if turn.status == crate::state::TurnStatus::Interrupted && !turn.journal_events.is_empty()
-        {
+        messages.extend(turn.context_messages.iter().map(replay_fossil));
+        if turn.status == crate::state::TurnStatus::Interrupted && !turn.journal_events.is_empty() {
             messages.extend(interrupted_turn_replay_messages(self, turn));
         } else {
             for exchange in &turn.question_exchanges {
@@ -3535,7 +3536,9 @@ impl Agent {
                 true,
             );
             if !turn.tool_reports.is_empty() {
-                messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
+                messages.push(ChatMessage::turn_context(private_tool_memory(
+                    &turn.tool_reports,
+                )));
             }
         }
     }
@@ -3956,13 +3959,30 @@ fn queued_prompt_images(prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>
 /// message so redo checkpoints (which append loop messages) never leak
 /// assistant/tool content into the fossil record.
 fn fossil_context_messages(tail: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Keyed on the explicit marker rather than the role: these blocks now ride
+    // as `user` messages (see `ChatMessage::turn_context`), which is
+    // indistinguishable by role from a real user turn.
     tail.iter()
         .take_while(|message| {
-            message.role == "system"
+            message.transient_context
                 && matches!(message.content.as_ref(), Some(ChatContent::Text(_)))
         })
         .cloned()
         .collect()
+}
+
+/// Fossils written before the role change are stored as `system`. Replaying
+/// them verbatim would keep re-poisoning the prefix for the rest of the
+/// session, so they are re-roled on the way out: one cold start at the upgrade
+/// boundary, byte-stable forever after.
+fn replay_fossil(message: &ChatMessage) -> ChatMessage {
+    if message.role != "system" {
+        return message.clone();
+    }
+    let mut message = message.clone();
+    message.role = "user".to_string();
+    message.transient_context = true;
+    message
 }
 
 fn replace_request_mode_context(
@@ -3973,14 +3993,15 @@ fn replace_request_mode_context(
     if let Some(system) = messages.first_mut() {
         *system = ChatMessage::system(system_prompt);
     }
+    // Role-agnostic on purpose: the live block is a `user` message now, while
+    // fossils written before the change are still `system`.
     if let Some(runtime) = messages.iter_mut().rev().find(|message| {
-        message.role == "system"
-            && matches!(
-                message.content.as_ref(),
-                Some(ChatContent::Text(content)) if content.starts_with("<runtime now=")
-            )
+        matches!(
+            message.content.as_ref(),
+            Some(ChatContent::Text(content)) if content.starts_with("<runtime now=")
+        )
     }) {
-        *runtime = ChatMessage::system(runtime_context(mode));
+        *runtime = ChatMessage::turn_context(runtime_context(mode));
     }
 }
 
@@ -4253,7 +4274,7 @@ fn push_assistant_message_with_reasoning(
         return;
     }
     if let Some(reasoning) = reasoning.and_then(private_reasoning_memory) {
-        messages.push(ChatMessage::system(reasoning));
+        messages.push(ChatMessage::turn_context(reasoning));
     }
     if force_assistant_message || !content.trim().is_empty() {
         messages.push(ChatMessage::assistant(content, None));
@@ -4293,7 +4314,9 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
         true,
     );
     if !turn.tool_reports.is_empty() {
-        messages.push(ChatMessage::system(private_tool_memory(&turn.tool_reports)));
+        messages.push(ChatMessage::turn_context(private_tool_memory(
+            &turn.tool_reports,
+        )));
     }
     overflow::estimate_messages_tokens(&messages)
 }
@@ -4323,7 +4346,7 @@ fn followup_assistant_replay_content(followup: &crate::state::TurnFollowup) -> O
 
 fn interrupted_turn_replay_messages(agent: &Agent, turn: &crate::state::Turn) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    messages.push(ChatMessage::system(
+    messages.push(ChatMessage::turn_context(
         "<interrupted-turn-recovery>上一轮回复已中断。以下内容是中断前已经持久化的模型输出和工具进度；不要重新执行已经完成的工具，基于这些内容继续处理当前用户请求。</interrupted-turn-recovery>",
     ));
 
@@ -4531,7 +4554,7 @@ fn flush_interrupted_assistant(
     }
     if !assistant_reasoning.trim().is_empty() {
         if let Some(reasoning) = private_reasoning_memory(assistant_reasoning) {
-            messages.push(ChatMessage::system(reasoning));
+            messages.push(ChatMessage::turn_context(reasoning));
         }
     }
     assistant_reasoning.clear();
@@ -6119,8 +6142,10 @@ mod tests {
             .set_turn_context_messages(
                 "old",
                 &[
-                    ChatMessage::system("<runtime now=\"frozen stamp\"/>"),
-                    ChatMessage::system("<associative-memory>frozen recall</associative-memory>"),
+                    ChatMessage::turn_context("<runtime now=\"frozen stamp\"/>"),
+                    ChatMessage::turn_context(
+                        "<associative-memory>frozen recall</associative-memory>",
+                    ),
                 ],
             )
             .unwrap();
@@ -6149,20 +6174,67 @@ mod tests {
             .unwrap();
         // The fossils sit, in order, strictly between the user message and the
         // assistant reply — byte-for-byte what the live request sent.
-        assert_eq!(messages[user + 1].role, "system");
+        assert_eq!(messages[user + 1].role, "user");
         assert!(text(&messages[user + 1]).contains("frozen stamp"));
-        assert_eq!(messages[user + 2].role, "system");
+        assert_eq!(messages[user + 2].role, "user");
         assert!(text(&messages[user + 2]).contains("frozen recall"));
         assert!(user + 2 < assistant);
     }
 
     #[test]
-    fn fossil_capture_stops_at_first_non_system_message() {
+    fn nothing_after_the_leading_prompt_may_carry_the_system_role() {
+        // Provider chat templates gather every `system` message to the front of
+        // the rendered prompt, so one appearing mid-conversation shifts that
+        // block and drops the prefix cache to zero. Measured on DeepSeek with a
+        // byte-identical prefix: appending `assistant + user` hit 99%, the same
+        // append with one `system` in front of it hit 0%, and moving that
+        // `system` to the very end still hit 0%.
+        let messages = vec![
+            ChatMessage::system("persona"),
+            ChatMessage::plain("user", "问题"),
+            ChatMessage::turn_context("<runtime now=\"x\"/>"),
+            ChatMessage::turn_context("<associative-memory>x</associative-memory>"),
+            ChatMessage::assistant("答案", None),
+        ];
+        let stray: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, message)| message.role == "system")
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "system role at {stray:?} would reset the prefix cache"
+        );
+    }
+
+    #[test]
+    fn a_fossil_written_before_the_role_change_replays_as_a_user_block() {
+        // Old turns stored the transient tail as `system`. Replaying that
+        // verbatim would keep poisoning the prefix for the rest of the
+        // session's life, so it is re-roled on the way out.
+        let stored = ChatMessage::system("<runtime now=\"old\"/>");
+        let replayed = replay_fossil(&stored);
+        assert_eq!(replayed.role, "user");
+        assert!(replayed.transient_context);
+        assert!(matches!(
+            replayed.content.as_ref(),
+            Some(ChatContent::Text(content)) if content == "<runtime now=\"old\"/>"
+        ));
+
+        // Already-converted fossils pass through untouched.
+        let fresh = ChatMessage::turn_context("<runtime now=\"new\"/>");
+        assert_eq!(replay_fossil(&fresh).role, "user");
+    }
+
+    #[test]
+    fn fossil_capture_stops_at_the_first_non_context_message() {
         let tail = vec![
-            ChatMessage::system("<runtime now=\"x\"/>"),
-            ChatMessage::system("hint"),
+            ChatMessage::turn_context("<runtime now=\"x\"/>"),
+            ChatMessage::turn_context("hint"),
             ChatMessage::plain("assistant", "loop starts here"),
-            ChatMessage::system("after loop — must not be captured"),
+            ChatMessage::turn_context("after loop — must not be captured"),
         ];
         let fossil = fossil_context_messages(&tail);
         assert_eq!(fossil.len(), 2);
@@ -7474,7 +7546,7 @@ mod tests {
             })
             .unwrap();
         assert!(messages.iter().any(|message| {
-            message["role"] == "system"
+            message["role"] == "user"
                 && message["content"].as_str().is_some_and(|content| {
                     content.contains("<previous_assistant_reasoning>\nfirst reasoning")
                 })
@@ -7753,23 +7825,27 @@ mod tests {
             .iter()
             .position(|item| item["type"] == "function_call_output")
             .unwrap();
-        let mode_index = input
-            .iter()
-            .position(|item| {
-                item["role"] == "system"
-                    && item["content"].as_str().is_some_and(|content| {
-                        content.contains("<mode-update active=\"plan\">")
-                            && content.contains(crate::prompts::PLAN_REMINDER)
-                    })
-            })
-            .unwrap();
-        assert!(input.iter().any(|item| {
-            item["role"] == "system"
-                && item["content"].as_str().is_some_and(|content| {
-                    content.contains("<mode-update active=\"plan\">")
-                        && content.contains(crate::prompts::PLAN_REMINDER)
-                })
-        }));
+        // Responses-style user items carry their text as `input_text` parts,
+        // so the block has to be read through both shapes.
+        let item_text = |item: &Value| -> String {
+            match &item["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            }
+        };
+        let is_mode_update = |item: &Value| {
+            let text = item_text(item);
+            item["role"] == "user"
+                && text.contains("<mode-update active=\"plan\">")
+                && text.contains(crate::prompts::PLAN_REMINDER)
+        };
+        let mode_index = input.iter().position(is_mode_update).unwrap();
+        assert!(input.iter().any(is_mode_update));
         let queued_index = input
             .iter()
             .position(|item| {
