@@ -1097,10 +1097,13 @@ mod tests {
             std::fs::write(dir.join(format!("clip-{index}.mov")), "abc").unwrap();
         }
         let body = body_for(&ask(&format!("rm -rf {}", dir.display())));
-        assert!(body.contains("3"), "{body}");
+        // Assert on the count phrase, not on a bare digit: the temp directory
+        // in the path carries a random name that regularly contains one, which
+        // made this test fail about one run in eight.
+        assert!(body.contains("3 个文件"), "{body}");
         assert!(
-            !body.contains("4"),
-            "directories must not be counted as files: {body}"
+            !body.contains("4 个文件"),
+            "the directory itself must not be counted as a file: {body}"
         );
         assert!(
             body.contains("不进回收站") || body.contains("not moved to the Trash"),

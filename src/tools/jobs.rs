@@ -1149,6 +1149,15 @@ mod tests {
             ids.push(spawned["job_id"].as_str().unwrap().to_string());
         }
 
+        // `wait_seconds` on a batch returns as soon as *any* job finishes (the
+        // tool says so), so wait on each one individually first. Otherwise the
+        // second job is often still running and this test flakes under load.
+        for id in &ids {
+            job_status(json!({"job_id": id, "wait_seconds": 10}))
+                .await
+                .unwrap();
+        }
+
         let status: Value = serde_json::from_str(
             &job_status(json!({"job_ids": ids, "wait_seconds": 10}))
                 .await
@@ -1157,6 +1166,10 @@ mod tests {
         .unwrap();
         let rows = status["jobs"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
+        // Rows come back in the order the ids were asked for.
+        for (row, id) in rows.iter().zip(&ids) {
+            assert_eq!(row["job_id"].as_str(), Some(id.as_str()));
+        }
         for (row, marker) in rows.iter().zip(["alpha", "beta"]) {
             assert!(row["output"]["content"].as_str().unwrap().contains(marker));
         }
