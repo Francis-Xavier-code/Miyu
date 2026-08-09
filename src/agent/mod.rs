@@ -6,7 +6,7 @@ use crate::clipboard::{ClipboardImage, PastedImage};
 use crate::config::{AppConfig, PromptAudience};
 use crate::llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind,
-    ImageUrlContent, OpenAiCompatibleClient, ToolCall, ToolCallFunction, Usage,
+    ImageUrlContent, OpenAiCompatibleClient, ToolCall, ToolCallFunction, TurnTokens, Usage,
 };
 use crate::memory::{EvictedTurn, MemoryAccess, MemoryOrganizerHandle, MemoryOrigin, MemoryStore};
 use crate::paths::MiyuPaths;
@@ -56,7 +56,7 @@ impl PendingTurnGuard {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         self.state.complete_turn_with_usage_and_model(
@@ -65,7 +65,7 @@ impl PendingTurnGuard {
             reasoning,
             provider_id,
             model,
-            token_total,
+            tokens,
             token_usage_estimated,
         )?;
         self.completed = true;
@@ -120,7 +120,7 @@ impl PendingRedoGuard {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         self.state.complete_turn_revision_with_usage_and_model(
@@ -130,7 +130,7 @@ impl PendingRedoGuard {
             reasoning,
             provider_id,
             model,
-            token_total,
+            tokens,
             token_usage_estimated,
         )?;
         self.completed = true;
@@ -1405,6 +1405,11 @@ impl Agent {
         self.state.session_cumulative_tokens()
     }
 
+    /// Same Σ with the prompt and cache-read halves its cache rate needs.
+    pub fn conversation_usage_token_totals(&self) -> Result<TurnTokens> {
+        self.state.session_cumulative_token_totals()
+    }
+
     fn tool_definition_tokens(&self, loaded_tools: &BTreeSet<String>) -> usize {
         let tools = self.tools.lock().unwrap();
         let definitions = if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
@@ -1650,6 +1655,24 @@ impl Agent {
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {
+        let session = self.state.session_id();
+        crate::tools::workspace::with_session(
+            session,
+            self.redo_stream_turn(candidate, prompts, control, on_event),
+        )
+        .await
+    }
+
+    async fn redo_stream_turn<F>(
+        &mut self,
+        candidate: &RedoCandidate,
+        prompts: Vec<RedoPromptInput>,
+        control: &AgentTurnControl,
+        on_event: F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
         self.cancel_cache_keepalive();
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
@@ -1767,13 +1790,13 @@ impl Agent {
             .collect::<Vec<_>>();
         self.state
             .append_persisted_contexts(&candidate.turn_id, &reports)?;
-        let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
+        let tokens = TurnTokens::from_usage(result.usage.as_ref());
         guard.complete_with_model(
             &result.content,
             result.reasoning.as_deref(),
             result.provider_id.as_deref(),
             result.model.as_deref(),
-            token_total,
+            tokens,
             result.usage_estimated,
         )?;
         if self.memory.process_after_turn(
@@ -1792,7 +1815,31 @@ impl Agent {
         Ok(result)
     }
 
+    /// Publishes the turn's session as the ambient scope before running it.
+    /// Subagents launched inside read it to hang their audit sessions off this
+    /// one, and those audits now count toward the session's Σ — without the
+    /// scope a subagent bills to nobody. The daemon actor sets the same scope;
+    /// re-scoping to the same id is harmless, and the direct/local paths had
+    /// no scope at all.
     async fn chat_stream_with_images_inner<F>(
+        &mut self,
+        input: &str,
+        images: &[Option<PastedImage>],
+        control: Option<&AgentTurnControl>,
+        on_event: F,
+    ) -> Result<ChatResult>
+    where
+        F: FnMut(AgentEvent) -> Result<()>,
+    {
+        let session = self.state.session_id();
+        crate::tools::workspace::with_session(
+            session,
+            self.chat_stream_turn(input, images, control, on_event),
+        )
+        .await
+    }
+
+    async fn chat_stream_turn<F>(
         &mut self,
         input: &str,
         images: &[Option<PastedImage>],
@@ -1906,13 +1953,13 @@ impl Agent {
             .map(|(_, report)| report)
             .collect::<Vec<_>>();
         self.state.append_persisted_contexts(&turn_id, &reports)?;
-        let token_total = result.usage.as_ref().map(Usage::effective_total_tokens);
+        let tokens = TurnTokens::from_usage(result.usage.as_ref());
         guard.complete_with_model(
             &result.content,
             result.reasoning.as_deref(),
             result.provider_id.as_deref(),
             result.model.as_deref(),
-            token_total,
+            tokens,
             result.usage_estimated,
         )?;
         if self.memory.process_after_turn(
@@ -6785,6 +6832,8 @@ mod tests {
             is_summary: false,
             owner_pid: None,
             token_total: 0,
+            token_prompt: 0,
+            token_cache_read: 0,
             token_usage_estimated: false,
             revision: 0,
             journal_events: Vec::new(),
@@ -6821,7 +6870,9 @@ mod tests {
         );
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "system");
+        // Rides as a `user` block: a mid-conversation `system` message resets
+        // the provider's whole prefix cache.
+        assert_eq!(messages[0].role, "user");
         assert!(matches!(
             messages[0].content.as_ref(),
             Some(ChatContent::Text(content))
@@ -6916,6 +6967,8 @@ mod tests {
             is_summary: false,
             owner_pid: None,
             token_total: 0,
+            token_prompt: 0,
+            token_cache_read: 0,
             token_usage_estimated: false,
             revision: 1,
             journal_events: vec![
@@ -7146,7 +7199,7 @@ mod tests {
         )
         .unwrap();
         state
-            .insert_summary_turn(&"summary ".repeat(2_000), None, true)
+            .insert_summary_turn(&"summary ".repeat(2_000), TurnTokens::default(), true)
             .unwrap();
         for id in ["t1", "t2"] {
             state
@@ -7412,7 +7465,7 @@ mod tests {
                 &["t1".to_string()],
                 &["t1".to_string()],
                 "summary",
-                None,
+                TurnTokens::default(),
                 false,
                 None,
             )

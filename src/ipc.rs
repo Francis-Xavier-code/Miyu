@@ -103,6 +103,13 @@ pub struct SessionState {
     pub context_tokens: u64,
     pub context_window: Option<usize>,
     pub cumulative_tokens: u64,
+    /// Prompt and cache-read halves behind Σ's cache rate. Defaulted so a REPL
+    /// talking to an older daemon degrades to "no cache reported" instead of
+    /// failing to parse the state frame.
+    #[serde(default)]
+    pub cumulative_prompt_tokens: u64,
+    #[serde(default)]
+    pub cumulative_cache_read_tokens: u64,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -1425,6 +1432,8 @@ mod tests {
                 context_tokens: 12,
                 context_window: Some(1000),
                 cumulative_tokens: 34,
+                cumulative_prompt_tokens: 20,
+                cumulative_cache_read_tokens: 10,
                 session_id: "default".to_string(),
                 session_name: "默认会话".to_string(),
                 workspace: None,

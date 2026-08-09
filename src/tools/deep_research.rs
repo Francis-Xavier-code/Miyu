@@ -65,6 +65,7 @@ struct ResearchStats {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_read_tokens: u64,
     token_estimate: u64,
     token_estimate_method: TokenEstimateMethod,
 }
@@ -85,6 +86,7 @@ impl ResearchStats {
             if total_tokens > 0 {
                 self.prompt_tokens += usage.prompt_tokens;
                 self.completion_tokens += usage.completion_tokens;
+                self.cache_read_tokens += usage.cache_read_tokens;
                 self.total_tokens += total_tokens;
                 self.token_estimate += total_tokens;
                 self.token_estimate_method = match self.token_estimate_method {
@@ -348,6 +350,7 @@ async fn run_deep_research(
         iterations,
         &state,
     )?;
+    record_research_audit(&context, &topic, &final_answer, &state);
     let stats = public_stats(&state);
     sa_progress.phase(format!(
         "{} {} {} {} {}\n{} {}",
@@ -455,6 +458,7 @@ fn merge_stats(
     state.stats.tool_errors += sa_stats.tool_errors;
     state.stats.prompt_tokens += sa_stats.prompt_tokens;
     state.stats.completion_tokens += sa_stats.completion_tokens;
+    state.stats.cache_read_tokens += sa_stats.cache_read_tokens;
     state.stats.total_tokens += sa_stats.total_tokens;
     state.stats.token_estimate += sa_stats.token_estimate;
     let has_provider = state.stats.token_estimate_method == TokenEstimateMethod::ProviderUsage
@@ -665,6 +669,73 @@ fn public_sources(state: &Arc<Mutex<ResearchState>>) -> Vec<Value> {
     state.references.iter().map(|item| json!({"ref": item.marker, "type": item.kind, "title": item.title, "url": item.url, "path": item.path})).collect()
 }
 
+/// Persists one aggregate audit session per research run, the same shape
+/// `task` uses: a hidden `kind='subagent'` session hanging off the launching
+/// session, carrying the run's merged usage. Without it a research run —
+/// easily the most expensive thing a turn can do — spends its tokens entirely
+/// outside the session's Σ. Provider/model are left unset because a run fans
+/// out over several tiers. Best-effort; never fails the research itself.
+///
+/// Recorded at completion only: a run that dies mid-flight still loses its
+/// accounting.
+fn record_research_audit(
+    context: &DeepResearchContext,
+    topic: &str,
+    final_answer: &str,
+    state: &Arc<Mutex<ResearchState>>,
+) {
+    let (prompt_tokens, completion_tokens, total_tokens, cache_read_tokens) = {
+        let state = state.lock().expect("deep research state lock");
+        (
+            state.stats.prompt_tokens as i64,
+            state.stats.completion_tokens as i64,
+            state.stats.total_tokens.max(state.stats.token_estimate) as i64,
+            state.stats.cache_read_tokens as i64,
+        )
+    };
+    if total_tokens == 0 {
+        return;
+    }
+    let outcome = (|| -> anyhow::Result<()> {
+        let store = crate::state::StateStore::new(&context.paths)?;
+        let parent = crate::tools::workspace::try_session().map(|session| session.to_string());
+        let persona = context.config.active_persona_scope();
+        let name: String = topic.chars().take(40).collect();
+        let record = store.create_session(&persona, &name, "subagent", parent.as_deref())?;
+        let pinned = store.pinned(&record.session_id);
+        let turn_id = format!(
+            "dra_{}_{:08x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            rand::random::<u32>()
+        );
+        pinned.start_turn(&turn_id, topic, std::process::id())?;
+        pinned.complete_turn(&turn_id, final_answer, None)?;
+        store.record_subagent_usage(
+            &record.session_id,
+            None,
+            None,
+            None,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+        )
+    })();
+    if let Err(error) = outcome {
+        tracing::warn!(
+            error = %error,
+            "{}",
+            crate::i18n::text(
+                "failed to record deep research audit session",
+                "记录深度研究审计会话失败"
+            )
+        );
+    }
+}
+
 fn public_stats(state: &Arc<Mutex<ResearchState>>) -> Value {
     let state = state.lock().expect("deep research state lock");
     json!({
@@ -674,6 +745,7 @@ fn public_stats(state: &Arc<Mutex<ResearchState>>) -> Value {
         "prompt_tokens": state.stats.prompt_tokens,
         "completion_tokens": state.stats.completion_tokens,
         "total_tokens": state.stats.total_tokens,
+        "cache_read_tokens": state.stats.cache_read_tokens,
         "token_estimate": state.stats.token_estimate,
         "token_estimate_method": token_estimate_method_label(state.stats.token_estimate_method),
         "token_estimate_is_actual": state.stats.token_estimate_method == TokenEstimateMethod::ProviderUsage,

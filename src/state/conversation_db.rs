@@ -1,5 +1,5 @@
 use crate::i18n::text as t;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, TurnTokens};
 use crate::memory::EvictedTurn;
 use crate::question::QuestionExchange;
 use anyhow::{bail, Context, Result};
@@ -132,6 +132,11 @@ pub struct Turn {
     pub is_summary: bool,
     pub owner_pid: Option<i64>,
     pub token_total: u64,
+    /// Prompt half of the turn's usage and how much of it the provider served
+    /// from cache. A hit rate needs the prompt as its denominator, not the
+    /// total: output tokens only enter the prompt on the *next* turn.
+    pub token_prompt: u64,
+    pub token_cache_read: u64,
     pub token_usage_estimated: bool,
     pub revision: i64,
     /// Semantic events for a non-completed generation. Completed turns keep
@@ -222,6 +227,10 @@ struct TurnRedoBackup {
     owner_pid: Option<i64>,
     queue_session_id: Option<String>,
     token_total: i64,
+    #[serde(default)]
+    token_prompt: i64,
+    #[serde(default)]
+    token_cache_read: i64,
     token_usage_estimated: i64,
     loaded_items: Vec<(String, String, Option<String>, String, String)>,
     consumed_prompt_ids: Vec<String>,
@@ -1690,6 +1699,25 @@ impl ConversationDb {
 
     /// Records the model identity and token usage a subagent session actually
     /// used (audit columns on `sessions`).
+    /// Writes a subagent row the way builds before v19 did: usage present,
+    /// `cache_read_tokens` left NULL.
+    #[cfg(test)]
+    pub fn record_legacy_subagent_usage_for_test(
+        &self,
+        session_id: &str,
+        prompt_tokens: i64,
+        total_tokens: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET prompt_tokens = ?2, total_tokens = ?3,
+                    cache_read_tokens = NULL
+             WHERE session_id = ?1",
+            params![session_id, prompt_tokens, total_tokens],
+        )?;
+        Ok(())
+    }
+
     pub fn record_subagent_usage(
         &self,
         session_id: &str,
@@ -1699,12 +1727,13 @@ impl ConversationDb {
         prompt_tokens: i64,
         completion_tokens: i64,
         total_tokens: i64,
+        cache_read_tokens: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE sessions SET provider_id = ?2, model = ?3, context_window = ?4,
                     prompt_tokens = ?5, completion_tokens = ?6, total_tokens = ?7,
-                    updated_at = ?8
+                    updated_at = ?8, cache_read_tokens = ?9
              WHERE session_id = ?1",
             params![
                 session_id,
@@ -1715,6 +1744,7 @@ impl ConversationDb {
                 completion_tokens,
                 total_tokens,
                 Utc::now().to_rfc3339(),
+                cache_read_tokens,
             ],
         )?;
         Ok(())
@@ -2148,7 +2178,15 @@ impl ConversationDb {
         content: &str,
         reasoning: Option<&str>,
     ) -> Result<()> {
-        self.complete_turn_with_usage(turn_id, content, reasoning, None, None, None, false)
+        self.complete_turn_with_usage(
+            turn_id,
+            content,
+            reasoning,
+            None,
+            None,
+            TurnTokens::default(),
+            false,
+        )
     }
 
     pub fn complete_turn_with_usage(
@@ -2158,18 +2196,18 @@ impl ConversationDb {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
-        let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         let affected = tx.execute(
             "UPDATE turns SET assistant_content = ?1, assistant_reasoning = ?2,
                     assistant_provider_id = ?3, assistant_model = ?4, assistant_timestamp = ?5,
-                    status = 'completed', token_total = ?6, token_usage_estimated = ?7
+                    status = 'completed', token_total = ?6, token_usage_estimated = ?7,
+                    token_prompt = ?9, token_cache_read = ?10
               WHERE turn_id = ?8 AND status = 'running'",
             params![
                 content,
@@ -2177,9 +2215,11 @@ impl ConversationDb {
                 provider_id,
                 model,
                 now,
-                token_total,
+                tokens.total as i64,
                 token_usage_estimated,
-                turn_id
+                turn_id,
+                tokens.prompt as i64,
+                tokens.cache_read as i64
             ],
         )?;
         if affected != 1 {
@@ -2207,7 +2247,7 @@ impl ConversationDb {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
@@ -2216,7 +2256,8 @@ impl ConversationDb {
         let affected = tx.execute(
             "UPDATE turns SET assistant_content = ?1, assistant_reasoning = ?2,
                     assistant_provider_id = ?3, assistant_model = ?4, assistant_timestamp = ?5,
-                    status = 'completed', token_total = ?6, token_usage_estimated = ?7
+                    status = 'completed', token_total = ?6, token_usage_estimated = ?7,
+                    token_prompt = ?10, token_cache_read = ?11
              WHERE turn_id = ?8 AND revision = ?9 AND status = 'running'",
             params![
                 content,
@@ -2224,10 +2265,12 @@ impl ConversationDb {
                 provider_id,
                 model,
                 now,
-                token_total.unwrap_or(0) as i64,
+                tokens.total as i64,
                 i64::from(token_usage_estimated),
                 turn_id,
-                revision
+                revision,
+                tokens.prompt as i64,
+                tokens.cache_read as i64
             ],
         )?;
         if affected != 1 {
@@ -3112,10 +3155,13 @@ impl ConversationDb {
             old_queue_session_id,
             token_total,
             token_usage_estimated,
+            token_prompt,
+            token_cache_read,
         ) = tx.query_row(
             "SELECT user_content, display_content, assistant_content, assistant_reasoning,
                     assistant_provider_id, assistant_model, assistant_timestamp, tool_reports,
-                    owner_pid, queue_session_id, token_total, token_usage_estimated
+                    owner_pid, queue_session_id, token_total, token_usage_estimated,
+                    token_prompt, token_cache_read
              FROM turns WHERE turn_id = ?1",
             params![turn_id],
             |row| {
@@ -3132,6 +3178,8 @@ impl ConversationDb {
                     row.get(9)?,
                     row.get(10)?,
                     row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
                 ))
             },
         )?;
@@ -3213,6 +3261,8 @@ impl ConversationDb {
             owner_pid: old_owner_pid,
             queue_session_id: old_queue_session_id,
             token_total,
+            token_prompt,
+            token_cache_read,
             token_usage_estimated,
             loaded_items,
             consumed_prompt_ids,
@@ -3725,7 +3775,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3745,7 +3795,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3765,7 +3815,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3784,7 +3834,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 AND hidden = 0 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3809,7 +3859,7 @@ impl ConversationDb {
         &self,
         session_id: &str,
         summary: &str,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -3823,12 +3873,11 @@ impl ConversationDb {
         );
         let seq = self.next_seq_locked(&conn, session_id)?;
         let now = Utc::now().to_rfc3339();
-        let token_total = token_total.unwrap_or(0) as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         conn.execute(
-            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9)",
-            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, token_prompt, token_cache_read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, ?10, ?11)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, tokens.total as i64, token_usage_estimated, tokens.prompt as i64, tokens.cache_read as i64],
         )?;
         Ok(())
     }
@@ -3838,7 +3887,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 AND is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
         )?;
         let turn = stmt
@@ -3871,7 +3920,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns WHERE session_id = ?1 AND is_summary = 0 ORDER BY seq ASC LIMIT ?2",
         )?;
         let mut to_remove: Vec<Turn> = stmt
@@ -3897,7 +3946,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
              FROM turns
              WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0 AND status != 'running'
              ORDER BY seq ASC LIMIT ?2",
@@ -4072,7 +4121,7 @@ impl ConversationDb {
         fold_turn_ids: &[String],
         visible_turn_ids: &[String],
         summary: &str,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
         footprint_json: Option<&str>,
     ) -> Result<()> {
@@ -4153,12 +4202,12 @@ impl ConversationDb {
             |row| row.get(0),
         )?;
         let now = Utc::now().to_rfc3339();
-        let token_total = token_total.unwrap_or(0) as i64;
+        let token_total = tokens.total as i64;
         let token_usage_estimated = i64::from(token_usage_estimated);
         tx.execute(
-            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, compact_reversible, compact_parent_summary_seq, compact_hidden_json, tool_footprint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, 1, ?10, ?11, ?12)",
-            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq, hidden_json, footprint_json],
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp, assistant_content, assistant_timestamp, status, tool_reports, hidden, is_summary, token_total, token_usage_estimated, token_prompt, token_cache_read, compact_reversible, compact_parent_summary_seq, compact_hidden_json, tool_footprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', '[]', 0, 1, ?8, ?9, ?13, ?14, 1, ?10, ?11, ?12)",
+            params![turn_id, session_id, seq, "[conversation summary]", now, summary, now, token_total, token_usage_estimated, parent_summary_seq, hidden_json, footprint_json, tokens.prompt as i64, tokens.cache_read as i64],
         )?;
         tx.commit()?;
         Ok(())
@@ -4177,6 +4226,14 @@ impl ConversationDb {
         )?;
         tx.execute(
             "DELETE FROM session_loaded_items WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        // Subagent audit sessions now count toward this session's Σ, so a
+        // reset that left them behind would zero the history and still report
+        // a running total. They are records of a conversation that no longer
+        // exists; they go with it.
+        tx.execute(
+            "DELETE FROM sessions WHERE parent_session_id = ?1 AND kind = 'subagent'",
             params![session_id],
         )?;
         tx.commit()?;
@@ -4223,6 +4280,17 @@ impl ConversationDb {
                 params![persona, platform],
             )?;
         }
+        // Subagent runs bill to the session that launched them, and their usage
+        // lives on the session row rather than in `turns` — deleting the turns
+        // alone would leave every Σ still carrying the subagent totals of a
+        // conversation that no longer exists.
+        tx.execute(
+            &format!(
+                "{target_sql} DELETE FROM sessions
+                  WHERE kind = 'subagent' AND session_id IN (SELECT session_id FROM targets)"
+            ),
+            params![persona, platform],
+        )?;
         tx.commit()?;
         Ok(session_ids)
     }
@@ -4232,13 +4300,41 @@ impl ConversationDb {
     /// keeps growing across compactions and only /reset (which deletes the
     /// rows) brings it back to zero.
     pub fn session_token_total(&self, session_id: &str) -> Result<u64> {
+        Ok(self.session_token_totals(session_id)?.total)
+    }
+
+    /// Session-lifetime sums behind the Σ meter. Returned together because the
+    /// cumulative cache rate is `cache_read / prompt` and reading the two
+    /// halves through separate locks could straddle a turn commit.
+    pub fn session_token_totals(&self, session_id: &str) -> Result<TurnTokens> {
         let conn = self.conn.lock().unwrap();
-        let total: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(token_total), 0) FROM turns WHERE session_id = ?1",
+        let (total, prompt, cache_read): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(token_total), 0), COALESCE(SUM(token_prompt), 0),
+                    COALESCE(SUM(token_cache_read), 0)
+             FROM turns WHERE session_id = ?1",
             rusqlite::params![session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        Ok(total.max(0) as u64)
+        // Subagents bill to the session that launched them: their audit
+        // sessions hang off this one, and a Σ that ignored them would hide the
+        // single biggest thing a turn can spend. Estimated runs land in
+        // `total_tokens` only — `prompt_tokens` stays 0 when the provider
+        // reported nothing — so a guessed number can inflate Σ but never
+        // reaches the cache rate's denominator.
+        let (sub_total, sub_prompt, sub_cache): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NULL THEN 0
+                                      ELSE prompt_tokens END), 0),
+                    COALESCE(SUM(cache_read_tokens), 0)
+             FROM sessions WHERE parent_session_id = ?1 AND kind = 'subagent'",
+            rusqlite::params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(TurnTokens {
+            total: total.saturating_add(sub_total).max(0) as u64,
+            prompt: prompt.saturating_add(sub_prompt).max(0) as u64,
+            cache_read: cache_read.saturating_add(sub_cache).max(0) as u64,
+        })
     }
 
     pub fn reset_history(&self, session_id: &str) -> Result<()> {
@@ -5147,7 +5243,9 @@ fn restore_redo_backup_locked(tx: &Transaction<'_>, turn_id: &str, revision: i64
             queue_session_id = ?11,
             token_total = ?12,
             token_usage_estimated = ?13,
-            revision = ?14
+            revision = ?14,
+            token_prompt = ?17,
+            token_cache_read = ?18
          WHERE turn_id = ?15 AND revision = ?16 AND status = 'running'",
         params![
             backup.user_content,
@@ -5165,7 +5263,9 @@ fn restore_redo_backup_locked(tx: &Transaction<'_>, turn_id: &str, revision: i64
             backup.token_usage_estimated,
             revision.saturating_sub(1),
             turn_id,
-            revision
+            revision,
+            backup.token_prompt,
+            backup.token_cache_read
         ],
     )?;
     if let (Some(content), Some(display_content)) = (
@@ -5231,6 +5331,8 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         is_summary: row.get::<_, i64>(13)? != 0,
         owner_pid: row.get(14)?,
         token_total: row.get::<_, i64>(15)?.max(0) as u64,
+        token_prompt: row.get::<_, i64>(19)?.max(0) as u64,
+        token_cache_read: row.get::<_, i64>(20)?.max(0) as u64,
         token_usage_estimated: row.get::<_, i64>(16)? != 0,
         revision: row.get(17)?,
         journal_events: Vec::new(),

@@ -2645,6 +2645,27 @@
     }
   }
 
+  // 缓存命中率只以输入为分母：输出 token 要到下一轮才进入输入，把它算进
+  // 分母会让同样的缓存效果随回复变长而显得越来越差。三家供应商的用量字段
+  // 也都是这么定义的（DeepSeek 直接把 prompt 劈成 hit+miss）。
+  function cacheSuffix(cached, prompt) {
+    const hit = asFiniteNumber(cached, 0);
+    const total = asFiniteNumber(prompt, 0);
+    if (hit <= 0 || total <= 0) return "";
+    return `（C${Math.min(100, Math.round((hit / total) * 100))}%）`;
+  }
+
+  function formatUsageMeta({ turnTotal, turnPrompt, turnCached, estimated, cumulative, cumulativePrompt, cumulativeCached }) {
+    const parts = [];
+    if (asFiniteNumber(turnTotal) > 0) {
+      parts.push(`本轮${estimated ? "约 " : " "}${formatTokens(turnTotal)}${cacheSuffix(turnCached, turnPrompt)}`);
+    }
+    if (asFiniteNumber(cumulative) > 0) {
+      parts.push(`累计 ${formatTokens(cumulative)}${cacheSuffix(cumulativeCached, cumulativePrompt)}`);
+    }
+    return parts.join(" · ");
+  }
+
   function formatTokens(value) {
     const number = Math.max(0, asFiniteNumber(value));
     if (number < 1000) return formatInteger(number);
@@ -5440,6 +5461,8 @@
     assets = [],
     timestamp = null,
     tokenTotal = 0,
+    tokenPrompt = 0,
+    tokenCached = 0,
     tokenEstimated = false,
     providerId = "",
     model = "",
@@ -5495,9 +5518,15 @@
       endpoint.textContent = [providerId, model].map((value) => String(value || "").trim()).filter(Boolean).join(" / ");
       meta.appendChild(endpoint);
     }
-    if (asFiniteNumber(tokenTotal) > 0) {
+    const usageText = formatUsageMeta({
+      turnTotal: tokenTotal,
+      turnPrompt: tokenPrompt,
+      turnCached: tokenCached,
+      estimated: tokenEstimated
+    });
+    if (usageText) {
       const token = document.createElement("span");
-      token.textContent = `${tokenEstimated ? "约 " : ""}${formatTokens(tokenTotal)} 词元`;
+      token.textContent = usageText;
       meta.appendChild(token);
     }
     if (!activeContext) {
@@ -5677,6 +5706,8 @@
         assets,
         timestamp: turn?.assistant_timestamp,
         tokenTotal: turn?.token_total,
+        tokenPrompt: turn?.token_prompt,
+        tokenCached: turn?.token_cache_read,
         tokenEstimated: Boolean(turn?.token_usage_estimated),
         activeContext: turn?.active_context !== false,
         turnId,
@@ -7592,12 +7623,16 @@
     if (kind === "completed") {
       if (live.headerStatus) live.headerStatus.textContent = "刚刚";
       if (live.meta) {
-        const total = effectiveUsageTotal(data?.usage);
-        const cached = asFiniteNumber(data?.usage?.cache_read_tokens, 0);
-        const cachedSuffix = cached > 0 && total > 0
-          ? ` · 缓存命中 ${Math.min(100, Math.round((cached / total) * 100))}%`
-          : "";
-        live.meta.textContent = total > 0 ? `${data?.usage_estimated ? "约 " : ""}${formatTokens(total)} 词元${cachedSuffix}` : "已完成";
+        const usage = formatUsageMeta({
+          turnTotal: effectiveUsageTotal(data?.usage),
+          turnPrompt: data?.usage?.prompt_tokens,
+          turnCached: data?.usage?.cache_read_tokens,
+          estimated: data?.usage_estimated,
+          cumulative: data?.cumulative_tokens,
+          cumulativePrompt: data?.cumulative_prompt_tokens,
+          cumulativeCached: data?.cumulative_cache_read_tokens
+        });
+        live.meta.textContent = usage || "已完成";
       }
     } else if (kind === "cancelled") {
       markUnfinishedTools(live);

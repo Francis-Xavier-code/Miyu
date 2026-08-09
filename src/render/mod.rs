@@ -771,87 +771,72 @@ pub fn print_markdown(markdown: &str) {
     println!("{}", skin.term_text(markdown.trim_end()));
 }
 
-pub fn print_token_usage(
-    turn_tokens: u64,
-    cached_tokens: u64,
-    session_tokens: u64,
-    context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
-    estimated: bool,
-) -> Result<()> {
-    let output = token_usage_output(
-        turn_tokens,
-        cached_tokens,
-        session_tokens,
-        context_window,
-        cumulative_tokens,
-        estimated,
-    );
+/// Everything the token meters show. Grouped into one struct because the two
+/// cache rates each need a numerator *and* a denominator, and threading eight
+/// loose `u64`s through four call layers was already past readable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokenMeter {
+    pub turn_tokens: u64,
+    /// Denominator of the turn cache rate. A cache hit is an input-side
+    /// property — output tokens only enter the prompt on the *next* turn — so
+    /// the rate is read/prompt, never read/total, which is what every provider
+    /// reports too (DeepSeek splits the prompt into hit+miss; OpenAI's
+    /// `cached_tokens` is a subset of `prompt_tokens`; Anthropic names all
+    /// three fields `*_input_tokens`).
+    pub turn_prompt_tokens: u64,
+    pub turn_cached_tokens: u64,
+    pub session_tokens: u64,
+    pub context_window: Option<usize>,
+    /// Σ: session-lifetime total. `None` hides it on narrow terminals.
+    pub cumulative_tokens: Option<u64>,
+    pub cumulative_prompt_tokens: u64,
+    pub cumulative_cached_tokens: u64,
+}
+
+/// `None` when there is nothing honest to report: a provider that never said
+/// anything about caching must not be rendered as a flat 0%.
+pub(crate) fn cache_percent(cached: u64, prompt: u64) -> Option<u64> {
+    (cached > 0 && prompt > 0)
+        .then(|| ((cached as f64 / prompt as f64) * 100.0).round().min(100.0) as u64)
+}
+
+fn cache_suffix(cached: u64, prompt: u64) -> String {
+    cache_percent(cached, prompt)
+        .map(|percent| format!("(C{percent}%)"))
+        .unwrap_or_default()
+}
+
+pub fn print_token_usage(meter: &TokenMeter, estimated: bool) -> Result<()> {
+    let output = token_usage_output(meter, estimated);
     let mut stdout = io::stdout();
     write!(stdout, "{output}")?;
     stdout.flush()?;
     Ok(())
 }
 
-pub(crate) fn token_usage_output(
-    turn_tokens: u64,
-    cached_tokens: u64,
-    session_tokens: u64,
-    context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
-    estimated: bool,
-) -> String {
+pub(crate) fn token_usage_output(meter: &TokenMeter, estimated: bool) -> String {
     let prefix = if estimated {
         t("Estimated ", "估算")
     } else {
         ""
     };
-    let line = format!(
-        "{prefix}Token: {}",
-        format_token_usage_inline(
-            turn_tokens,
-            cached_tokens,
-            session_tokens,
-            context_window,
-            cumulative_tokens
-        )
-    );
+    let line = format!("{prefix}Token: {}", format_token_usage_inline(meter));
     format!("\x1b[2m{line}\x1b[0m\n\n")
 }
 
-pub(crate) fn format_token_usage_inline(
-    turn_tokens: u64,
-    cached_tokens: u64,
-    session_tokens: u64,
-    context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
-) -> String {
-    format_token_usage_inline_opts(
-        turn_tokens,
-        cached_tokens,
-        session_tokens,
-        context_window,
-        cumulative_tokens,
-        true,
-    )
+pub(crate) fn format_token_usage_inline(meter: &TokenMeter) -> String {
+    format_token_usage_inline_opts(meter, true)
 }
 
-pub(crate) fn format_token_usage_inline_opts(
-    turn_tokens: u64,
-    cached_tokens: u64,
-    session_tokens: u64,
-    context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
-    show_percent: bool,
-) -> String {
-    let context_window = context_window.map(|value| value as u64);
+pub(crate) fn format_token_usage_inline_opts(meter: &TokenMeter, show_percent: bool) -> String {
+    let context_window = meter.context_window.map(|value| value as u64);
     let context = context_window
         .map(format_compact_count)
         .unwrap_or_else(|| "?".to_string());
     let usage_ratio = if let Some(context_window) = context_window.filter(|value| *value > 0) {
         format!(
             "{:.1}%",
-            session_tokens as f64 / context_window as f64 * 100.0
+            meter.session_tokens as f64 / context_window as f64 * 100.0
         )
     } else {
         "?".to_string()
@@ -859,27 +844,31 @@ pub(crate) fn format_token_usage_inline_opts(
 
     let mut session = if show_percent {
         format!(
-            "{}/{} ({usage_ratio})",
-            format_compact_count(session_tokens),
+            "{}/{}({usage_ratio})",
+            format_compact_count(meter.session_tokens),
             context,
         )
     } else {
-        format!("{}/{}", format_compact_count(session_tokens), context)
+        format!("{}/{}", format_compact_count(meter.session_tokens), context)
     };
-    if let Some(cumulative_tokens) = cumulative_tokens {
-        session.push_str(&format!(" · Σ{}", format_compact_count(cumulative_tokens)));
+    if let Some(cumulative_tokens) = meter.cumulative_tokens {
+        session.push_str(&format!(
+            " · Σ{}{}",
+            format_compact_count(cumulative_tokens),
+            cache_suffix(
+                meter.cumulative_cached_tokens,
+                meter.cumulative_prompt_tokens
+            ),
+        ));
     }
-    if turn_tokens == 0 {
+    if meter.turn_tokens == 0 {
         session
-    } else if cached_tokens > 0 {
-        let cache_percent =
-            ((cached_tokens as f64 / turn_tokens as f64) * 100.0).round().min(100.0) as u64;
-        format!(
-            "{}(C{cache_percent}%) · {session}",
-            format_compact_count(turn_tokens),
-        )
     } else {
-        format!("{} · {session}", format_compact_count(turn_tokens))
+        format!(
+            "{}{} · {session}",
+            format_compact_count(meter.turn_tokens),
+            cache_suffix(meter.turn_cached_tokens, meter.turn_prompt_tokens),
+        )
     }
 }
 
@@ -4508,16 +4497,71 @@ mod tests {
     #[test]
     fn token_usage_hides_zero_turn_tokens() {
         assert_eq!(
-            format_token_usage_inline(0, 0, 1_300, Some(272_000), None),
-            "1.3k/272k (0.5%)"
+            format_token_usage_inline(&TokenMeter {
+                session_tokens: 1_300,
+                context_window: Some(272_000),
+                ..Default::default()
+            }),
+            "1.3k/272k(0.5%)"
         );
         assert_eq!(
-            format_token_usage_inline(1_300, 0, 1_300, Some(272_000), None),
-            "1.3k · 1.3k/272k (0.5%)"
+            format_token_usage_inline(&TokenMeter {
+                turn_tokens: 1_300,
+                session_tokens: 1_300,
+                context_window: Some(272_000),
+                ..Default::default()
+            }),
+            "1.3k · 1.3k/272k(0.5%)"
         );
         assert_eq!(
-            format_token_usage_inline(5_300, 0, 10_000, Some(200_000), Some(86_200)),
-            "5.3k · 10k/200k (5.0%) · Σ86.2k"
+            format_token_usage_inline(&TokenMeter {
+                turn_tokens: 5_300,
+                session_tokens: 10_000,
+                context_window: Some(200_000),
+                cumulative_tokens: Some(86_200),
+                ..Default::default()
+            }),
+            "5.3k · 10k/200k(5.0%) · Σ86.2k"
+        );
+    }
+
+    #[test]
+    fn a_cache_rate_divides_by_the_prompt_not_the_whole_turn() {
+        // 24.8k turn = 12.0k prompt + 12.8k output, 11.2k of the prompt cached.
+        // Dividing by the turn total would report 45% and would sag further the
+        // longer the model talked, which says nothing about the cache.
+        let meter = TokenMeter {
+            turn_tokens: 24_800,
+            turn_prompt_tokens: 12_000,
+            turn_cached_tokens: 11_200,
+            session_tokens: 12_000,
+            context_window: Some(200_000),
+            cumulative_tokens: Some(380_000),
+            cumulative_prompt_tokens: 248_000,
+            cumulative_cached_tokens: 226_000,
+        };
+        assert_eq!(
+            format_token_usage_inline(&meter),
+            "24.8k(C93%) · 12k/200k(6.0%) · Σ380k(C91%)"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cache_shows_no_rate() {
+        // Turns recorded before the cache columns existed read as zeros; a flat
+        // "C0%" would be a claim the database cannot support.
+        let meter = TokenMeter {
+            turn_tokens: 5_300,
+            turn_prompt_tokens: 4_000,
+            session_tokens: 10_000,
+            context_window: Some(200_000),
+            cumulative_tokens: Some(86_200),
+            cumulative_prompt_tokens: 70_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_token_usage_inline(&meter),
+            "5.3k · 10k/200k(5.0%) · Σ86.2k"
         );
     }
 

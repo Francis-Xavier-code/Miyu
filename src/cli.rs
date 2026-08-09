@@ -5,7 +5,7 @@ use crate::config::{ActiveProviderModelConfig, AppConfig};
 use crate::i18n::{is_zh, text as t};
 use crate::ipc::{self, Command as IpcCommand, Frame as IpcFrame, Request as IpcRequest};
 use crate::llm::{
-    ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions, Usage,
+    ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ThinkingVariantOptions, TurnTokens, Usage,
 };
 use crate::memory::{MemoryOrganizer, MemoryStore};
 use crate::paths::MiyuPaths;
@@ -58,24 +58,31 @@ struct ReplFooterStatus {
     model: String,
     mixed_models: bool,
     thinking: Option<String>,
-    token_usage: ReplTokenUsage,
+    token_usage: render::TokenMeter,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ReplTokenUsage {
-    turn_tokens: u64,
-    cached_tokens: u64,
-    session_tokens: u64,
-    context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
+/// The daemon reports Σ as three flat numbers; regroup them for the meters.
+fn state_cumulative(state: &ipc::SessionState) -> TurnTokens {
+    TurnTokens {
+        total: state.cumulative_tokens,
+        prompt: state.cumulative_prompt_tokens,
+        cache_read: state.cumulative_cache_read_tokens,
+    }
+}
+
+/// Σ is hidden entirely when nothing has been spent yet, so an empty session
+/// does not carry a "Σ0" that means nothing.
+fn meter_cumulative(cumulative: TurnTokens) -> render::TokenMeter {
+    render::TokenMeter {
+        cumulative_tokens: (cumulative.total > 0).then_some(cumulative.total),
+        cumulative_prompt_tokens: cumulative.prompt,
+        cumulative_cached_tokens: cumulative.cache_read,
+        ..Default::default()
+    }
 }
 
 impl ReplFooterStatus {
-    fn from_config(
-        config: &AppConfig,
-        session_tokens: u64,
-        cumulative_tokens: Option<u64>,
-    ) -> Self {
+    fn from_config(config: &AppConfig, session_tokens: u64, cumulative: TurnTokens) -> Self {
         let active = config.active_provider_model_choices();
         let mixed_models = active.len() > 1;
         let (provider_id, model) = match active.as_slice() {
@@ -92,12 +99,10 @@ impl ReplFooterStatus {
             provider: provider_id,
             mixed_models,
             thinking: None,
-            token_usage: ReplTokenUsage {
-                turn_tokens: 0,
-                cached_tokens: 0,
+            token_usage: render::TokenMeter {
                 session_tokens,
                 context_window: config.active_context_window().ok().flatten(),
-                cumulative_tokens,
+                ..meter_cumulative(cumulative)
             },
         }
     }
@@ -107,16 +112,11 @@ impl ReplFooterStatus {
         result: &crate::llm::ChatResult,
         session_tokens: u64,
         context_window: Option<usize>,
-        cumulative_tokens: Option<u64>,
+        cumulative: TurnTokens,
     ) {
-        if let Some(usage) = &result.usage {
-            self.set_token_usage_with_cache(
-                render::usage_total(usage),
-                usage.cache_read_tokens,
-                session_tokens,
-                context_window,
-                cumulative_tokens,
-            );
+        if result.usage.is_some() {
+            let turn = TurnTokens::from_usage(result.usage.as_ref());
+            self.set_token_usage_with_cache(turn, session_tokens, context_window, cumulative);
         }
     }
 
@@ -125,31 +125,33 @@ impl ReplFooterStatus {
         turn_tokens: u64,
         session_tokens: u64,
         context_window: Option<usize>,
-        cumulative_tokens: Option<u64>,
+        cumulative: TurnTokens,
     ) {
         self.set_token_usage_with_cache(
-            turn_tokens,
-            0,
+            TurnTokens {
+                total: turn_tokens,
+                ..TurnTokens::default()
+            },
             session_tokens,
             context_window,
-            cumulative_tokens,
+            cumulative,
         );
     }
 
     fn set_token_usage_with_cache(
         &mut self,
-        turn_tokens: u64,
-        cached_tokens: u64,
+        turn: TurnTokens,
         session_tokens: u64,
         context_window: Option<usize>,
-        cumulative_tokens: Option<u64>,
+        cumulative: TurnTokens,
     ) {
-        self.token_usage = ReplTokenUsage {
-            turn_tokens,
-            cached_tokens,
+        self.token_usage = render::TokenMeter {
+            turn_tokens: turn.total,
+            turn_prompt_tokens: turn.prompt,
+            turn_cached_tokens: turn.cache_read,
             session_tokens,
             context_window,
-            cumulative_tokens,
+            ..meter_cumulative(cumulative)
         };
     }
 
@@ -4760,14 +4762,14 @@ async fn run_chat_with_images(
         Err(err) => return Err(err),
     };
     print_mixed_model_endpoint(show_mixed_model_endpoint, &result, None);
-    let mut cumulative_tokens = result.usage.as_ref().map(render::usage_total).unwrap_or(0);
+    let mut cumulative_tokens = TurnTokens::from_usage(result.usage.as_ref());
     let context_tokens = agent.effective_context_tokens()?;
     print_chat_token_usage(
         &result,
         show_token_usage,
         context_tokens,
         result_context_window(&display_config, &result).or(agent.context_window()),
-        Some(cumulative_tokens),
+        cumulative_tokens,
     )?;
     let overflow_result = handle_post_turn_overflow(
         &agent,
@@ -4784,7 +4786,7 @@ async fn run_chat_with_images(
             show_token_usage,
             updated_context_tokens,
             result_context_window(&display_config, &result).or(agent.context_window()),
-            Some(cumulative_tokens),
+            cumulative_tokens,
         )?;
     }
     Ok(())
@@ -5082,14 +5084,14 @@ async fn run_chat_with_options(
         Err(err) => return Err(err),
     };
     print_mixed_model_endpoint(show_mixed_model_endpoint, &result, None);
-    let mut cumulative_tokens = result.usage.as_ref().map(render::usage_total).unwrap_or(0);
+    let mut cumulative_tokens = TurnTokens::from_usage(result.usage.as_ref());
     let context_tokens = agent.effective_context_tokens()?;
     print_chat_token_usage(
         &result,
         show_token_usage,
         context_tokens,
         result_context_window(&display_config, &result).or(agent.context_window()),
-        Some(cumulative_tokens),
+        cumulative_tokens,
     )?;
     let overflow_result = handle_post_turn_overflow(
         &agent,
@@ -5106,7 +5108,7 @@ async fn run_chat_with_options(
             show_token_usage,
             updated_context_tokens,
             result_context_window(&display_config, &result).or(agent.context_window()),
-            Some(cumulative_tokens),
+            cumulative_tokens,
         )?;
     }
     Ok(())
@@ -5116,7 +5118,7 @@ struct RemoteTurnSummary {
     result: ChatResult,
     context_tokens: u64,
     context_window: Option<usize>,
-    cumulative_tokens: u64,
+    cumulative_tokens: TurnTokens,
 }
 
 /// Marker error for a remote turn interrupted by the user (Ctrl+C) or a
@@ -5748,16 +5750,23 @@ async fn try_run_remote_chat(
         .get("context_window")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| usize::try_from(value).ok());
-    let cumulative_tokens = completion
-        .get("cumulative_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
+    let completion_u64 = |key: &str| {
+        completion
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    };
+    let cumulative_tokens = TurnTokens {
+        total: completion_u64("cumulative_tokens"),
+        prompt: completion_u64("cumulative_prompt_tokens"),
+        cache_read: completion_u64("cumulative_cache_read_tokens"),
+    };
     print_chat_token_usage(
         &result,
         config.display.show_token_usage && !plain,
         context_tokens,
         context_window,
-        result.usage.as_ref().map(render::usage_total),
+        TurnTokens::from_usage(result.usage.as_ref()),
     )?;
     Ok(Some(RemoteTurnSummary {
         result,
@@ -5846,7 +5855,7 @@ async fn apply_repl_session_switch(
     history: &mut Vec<String>,
     live_repl: &mut LiveReplTail,
     footer: &mut ReplFooterStatus,
-    cumulative_tokens: &mut u64,
+    cumulative_tokens: &mut TurnTokens,
 ) -> Result<()> {
     if state.session_id.is_empty() {
         bail!("{}", t("session state has no id", "会话状态缺少 ID"));
@@ -5873,13 +5882,10 @@ async fn apply_repl_session_switch(
     // token numbers. `refresh_footer` repaints straight away — merely storing
     // the footer left the previous session's numbers on screen until the next
     // turn finished.
-    *cumulative_tokens = state.cumulative_tokens;
+    *cumulative_tokens = state_cumulative(&state);
     let session_config = footer_config_for_session(paths, config, &state.session_id);
-    *footer = ReplFooterStatus::from_config(
-        &session_config,
-        state.context_tokens,
-        (*cumulative_tokens > 0).then_some(*cumulative_tokens),
-    );
+    *footer =
+        ReplFooterStatus::from_config(&session_config, state.context_tokens, *cumulative_tokens);
     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
     footer.update_thinking_variant(client.thinking_variant_summary().as_deref());
     footer.update_context_window(state.context_window);
@@ -6709,22 +6715,34 @@ fn print_chat_token_usage(
     enabled: bool,
     session_token_total: u64,
     context_window: Option<usize>,
-    cumulative_tokens: Option<u64>,
+    cumulative: TurnTokens,
 ) -> Result<()> {
-    if enabled {
-        if let Some(usage) = &result.usage {
-            let turn_tokens = render::usage_total(usage);
-            render::print_token_usage(
-                turn_tokens,
-                usage.cache_read_tokens,
-                session_token_total,
-                context_window,
-                cumulative_tokens,
-                result.usage_estimated,
-            )?;
-        }
+    if enabled && result.usage.is_some() {
+        let meter = turn_meter(
+            TurnTokens::from_usage(result.usage.as_ref()),
+            session_token_total,
+            context_window,
+            cumulative,
+        );
+        render::print_token_usage(&meter, result.usage_estimated)?;
     }
     Ok(())
+}
+
+fn turn_meter(
+    turn: TurnTokens,
+    session_tokens: u64,
+    context_window: Option<usize>,
+    cumulative: TurnTokens,
+) -> render::TokenMeter {
+    render::TokenMeter {
+        turn_tokens: turn.total,
+        turn_prompt_tokens: turn.prompt,
+        turn_cached_tokens: turn.cache_read,
+        session_tokens,
+        context_window,
+        ..meter_cumulative(cumulative)
+    }
 }
 
 fn result_context_window(config: &AppConfig, result: &crate::llm::ChatResult) -> Option<usize> {
@@ -6744,18 +6762,18 @@ async fn handle_post_turn_overflow(
     renderer: &mut render::StreamRenderer,
     context_tokens: u64,
     show_token_usage: bool,
-    cumulative_tokens: Option<&mut u64>,
+    cumulative_tokens: Option<&mut TurnTokens>,
 ) -> Result<Option<crate::llm::ChatResult>> {
     let compact_result = agent
         .handle_overflow_after_turn(context_tokens, |event| handle_agent_event(renderer, event))
         .await?;
     renderer.finish()?;
     if let Some(compact_result) = compact_result {
-        let mut cumulative_display = None;
+        let mut cumulative_display = TurnTokens::default();
         if let Some(total) = cumulative_tokens {
             if let Some(usage) = compact_result.usage.as_ref() {
-                *total = total.saturating_add(render::usage_total(usage));
-                cumulative_display = Some(*total);
+                total.add(TurnTokens::from_usage(Some(usage)));
+                cumulative_display = *total;
             }
         }
         print_chat_token_usage(
@@ -6776,7 +6794,7 @@ async fn handle_live_post_turn_overflow(
     renderer: &mut render::StreamRenderer,
     context_tokens: u64,
     show_token_usage: bool,
-    cumulative_tokens: Option<&mut u64>,
+    cumulative_tokens: Option<&mut TurnTokens>,
 ) -> Result<Option<crate::llm::ChatResult>> {
     let compact_result = agent
         .handle_overflow_after_turn(context_tokens, |event| {
@@ -6786,21 +6804,22 @@ async fn handle_live_post_turn_overflow(
     renderer.finish()?;
     live.apply_renderer_frame(renderer)?;
     if let Some(compact_result) = compact_result {
-        let mut cumulative_display = None;
+        let mut cumulative_display = TurnTokens::default();
         if let Some(total) = cumulative_tokens {
             if let Some(usage) = compact_result.usage.as_ref() {
-                *total = total.saturating_add(render::usage_total(usage));
-                cumulative_display = Some(*total);
+                total.add(TurnTokens::from_usage(Some(usage)));
+                cumulative_display = *total;
             }
         }
         if show_token_usage {
             if let Some(usage) = compact_result.usage.as_ref() {
                 let frame = render::token_usage_output(
-                    render::usage_total(usage),
-                    usage.cache_read_tokens,
-                    agent.effective_context_tokens()?,
-                    agent.context_window(),
-                    cumulative_display,
+                    &turn_meter(
+                        TurnTokens::from_usage(Some(usage)),
+                        agent.effective_context_tokens()?,
+                        agent.context_window(),
+                        cumulative_display,
+                    ),
                     compact_result.usage_estimated,
                 );
                 live.apply_output_frame(frame.strip_suffix('\n').unwrap_or(&frame).as_bytes())?;
@@ -6936,11 +6955,11 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let history_state = StateStore::new(paths)?.pinned(&active_session_id);
     let mut history = load_repl_input_history(&history_state, paths)?;
     drop(history_state);
-    let mut cumulative_tokens = daemon_state.cumulative_tokens;
+    let mut cumulative_tokens = state_cumulative(&daemon_state);
     let mut footer = ReplFooterStatus::from_config(
         &footer_config_for_session(paths, &config, &active_session_id),
         daemon_state.context_tokens,
-        (cumulative_tokens > 0).then_some(cumulative_tokens),
+        cumulative_tokens,
     );
     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
     let thinking_summary = client.thinking_variant_summary();
@@ -7425,41 +7444,34 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         &format!("{}\n\n", usage_overview_text(&snapshot, context)),
                     )?;
                 }
-                ReplSlashCommand::Persona => {
-                    match run_persona_picker(paths, command_args) {
-                        Ok(true) => {
-                            let _ = repl_ipc_admin(
-                                paths,
-                                &mut live_repl,
-                                IpcCommand::ReloadConfig,
-                            )
-                            .await;
-                            config = AppConfig::load(paths)?;
-                            let session_config =
-                                footer_config_for_session(paths, &config, &active_session_id);
-                            let (state, _) =
-                                repl_active_or_default_state(paths, &active_session_id).await?;
-                            cumulative_tokens = state.cumulative_tokens;
-                            footer = ReplFooterStatus::from_config(
-                                &session_config,
-                                state.context_tokens,
-                                (cumulative_tokens > 0).then_some(cumulative_tokens),
-                            );
-                            let client =
-                                OpenAiCompatibleClient::from_config(&session_config, paths)?;
-                            footer
-                                .update_thinking_variant(client.thinking_variant_summary().as_deref());
-                            footer.update_context_window(state.context_window);
-                            live_repl.set_footer(footer.clone());
-                            repl_note(
-                                &mut live_repl,
-                                &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
-                            )?;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            repl_note(&mut live_repl, &format!("\x1b[31m{error:#}\x1b[0m\n"))?
-                        }
+                ReplSlashCommand::Persona => match run_persona_picker(paths, command_args) {
+                    Ok(true) => {
+                        let _ =
+                            repl_ipc_admin(paths, &mut live_repl, IpcCommand::ReloadConfig).await;
+                        config = AppConfig::load(paths)?;
+                        let session_config =
+                            footer_config_for_session(paths, &config, &active_session_id);
+                        let (state, _) =
+                            repl_active_or_default_state(paths, &active_session_id).await?;
+                        cumulative_tokens = state_cumulative(&state);
+                        footer = ReplFooterStatus::from_config(
+                            &session_config,
+                            state.context_tokens,
+                            cumulative_tokens,
+                        );
+                        let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
+                        footer
+                            .update_thinking_variant(client.thinking_variant_summary().as_deref());
+                        footer.update_context_window(state.context_window);
+                        live_repl.set_footer(footer.clone());
+                        repl_note(
+                            &mut live_repl,
+                            &format!("{}\n", t("configuration reloaded", "配置已重新加载")),
+                        )?;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        repl_note(&mut live_repl, &format!("\x1b[31m{error:#}\x1b[0m\n"))?
                     }
                 }
                 ReplSlashCommand::Models => {
@@ -7482,11 +7494,11 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         footer_config_for_session(paths, &config, &active_session_id);
                     let (state, _) =
                         repl_active_or_default_state(paths, &active_session_id).await?;
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer = ReplFooterStatus::from_config(
                         &session_config,
                         state.context_tokens,
-                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                        cumulative_tokens,
                     );
                     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
@@ -7531,11 +7543,11 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         )
                         .await?;
                     }
-                    cumulative_tokens = state.cumulative_tokens;
+                    cumulative_tokens = state_cumulative(&state);
                     footer = ReplFooterStatus::from_config(
                         &footer_config_for_session(paths, &config, &active_session_id),
                         state.context_tokens,
-                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                        cumulative_tokens,
                     );
                     let client = OpenAiCompatibleClient::from_config(&config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
@@ -7592,11 +7604,11 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                                 )
                                 .await?;
                             }
-                            cumulative_tokens = state.cumulative_tokens;
+                            cumulative_tokens = state_cumulative(&state);
                             footer = ReplFooterStatus::from_config(
                                 &footer_config_for_session(paths, &config, &active_session_id),
                                 state.context_tokens,
-                                (cumulative_tokens > 0).then_some(cumulative_tokens),
+                                cumulative_tokens,
                             );
                             let thinking_summary = client.thinking_variant_summary();
                             footer.update_thinking_variant(thinking_summary.as_deref());
@@ -7764,7 +7776,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             config.display.show_token_usage,
                             state.context_tokens,
                             state.context_window,
-                            Some(state.cumulative_tokens),
+                            state_cumulative(&state),
                         )?;
                     } else {
                         repl_note(
@@ -7857,7 +7869,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     &summary.result,
                     summary.context_tokens,
                     summary.context_window,
-                    Some(cumulative_tokens),
+                    cumulative_tokens,
                 );
                 // Refresh the job strip right away — a background command
                 // spawned this turn must show up without waiting a poll.
@@ -7980,7 +7992,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
         println!("\x1b[2m{message}\x1b[0m");
     }
-    let mut cumulative_tokens = state.session_cumulative_tokens().unwrap_or(0);
+    let mut cumulative_tokens = state.session_cumulative_token_totals().unwrap_or_default();
     let mut show_shortcut_hint = true;
     let initial_registry =
         build_tool_registry(&config, paths, mode, crate::question_tui::available(false))?;
@@ -7994,8 +8006,11 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     )?;
     agent.set_memory_organizer(memory_organizer_handle);
     agent.prepare_for_turn()?;
-    let mut footer =
-        ReplFooterStatus::from_config(&config, agent.effective_context_tokens()?, None);
+    let mut footer = ReplFooterStatus::from_config(
+        &config,
+        agent.effective_context_tokens()?,
+        TurnTokens::default(),
+    );
     let thinking_summary = client.thinking_variant_summary();
     footer.update_thinking_variant(thinking_summary.as_deref());
     footer.update_context_window(agent.context_window());
@@ -8080,7 +8095,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                     footer = ReplFooterStatus::from_config(
                         &config,
                         agent.effective_context_tokens()?,
-                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                        cumulative_tokens,
                     );
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
@@ -8116,7 +8131,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             footer = ReplFooterStatus::from_config(
                 &config,
                 agent.effective_context_tokens()?,
-                (cumulative_tokens > 0).then_some(cumulative_tokens),
+                cumulative_tokens,
             );
             let thinking_summary = client.thinking_variant_summary();
             footer.update_thinking_variant(thinking_summary.as_deref());
@@ -8138,7 +8153,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             footer = ReplFooterStatus::from_config(
                 &config,
                 agent.effective_context_tokens()?,
-                (cumulative_tokens > 0).then_some(cumulative_tokens),
+                cumulative_tokens,
             );
             let thinking_summary = client.thinking_variant_summary();
             footer.update_thinking_variant(thinking_summary.as_deref());
@@ -8244,14 +8259,13 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 Ok(Some(result)) => {
                     renderer.finish()?;
                     if let Some(usage) = result.usage.as_ref() {
-                        cumulative_tokens =
-                            cumulative_tokens.saturating_add(render::usage_total(usage));
+                        cumulative_tokens.add(TurnTokens::from_usage(Some(usage)));
                     }
                     footer.update_token_usage(
                         &result,
                         agent.effective_context_tokens()?,
                         agent.context_window(),
-                        (cumulative_tokens > 0).then_some(cumulative_tokens),
+                        cumulative_tokens,
                     );
                     if config.display.show_token_usage {
                         print_chat_token_usage(
@@ -8259,7 +8273,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                             true,
                             agent.effective_context_tokens()?,
                             agent.context_window(),
-                            (cumulative_tokens > 0).then_some(cumulative_tokens),
+                            cumulative_tokens,
                         )?;
                     }
                 }
@@ -8369,17 +8383,16 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             Ok(Some(result)) => {
                 let context_window =
                     result_context_window(&config, &result).or(agent.context_window());
-                let mut turn_tokens = result.usage.as_ref().map(render::usage_total).unwrap_or(0);
+                let mut turn_tokens = TurnTokens::from_usage(result.usage.as_ref());
                 if let Some(usage) = result.usage.as_ref() {
-                    cumulative_tokens =
-                        cumulative_tokens.saturating_add(render::usage_total(usage));
+                    cumulative_tokens.add(TurnTokens::from_usage(Some(usage)));
                 }
                 let context_tokens = agent.effective_context_tokens()?;
                 footer.update_token_usage(
                     &result,
                     context_tokens,
                     context_window,
-                    (cumulative_tokens > 0).then_some(cumulative_tokens),
+                    cumulative_tokens,
                 );
                 let endpoint_variant = result.provider_id.as_deref().and_then(|provider_id| {
                     result
@@ -8408,13 +8421,13 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 {
                     Ok(Some(compact_result)) => {
                         if let Some(usage) = compact_result.usage.as_ref() {
-                            turn_tokens = turn_tokens.saturating_add(render::usage_total(usage));
+                            turn_tokens.add(TurnTokens::from_usage(Some(usage)));
                         }
-                        footer.set_token_usage(
+                        footer.set_token_usage_with_cache(
                             turn_tokens,
                             agent.effective_context_tokens()?,
                             agent.context_window(),
-                            (cumulative_tokens > 0).then_some(cumulative_tokens),
+                            cumulative_tokens,
                         );
                     }
                     Ok(None) => {
@@ -10799,6 +10812,11 @@ struct SharedJobsFeed {
     jobs: std::sync::Mutex<Vec<crate::tools::jobs::JobOverview>>,
     /// Rendered wake-turn reports waiting to be printed into the scrollback.
     reports: std::sync::Mutex<Vec<BackgroundReport>>,
+    /// Latest session Σ read straight from the store. Background subagents
+    /// bill to the session that launched them, but they finish long after the
+    /// turn that spawned them published its totals — without this the footer
+    /// sat on a stale Σ until the user happened to send another prompt.
+    cumulative: std::sync::Mutex<Option<TurnTokens>>,
     /// Active daemon-initiated wake runs: (run_id, session_id, label).
     wake_runs: std::sync::Mutex<Vec<(String, String, String)>>,
     /// Wake runs already attached to (never re-follow), and turn ids that
@@ -10837,6 +10855,15 @@ impl JobsFeed {
         match self {
             JobsFeed::Shared(shared) => shared.jobs.lock().unwrap().clone(),
             JobsFeed::Local => crate::tools::jobs::overview(),
+        }
+    }
+
+    /// The store's current Σ for the REPL's session, or `None` when this feed
+    /// has no store behind it.
+    fn cumulative(&self) -> Option<TurnTokens> {
+        match self {
+            JobsFeed::Shared(shared) => *shared.cumulative.lock().unwrap(),
+            JobsFeed::Local => None,
         }
     }
 
@@ -13252,6 +13279,8 @@ mod repl_input_tests {
             is_summary: false,
             owner_pid: None,
             token_total: 0,
+            token_prompt: 0,
+            token_cache_read: 0,
             token_usage_estimated: false,
             revision: 0,
             journal_events: Vec::new(),
@@ -14326,8 +14355,23 @@ mod repl_input_tests {
     #[test]
     fn footer_reset_clears_turn_and_cumulative_tokens() {
         let config = AppConfig::default();
-        let mut footer = ReplFooterStatus::from_config(&config, 100, Some(250));
-        footer.set_token_usage(50, 100, Some(200_000), Some(250));
+        let mut footer = ReplFooterStatus::from_config(
+            &config,
+            100,
+            TurnTokens {
+                total: 250,
+                ..Default::default()
+            },
+        );
+        footer.set_token_usage(
+            50,
+            100,
+            Some(200_000),
+            TurnTokens {
+                total: 250,
+                ..Default::default()
+            },
+        );
 
         footer.reset_token_usage(0, Some(200_000));
 
@@ -14343,7 +14387,7 @@ mod repl_input_tests {
     #[test]
     fn footer_turn_completion_updates_the_rendered_token_accounting() {
         let config = AppConfig::default();
-        let mut footer = ReplFooterStatus::from_config(&config, 0, None);
+        let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
         let result = ChatResult {
             content: "reply".to_string(),
             reasoning: None,
@@ -14363,7 +14407,15 @@ mod repl_input_tests {
             responses_continuation: None,
         };
 
-        footer.update_token_usage(&result, 240, Some(200_000), Some(100));
+        footer.update_token_usage(
+            &result,
+            240,
+            Some(200_000),
+            TurnTokens {
+                total: 100,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(footer.token_usage.turn_tokens, 100);
         assert_eq!(footer.token_usage.session_tokens, 240);
@@ -14476,7 +14528,7 @@ mod repl_input_tests {
                 model: second_model,
             },
         ]);
-        let mut footer = ReplFooterStatus::from_config(&config, 0, None);
+        let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
         footer.update_thinking_variant(Some("mixed"));
 
         let line = repl_footer_left(AgentMode::Normal, &footer, 120);
@@ -14736,7 +14788,7 @@ mod repl_input_tests {
             editor: LiveReplEditor::new(AgentMode::Normal, Vec::new()),
             queued: Vec::new(),
             pending_chunks: Vec::new(),
-            footer: ReplFooterStatus::from_config(&config, 0, None),
+            footer: ReplFooterStatus::from_config(&config, 0, TurnTokens::default()),
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,
@@ -14768,7 +14820,7 @@ mod repl_input_tests {
             editor: LiveReplEditor::new(AgentMode::Normal, Vec::new()),
             queued: Vec::new(),
             pending_chunks: Vec::new(),
-            footer: ReplFooterStatus::from_config(&config, 0, None),
+            footer: ReplFooterStatus::from_config(&config, 0, TurnTokens::default()),
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,

@@ -288,6 +288,36 @@ impl Usage {
     }
 }
 
+/// The slice of a turn's usage that is worth persisting. `total` alone cannot
+/// express a cache hit rate: a hit is an input-side property — output tokens
+/// only enter the prompt on the *next* turn — so the rate needs `prompt` as
+/// its denominator, and both halves have to survive into the database for the
+/// cumulative figure to mean anything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnTokens {
+    pub total: u64,
+    pub prompt: u64,
+    pub cache_read: u64,
+}
+
+impl TurnTokens {
+    pub fn from_usage(usage: Option<&Usage>) -> Self {
+        usage
+            .map(|usage| Self {
+                total: usage.effective_total_tokens(),
+                prompt: usage.prompt_tokens,
+                cache_read: usage.cache_read_tokens,
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add(&mut self, other: TurnTokens) {
+        self.total = self.total.saturating_add(other.total);
+        self.prompt = self.prompt.saturating_add(other.prompt);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesContinuation {
     pub(crate) response_id: String,

@@ -488,6 +488,8 @@ pub(crate) struct ContextSnapshot {
     pub(crate) tokens: u64,
     pub(crate) window: Option<usize>,
     pub(crate) cumulative_tokens: u64,
+    pub(crate) cumulative_prompt_tokens: u64,
+    pub(crate) cumulative_cache_read_tokens: u64,
 }
 
 pub(crate) enum ActorCommand {
@@ -1632,6 +1634,8 @@ struct SafeTurn {
     user_timestamp: String,
     assistant_timestamp: Option<String>,
     token_total: u64,
+    token_prompt: u64,
+    token_cache_read: u64,
     token_usage_estimated: bool,
     question_exchanges: Vec<crate::question::QuestionExchange>,
     followups: Vec<SafeFollowup>,
@@ -2268,36 +2272,6 @@ async fn handle_ipc_connection(
                     return Ok(());
                 }
             };
-            if all {
-                let config = state.manager.lock().unwrap().config.clone();
-                match reset_platform_persona_state(&state, &config).await {
-                    Ok(sessions) => {
-                        let target_state = session_state_for(&state, &target_record.session_id)?;
-                        ipc::send(
-                            &mut stream,
-                            &IpcFrame::AdminResult {
-                                state: target_state,
-                                data: json!({ "sessions": sessions }),
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(PlatformPersonaResetError::Busy) => {
-                        ipc::send(
-                            &mut stream,
-                            &IpcFrame::coded_error(ipc::ErrorCode::Busy, ipc::ADMIN_BUSY_MESSAGE),
-                        )
-                        .await?;
-                    }
-                    Err(PlatformPersonaResetError::Unavailable) => {
-                        anyhow::bail!("Miyu core worker is unavailable");
-                    }
-                    Err(PlatformPersonaResetError::Internal(message)) => {
-                        ipc::send(&mut stream, &IpcFrame::error(message)).await?;
-                    }
-                }
-                return Ok(());
-            }
             let session_id: Arc<str> = target_record.session_id.into();
             reserve_admin_for_session(&state.manager, &session_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -7612,6 +7586,8 @@ fn finish_cancelled_run(
         payload["context_tokens"] = json!(context.tokens);
         payload["context_window"] = json!(context.window);
         payload["cumulative_tokens"] = json!(context.cumulative_tokens);
+        payload["cumulative_prompt_tokens"] = json!(context.cumulative_prompt_tokens);
+        payload["cumulative_cache_read_tokens"] = json!(context.cumulative_cache_read_tokens);
     }
     finish_run(manager, run_id, context);
     events.publish("run.cancelled", payload);
@@ -7714,15 +7690,20 @@ fn publish_completed(
             "context_tokens": context_tokens,
             "context_window": context.window,
             "cumulative_tokens": context.cumulative_tokens,
+            "cumulative_prompt_tokens": context.cumulative_prompt_tokens,
+            "cumulative_cache_read_tokens": context.cumulative_cache_read_tokens,
         }),
     );
 }
 
 fn current_context(agent: &Agent) -> Result<ContextSnapshot> {
+    let cumulative = agent.conversation_usage_token_totals()?;
     Ok(ContextSnapshot {
         tokens: agent.effective_context_tokens()?,
         window: agent.context_window(),
-        cumulative_tokens: agent.conversation_usage_tokens()?,
+        cumulative_tokens: cumulative.total,
+        cumulative_prompt_tokens: cumulative.prompt,
+        cumulative_cache_read_tokens: cumulative.cache_read,
     })
 }
 
@@ -7780,10 +7761,13 @@ fn actor_context(
 }
 
 fn cold_context(config: &AppConfig, state_store: &StateStore) -> Result<ContextSnapshot> {
+    let cumulative = state_store.session_cumulative_token_totals()?;
     Ok(ContextSnapshot {
         tokens: 0,
         window: config.active_context_window()?,
-        cumulative_tokens: state_store.session_cumulative_tokens()?,
+        cumulative_tokens: cumulative.total,
+        cumulative_prompt_tokens: cumulative.prompt,
+        cumulative_cache_read_tokens: cumulative.cache_read,
     })
 }
 
@@ -7798,6 +7782,8 @@ fn session_state(
         context_tokens: context.tokens,
         context_window: context.window,
         cumulative_tokens: context.cumulative_tokens,
+        cumulative_prompt_tokens: context.cumulative_prompt_tokens,
+        cumulative_cache_read_tokens: context.cumulative_cache_read_tokens,
         session_id: session_id.to_string(),
         session_name: record
             .as_ref()
@@ -7824,6 +7810,8 @@ fn session_state_for(state: &DaemonState, session_id: &str) -> Result<ipc::Sessi
         context_tokens: context.tokens,
         context_window: context.window,
         cumulative_tokens: context.cumulative_tokens,
+        cumulative_prompt_tokens: context.cumulative_prompt_tokens,
+        cumulative_cache_read_tokens: context.cumulative_cache_read_tokens,
         session_id: record.session_id,
         session_name: record.name,
         workspace: record.workspace,
@@ -9298,6 +9286,8 @@ impl SafeTurn {
             user_timestamp: turn.user_timestamp,
             assistant_timestamp: turn.assistant_timestamp,
             token_total: turn.token_total,
+            token_prompt: turn.token_prompt,
+            token_cache_read: turn.token_cache_read,
             token_usage_estimated: turn.token_usage_estimated,
             question_exchanges: turn.question_exchanges,
             followups: turn.followups.into_iter().map(SafeFollowup::from).collect(),
@@ -10821,6 +10811,8 @@ mod tests {
                 tokens: 0,
                 window: None,
                 cumulative_tokens: 0,
+                cumulative_prompt_tokens: 0,
+                cumulative_cache_read_tokens: 0,
             },
             persona_session_ids: HashMap::new(),
         }));
@@ -11160,6 +11152,8 @@ mod tests {
                 tokens: 0,
                 window: None,
                 cumulative_tokens: 0,
+                cumulative_prompt_tokens: 0,
+                cumulative_cache_read_tokens: 0,
             },
             &paths,
         )

@@ -381,7 +381,7 @@ impl Compactor {
             &fold_turn_ids,
             &visible_turn_ids,
             &summary,
-            Some(compact_usage.effective_total_tokens()),
+            crate::llm::TurnTokens::from_usage(Some(&compact_usage)),
             usage_estimated,
             footprint_json.as_deref(),
         )?;
@@ -818,6 +818,8 @@ mod tests {
             is_summary: false,
             owner_pid: None,
             token_total: 0,
+            token_prompt: 0,
+            token_cache_read: 0,
             token_usage_estimated: false,
             revision: 0,
             journal_events: Vec::new(),

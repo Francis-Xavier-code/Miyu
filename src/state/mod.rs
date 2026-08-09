@@ -8,7 +8,7 @@ pub fn latest_schema_version() -> i64 {
     migrations::LATEST_VERSION
 }
 
-use crate::llm::Usage;
+use crate::llm::{TurnTokens, Usage};
 use crate::memory::EvictedTurn;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
@@ -706,6 +706,7 @@ impl StateStore {
         prompt_tokens: i64,
         completion_tokens: i64,
         total_tokens: i64,
+        cache_read_tokens: i64,
     ) -> Result<()> {
         self.conv_db.record_subagent_usage(
             session_id,
@@ -715,6 +716,7 @@ impl StateStore {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_tokens,
         )
     }
 
@@ -849,7 +851,7 @@ impl StateStore {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         self.conv_db.complete_turn_with_usage(
@@ -858,7 +860,7 @@ impl StateStore {
             reasoning,
             provider_id,
             model,
-            token_total,
+            tokens,
             token_usage_estimated,
         )
     }
@@ -872,7 +874,7 @@ impl StateStore {
         reasoning: Option<&str>,
         provider_id: Option<&str>,
         model: Option<&str>,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
         self.conv_db.complete_turn_revision_with_usage(
@@ -882,7 +884,7 @@ impl StateStore {
             reasoning,
             provider_id,
             model,
-            token_total,
+            tokens,
             token_usage_estimated,
         )
     }
@@ -1459,15 +1461,11 @@ impl StateStore {
     pub fn insert_summary_turn(
         &self,
         summary: &str,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
     ) -> Result<()> {
-        self.conv_db.insert_summary_turn(
-            &self.session(),
-            summary,
-            token_total,
-            token_usage_estimated,
-        )
+        self.conv_db
+            .insert_summary_turn(&self.session(), summary, tokens, token_usage_estimated)
     }
 
     pub fn load_last_summary(&self) -> Result<Option<Turn>> {
@@ -1492,7 +1490,7 @@ impl StateStore {
         fold_turn_ids: &[String],
         visible_turn_ids: &[String],
         summary: &str,
-        token_total: Option<u64>,
+        tokens: TurnTokens,
         token_usage_estimated: bool,
         footprint_json: Option<&str>,
     ) -> Result<()> {
@@ -1501,7 +1499,7 @@ impl StateStore {
             fold_turn_ids,
             visible_turn_ids,
             summary,
-            token_total,
+            tokens,
             token_usage_estimated,
             footprint_json,
         )
@@ -1825,6 +1823,12 @@ impl StateStore {
     /// zeroed by /reset). This is the Σ shown in the REPL/WebUI footer.
     pub fn session_cumulative_tokens(&self) -> Result<u64> {
         self.conv_db.session_token_total(&self.session())
+    }
+
+    /// Same Σ, plus the prompt and cache-read halves the cumulative cache rate
+    /// is computed from.
+    pub fn session_cumulative_token_totals(&self) -> Result<TurnTokens> {
+        self.conv_db.session_token_totals(&self.session())
     }
 
     pub fn clear_last_usage(&self) -> Result<()> {
@@ -3313,6 +3317,136 @@ mod tests {
     }
 
     #[test]
+    fn wiping_the_persona_takes_the_subagent_rows_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let parent = store.session_id();
+        let audit = store
+            .create_session("miyu", "深挖", "subagent", Some(&parent))
+            .unwrap();
+        store
+            .record_subagent_usage(&audit.session_id, None, None, None, 400, 100, 500, 200)
+            .unwrap();
+        assert_eq!(store.session_cumulative_token_totals().unwrap().total, 500);
+
+        // Subagent usage lives on the session row, not in `turns` — clearing
+        // the turns alone left every Σ still carrying it.
+        store.reset_persona_contexts("miyu", "onebot").unwrap();
+        assert_eq!(
+            store.session_cumulative_token_totals().unwrap(),
+            TurnTokens::default()
+        );
+    }
+
+    #[test]
+    fn a_subagents_tokens_land_in_the_launching_sessions_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let parent = store.session_id();
+
+        let turn_id = "turn_parent_1";
+        store
+            .start_turn(turn_id, "问题", std::process::id())
+            .unwrap();
+        store
+            .complete_turn_with_usage_and_model(
+                turn_id,
+                "答案",
+                None,
+                None,
+                None,
+                TurnTokens {
+                    total: 1_000,
+                    prompt: 900,
+                    cache_read: 300,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.session_cumulative_token_totals().unwrap(),
+            TurnTokens {
+                total: 1_000,
+                prompt: 900,
+                cache_read: 300
+            }
+        );
+
+        let audit = store
+            .create_session("miyu", "深挖", "subagent", Some(&parent))
+            .unwrap();
+        store
+            .record_subagent_usage(&audit.session_id, None, None, None, 400, 100, 500, 200)
+            .unwrap();
+
+        // A subagent bills to the session that launched it, cache hits and all
+        // — otherwise the most expensive thing a turn can do is invisible.
+        assert_eq!(
+            store.session_cumulative_token_totals().unwrap(),
+            TurnTokens {
+                total: 1_500,
+                prompt: 1_300,
+                cache_read: 500
+            }
+        );
+
+        // A reset that left the audit sessions behind would zero the history
+        // and still report a running total.
+        store.reset_conversation().unwrap();
+        assert_eq!(
+            store.session_cumulative_token_totals().unwrap(),
+            TurnTokens::default()
+        );
+    }
+
+    #[test]
+    fn a_subagent_run_recorded_before_the_cache_column_stays_out_of_the_rate() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let parent = store.session_id();
+        let audit = store
+            .create_session("miyu", "升级前的一次", "subagent", Some(&parent))
+            .unwrap();
+        // Exactly what the v19 migration leaves behind: usage recorded, cache
+        // unknown (NULL). Counting its prompt with no hits to match turned a
+        // measured 24% into 1% on the real database.
+        store
+            .conv_db()
+            .record_legacy_subagent_usage_for_test(&audit.session_id, 1_111_360, 1_222_121)
+            .unwrap();
+        let totals = store.session_cumulative_token_totals().unwrap();
+        assert_eq!(totals.total, 1_222_121);
+        assert_eq!(
+            totals.prompt, 0,
+            "unknown cache must not claim a denominator"
+        );
+        assert_eq!(totals.cache_read, 0);
+    }
+
+    #[test]
+    fn an_estimated_subagent_run_never_reaches_the_cache_denominator() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StateStore::new(&test_paths(temp.path())).unwrap();
+        store.adopt_sessions_for_persona("miyu").unwrap();
+        let parent = store.session_id();
+        let audit = store
+            .create_session("miyu", "估算的一次", "subagent", Some(&parent))
+            .unwrap();
+        // The provider reported nothing, so only the char estimate is known:
+        // it inflates the total but must not pretend to be measured prompt.
+        store
+            .record_subagent_usage(&audit.session_id, None, None, None, 0, 0, 9_000, 0)
+            .unwrap();
+        let totals = store.session_cumulative_token_totals().unwrap();
+        assert_eq!(totals.total, 9_000);
+        assert_eq!(totals.prompt, 0);
+        assert_eq!(totals.cache_read, 0);
+    }
+
+    #[test]
     fn subagent_audit_sessions_are_hidden_and_expire() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&test_paths(temp.path())).unwrap();
@@ -3337,6 +3471,7 @@ mod tests {
                 100,
                 50,
                 150,
+                40,
             )
             .unwrap();
 
@@ -3355,7 +3490,7 @@ mod tests {
         assert_eq!(store.delete_subagent_sessions_older_than(7).unwrap(), 0);
         store
             .conv_db()
-            .record_subagent_usage(&audit.session_id, None, None, None, 0, 0, 0)
+            .record_subagent_usage(&audit.session_id, None, None, None, 0, 0, 0, 0)
             .unwrap();
         // Backdate updated_at directly.
         store.conv_db().touch_session(&audit.session_id).unwrap();
@@ -3990,7 +4125,14 @@ mod tests {
         store.complete_turn("t1", "hi", None).unwrap();
 
         store
-            .insert_summary_turn("## Task Goal\nDo stuff", Some(12), true)
+            .insert_summary_turn(
+                "## Task Goal\nDo stuff",
+                TurnTokens {
+                    total: 12,
+                    ..Default::default()
+                },
+                true,
+            )
             .unwrap();
 
         let summary = store.load_last_summary().unwrap();
@@ -4031,7 +4173,14 @@ mod tests {
         store.start_turn("t1", "old", 999999).unwrap();
         store.complete_turn("t1", "old reply", None).unwrap();
         store
-            .insert_summary_turn("summary of old", Some(8), true)
+            .insert_summary_turn(
+                "summary of old",
+                TurnTokens {
+                    total: 8,
+                    ..Default::default()
+                },
+                true,
+            )
             .unwrap();
         store.start_turn("t2", "new", 999999).unwrap();
         store.complete_turn("t2", "new reply", None).unwrap();
@@ -4175,7 +4324,14 @@ mod tests {
     fn interrupted_turn_is_evictable_but_summary_and_running_turn_are_not() {
         let (_temp, store) = test_store();
         store
-            .insert_summary_turn("summary", Some(1), false)
+            .insert_summary_turn(
+                "summary",
+                TurnTokens {
+                    total: 1,
+                    ..Default::default()
+                },
+                false,
+            )
             .unwrap();
         store.start_turn("completed", "completed", 999999).unwrap();
         store.complete_turn("completed", "reply", None).unwrap();
@@ -4208,7 +4364,17 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", Some(10), true, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "summary",
+                TurnTokens {
+                    total: 10,
+                    ..Default::default()
+                },
+                true,
+                None,
+            )
             .unwrap();
 
         let all = store.load_turns().unwrap();
@@ -4248,13 +4414,27 @@ mod tests {
         }
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary one", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "summary one",
+                TurnTokens::default(),
+                false,
+                None,
+            )
             .unwrap();
         store.start_turn("t3", "third", 999999).unwrap();
         store.complete_turn("t3", "reply", None).unwrap();
         let (fold_ids, turn_ids) = visible_snapshot(&store);
         store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary two", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "summary two",
+                TurnTokens::default(),
+                false,
+                None,
+            )
             .unwrap();
 
         assert_eq!(
@@ -4296,7 +4476,7 @@ mod tests {
                 &["t1".to_string(), "t2".to_string()],
                 &all_ids,
                 "summary",
-                None,
+                TurnTokens::default(),
                 false,
                 None,
             )
@@ -4338,7 +4518,7 @@ mod tests {
                 &["t1".to_string()],
                 &all_ids,
                 "summary one",
-                None,
+                TurnTokens::default(),
                 false,
                 None,
             )
@@ -4355,7 +4535,7 @@ mod tests {
                 &["t2".to_string()],
                 &all_ids,
                 "summary two",
-                None,
+                TurnTokens::default(),
                 false,
                 None,
             )
@@ -4437,7 +4617,14 @@ mod tests {
         let (fold_ids, turn_ids) = visible_snapshot(&store);
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "  ", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "  ",
+                TurnTokens::default(),
+                false,
+                None
+            )
             .is_err());
 
         let visible = store.load_visible_turns().unwrap();
@@ -4460,7 +4647,14 @@ mod tests {
         .unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "summary", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "summary",
+                TurnTokens::default(),
+                false,
+                None
+            )
             .is_err());
         let visible = store.load_visible_turns().unwrap();
         assert_eq!(visible.len(), 1);
@@ -4472,7 +4666,7 @@ mod tests {
     fn irreversible_legacy_summary_is_not_deleted_by_undo() {
         let (_temp, store) = test_store();
         store
-            .insert_summary_turn("legacy summary", None, false)
+            .insert_summary_turn("legacy summary", TurnTokens::default(), false)
             .unwrap();
 
         assert_eq!(store.undo_last_turn().unwrap(), (0, None));
@@ -4490,12 +4684,12 @@ mod tests {
     fn irreversible_nested_legacy_summary_is_not_downgraded_by_undo() {
         let (_temp, store) = test_store();
         store
-            .insert_summary_turn("legacy summary one", None, false)
+            .insert_summary_turn("legacy summary one", TurnTokens::default(), false)
             .unwrap();
         let first_seq = store.load_visible_turns().unwrap()[0].seq;
         store.hide_turns_before_seq(first_seq).unwrap();
         store
-            .insert_summary_turn("legacy summary two", None, false)
+            .insert_summary_turn("legacy summary two", TurnTokens::default(), false)
             .unwrap();
 
         assert_eq!(store.undo_last_turn().unwrap(), (0, None));
@@ -4531,7 +4725,14 @@ mod tests {
         store.undo_last_turn().unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "stale",
+                TurnTokens::default(),
+                false,
+                None
+            )
             .is_err());
         assert!(store.load_visible_turns().unwrap().is_empty());
     }
@@ -4546,7 +4747,14 @@ mod tests {
         store.complete_turn("t2", "reply", None).unwrap();
 
         assert!(store
-            .replace_visible_with_summary(&fold_ids, &turn_ids, "stale", None, false, None)
+            .replace_visible_with_summary(
+                &fold_ids,
+                &turn_ids,
+                "stale",
+                TurnTokens::default(),
+                false,
+                None
+            )
             .is_err());
         assert_eq!(store.load_visible_turns().unwrap().len(), 2);
     }
@@ -4600,7 +4808,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                TurnTokens::default(),
                 false,
             )
             .unwrap();

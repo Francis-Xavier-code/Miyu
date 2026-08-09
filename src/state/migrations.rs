@@ -106,10 +106,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_replay_journal",
         apply: apply_v17_turn_replay_journal,
     },
+    Migration {
+        version: 18,
+        name: "turn_cache_tokens",
+        apply: apply_v18_turn_cache_tokens,
+    },
+    Migration {
+        version: 19,
+        name: "session_cache_tokens",
+        apply: apply_v19_session_cache_tokens,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 17;
+pub const LATEST_VERSION: i64 = 19;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -788,6 +798,36 @@ fn apply_v16_turn_tool_footprint(conn: &Connection) -> Result<()> {
 /// in order, for the REPL to redraw a reopened session the way it looked.
 fn apply_v17_turn_replay_journal(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "turns", "replay_journal", "TEXT")
+}
+
+/// Prompt and cache-read halves of a turn's usage. `token_total` alone cannot
+/// express a cache hit rate: hits are an input-side property (output tokens
+/// only enter the prompt on the *next* turn), so the rate needs the prompt as
+/// its denominator, not the total. Turns recorded before this migration keep
+/// zeros, which read as "the provider reported no cache" and so display
+/// nothing rather than a fake 0%.
+fn apply_v18_turn_cache_tokens(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "token_prompt", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "turns",
+        "token_cache_read",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
+/// Cache-read half of a subagent run's usage. Subagent sessions already carry
+/// prompt/completion/total on the session row; the cumulative cache rate needs
+/// the hits too, or folding subagent prompts into the denominator would make a
+/// healthy cache read as broken.
+///
+/// Deliberately nullable: rows written before this migration have an *unknown*
+/// cache figure, not a zero one. Defaulting them to 0 would drag their prompt
+/// tokens into the rate's denominator with no hits to match — on a real
+/// database that turned a measured 24% into 1%. NULL keeps them in the Σ total
+/// and out of the rate.
+fn apply_v19_session_cache_tokens(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "sessions", "cache_read_tokens", "INTEGER")
 }
 
 fn add_column_if_missing(

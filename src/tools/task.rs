@@ -612,13 +612,14 @@ fn record_subagent_audit(
                 .map(|window| window as i64),
             _ => None,
         };
-        let (prompt_tokens, completion_tokens, total_tokens) = match stats {
+        let (prompt_tokens, completion_tokens, total_tokens, cache_read_tokens) = match stats {
             Some(stats) => (
                 stats.prompt_tokens as i64,
                 stats.completion_tokens as i64,
                 stats.total_tokens.max(stats.token_estimate) as i64,
+                stats.cache_read_tokens as i64,
             ),
-            None => (0, 0, 0),
+            None => (0, 0, 0, 0),
         };
         store.record_subagent_usage(
             &record.session_id,
@@ -628,6 +629,7 @@ fn record_subagent_audit(
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_tokens,
         )
     })();
     if let Err(error) = outcome {

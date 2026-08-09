@@ -180,6 +180,11 @@ pub struct SubagentStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// How much of `prompt_tokens` the provider served from cache. Tracked so
+    /// subagent usage can join the session's cumulative cache rate without
+    /// diluting it: folding the prompt into the denominator while dropping the
+    /// hits would make a healthy cache look broken.
+    pub cache_read_tokens: u64,
     pub token_estimate: u64,
     pub token_estimate_method: TokenEstimateMethod,
     pub budget_reached: bool,
@@ -201,6 +206,7 @@ impl SubagentStats {
             if total_tokens > 0 {
                 self.prompt_tokens += usage.prompt_tokens;
                 self.completion_tokens += usage.completion_tokens;
+                self.cache_read_tokens += usage.cache_read_tokens;
                 self.total_tokens += total_tokens;
                 self.token_estimate += total_tokens;
                 self.token_estimate_method = match self.token_estimate_method {
@@ -230,6 +236,7 @@ impl SubagentStats {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
             "token_estimate": self.token_estimate,
             "token_estimate_method": token_estimate_method_label(self.token_estimate_method),
             "token_estimate_is_actual": self.token_estimate_method == TokenEstimateMethod::ProviderUsage,
