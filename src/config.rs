@@ -3640,6 +3640,9 @@ impl AppConfig {
         config.migrate()?;
         config.normalize_api_quota_accounts();
         config.normalize_platform_model_routes();
+        // Also on save, not just on load: a value healed only in memory is
+        // rewritten stale on the next write, so the file never recovers.
+        config.normalize_managed_output_paths(paths);
         let effective_memory = config.memory_config().clone();
         config.plugins.memory = effective_memory;
         config.memory = MemoryConfig::default();
@@ -3767,18 +3770,35 @@ impl AppConfig {
                 directories::UserDirs::new().and_then(|dirs| dirs.picture_dir().map(PathBuf::from))
             })
             .unwrap_or_else(|| base.home_dir().join("Pictures"));
-        remap_managed_output_dir(
+        // The XDG data root is a legacy root too: an upgrade that ran while
+        // `data_dir` still pointed at `~/.local/share/miyu` remapped these
+        // fields onto it and persisted the result, so the value we now have to
+        // heal is one this function itself wrote.
+        let legacy_data = base.data_dir().join("miyu");
+        if let Some((from, to)) = remap_managed_output_dir(
             &mut self.plugins.deep_research.output_dir,
-            &[documents.join("Miyu"), documents.join("miyu")],
+            &[
+                documents.join("Miyu"),
+                documents.join("miyu"),
+                legacy_data.join("documents"),
+            ],
             &paths.data_dir.join("documents"),
             base.home_dir(),
-        );
-        remap_managed_output_dir(
+        ) {
+            relocate_managed_output(&from, &to);
+        }
+        if let Some((from, to)) = remap_managed_output_dir(
             &mut self.plugins.image_generation.output_dir,
-            &[pictures.join("miyu"), pictures.join("Miyu")],
+            &[
+                pictures.join("miyu"),
+                pictures.join("Miyu"),
+                legacy_data.join("pictures"),
+            ],
             &paths.data_dir.join("pictures"),
             base.home_dir(),
-        );
+        ) {
+            relocate_managed_output(&from, &to);
+        }
     }
 
     fn prune_stale_active_provider_models(&mut self) {
@@ -5520,12 +5540,14 @@ fn default_miyu_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~/.miyu"))
 }
 
+/// Returns the old absolute directory when the value was rewritten, so the
+/// caller can carry any files across; `None` when nothing matched.
 fn remap_managed_output_dir(
     value: &mut String,
     legacy_roots: &[PathBuf],
     destination_root: &Path,
     home: &Path,
-) {
+) -> Option<(PathBuf, PathBuf)> {
     let trimmed = value.trim();
     let expanded = trimmed
         .strip_prefix("~/")
@@ -5535,8 +5557,49 @@ fn remap_managed_output_dir(
         let Ok(relative) = expanded.strip_prefix(legacy_root) else {
             continue;
         };
-        *value = destination_root.join(relative).display().to_string();
+        let destination = destination_root.join(relative);
+        *value = destination.display().to_string();
+        return Some((expanded, destination));
+    }
+    None
+}
+
+/// Carries files left behind at a remapped output directory over to the new
+/// one. Best effort: a file that cannot be moved is left where it is rather
+/// than failing a config load over it.
+fn relocate_managed_output(from: &Path, to: &Path) {
+    if from == to || !from.is_dir() {
         return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    let mut moved = 0usize;
+    for entry in entries.flatten() {
+        let target = to.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        if std::fs::create_dir_all(to).is_err() {
+            return;
+        }
+        if std::fs::rename(entry.path(), &target).is_ok() {
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        // Only prunes when it empties out; anything left is someone else's.
+        let _ = std::fs::remove_dir(from);
+        tracing::info!(
+            from = %from.display(),
+            to = %to.display(),
+            moved,
+            "{}",
+            crate::i18n::text(
+                "moved files from a stale managed output directory",
+                "已把过时输出目录里的文件搬到新位置",
+            )
+        );
     }
 }
 
@@ -5645,6 +5708,55 @@ fn default_on_overflow() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_xdg_output_dir_is_healed_and_its_files_follow() {
+        // The value being healed is one an earlier upgrade wrote itself: it
+        // remapped onto data_dir while data_dir still pointed at the legacy
+        // XDG root, so the old root has to be a legacy root too.
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let legacy = home.join(".local/share/miyu/pictures/generated-images");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("one.png"), "a").unwrap();
+        std::fs::write(legacy.join("two.png"), "b").unwrap();
+
+        let destination_root = home.join(".miyu/data/pictures");
+        let mut value = legacy.display().to_string();
+        let moved = remap_managed_output_dir(
+            &mut value,
+            &[home.join(".local/share/miyu/pictures")],
+            &destination_root,
+            home,
+        );
+        let (from, to) = moved.expect("the stale root must be recognised");
+        assert_eq!(to, destination_root.join("generated-images"));
+        assert_eq!(value, to.display().to_string());
+
+        relocate_managed_output(&from, &to);
+        assert!(to.join("one.png").exists());
+        assert!(to.join("two.png").exists());
+        assert!(
+            !from.exists(),
+            "an emptied stale directory should not linger"
+        );
+    }
+
+    #[test]
+    fn a_path_outside_every_legacy_root_is_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let mut value = home.join("my-own-folder").display().to_string();
+        let before = value.clone();
+        let moved = remap_managed_output_dir(
+            &mut value,
+            &[home.join(".local/share/miyu/pictures")],
+            &home.join(".miyu/data/pictures"),
+            home,
+        );
+        assert!(moved.is_none());
+        assert_eq!(value, before);
+    }
 
     #[test]
     fn api_quota_partial_provider_configs_keep_defaults() {
