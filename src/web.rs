@@ -5624,6 +5624,9 @@ fn spawn_actor(
     let (sender, receiver) = mpsc::unbounded_channel();
     let join = std::thread::Builder::new()
         .name("miyu-daemon-core".to_string())
+        // tiktoken 词元计数器首次初始化会走 fancy_regex/regex_automata 的深递归
+        // 编译，debug 构建栈帧大，默认 2MB 线程栈会溢出（release 勉强够用）
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

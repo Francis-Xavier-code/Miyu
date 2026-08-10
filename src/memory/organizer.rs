@@ -50,6 +50,8 @@ impl MemoryOrganizer {
         let worker_shutdown = shutdown.clone();
         let join = std::thread::Builder::new()
             .name("miyu-memory-organizer".to_string())
+            // 同 daemon-core：防 tiktoken 正则编译递归在 debug 构建下打穿默认栈
+            .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
