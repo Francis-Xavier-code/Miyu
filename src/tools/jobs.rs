@@ -153,7 +153,6 @@ struct LedgerEntry {
 
 struct JobHost {
     paths: MiyuPaths,
-    max_runtime: Duration,
 }
 
 fn jobs() -> &'static Mutex<HashMap<String, JobEntry>> {
@@ -228,12 +227,11 @@ pub fn set_completion_hook(hook: CompletionHook) {
     *completion_hook().lock().unwrap() = Some(hook);
 }
 
-/// One-time host init: remembers paths/limits and sweeps ledger entries
+/// One-time host init: remembers paths and sweeps ledger entries
 /// left behind by dead predecessor processes.
-pub fn init(paths: &MiyuPaths, max_runtime_minutes: u64) {
+pub fn init(paths: &MiyuPaths) {
     let _ = host().set(JobHost {
         paths: paths.clone(),
-        max_runtime: Duration::from_secs(max_runtime_minutes.max(1) * 60),
     });
     sweep_stale_jobs(paths);
     cleanup_old_logs(paths);
@@ -465,25 +463,16 @@ pub async fn spawn_background(
     }
 
     let reaper_job_id = job_id.clone();
-    let max_runtime = host.max_runtime;
     tokio::spawn(async move {
-        let state = tokio::select! {
-            status = child.wait() => match status {
-                Ok(status) => match status.code() {
-                    Some(code) => JobState::Exited { code: Some(code) },
-                    None => JobState::Exited { code: None },
-                },
-                Err(_) => JobState::Exited { code: None },
+        // 后台任务不设运行时长上限:自然退出为准。泄漏保护由
+        // sweep_stale_jobs(死进程清扫)与 job_stop 显式停止承担;
+        // JobState::TimedOut 仅为兼容旧账本记录保留。
+        let state = match child.wait().await {
+            Ok(status) => match status.code() {
+                Some(code) => JobState::Exited { code: Some(code) },
+                None => JobState::Exited { code: None },
             },
-            _ = tokio::time::sleep(max_runtime) => {
-                signal_process_group(pid, libc::SIGTERM);
-                let _ = tokio::time::timeout(STOP_GRACE, child.wait()).await;
-                if process_alive(pid) {
-                    signal_process_group(pid, libc::SIGKILL);
-                    let _ = child.wait().await;
-                }
-                JobState::TimedOut
-            }
+            Err(_) => JobState::Exited { code: None },
         };
         finalize_job(&reaper_job_id, state, true);
     });
@@ -1056,7 +1045,7 @@ mod tests {
                 state_dir: root.join("state"),
                 ..crate::paths::MiyuPaths::new().unwrap()
             };
-            init(&paths, 120);
+            init(&paths);
         });
     }
 

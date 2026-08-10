@@ -6,7 +6,6 @@ use crate::llm::OpenAiCompatibleClient;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/subagent-explore.md");
 const GENERAL_SYSTEM_PROMPT: &str = include_str!("../prompts/subagent-general.md");
@@ -54,8 +53,6 @@ const EXPLORE_MAX_STEPS: usize = 30;
 const GENERAL_MAX_STEPS: usize = 50;
 const EXPLORE_TOOL_TIMEOUT: u64 = 60;
 const GENERAL_TOOL_TIMEOUT: u64 = 120;
-const EXPLORE_TOTAL_TIMEOUT: u64 = 300;
-const GENERAL_TOTAL_TIMEOUT: u64 = 600;
 
 #[derive(Clone)]
 struct TaskContext {
@@ -103,13 +100,6 @@ impl SubagentType {
         match self {
             Self::Explore => EXPLORE_TOOL_TIMEOUT,
             Self::General => GENERAL_TOOL_TIMEOUT,
-        }
-    }
-
-    fn total_timeout(self) -> u64 {
-        match self {
-            Self::Explore => EXPLORE_TOTAL_TIMEOUT,
-            Self::General => GENERAL_TOTAL_TIMEOUT,
         }
     }
 
@@ -418,7 +408,6 @@ async fn run_task_core(
         tier,
     } = params;
     let tool_timeout = sa_type.tool_timeout();
-    let total_timeout = sa_type.total_timeout();
 
     let mode = ProgressMode::from_config(&context.config);
     let enabled = context.config.plugins.deep_research.show_progress;
@@ -479,14 +468,11 @@ async fn run_task_core(
             &[]
         });
 
-    let (result, stats) = match tokio::time::timeout(
-        Duration::from_secs(total_timeout),
-        runner.run_with_resume(&prompt, resume_id.as_deref()),
-    )
-    .await
-    {
-            Ok(Ok((result, stats))) => (result, stats),
-            Ok(Err(err)) => {
+    // 子代理不设总时长上限:它自然结束于任务完成或步数预算;逐工具超时
+    // (tool_timeout)仍然兜底单步挂死。
+    let (result, stats) = match runner.run_with_resume(&prompt, resume_id.as_deref()).await {
+            Ok((result, stats)) => (result, stats),
+            Err(err) => {
                 let output = serde_json::to_string_pretty(&json!({
                     "ok": false,
                     "kind": "task",
@@ -496,29 +482,6 @@ async fn run_task_core(
                     "description": description,
                     "state": "error",
                     "error": err.to_string(),
-                    "stats": SubagentStats::default().public(),
-                }))?;
-                record_subagent_audit(
-                    &context,
-                    &anchor,
-                    &description,
-                    &prompt,
-                    &output,
-                    None,
-                    &model_choice,
-                );
-                return Ok(output);
-            }
-            Err(_) => {
-                let output = serde_json::to_string_pretty(&json!({
-                    "ok": false,
-                    "kind": "task",
-                    "subagent_type": sa_type.label(),
-                    "tier": tier.label(),
-                    "tier_notice": tier_notice,
-                    "description": description,
-                    "state": "timeout",
-                    "error": format!("subagent timed out after {total_timeout}s"),
                     "stats": SubagentStats::default().public(),
                 }))?;
                 record_subagent_audit(

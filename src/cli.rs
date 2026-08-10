@@ -7979,7 +7979,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     let _cursor_restore = ReplCursorRestore;
     AppConfig::init_files(paths)?;
     let mut config = AppConfig::load_or_default(paths)?;
-    tools::jobs::init(paths, config.tools.background_job_max_minutes);
+    tools::jobs::init(paths);
     let state = StateStore::new(paths)?;
     state.init_files()?;
     // Same lane as the remote REPL: resume where the last REPL was, not where

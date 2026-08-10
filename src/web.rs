@@ -1744,7 +1744,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let password = resolve_web_password(&args)?;
     AppConfig::init_files(&paths)?;
     let config = AppConfig::load_or_default(&paths)?;
-    tools::jobs::init(&paths, config.tools.background_job_max_minutes);
+    tools::jobs::init(&paths);
     let state_store = StateStore::new(&paths)?;
     state_store.init_files()?;
     let persona = config.active_persona_scope();
