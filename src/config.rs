@@ -25,6 +25,8 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_multimodal_provider_models: Option<Vec<ActiveProviderModelConfig>>,
     pub providers: Vec<ProviderConfig>,
+    #[serde(default, skip_serializing_if = "EmbeddingConfig::is_default")]
+    pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
@@ -2500,6 +2502,48 @@ pub fn resolve_provider_model_argument<'a>(
     }
 }
 
+/// Which model turns text into vectors, and the settings that belong to that
+/// model rather than to any one feature — a similarity floor means different
+/// things on different models. Deliberately has no on/off switch: configuring a
+/// model only makes it available, and each feature decides whether to use it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Id of an existing provider; the model is named separately, so a provider
+    /// serving both chat and embedding models is still configured once.
+    pub provider_id: String,
+    pub model: String,
+    pub timeout_seconds: u64,
+    /// Cosine similarity below this is not a hit.
+    pub min_score: f32,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider_id: String::new(),
+            model: String::new(),
+            timeout_seconds: 60,
+            min_score: 0.35,
+        }
+    }
+}
+
+/// Marks a model as producing vectors rather than chat.
+pub const EMBEDDING_MODALITY: &str = "embedding";
+
+impl EmbeddingConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A model is configured; whether any feature uses it is that feature's
+    /// business.
+    pub fn is_configured(&self) -> bool {
+        !self.provider_id.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     #[serde(default = "default_trim_at_ratio")]
@@ -3037,6 +3081,7 @@ impl Default for AppConfig {
             active_provider_models: None,
             active_multimodal_provider_models: None,
             providers: ProviderConfig::default_templates(),
+            embedding: EmbeddingConfig::default(),
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
             cache: CacheConfig::default(),
@@ -3742,6 +3787,22 @@ impl AppConfig {
                 if (provider.temperature - LEGACY_DEFAULT_TEMPERATURE).abs() < f32::EPSILON {
                     provider.temperature = default_temperature();
                 }
+            }
+        }
+        // The embedding model used to live under the knowledge base, which is
+        // where it was first needed. It now also backs memory recall, and a
+        // knowledge-base setting silently steering group-chat search is a trap
+        // for whoever reads this next.
+        if !self.embedding.is_configured() {
+            let kb = &self.plugins.knowledge_base;
+            if !kb.embedding_provider_id.trim().is_empty() && !kb.embedding_model.trim().is_empty()
+            {
+                self.embedding.provider_id = kb.embedding_provider_id.trim().to_string();
+                self.embedding.model = kb.embedding_model.trim().to_string();
+                if kb.embedding_timeout_seconds > 0 {
+                    self.embedding.timeout_seconds = kb.embedding_timeout_seconds;
+                }
+                self.embedding.min_score = kb.semantic_min_score;
             }
         }
         self.config_version = CURRENT_CONFIG_VERSION;
@@ -4522,6 +4583,9 @@ impl AppConfig {
             .collect()
     }
 
+    /// Embedding models are excluded: they produce vectors, not replies, and
+    /// picking one here is always a mistake. The multimodal list derives from
+    /// this one, so filtering here covers both.
     pub fn text_provider_model_choices(&self) -> Vec<ProviderModelChoice> {
         self.providers
             .iter()
@@ -4530,6 +4594,7 @@ impl AppConfig {
                     .models
                     .iter()
                     .filter(|model| !model.trim().is_empty())
+                    .filter(|model| !Self::model_is_embedding(provider, model))
                     .map(|model| ProviderModelChoice {
                         provider_id: provider.id.clone(),
                         provider_name: provider.display_name.clone(),
@@ -4538,6 +4603,16 @@ impl AppConfig {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// A model marked as producing vectors rather than chat. Stored beside the
+    /// input modalities because it answers the same question — what the model
+    /// is for.
+    pub fn model_is_embedding(provider: &ProviderConfig, model: &str) -> bool {
+        provider
+            .model_modalities
+            .get(model)
+            .is_some_and(|modalities| modalities.iter().any(|item| item == EMBEDDING_MODALITY))
     }
 
     pub fn active_provider_model_choices(&self) -> Vec<ProviderModelChoice> {
@@ -7062,6 +7137,52 @@ mod tests {
         merge_real_context_settings(&mut custom, &settings);
         assert_eq!(custom.settings["continuation_window_seconds"], 420);
         assert!(!custom.settings.contains_key("continuation_window_minutes"));
+    }
+
+    #[test]
+    fn an_embedding_model_never_reaches_the_chat_pickers() {
+        // It produces vectors, not replies; the multimodal list derives from
+        // the text one, so filtering at the source covers both.
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        provider.models = vec!["chat-model".to_string(), "vector-model".to_string()];
+        provider
+            .model_modalities
+            .insert("chat-model".to_string(), vec!["text".to_string()]);
+        provider.model_modalities.insert(
+            "vector-model".to_string(),
+            vec![EMBEDDING_MODALITY.to_string()],
+        );
+
+        let text: Vec<String> = config
+            .text_provider_model_choices()
+            .into_iter()
+            .map(|choice| choice.model)
+            .collect();
+        assert!(text.contains(&"chat-model".to_string()), "{text:?}");
+        assert!(!text.contains(&"vector-model".to_string()), "{text:?}");
+    }
+
+    #[test]
+    fn the_embedding_model_moves_out_from_under_the_knowledge_base() {
+        // It was configured there because that is where it was first needed;
+        // it now also backs memory recall, and a knowledge-base setting quietly
+        // steering group-chat search is a trap for whoever reads this next.
+        let mut config = AppConfig::default();
+        config.plugins.knowledge_base.embedding_provider_id = "omlx".to_string();
+        config.plugins.knowledge_base.embedding_model = "bge-m3".to_string();
+        config.plugins.knowledge_base.embedding_timeout_seconds = 45;
+        config.plugins.knowledge_base.semantic_min_score = 0.5;
+        config.config_version = 0;
+        config.migrate().unwrap();
+        assert_eq!(config.embedding.provider_id, "omlx");
+        assert_eq!(config.embedding.model, "bge-m3");
+        assert_eq!(config.embedding.timeout_seconds, 45);
+        assert!((config.embedding.min_score - 0.5).abs() < f32::EPSILON);
+
+        // Configuring a model only makes it available; there is no switch.
+        assert!(config.embedding.is_configured());
+        assert!(!AppConfig::default().embedding.is_configured());
     }
 
     #[test]

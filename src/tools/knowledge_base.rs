@@ -756,7 +756,7 @@ impl KnowledgeBase {
                 continue;
             };
             let score = cosine(&query_embedding, &embedding);
-            if score < self.config.plugins.knowledge_base.semantic_min_score {
+            if score < self.config.embedding.min_score {
                 continue;
             }
             results.push(SearchResult::new(
@@ -881,16 +881,17 @@ impl KnowledgeBase {
     }
 
     fn embedding_provider(&self) -> Result<Option<(ProviderConfig, String)>> {
-        let kb = &self.config.plugins.knowledge_base;
-        if kb.embedding_provider_id.trim().is_empty() || kb.embedding_model.trim().is_empty() {
+        let embedding = &self.config.embedding;
+        if !embedding.is_configured() {
             return Ok(None);
         }
         let mut provider = self
             .config
-            .provider(Some(kb.embedding_provider_id.trim()))?
+            .provider(Some(embedding.provider_id.trim()))?
             .clone();
-        provider.default_model = kb.embedding_model.trim().to_string();
-        Ok(Some((provider, kb.embedding_model.trim().to_string())))
+        let model = embedding.model.trim().to_string();
+        provider.default_model = model.clone();
+        Ok(Some((provider, model)))
     }
 
     fn meta_conn(&self) -> Result<Connection> {
@@ -1185,9 +1186,7 @@ pub async fn embed_text(
         bail!("embedding provider {} has no api_key", provider.id)
     }
     let client = Client::builder()
-        .timeout(Duration::from_secs(
-            config.plugins.knowledge_base.embedding_timeout_seconds,
-        ))
+        .timeout(Duration::from_secs(config.embedding.timeout_seconds.max(1)))
         .build()?;
     let url = format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
     let response = client

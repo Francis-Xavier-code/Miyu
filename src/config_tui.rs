@@ -89,6 +89,7 @@ fn run_main_menu(
         let active = active_label(config);
         let multimodal = active_multimodal_label(config);
         let options = [
+            t("Providers and models", "供应商和模型").to_string(),
             format!(
                 "{} ({}: {active})",
                 t("Configure text model", "配置文本模型"),
@@ -100,11 +101,16 @@ fn run_main_menu(
                 t("Current", "当前")
             ),
             format!(
+                "{} ({}: {})",
+                t("Configure embedding model", "配置 Embedding 模型"),
+                t("Current", "当前"),
+                embedding_model_label(config)
+            ),
+            format!(
                 "{} ({})",
                 t("Configure subagent tier pools", "配置子代理档位池"),
                 subagent_tiers_label(config)
             ),
-            t("Providers and models", "供应商和模型").to_string(),
             t("Plugins", "插件配置").to_string(),
             t("Custom prompts", "自定义提示词").to_string(),
             format!(
@@ -140,15 +146,16 @@ fn run_main_menu(
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
             KeyCode::Enter => match selected {
-                0 => select_active_provider(stdout, config)?,
-                1 => select_active_multimodal_provider(stdout, config)?,
-                2 => select_subagent_tiers(stdout, config)?,
-                3 => ProviderBrowser::new(paths, config, thinking_variants).run(stdout)?,
-                4 => edit_plugins(stdout, config)?,
-                5 => edit_custom_prompts(stdout, paths, config)?,
-                6 => select_platforms(stdout, paths, config)?,
-                7 => edit_settings(stdout, config)?,
-                8 => {
+                0 => ProviderBrowser::new(paths, config, thinking_variants).run(stdout)?,
+                1 => select_active_provider(stdout, config)?,
+                2 => select_active_multimodal_provider(stdout, config)?,
+                3 => edit_embedding_model(stdout, config)?,
+                4 => select_subagent_tiers(stdout, config)?,
+                5 => edit_plugins(stdout, config)?,
+                6 => edit_custom_prompts(stdout, paths, config)?,
+                7 => select_platforms(stdout, paths, config)?,
+                8 => edit_settings(stdout, config)?,
+                9 => {
                     config.save(paths)?;
                     thinking_variants.save(paths)?;
                     return Ok(true);
@@ -2598,6 +2605,136 @@ fn select_active_provider(stdout: &mut io::Stdout, config: &mut AppConfig) -> Re
             _ => {}
         }
     }
+}
+
+use crate::config::EMBEDDING_MODALITY;
+
+fn model_is_embedding(provider: &ProviderConfig, model: &str) -> bool {
+    AppConfig::model_is_embedding(provider, model)
+}
+
+fn embedding_model_label(config: &AppConfig) -> String {
+    if config.embedding.is_configured() {
+        format!(
+            "{}/{}",
+            config.embedding.provider_id.trim(),
+            config.embedding.model.trim()
+        )
+    } else {
+        t("not set", "未设置").to_string()
+    }
+}
+
+fn edit_embedding_model(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for provider in &config.providers {
+        for model in &provider.models {
+            if model_is_embedding(provider, model) {
+                candidates.push((provider.id.clone(), model.clone()));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        message(
+            stdout,
+            t(
+                "No embedding models yet. Mark one in Providers and models -> Edit model.",
+                "还没有语义模型。请在「供应商和模型」->「编辑模型」里把某个模型标记为语义模型。",
+            ),
+        )?;
+        return Ok(());
+    }
+    let mut options: Vec<String> = candidates
+        .iter()
+        .map(|(provider, model)| format!("{provider}/{model}"))
+        .collect();
+    options.push(t("Advanced settings", "高级设置").to_string());
+    options.push(t("Clear selection", "清除选择").to_string());
+    let mut selected = candidates
+        .iter()
+        .position(|(provider, model)| {
+            provider == config.embedding.provider_id.trim()
+                && model == config.embedding.model.trim()
+        })
+        .unwrap_or(0);
+    loop {
+        draw_menu(
+            stdout,
+            t(" EMBEDDING MODEL ", " EMBEDDING 模型 "),
+            &options,
+            selected,
+            t(
+                "[Enter]select [j/k]move [q]back",
+                "[Enter]选择 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => {
+                if selected == options.len() - 1 {
+                    config.embedding.provider_id.clear();
+                    config.embedding.model.clear();
+                    return Ok(());
+                }
+                if selected == options.len() - 2 {
+                    edit_embedding_advanced(stdout, config)?;
+                    continue;
+                }
+                let (provider, model) = candidates[selected].clone();
+                config.embedding.provider_id = provider;
+                config.embedding.model = model;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn edit_embedding_advanced(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let mut fields = vec![
+        Field::new(
+            t("Request timeout (seconds)", "请求超时（秒）"),
+            config.embedding.timeout_seconds.to_string(),
+        ),
+        Field::new(
+            t("Similarity floor (0-1)", "相似度下限（0-1）"),
+            config.embedding.min_score.to_string(),
+        ),
+    ];
+    if !run_form(
+        stdout,
+        t(" EMBEDDING ADVANCED ", " EMBEDDING 高级设置 "),
+        &mut fields,
+    )? {
+        return Ok(());
+    }
+    let timeout: u64 = fields[0]
+        .value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!(t("Invalid timeout.", "超时数值无效。")))?;
+    let score: f32 = fields[1]
+        .value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!(t("Invalid similarity floor.", "相似度下限无效。")))?;
+    if timeout == 0 {
+        return Err(anyhow::anyhow!(t(
+            "Timeout must be positive.",
+            "超时必须大于 0。"
+        )));
+    }
+    if !(0.0..=1.0).contains(&score) {
+        return Err(anyhow::anyhow!(t(
+            "Similarity floor must be between 0 and 1.",
+            "相似度下限必须在 0 与 1 之间。"
+        )));
+    }
+    config.embedding.timeout_seconds = timeout;
+    config.embedding.min_score = score;
+    Ok(())
 }
 
 fn subagent_tiers_label(config: &AppConfig) -> String {
@@ -6418,6 +6555,10 @@ fn edit_model_form(
             t("Supported input", "支持输入"),
             modality_field_value(provider, model),
         ),
+        Field::boolean(
+            t("Is an embedding model", "这是语义模型吗"),
+            model_is_embedding(provider, model),
+        ),
         Field::new(
             t(
                 "Model context window (tokens, 0=auto)",
@@ -6431,10 +6572,15 @@ fn edit_model_form(
     if !run_form(stdout, t(" EDIT MODEL ", " 编辑模型 "), &mut fields)? {
         return Ok(false);
     }
+    let mut modalities = parse_modalities(&fields[0].value);
+    modalities.retain(|item| item != EMBEDDING_MODALITY);
+    if parse_bool_field(&fields[1].value)? {
+        modalities.push(EMBEDDING_MODALITY.to_string());
+    }
     provider
         .model_modalities
-        .insert(model.to_string(), parse_modalities(&fields[0].value));
-    match fields[1].value.trim().parse::<usize>().unwrap_or_default() {
+        .insert(model.to_string(), modalities);
+    match fields[2].value.trim().parse::<usize>().unwrap_or_default() {
         0 => {
             provider.model_context_window.remove(model);
         }
@@ -6445,11 +6591,11 @@ fn edit_model_form(
         }
     }
     let selected_variant =
-        (!fields[2].value.trim().is_empty()).then(|| fields[2].value.trim().to_string());
+        (!fields[3].value.trim().is_empty()).then(|| fields[3].value.trim().to_string());
     if selected_variant != initial_variant {
         thinking_variants.set(&provider.id, model, selected_variant);
     }
-    provider.temperature = fields[3].value.trim().parse().unwrap_or(1.0);
+    provider.temperature = fields[4].value.trim().parse().unwrap_or(1.0);
     Ok(true)
 }
 
