@@ -710,7 +710,14 @@ pub struct RealContextIdentityMapping {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RealContextPluginSettings {
-    pub context_messages: usize,
+    /// How much group log the reply turn starts from. Once the history is
+    /// append-only this is a one-off opening snapshot rather than a per-turn
+    /// window, so it can afford to be generous.
+    pub reply_context_window: usize,
+    /// How much group log the active-reply judge sees. It rates the mood of the
+    /// moment, so a longer window dilutes the recent signal and stretches the
+    /// timeframe — and the judge runs on every message, not once per turn.
+    pub judge_context_window: usize,
     #[serde(alias = "group_member_page_size")]
     pub group_member_search_max_results: usize,
 
@@ -802,7 +809,8 @@ pub struct RealContextPluginSettings {
 impl Default for RealContextPluginSettings {
     fn default() -> Self {
         Self {
-            context_messages: 20,
+            reply_context_window: 50,
+            judge_context_window: 30,
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
@@ -914,7 +922,8 @@ impl RealContextPluginSettings {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_real_context_count("context_messages", self.context_messages, 1, 200)?;
+        validate_real_context_count("reply_context_window", self.reply_context_window, 1, 200)?;
+        validate_real_context_count("judge_context_window", self.judge_context_window, 1, 200)?;
         validate_real_context_count(
             "group_member_search_max_results",
             self.group_member_search_max_results,
@@ -1253,6 +1262,7 @@ const DEPRECATED_REAL_CONTEXT_SETTINGS: &[&str] = &[
     "group_member_page_size",
     "reply_context_messages",
     "active_context_messages",
+    "context_messages",
     "activity_statistics_enable",
     "daily_reply_limit_per_session",
     "log_judge_decision",
@@ -1284,13 +1294,20 @@ fn migrate_real_context_settings_map(settings: &mut serde_json::Map<String, serd
             settings.insert("text_models".to_string(), value);
         }
     }
-    if !settings.contains_key("context_messages") {
-        let context_messages = settings
-            .get("reply_context_messages")
-            .cloned()
-            .or_else(|| settings.get("active_context_messages").cloned());
-        if let Some(value) = context_messages {
-            settings.insert("context_messages".to_string(), value);
+    // One knob used to feed both the reply turn and the judge. Their optimal
+    // sizes point in opposite directions — the reply wants a generous opening
+    // snapshot, the judge wants a tight recent window — and so do their cost
+    // models, since the judge runs on every message rather than once per turn.
+    let legacy_window = settings
+        .get("context_messages")
+        .cloned()
+        .or_else(|| settings.get("reply_context_messages").cloned())
+        .or_else(|| settings.get("active_context_messages").cloned());
+    if let Some(value) = legacy_window {
+        for key in ["reply_context_window", "judge_context_window"] {
+            if !settings.contains_key(key) {
+                settings.insert(key.to_string(), value.clone());
+            }
         }
     }
     if !settings.contains_key("takeover_direct_trigger_enable") {
@@ -6866,7 +6883,8 @@ mod tests {
     fn real_context_defaults_match_the_deployed_contract() {
         let settings = RealContextPluginSettings::default();
 
-        assert_eq!(settings.context_messages, 20);
+        assert_eq!(settings.reply_context_window, 50);
+        assert_eq!(settings.judge_context_window, 30);
         assert_eq!(settings.group_member_search_max_results, 200);
         assert!(settings.active_reply_enable);
         assert!(settings.judge_include_persona);
@@ -7010,6 +7028,28 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_shared_window_seeds_both_new_windows() {
+        // One knob used to drive both the reply turn and the judge. Their best
+        // values point opposite ways — the reply wants a generous opening
+        // snapshot, the judge a tight recent window — so the knob split, and an
+        // existing config has to land on its old value for both rather than
+        // silently jumping to the new defaults.
+        let mut settings = serde_json::Map::new();
+        settings.insert("context_messages".to_string(), serde_json::json!(12));
+        migrate_real_context_settings_map(&mut settings);
+        assert_eq!(settings["reply_context_window"], 12);
+        assert_eq!(settings["judge_context_window"], 12);
+
+        // An explicit new value wins over the legacy one.
+        let mut settings = serde_json::Map::new();
+        settings.insert("context_messages".to_string(), serde_json::json!(12));
+        settings.insert("judge_context_window".to_string(), serde_json::json!(30));
+        migrate_real_context_settings_map(&mut settings);
+        assert_eq!(settings["reply_context_window"], 12);
+        assert_eq!(settings["judge_context_window"], 30);
+    }
+
+    #[test]
     fn real_context_legacy_settings_migrate_and_deprecated_keys_are_removed() {
         let mut instance = PlatformPluginInstanceConfig {
             enabled: None,
@@ -7029,7 +7069,8 @@ mod tests {
         };
 
         let settings = RealContextPluginSettings::from_instance(&instance).unwrap();
-        assert_eq!(settings.context_messages, 37);
+        assert_eq!(settings.reply_context_window, 37);
+        assert_eq!(settings.judge_context_window, 37);
         assert!(settings.takeover_direct_trigger_enable);
         assert_eq!(settings.takeover_direct_trigger_boost_score, 0.4);
         assert_eq!(
@@ -7038,7 +7079,7 @@ mod tests {
         );
 
         merge_real_context_settings(&mut instance, &settings);
-        assert_eq!(instance.settings["context_messages"], 37);
+        assert_eq!(instance.settings["reply_context_window"], 37);
         // Migrated to `true`, which now equals the default and is pruned from
         // the persisted map; the effective value is asserted above.
         assert!(!instance

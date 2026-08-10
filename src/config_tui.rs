@@ -4522,8 +4522,8 @@ fn edit_real_context(
             ),
             format!(
                 "{}: {}",
-                t("Context messages", "上下文消息数量"),
-                settings.context_messages
+                t("Reply context window", "回复上下文消息数"),
+                settings.reply_context_window
             ),
             t("Group member information", "群成员信息查询").to_string(),
             t("Active reply judgement", "主动回复判断").to_string(),
@@ -4558,10 +4558,10 @@ fn edit_real_context(
                 1 => select_real_context_model_pool(stdout, config, &mut settings.text_models)?,
                 2 => edit_real_context_number(
                     stdout,
-                    t("Context messages", "上下文消息数量"),
-                    settings.context_messages,
+                    t("Reply context window", "回复上下文消息数"),
+                    settings.reply_context_window,
                     &mut settings,
-                    |candidate, value| candidate.context_messages = value,
+                    |candidate, value| candidate.reply_context_window = value,
                 )?,
                 3 => edit_real_context_history(stdout, &mut settings)?,
                 4 => match StateStore::new(paths) {
@@ -4705,6 +4705,11 @@ fn edit_real_context_active_reply(
             t("Continuation window", "续聊窗口").to_string(),
             t("Trigger methods", "触发方式").to_string(),
             t("Concurrency and weights", "并发与权重").to_string(),
+            format!(
+                "{}: {}",
+                t("Judge context window", "判断上下文消息数"),
+                settings.judge_context_window
+            ),
         ];
         draw_menu(
             stdout,
@@ -4799,6 +4804,13 @@ fn edit_real_context_active_reply(
                 13 => edit_real_context_continuation(stdout, settings)?,
                 14 => edit_real_context_triggers(stdout, settings)?,
                 15 => edit_real_context_judge_advanced(stdout, settings)?,
+                16 => edit_real_context_number(
+                    stdout,
+                    t("Judge context window", "判断上下文消息数"),
+                    settings.judge_context_window,
+                    settings,
+                    |candidate, value| candidate.judge_context_window = value,
+                )?,
                 _ => {}
             },
             _ => {}
@@ -8120,7 +8132,7 @@ mod tests {
             .insert(REAL_CONTEXT_PLUGIN_ID.to_string(), instance);
         let settings = RealContextPluginSettings {
             reply_threshold: 0.9,
-            context_messages: 42,
+            reply_context_window: 42,
             judge_persona_prompt: "judge persona".to_string(),
             ..RealContextPluginSettings::default()
         };
@@ -8130,7 +8142,7 @@ mod tests {
         let instance = &config.platforms.qq.plugins[REAL_CONTEXT_PLUGIN_ID];
         assert_eq!(instance.enabled, Some(false));
         assert_eq!(instance.settings["reply_threshold"], 0.9);
-        assert_eq!(instance.settings["context_messages"], 42);
+        assert_eq!(instance.settings["reply_context_window"], 42);
         assert_eq!(instance.settings["judge_persona_prompt"], "judge persona");
         assert_eq!(instance.settings["future_option"]["value"], 1);
         let (enabled, reparsed) = real_context_values(&config).unwrap();

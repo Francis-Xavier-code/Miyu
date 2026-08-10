@@ -350,7 +350,7 @@ impl RealContextPlugin {
                     RecentQuery::for_context(
                         group_key(context)?,
                         context.config.active_persona_scope(),
-                        history_query_limit(settings.context_messages),
+                        history_query_limit(settings.judge_context_window),
                     )
                     .before_ingress_order(event.ingress_order),
                 )
@@ -386,7 +386,11 @@ impl RealContextPlugin {
                 return Ok(());
             }
         };
-        prepare_history(&mut history, &event.message_id, settings.context_messages);
+        prepare_history(
+            &mut history,
+            &event.message_id,
+            settings.judge_context_window,
+        );
         let (heat_penalty, heat_threshold_boost) = restraint_adjustments(
             settings.reply_restraint_enable,
             &settings.reply_restraint_strength,
@@ -742,12 +746,17 @@ impl RealContextPlugin {
         if let Some(event) = context.inbound_event() {
             input.content = active_target_prompt(context, event, &input.content);
         }
-        let count = settings.context_messages;
+        let count = settings.reply_context_window;
         let ingress_order = context
             .inbound_event()
             .and_then(|event| event.ingress_order);
+        // Everything the previous reply turn rendered is still in the
+        // conversation history, replayed byte for byte, so this turn only has
+        // to carry what arrived since. The first turn of a conversation has no
+        // watermark and falls back to a full opening snapshot.
+        let watermark = self.reply_watermark(context);
         let query_limit = history_query_limit(count);
-        let mut history = self
+        let page = self
             .store(context)
             .recent(
                 RecentQuery::for_context(
