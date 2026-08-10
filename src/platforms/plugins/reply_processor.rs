@@ -387,7 +387,12 @@ impl PlatformPlugin for ReplyProcessorPlugin {
             }
             let notices = Self::recent_notices(context, &settings.config)?;
             if !notices.is_empty() {
-                input.system_context.push(Self::context_notice(&notices));
+                // Turn tail, not system prompt: the notice set changes whenever
+                // a conversion happens or a record expires, and a changing
+                // system prompt invalidates the whole history prefix. As a
+                // fossilized tail block it appends instead; the agent skips it
+                // when the identical text is already visible in the replay.
+                input.turn_system_context.push(Self::context_notice(&notices));
             }
             Ok(())
         })
@@ -541,7 +546,7 @@ impl Default for ReplyProcessorConfig {
     fn default() -> Self {
         Self {
             default_enabled: true,
-            threshold: 200,
+            threshold: 300,
             mode: ReplyMode::Image,
             followup_mention: true,
             strip_period: true,
@@ -970,7 +975,7 @@ mod tests {
         ReplyProcessorPlugin::handle_admin_command(&context, "恢复默认").unwrap();
         let defaults = ReplyProcessorPlugin::effective_settings(&context).unwrap();
         assert!(defaults.enabled);
-        assert_eq!(defaults.threshold, 200);
+        assert_eq!(defaults.threshold, 300);
         assert_eq!(defaults.mode, ReplyMode::Image);
         assert!(!defaults.custom);
     }
@@ -1114,17 +1119,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_threshold_converts_only_after_two_hundred_characters() {
+    async fn default_threshold_converts_only_after_three_hundred_characters() {
         let (_temp, mut context) = test_context(true);
         set_plugin_setting(&mut context, "mode", json!("forward"));
         let plugin = ReplyProcessorPlugin::new().unwrap();
 
-        let boundary = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(200));
+        let boundary = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(300));
         let unchanged = plugin.before_send(&context, boundary).await.unwrap();
         assert!(unchanged.fallback.is_none());
         assert!(matches!(unchanged.primary.body, OutboundBody::Segments(_)));
 
-        let over = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(201));
+        let over = OutboundMessage::markdown(OutboundOrigin::FinalReply, "x".repeat(301));
         let converted = plugin.before_send(&context, over).await.unwrap();
         assert!(converted.fallback.is_some());
         assert!(matches!(converted.primary.body, OutboundBody::Forward(_)));
@@ -1311,13 +1316,17 @@ mod tests {
 
         let mut input = PlatformTurnInput {
             content: "next".to_string(),
+            memory_content: "next".to_string(),
             system_context: Vec::new(),
+            turn_system_context: Vec::new(),
             context_images: Vec::new(),
         };
         plugin.before_turn(&context, &mut input).await.unwrap();
         assert_eq!(input.content, "next");
-        assert_eq!(input.system_context.len(), 1);
-        assert!(input.system_context[0].contains("LongReplyImageConversion"));
-        assert!(!input.system_context[0].contains("rendered long reply"));
+        // 通知走 turn 尾部通道,system prompt 保持字节稳定
+        assert!(input.system_context.is_empty());
+        assert_eq!(input.turn_system_context.len(), 1);
+        assert!(input.turn_system_context[0].contains("LongReplyImageConversion"));
+        assert!(!input.turn_system_context[0].contains("rendered long reply"));
     }
 }

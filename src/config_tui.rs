@@ -1050,6 +1050,10 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                     t("Recall boost strength", "回忆增强强度"),
                     memory.forgetting_review_boost.to_string(),
                 ),
+                Field::boolean(
+                    t("Association dedup", "联想跨回合去重"),
+                    memory.association_dedup,
+                ),
             ]
         }
         11 => vec![Field::boolean(
@@ -1222,6 +1226,7 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
                 fields[14].value.trim().parse::<f64>()?;
             config.plugins.memory.forgetting_review_boost =
                 fields[15].value.trim().parse::<f64>()?;
+            config.plugins.memory.association_dedup = parse_bool_field(&fields[16].value)?;
         }
         11 => {
             config.plugins.package_advisor.enabled = parse_bool_field(&fields[0].value)?;

@@ -899,6 +899,12 @@ pub struct Agent {
     /// rendered as a tail system message after the user turn. Kept out of the
     /// system prompt so the stable prefix stays byte-identical across turns.
     turn_system_context: Vec<String>,
+    /// Raw user input snapshot taken before platform plugins wrapped the turn
+    /// content (instruction boilerplate, group history, …). The memory diary
+    /// records this instead of the wrapped prompt — the minimal C10 "记忆只读
+    /// raw_content" separation. `None` on paths whose input is already raw
+    /// (terminal, WebUI) and on redo replays.
+    memory_content: Option<String>,
     suppress_session_history: bool,
     trim_at_ratio: f32,
     trim_batch_ratio: f32,
@@ -1004,6 +1010,7 @@ impl Agent {
             system_prompt,
             runtime_system_context: Vec::new(),
             turn_system_context: Vec::new(),
+            memory_content: None,
             suppress_session_history: false,
             trim_at_ratio: config.context.trim_at_ratio,
             trim_batch_ratio: config.context.trim_batch_ratio,
@@ -1120,6 +1127,11 @@ impl Agent {
     /// Per-message transport blocks that ride the turn tail (after the user
     /// message) instead of the system prompt. No prompt refresh needed: they
     /// are consumed at message-assembly time.
+    /// Raw input for the memory diary; `None` falls back to the turn content.
+    pub fn set_memory_content(&mut self, content: Option<String>) {
+        self.memory_content = content.filter(|text| !text.trim().is_empty());
+    }
+
     pub fn set_turn_system_context(&mut self, context: Vec<String>) {
         self.turn_system_context = context
             .into_iter()
@@ -1898,24 +1910,54 @@ impl Agent {
         if !self.turn_system_context.is_empty() {
             // Trusted transport/control tail (v7 §三): host-derived per-message
             // context lands after the user message, before untrusted blocks.
-            messages.push(ChatMessage::turn_context(
-                self.turn_system_context.join("\n\n"),
-            ));
+            // Standing advisories (the `[SystemInfo:` class, e.g. long-reply
+            // conversion records) repeat identical text turn after turn; when
+            // the exact bytes are already visible in a replayed fossil the
+            // repeat adds nothing and is skipped — the associative-memory
+            // dedup reasoning. Everything else ("this turn is system
+            // triggered", identity warnings, moderation prechecks) refers to
+            // the CURRENT turn, so an identical old fossil is no substitute
+            // and those blocks are always sent.
+            let fresh = self
+                .turn_system_context
+                .iter()
+                .filter(|block| {
+                    !(block.starts_with(STANDING_ADVISORY_PREFIX)
+                        && turn_context_block_visible(&messages, block))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !fresh.is_empty() {
+                messages.push(ChatMessage::turn_context(fresh.join("\n\n")));
+            }
         }
         messages.extend(prepared.hints);
         if self.mode != AgentMode::Chat {
-            if let Some(association) = self.memory.association(&input)? {
+            if let Some(mut association) = self.memory.association(&input)? {
                 if association.organization_due {
                     self.wake_memory_organizer();
                 }
-                // v7 Phase 1.1: the associative-memory block rides the turn
-                // tail instead of `insert(1)`, so the stable history prefix in
-                // front stays byte-identical for provider prefix caches. It
-                // lands after `replay_start`, so redo checkpoints freeze the
-                // recalled snapshot (decision 6).
-                messages.push(ChatMessage::turn_context(
-                    self.memory.format_association(&association),
-                ));
+                if self.memory.association_dedup_enabled() {
+                    // Cross-turn dedup: fossils replay earlier associative
+                    // blocks byte-for-byte, so a line already visible in this
+                    // request adds nothing but tokens. Filtering only shrinks
+                    // the block being built this turn; once a carrying turn is
+                    // hidden by compact or trim, its lines leave the request
+                    // and the memory becomes eligible for injection again.
+                    let seen = visible_association_lines(&messages);
+                    self.memory
+                        .retain_unseen_association(&mut association, &seen);
+                }
+                if !association.facts.is_empty() || !association.episodes.is_empty() {
+                    // v7 Phase 1.1: the associative-memory block rides the turn
+                    // tail instead of `insert(1)`, so the stable history prefix
+                    // in front stays byte-identical for provider prefix caches.
+                    // It lands after `replay_start`, so redo checkpoints freeze
+                    // the recalled snapshot (decision 6).
+                    messages.push(ChatMessage::turn_context(
+                        self.memory.format_association(&association),
+                    ));
+                }
             }
         }
         if self.mode != AgentMode::Plan {
@@ -1968,7 +2010,9 @@ impl Agent {
             result.usage_estimated,
         )?;
         if self.memory.process_after_turn(
-            &input,
+            // C10 三份内容分离(最小实现):日记读平台包装前的原文快照,
+            // 而不是带指令样板和群聊记录块的完整 prompt 内容。
+            self.memory_content.as_deref().unwrap_or(&input),
             &result.content,
             &self.memory_origin,
             &self.memory_database_id,
@@ -4028,6 +4072,53 @@ fn queued_prompt_images(prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>
 /// system-role text messages. Stops at the first non-system or non-text
 /// message so redo checkpoints (which append loop messages) never leak
 /// assistant/tool content into the fossil record.
+/// Marks turn-context blocks that are standing advisories about recent state
+/// (not about the current message): only these may be skipped when an
+/// identical copy is already visible in a replayed fossil. Producers opt in
+/// by using this prefix (reply_processor's long-reply conversion notice).
+const STANDING_ADVISORY_PREFIX: &str = "[SystemInfo:";
+
+/// True when `block`'s exact text already appears inside a user-role message
+/// of the request being built (a fossilized turn tail replayed from an earlier
+/// turn). Stops standing notices from re-fossilizing identical bytes every
+/// turn; a block whose content changed no longer matches and is sent again.
+fn turn_context_block_visible(messages: &[ChatMessage], block: &str) -> bool {
+    messages.iter().any(|message| {
+        message.role == "user"
+            && matches!(
+                message.content.as_ref(),
+                Some(ChatContent::Text(text)) if text.contains(block)
+            )
+    })
+}
+
+/// Collects the associative-memory entry lines already visible in the request
+/// being built. Fossilized blocks replay as `user` messages whose text starts
+/// with the block tag, so matching on that prefix picks up exactly the earlier
+/// injections (legacy `system` fossils are re-roled to `user` before this
+/// point). Matching whole rendered lines means an updated memory — new content
+/// or date — no longer matches and gets injected again.
+fn visible_association_lines(messages: &[ChatMessage]) -> HashSet<&str> {
+    let mut seen = HashSet::new();
+    for message in messages {
+        if message.role != "user" {
+            continue;
+        }
+        let Some(ChatContent::Text(text)) = message.content.as_ref() else {
+            continue;
+        };
+        if !text.starts_with("<associative-memory") {
+            continue;
+        }
+        for line in text.lines() {
+            if line.starts_with("- [") {
+                seen.insert(line.trim_end());
+            }
+        }
+    }
+    seen
+}
+
 fn fossil_context_messages(tail: &[ChatMessage]) -> Vec<ChatMessage> {
     // Keyed on the explicit marker rather than the role: these blocks now ride
     // as `user` messages (see `ChatMessage::turn_context`), which is
@@ -6382,6 +6473,46 @@ mod tests {
         let fossil = fossil_context_messages(&tail);
         assert_eq!(fossil.len(), 2);
         assert!(format!("{:?}", fossil[1].content).contains("hint"));
+    }
+
+    #[test]
+    fn visible_association_lines_collects_only_replayed_memory_blocks() {
+        let block = "<associative-memory>\n以下是根据当前输入联想到的完整人格记忆。\n\n曾经记住的相关知识点：\n- [2026-08-10] [公共知识] AUR 镜像只读\n</associative-memory>";
+        let messages = vec![
+            ChatMessage::system("prompt"),
+            // 回放的化石块：user 角色、正文以标签开头 → 计入
+            ChatMessage::plain("user", block),
+            // 用户正文中途引用同样文本 → 不以标签开头，不计入
+            ChatMessage::plain("user", format!("用户引用了 {block}")),
+            // 非 user 角色 → 不计入
+            ChatMessage::plain("assistant", "- [2026-08-10] [公共知识] AUR 镜像只读"),
+        ];
+        let seen = visible_association_lines(&messages);
+        assert_eq!(seen.len(), 1);
+        assert!(seen.contains("- [2026-08-10] [公共知识] AUR 镜像只读"));
+    }
+
+    #[test]
+    fn turn_context_blocks_already_visible_in_fossils_are_skipped() {
+        let notice = "[SystemInfo:LongReplyImageConversion]\n1. 你的一条长回复（约 480 字）已被自动渲染为 1 张图片发送。";
+        let messages = vec![
+            ChatMessage::system("prompt"),
+            // 上一轮化石里已经带着同样的通知
+            ChatMessage::plain("user", format!("<qq-request-context>…</qq-request-context>\n\n{notice}")),
+            ChatMessage::plain("assistant", "回复"),
+        ];
+        assert!(turn_context_block_visible(&messages, notice));
+        // 内容变化(记录数不同)不再匹配,照常注入
+        let changed = "[SystemInfo:LongReplyImageConversion]\n1. 你的一条长回复（约 480 字）已被自动渲染为 1 张图片发送。\n2. 你的一条长回复（约 900 字）已被自动渲染为 2 张图片发送。";
+        assert!(!turn_context_block_visible(&messages, changed));
+        // 非 user 角色的出现不算
+        let assistant_only = vec![ChatMessage::plain("assistant", notice)];
+        assert!(!turn_context_block_visible(&assistant_only, notice));
+        // 只有 [SystemInfo: 前缀的常驻通告参与去重;指涉"当前回合"的块
+        // (唤醒通知/身份告警/审核初判)即使字节相同也必须重发
+        assert!(notice.starts_with(STANDING_ADVISORY_PREFIX));
+        assert!(!"本轮由系统自动触发：一个后台任务刚刚结束。".starts_with(STANDING_ADVISORY_PREFIX));
+        assert!(!"<qq-identity-warning>…</qq-identity-warning>".starts_with(STANDING_ADVISORY_PREFIX));
     }
 
     #[test]

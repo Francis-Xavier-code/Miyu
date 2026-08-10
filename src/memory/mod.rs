@@ -840,6 +840,7 @@ impl MemoryStore {
               ORDER BY id DESC"
         ))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let normalized_query = compact_line(query).to_ascii_lowercase();
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
             let id = row.get::<_, i64>(0)?;
@@ -849,7 +850,7 @@ impl MemoryStore {
             let visibility = row.get::<_, String>(4)?;
             let owner_principal = row.get::<_, String>(5)?;
             let owner_display_name = row.get::<_, String>(6)?;
-            let score = score_text(&content, query, &tokens);
+            let score = score_text(&content, &normalized_query, &tokens);
             if score <= 0.0 {
                 continue;
             }
@@ -1455,8 +1456,9 @@ impl MemoryStore {
         limit: usize,
         include_forgotten: bool,
     ) -> Result<Value> {
-        let facts = self.search_facts(query, limit, include_forgotten)?;
-        let episodes = self.search_episodes(query, limit, include_forgotten)?;
+        let conn = self.data_conn()?;
+        let facts = self.search_facts(&conn, query, limit, include_forgotten)?;
+        let episodes = self.search_episodes(&conn, query, limit, include_forgotten)?;
         Ok(json!({
             "ok": true,
             "query": query,
@@ -1479,7 +1481,8 @@ impl MemoryStore {
     }
 
     fn recall_past_events_existing(&self, query: &str, limit: usize) -> Result<Value> {
-        let episodes = self.search_episodes(query, limit, true)?;
+        let conn = self.data_conn()?;
+        let episodes = self.search_episodes(&conn, query, limit, true)?;
         Ok(json!({
             "ok": true,
             "query": query,
@@ -1491,8 +1494,12 @@ impl MemoryStore {
         if !self.config.enabled || !self.config.association_enabled {
             return Ok(None);
         }
-        let facts = self.search_facts(query, self.config.association_facts, false)?;
-        let mut episodes = self.search_episodes(query, self.config.association_episodes, false)?;
+        // 一条连接贯穿本回合的两次检索与全部 reinforce,替代此前最多 10 次
+        // Connection::open + PRAGMA 重设。
+        let conn = self.data_conn()?;
+        let facts = self.search_facts(&conn, query, self.config.association_facts, false)?;
+        let mut episodes =
+            self.search_episodes(&conn, query, self.config.association_episodes, false)?;
         let matched_short_ids = episodes
             .iter()
             .filter(|hit| hit.retention.as_deref() == Some(SHORT_TERM))
@@ -1507,7 +1514,7 @@ impl MemoryStore {
         });
         let mut organization_due = false;
         for hit in facts.iter().chain(episodes.iter()) {
-            organization_due |= self.reinforce(hit)?;
+            organization_due |= self.reinforce(&conn, hit)?;
         }
         if facts.is_empty() && episodes.is_empty() {
             return Ok(None);
@@ -1577,22 +1584,50 @@ impl MemoryStore {
         truncate_chars(&output, max_chars)
     }
 
+    pub fn association_dedup_enabled(&self) -> bool {
+        self.config.association_dedup
+    }
+
+    /// 过滤掉「渲染行已在本次请求上下文中可见」的命中（早前回合的化石逐字回放
+    /// 时携带了同一行）。只缩小当前回合新生成的块；历史化石一字节不改写，
+    /// append-only 回放与供应商前缀缓存均不受影响。命中被过滤不影响
+    /// `association()` 内已完成的 reinforce 记账。
+    pub fn retain_unseen_association(
+        &self,
+        association: &mut AssociationContext,
+        seen: &HashSet<&str>,
+    ) {
+        if seen.is_empty() {
+            return;
+        }
+        let access = &self.access;
+        association
+            .facts
+            .retain(|hit| !seen.contains(association_entry_line(hit, access).trim_end()));
+        association
+            .episodes
+            .retain(|hit| !seen.contains(association_entry_line(hit, access).trim_end()));
+    }
+
     fn search_facts(
         &self,
+        conn: &Connection,
         query: &str,
         limit: usize,
         include_forgotten: bool,
     ) -> Result<Vec<MemoryHit>> {
-        self.search_table("facts", MemoryKind::Fact, query, limit, include_forgotten)
+        self.search_table(conn, "facts", MemoryKind::Fact, query, limit, include_forgotten)
     }
 
     fn search_episodes(
         &self,
+        conn: &Connection,
         query: &str,
         limit: usize,
         include_forgotten: bool,
     ) -> Result<Vec<MemoryHit>> {
         self.search_table(
+            conn,
             "episodes",
             MemoryKind::Diary,
             query,
@@ -1603,6 +1638,7 @@ impl MemoryStore {
 
     fn search_table(
         &self,
+        conn: &Connection,
         table: &str,
         kind: MemoryKind,
         query: &str,
@@ -1613,6 +1649,8 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let tokens = query_tokens(query);
+        // 归一化与行无关,提到 5000 行循环外做一次。
+        let normalized_query = compact_line(query).to_ascii_lowercase();
         let status_filter = if kind == MemoryKind::Fact && include_forgotten {
             "WHERE truth_status!='rejected'"
         } else if kind == MemoryKind::Fact {
@@ -1642,7 +1680,6 @@ impl MemoryStore {
             status_filter,
             access_filter,
         );
-        let conn = self.data_conn()?;
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = match self.access.principal_key() {
             Some(principal) => stmt.query([principal])?,
@@ -1666,7 +1703,7 @@ impl MemoryStore {
             if !include_forgotten && status == "forgotten" {
                 continue;
             }
-            let lexical_score = score_text(&content, query, &tokens);
+            let lexical_score = score_text(&content, &normalized_query, &tokens);
             if lexical_score <= 0.0 {
                 continue;
             }
@@ -1697,9 +1734,8 @@ impl MemoryStore {
         Ok(hits)
     }
 
-    fn reinforce(&self, hit: &MemoryHit) -> Result<bool> {
+    fn reinforce(&self, conn: &Connection, hit: &MemoryHit) -> Result<bool> {
         let timestamp = now();
-        let conn = self.data_conn()?;
         if hit.kind == MemoryKind::Fact {
             conn.execute(
                 "UPDATE facts SET recall_count=recall_count+1,
@@ -2354,6 +2390,51 @@ fn memory_hit_json(hit: &MemoryHit) -> Value {
     })
 }
 
+/// 渲染单条联想记忆行（含结尾换行），与注入块中的字节完全一致。
+/// 整行同时充当跨回合去重键：内容或日期变化的记忆会渲染出不同的行，
+/// 因而被视为新条目重新注入。
+fn association_entry_line(hit: &MemoryHit, access: &MemoryAccess) -> String {
+    let label = match (access, hit.visibility.as_str()) {
+        (_, VISIBILITY_PUBLIC) => "公共知识".to_string(),
+        (MemoryAccess::Privileged, VISIBILITY_PRINCIPAL) => format!(
+            "归属={}{}",
+            hit.owner_principal,
+            if hit.owner_display_name.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "，记录昵称={}",
+                    truncate_chars(&compact_line(&hit.owner_display_name), 128)
+                )
+            }
+        ),
+        (MemoryAccess::Principal(_), VISIBILITY_PRINCIPAL) => "当前用户记忆".to_string(),
+        _ => "仅管理员".to_string(),
+    };
+    let mut content = compact_line(&hit.content);
+    // 短期日记正文自带 RFC3339 前缀（diary_content），加日期标签后去重
+    if let Some(rest) = content
+        .strip_prefix(hit.timestamp.as_str())
+        .and_then(|rest| rest.strip_prefix('，'))
+    {
+        content = rest.to_string();
+    }
+    let date = association_date(&hit.timestamp);
+    // organizer 写的日记常以「YYYY-MM-DD，」开头，与日期标签相同时也去重
+    if let Some(date) = date.as_deref() {
+        if let Some(rest) = content
+            .strip_prefix(date)
+            .and_then(|rest| rest.strip_prefix('，'))
+        {
+            content = rest.to_string();
+        }
+    }
+    match date {
+        Some(date) => format!("- [{date}] [{label}] {content}\n"),
+        None => format!("- [{label}] {content}\n"),
+    }
+}
+
 fn append_association_section<'a>(
     output: &mut String,
     title: &str,
@@ -2365,45 +2446,7 @@ fn append_association_section<'a>(
     let heading = format!("\n{title}：\n");
     let mut section = String::new();
     for hit in hits {
-        let label = match (access, hit.visibility.as_str()) {
-            (_, VISIBILITY_PUBLIC) => "公共知识".to_string(),
-            (MemoryAccess::Privileged, VISIBILITY_PRINCIPAL) => format!(
-                "归属={}{}",
-                hit.owner_principal,
-                if hit.owner_display_name.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "，记录昵称={}",
-                        truncate_chars(&compact_line(&hit.owner_display_name), 128)
-                    )
-                }
-            ),
-            (MemoryAccess::Principal(_), VISIBILITY_PRINCIPAL) => "当前用户记忆".to_string(),
-            _ => "仅管理员".to_string(),
-        };
-        let mut content = compact_line(&hit.content);
-        // 短期日记正文自带 RFC3339 前缀（diary_content），加日期标签后去重
-        if let Some(rest) = content
-            .strip_prefix(hit.timestamp.as_str())
-            .and_then(|rest| rest.strip_prefix('，'))
-        {
-            content = rest.to_string();
-        }
-        let date = association_date(&hit.timestamp);
-        // organizer 写的日记常以「YYYY-MM-DD，」开头，与日期标签相同时也去重
-        if let Some(date) = date.as_deref() {
-            if let Some(rest) = content
-                .strip_prefix(date)
-                .and_then(|rest| rest.strip_prefix('，'))
-            {
-                content = rest.to_string();
-            }
-        }
-        let line = match date {
-            Some(date) => format!("- [{date}] [{label}] {content}\n"),
-            None => format!("- [{label}] {content}\n"),
-        };
+        let line = association_entry_line(hit, access);
         let total = output.chars().count()
             + heading.chars().count()
             + section.chars().count()
@@ -2920,12 +2963,13 @@ fn build_evicted_fts_query(terms: &[String]) -> String {
         .join(" OR ")
 }
 
-fn score_text(text: &str, query: &str, tokens: &[String]) -> f32 {
+/// `normalized_query` 需已 `compact_line` + 小写化:归一化与被打分的行无关,
+/// 调用方在循环外做一次,而不是在每一行上重复三次分配。
+fn score_text(text: &str, normalized_query: &str, tokens: &[String]) -> f32 {
     if tokens.is_empty() {
         return 0.0;
     }
     let lower = text.to_ascii_lowercase();
-    let query = compact_line(query).to_ascii_lowercase();
     let mut score = 0.0;
     let mut matched = HashSet::new();
     for token in tokens {
@@ -2934,7 +2978,7 @@ fn score_text(text: &str, query: &str, tokens: &[String]) -> f32 {
             matched.insert(token);
         }
     }
-    if !query.is_empty() && lower.contains(&query) {
+    if !normalized_query.is_empty() && lower.contains(normalized_query) {
         score += 20.0;
     }
     score + matched.len() as f32 / tokens.len() as f32 * 24.0
@@ -3039,8 +3083,10 @@ fn association_date(timestamp: &str) -> Option<String> {
 }
 
 fn diary_content(created_at: &str, user_message: &str, assistant_message: &str) -> String {
+    // 第一人称的互动记忆,不是工单:归属(谁说的)由注入行的 [归属=…] 标签
+    // 承担,昵称是可改的不可信字段,不进正文。
     format!(
-        "{}，我被要求：{}；结果：{}",
+        "{}，对方说：{}；我回：{}",
         created_at,
         truncate_chars(&compact_line(user_message), 260),
         truncate_chars(&compact_line(assistant_message), 520)
@@ -3583,7 +3629,7 @@ mod tests {
         let diary = MemoryHit {
             id: 2,
             kind: MemoryKind::Diary,
-            content: format!("{stamp}，我被要求：测试；结果：通过"),
+            content: format!("{stamp}，对方说：测试；我回：通过"),
             retention: Some(SHORT_TERM.to_string()),
             ..base.clone()
         };
@@ -3593,8 +3639,86 @@ mod tests {
             organization_due: false,
         });
         assert!(formatted.contains(&format!("[{date}] [公共知识] 知识点内容")));
-        assert!(formatted.contains(&format!("[{date}] [公共知识] 我被要求：测试；结果：通过")));
+        assert!(formatted.contains(&format!("[{date}] [公共知识] 对方说：测试；我回：通过")));
         assert!(!formatted.contains(&stamp));
+    }
+
+    #[test]
+    fn diary_content_reads_as_a_first_person_exchange() {
+        let content = diary_content(
+            "2026-08-10T12:00:00+00:00",
+            "wps 保存文件默认的编码是gbk吗",
+            "分情况：纯文本默认 GBK，docx 内部是 UTF-8",
+        );
+        assert_eq!(
+            content,
+            "2026-08-10T12:00:00+00:00，对方说：wps 保存文件默认的编码是gbk吗；我回：分情况：纯文本默认 GBK，docx 内部是 UTF-8"
+        );
+    }
+
+    #[test]
+    fn association_dedup_filters_visible_lines_and_keeps_changed_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        assert!(store.association_dedup_enabled());
+        let stamp = now();
+        let fact = MemoryHit {
+            id: 1,
+            kind: MemoryKind::Fact,
+            content: "AUR 的 GitHub 镜像只读".to_string(),
+            score: 1.0,
+            timestamp: stamp.clone(),
+            source: "test".to_string(),
+            retention: None,
+            visibility: VISIBILITY_PUBLIC.to_string(),
+            owner_principal: String::new(),
+            owner_display_name: String::new(),
+            subjects: "[]".to_string(),
+            source_episode_ids: Vec::new(),
+        };
+        let diary = MemoryHit {
+            id: 2,
+            kind: MemoryKind::Diary,
+            content: "对方说：测试；我回：通过".to_string(),
+            retention: Some(SHORT_TERM.to_string()),
+            ..fact.clone()
+        };
+        let updated_fact = MemoryHit {
+            id: 1,
+            content: "AUR 的 GitHub 镜像只读，推送需走官方地址".to_string(),
+            ..fact.clone()
+        };
+        // 第一回合的注入块回放时携带的行
+        let first = store.format_association(&AssociationContext {
+            facts: vec![fact.clone()],
+            episodes: vec![diary.clone()],
+            organization_due: false,
+        });
+        let seen = first
+            .lines()
+            .filter(|line| line.starts_with("- ["))
+            .collect::<HashSet<_>>();
+        assert_eq!(seen.len(), 2);
+        // 未变化的 fact 与 diary 被过滤；内容更新过的 fact 保留
+        let mut association = AssociationContext {
+            facts: vec![fact.clone(), updated_fact],
+            episodes: vec![diary],
+            organization_due: false,
+        };
+        store.retain_unseen_association(&mut association, &seen);
+        assert_eq!(association.facts.len(), 1);
+        assert!(association.facts[0].content.contains("官方地址"));
+        assert!(association.episodes.is_empty());
+        // 空 seen 集不过滤
+        let mut untouched = AssociationContext {
+            facts: vec![fact],
+            episodes: Vec::new(),
+            organization_due: false,
+        };
+        store.retain_unseen_association(&mut untouched, &HashSet::new());
+        assert_eq!(untouched.facts.len(), 1);
     }
 
     #[test]

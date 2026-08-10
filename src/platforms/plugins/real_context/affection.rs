@@ -585,7 +585,8 @@ async fn run_update(job: AffectionUpdateJob) -> Result<()> {
         config.active_provider_models = Some(models.to_vec());
     }
     let client = OpenAiCompatibleClient::from_config(&config, &job.paths)
-        .context("initializing the affection update model pool")?;
+        .context("initializing the affection update model pool")?
+        .with_request_scope("qq-affection");
     let persona = if job.settings.judge_include_persona {
         config
             .system_prompt_for(&job.paths, crate::config::PromptAudience::Internal)

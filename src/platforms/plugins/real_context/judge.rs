@@ -84,7 +84,8 @@ pub(super) async fn run(
     );
     let client = OpenAiCompatibleClient::from_config(&config, &context.paths)
         .context("initializing the real-context judge model pool")?
-        .with_request_timeouts(endpoint_timeout, endpoint_timeout);
+        .with_request_timeouts(endpoint_timeout, endpoint_timeout)
+        .with_request_scope("qq-judge");
     let prompt = build_prompt(context, settings, &request)?;
     let deadline =
         (timeout > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(timeout));

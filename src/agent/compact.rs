@@ -71,7 +71,9 @@ impl Compactor {
         // Hard cap on the summary completion (pi: 0.8×reserve, opencode: 4k
         // flat): a runaway summary must not eat the reserved output space.
         let summary_cap = ((reserved_tokens as f32 * 0.8) as u32).clamp(1024, 8192);
-        let client = client.with_max_tokens(summary_cap);
+        let client = client
+            .with_max_tokens(summary_cap)
+            .with_request_scope("compact");
         Self {
             client,
             state,

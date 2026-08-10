@@ -720,11 +720,12 @@ pub(crate) async fn wake_conversation_for_job(
     // context blocks — the wake turn should see the conversation exactly
     // like an inbound turn would.
     let prepared = context.prepare_turn(content).await;
-    let turn_system_context = vec![
+    let mut turn_system_context = vec![
         "本轮由系统自动触发：一个后台任务刚刚结束。这不是任何群成员或用户发来的消息；\
          请用 job_status 查看任务输出，然后以你自己的身份把结果自然地发到会话里。"
             .to_string(),
     ];
+    turn_system_context.extend(prepared.turn_system_context);
     let profile = super::TurnProfile {
         active_persona: Some(context.config.prompt.active_persona.clone()),
         text_models: context.config.active_provider_models.clone(),
@@ -737,6 +738,7 @@ pub(crate) async fn wake_conversation_for_job(
             .map(<[_]>::to_vec),
         system_context: prepared.system_context,
         turn_system_context,
+        memory_content: Some(prepared.memory_content),
         context_images: prepared.context_images,
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),
@@ -3694,7 +3696,7 @@ async fn build_and_run_turn(
     // message ids, mentions) changes on every inbound message. It rides the
     // turn tail via `turn_system_context`; only stable policy text stays in the
     // system prompt so the provider prefix cache survives across messages.
-    let turn_system_context = vec![qq_turn_system_context(
+    let mut turn_system_context = vec![qq_turn_system_context(
         &context.config.platforms.qq,
         &context.conversation,
         &context.sender_id,
@@ -3703,6 +3705,7 @@ async fn build_and_run_turn(
         context.inbound_event(),
         group_name,
     )];
+    turn_system_context.extend(prepared.turn_system_context);
     let mut system_context = Vec::new();
     if let Some(prompt) = route
         .map(|route| route.extra_prompt.trim())
@@ -3720,6 +3723,7 @@ async fn build_and_run_turn(
             .map(<[_]>::to_vec),
         system_context,
         turn_system_context,
+        memory_content: Some(prepared.memory_content),
         context_images: prepared.context_images,
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),

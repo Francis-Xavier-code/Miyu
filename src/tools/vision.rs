@@ -584,7 +584,8 @@ fn vision_client(config: &AppConfig, paths: &MiyuPaths) -> Result<OpenAiCompatib
             })
             .collect::<Vec<_>>();
         if !choices.is_empty() {
-            return OpenAiCompatibleClient::from_choices(config, paths, &choices);
+            return OpenAiCompatibleClient::from_choices(config, paths, &choices)
+                .map(|client| client.with_request_scope("vision"));
         }
     }
     let (provider_id, model) = config.vision_provider_choice()?;

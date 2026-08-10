@@ -1816,7 +1816,11 @@ impl StreamRenderer {
         self.reasoning_started_at
             .get_or_insert_with(std::time::Instant::now);
         self.reasoning_text.push_str(text);
-        self.reasoning_tokens = crate::token_estimate::estimate_tokens(&self.reasoning_text);
+        // Incremental: recounting the whole accumulated text on every chunk is
+        // O(n²) over the stream and the value only feeds the spinner label.
+        // Per-chunk sums drift <1% from a full recount (BPE merges across
+        // chunk boundaries) — fine for a display estimate.
+        self.reasoning_tokens += crate::token_estimate::estimate_tokens(text);
     }
 
     /// Gets or creates a tool's stats entry, stamping first-seen order so
@@ -5607,7 +5611,10 @@ mod tests {
         renderer.record_reasoning_text("one\nt");
         renderer.record_reasoning_text("wo\nthree");
         renderer.reasoning_title = Some("分析摘要协议".to_string());
-        let expected = crate::token_estimate::estimate_tokens("one\ntwo\nthree");
+        // 词元数按 chunk 增量累加(避免每 chunk 对全文 O(n²) 重算),
+        // 期望值即各 chunk 估算之和;跨 chunk 切词处与全文重算略有出入。
+        let expected = crate::token_estimate::estimate_tokens("one\nt")
+            + crate::token_estimate::estimate_tokens("wo\nthree");
         let summary = renderer.reasoning_summary_text();
         let title_separator = t(": ", "：");
         assert!(summary.starts_with(&format!(

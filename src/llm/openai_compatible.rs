@@ -718,6 +718,10 @@ pub struct OpenAiCompatibleClient {
     /// clone the client and set this so a runaway summary cannot eat the
     /// window; None leaves the provider default untouched.
     max_tokens_override: Option<u32>,
+    /// Scope tag for the per-request cache accounting log ("chat", "qq-judge",
+    /// "compact", …). Auxiliary callers override it via `with_request_scope`
+    /// so cache stats separate the main conversation from side channels.
+    request_scope: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -856,10 +860,29 @@ fn endpoint_failover_allowed(error: &anyhow::Error) -> bool {
 }
 
 fn endpoint_client(provider: &ProviderConfig) -> Result<Client> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(provider.timeout_seconds.clamp(5, 30)))
+    // Auxiliary callers (judge/affection/organizer) rebuild their client per
+    // call; without this cache every judge run pays fresh TLS setup and loses
+    // connection reuse. Keyed by every input the builder consumes, so a config
+    // edit that changes the timeout naturally mints a new client; the map is
+    // bounded by the number of distinct providers. `reqwest::Client` is an Arc
+    // handle — clones share one pool.
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, u64), Client>>> =
+        std::sync::OnceLock::new();
+    let timeout = provider.timeout_seconds.clamp(5, 30);
+    let key = (provider.id.clone(), timeout);
+    let mut cache = CLIENTS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(client) = cache.get(&key) {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(timeout))
         .build()
-        .with_context(|| format!("building HTTP client for provider {}", provider.id))
+        .with_context(|| format!("building HTTP client for provider {}", provider.id))?;
+    cache.insert(key, client.clone());
+    Ok(client)
 }
 
 fn llm_endpoints(config: &AppConfig, paths: &MiyuPaths) -> Result<Vec<LlmEndpoint>> {
@@ -897,6 +920,7 @@ fn llm_endpoints(config: &AppConfig, paths: &MiyuPaths) -> Result<Vec<LlmEndpoin
 
 impl OpenAiCompatibleClient {
     pub fn from_config(config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
+        super::cache_log::configure(paths, &config.cache);
         let endpoints = llm_endpoints(config, paths)?;
         let first = endpoints
             .first()
@@ -912,6 +936,7 @@ impl OpenAiCompatibleClient {
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -925,6 +950,7 @@ impl OpenAiCompatibleClient {
         paths: &MiyuPaths,
         choices: &[crate::config::ProviderModelChoice],
     ) -> Result<Self> {
+        super::cache_log::configure(paths, &config.cache);
         let mut endpoints = Vec::new();
         let mut errors = Vec::new();
         for choice in choices {
@@ -972,6 +998,7 @@ impl OpenAiCompatibleClient {
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1011,6 +1038,7 @@ impl OpenAiCompatibleClient {
             detailed_reasoning_summary: reasoning_summary_is_detailed(config),
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1097,10 +1125,16 @@ impl OpenAiCompatibleClient {
             detailed_reasoning_summary: self.detailed_reasoning_summary,
             request_timeouts: self.request_timeouts,
             max_tokens_override: self.max_tokens_override,
+            request_scope: self.request_scope,
         }
     }
 
     /// Returns a clone whose chat completions are capped at `max_tokens`.
+    pub fn with_request_scope(mut self, scope: &'static str) -> Self {
+        self.request_scope = scope;
+        self
+    }
+
     pub fn with_max_tokens(&self, max_tokens: u32) -> Self {
         let mut clone = self.clone();
         clone.max_tokens_override = Some(max_tokens.max(1));
@@ -1559,6 +1593,14 @@ impl OpenAiCompatibleClient {
                         next.endpoint_id = endpoint.id();
                     }
                     mark_endpoint_success(endpoint);
+                    super::cache_log::record(
+                        self.request_scope,
+                        &endpoint.provider.id,
+                        &endpoint.provider.default_model,
+                        endpoint.key_index,
+                        &request_id,
+                        result.usage.as_ref(),
+                    );
                     tracing::debug!(
                         request_id,
                         attempt = attempt + 1,
@@ -6524,6 +6566,7 @@ mod tests {
                 stream_idle: Duration::from_secs(1),
             }),
             max_tokens_override: None,
+            request_scope: "chat",
         };
 
         let result = client
@@ -6952,6 +6995,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
         let initial_result = initial_client
             .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
@@ -6986,6 +7030,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
 
         let result = client
@@ -7121,6 +7166,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
         let mut chunks = Vec::new();
 
@@ -7205,6 +7251,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
 
         let result = client
@@ -7431,6 +7478,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
 
         let error = client
@@ -7606,6 +7654,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         }
     }
 
@@ -7994,6 +8043,7 @@ mod tests {
             detailed_reasoning_summary: false,
             request_timeouts: None,
             max_tokens_override: None,
+            request_scope: "chat",
         };
 
         let first_endpoint = client.with_endpoint(&client.endpoints[0]);

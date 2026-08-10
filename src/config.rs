@@ -59,9 +59,10 @@ pub struct AppConfig {
     pub platforms: PlatformsConfig,
 }
 
-/// Provider prompt-cache tuning (v7, DeepSeek 高命中策略实测产物). All
-/// options default to off; they trade a little latency or a few cheap
-/// requests for prefix-cache hits on best-effort provider caches.
+/// Provider prompt-cache tuning (v7, DeepSeek 高命中策略实测产物). The
+/// tuning knobs default to off — they trade a little latency or a few cheap
+/// requests for prefix-cache hits on best-effort provider caches. The
+/// accounting log defaults to on (numbers only, ~0.2 KB per request).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheConfig {
@@ -82,6 +83,14 @@ pub struct CacheConfig {
     /// consecutive tool-loop requests wait until at least this many
     /// milliseconds have passed since the previous round completed.
     pub write_grace_ms: u64,
+    /// Per-request cache accounting log: one JSONL line of absolute token
+    /// numbers (prompt/cache_read/completion/…) per LLM request under
+    /// cache/logs/cache-usage.<date>.jsonl. Numbers only — never prompt text.
+    /// Roughly 0.2 KB per request; daily files, pruned by retention below.
+    pub request_log: bool,
+    /// Days of cache-usage JSONL files to keep (older files are deleted when
+    /// a new line is written).
+    pub request_log_retention_days: u64,
 }
 
 impl Default for CacheConfig {
@@ -90,6 +99,8 @@ impl Default for CacheConfig {
             keepalive_seconds: 0,
             keepalive_max_pings: 20,
             write_grace_ms: 0,
+            request_log: true,
+            request_log_retention_days: 14,
         }
     }
 }
@@ -2699,6 +2710,10 @@ pub struct MemoryConfig {
     pub association_episodes: usize,
     #[serde(default = "default_memory_association_max_chars")]
     pub association_max_chars: usize,
+    /// 同一条记忆若已在本会话早前回合注入过（化石仍在可见上下文中逐字回放），
+    /// 本回合不再重复注入。内容或日期变化的记忆视为新条目照常注入。
+    #[serde(default = "default_true")]
+    pub association_dedup: bool,
     #[serde(default = "default_memory_snippet_chars")]
     pub snippet_chars: usize,
     #[serde(default = "default_memory_forget_after_days")]
@@ -3412,6 +3427,7 @@ impl Default for MemoryConfig {
             association_facts: default_memory_association_facts(),
             association_episodes: default_memory_association_episodes(),
             association_max_chars: default_memory_association_max_chars(),
+            association_dedup: default_true(),
             snippet_chars: default_memory_snippet_chars(),
             forget_after_days: default_memory_forget_after_days(),
             forgetting_enabled: default_true(),

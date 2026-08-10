@@ -543,6 +543,9 @@ pub(crate) struct TurnProfile {
     /// folded into the system prompt, so the stable prefix stays byte-identical
     /// across turns (v7 Phase 2.1).
     pub(crate) turn_system_context: Vec<String>,
+    /// Raw input snapshot for the memory diary (pre-plugin content); `None`
+    /// keeps the agent's default of recording the turn content as-is.
+    pub(crate) memory_content: Option<String>,
     pub(crate) context_images: Vec<PlatformContextImageRef>,
     pub(crate) platform: Option<Arc<PlatformTurnContext>>,
     pub(crate) image_cache_namespace: Option<String>,
@@ -564,6 +567,7 @@ impl Default for TurnProfile {
             multimodal_models: None,
             system_context: Vec::new(),
             turn_system_context: Vec::new(),
+            memory_content: None,
             context_images: Vec::new(),
             platform: None,
             image_cache_namespace: None,
@@ -861,8 +865,10 @@ impl PlatformTurnContext {
 
     pub(crate) async fn prepare_turn(&self, content: String) -> plugins::PlatformTurnInput {
         let mut input = plugins::PlatformTurnInput {
+            memory_content: content.clone(),
             content,
             system_context: Vec::new(),
+            turn_system_context: Vec::new(),
             context_images: Vec::new(),
         };
         self.plugins.before_turn(self, &mut input).await;

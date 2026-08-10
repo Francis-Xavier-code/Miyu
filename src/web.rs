@@ -6315,6 +6315,7 @@ async fn run_turn_task(
         }
         if let Some(profile) = &profile {
             agent.set_memory_writes_enabled(profile.memory_write_enabled);
+            agent.set_memory_content(profile.memory_content.clone());
             agent.set_session_history_suppressed(profile.suppress_session_history);
             if let Some(namespace) = profile.image_cache_namespace.as_deref() {
                 agent.set_image_platform(

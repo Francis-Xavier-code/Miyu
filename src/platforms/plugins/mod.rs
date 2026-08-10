@@ -56,7 +56,19 @@ pub(crate) struct PluginDescriptor {
 
 pub(crate) struct PlatformTurnInput {
     pub(crate) content: String,
+    /// 插件运行前的输入快照(用户原话+入站附注)。记忆日记只读它,不读被
+    /// 插件包装后的 `content`(指令样板/群聊记录块)——C10「三份内容分离」
+    /// 的最小实现。插件不得修改此字段。
+    pub(crate) memory_content: String,
+    /// Stable policy text folded into the system prompt. Only content that is
+    /// byte-identical on every turn of the conversation belongs here — a block
+    /// that appears, changes, or disappears per turn breaks the provider
+    /// prefix cache from the system prompt onwards.
     pub(crate) system_context: Vec<String>,
+    /// Per-turn transport/control blocks. They ride the turn tail after the
+    /// user message and get fossilized (v7 §三 [E] 区), so the system prompt
+    /// stays byte-stable no matter how often they come and go.
+    pub(crate) turn_system_context: Vec<String>,
     pub(crate) context_images: Vec<PlatformContextImageRef>,
 }
 

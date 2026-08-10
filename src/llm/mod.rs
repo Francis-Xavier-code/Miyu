@@ -1,3 +1,4 @@
+mod cache_log;
 mod openai_compatible;
 
 pub(crate) use openai_compatible::{

@@ -438,7 +438,8 @@ async fn run_task_core(
             ));
         }
         (
-            OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+            OpenAiCompatibleClient::from_config(&context.config, &context.paths)?
+                .with_request_scope("subagent"),
             main_pool_choice(&context.config),
         )
     } else {
@@ -446,7 +447,7 @@ async fn run_task_core(
             Ok(client) => {
                 let first = &pool[0];
                 (
-                    client,
+                    client.with_request_scope("subagent"),
                     Some((first.provider_id.clone(), first.model.clone())),
                 )
             }
@@ -456,7 +457,8 @@ async fn run_task_core(
                     tier.label()
                 ));
                 (
-                    OpenAiCompatibleClient::from_config(&context.config, &context.paths)?,
+                    OpenAiCompatibleClient::from_config(&context.config, &context.paths)?
+                .with_request_scope("subagent"),
                     main_pool_choice(&context.config),
                 )
             }
