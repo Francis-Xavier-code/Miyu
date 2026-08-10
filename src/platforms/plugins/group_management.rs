@@ -11,13 +11,14 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const GROUP_MANAGEMENT_PLUGIN_ID: &str = "qq_group_management";
 const ROLE_KEY: &str = "qq_group_management.bot_role";
 const OFFENDERS_KEY: &str = "offender_history";
 const KICKS_KEY: &str = "kick_history";
+const EVENTS_KEY: &str = "management_events";
 const MAX_TARGETS: usize = 32;
 /// QQ caps a mute at 30 days; anything longer is rejected by the server, so
 /// catch it here where the message can explain itself.
@@ -84,20 +85,32 @@ struct KickRecord {
     source: String,
 }
 
-#[derive(Default)]
-struct Runtime {
-    bans: HashMap<String, Vec<BanRecord>>,
+/// 统一的群管理事件流：禁言/解禁/踢出/头衔追加到同一份持久化记录，
+/// 查询与统计从这里读取。旧的 offender_history / kick_history 两个 key
+/// 照常写入（WebUI 的 HTTP 端点依赖它们），查询时按 record_id 去重合并，
+/// 事件流上线前的历史因此自动补齐。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManagementEvent {
+    record_id: String,
+    /// ban | unban | kick | kick_black | title_set | title_clear
+    action: String,
+    user_id: String,
+    user_name: String,
+    #[serde(default)]
+    duration: u64,
+    happened_at: i64,
+    operator_id: String,
+    reason: String,
+    source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    detail: String,
 }
 
-pub(crate) struct GroupManagementPlugin {
-    runtime: Mutex<Runtime>,
-}
+pub(crate) struct GroupManagementPlugin;
 
 impl GroupManagementPlugin {
     pub(crate) fn new() -> Self {
-        Self {
-            runtime: Mutex::new(Runtime::default()),
-        }
+        Self
     }
 
     fn scope(context: &PlatformTurnContext) -> PlatformPluginScopeKey {
@@ -108,10 +121,6 @@ impl GroupManagementPlugin {
             conversation_kind: context.conversation.kind.as_str().to_string(),
             conversation_id: context.conversation.conversation_id.clone(),
         }
-    }
-
-    fn visible(context: &PlatformTurnContext) -> bool {
-        context.conversation.kind == ConversationKind::Group
     }
 
     async fn prepare_role(context: &PlatformTurnContext) {
@@ -129,19 +138,23 @@ impl GroupManagementPlugin {
         registry: &mut ToolRegistry,
         context: Arc<PlatformTurnContext>,
     ) -> Result<()> {
-        if !Self::visible(&context) {
+        let settings = settings(&context)?;
+        let query_enabled = settings.enable_tool || settings.enable_kick_tool;
+        if context.conversation.kind != ConversationKind::Group {
+            // 群聊之外只给 Miyu 管理员留跨群查询入口（group_id 必填）
+            if query_enabled && context.is_admin {
+                self.register_history_query(registry, context);
+            }
             return Ok(());
         }
-        let settings = settings(&context)?;
         if settings.enable_tool {
             self.register_ban(registry, context.clone());
-            self.register_log_query(registry, context.clone());
-            self.register_offender_query(registry, context.clone());
         }
         if settings.enable_kick_tool {
-            self.register_kick(registry, context.clone(), false);
-            self.register_kick(registry, context.clone(), true);
-            self.register_kick_query(registry, context.clone());
+            self.register_kick(registry, context.clone());
+        }
+        if query_enabled {
+            self.register_history_query(registry, context.clone());
         }
         if settings.enable_special_title_tool {
             self.register_title(registry, context);
@@ -195,35 +208,21 @@ impl GroupManagementPlugin {
         self: &Arc<Self>,
         registry: &mut ToolRegistry,
         context: Arc<PlatformTurnContext>,
-        blacklist: bool,
     ) {
         let plugin = self.clone();
-        let name = if blacklist {
-            "qq_group_manage_kick_black_with_log"
-        } else {
-            "qq_group_manage_kick_with_log"
-        };
         registry.register(
             ToolSpec::new(
-                name,
-                if blacklist {
-                    "Kick one or more members from the current QQ group and reject their future join requests. Pass every target in a single call; the result reports each target separately."
-                } else {
-                    "Kick one or more members from the current QQ group without blacklisting. Pass every target in a single call; the result reports each target separately."
-                },
+                "qq_group_manage_kick_with_log",
+                "Kick one or more members from the current QQ group and record the action. Set blacklist=true to also reject their future join requests. Pass every target in a single call; the result reports each target separately.",
                 kick_schema(),
                 move |args| {
                     let plugin = plugin.clone();
                     let context = context.clone();
-                    async move { plugin.kick(args, context, blacklist).await }
+                    async move { plugin.kick(args, context).await }
                 },
             )
             .writes()
-            .with_display_name(if blacklist {
-                "QQ群踢黑"
-            } else {
-                "QQ群踢人"
-            }),
+            .with_display_name("QQ群踢人"),
         );
     }
 
@@ -260,63 +259,18 @@ impl GroupManagementPlugin {
         );
     }
 
-    fn register_log_query(
-        self: &Arc<Self>,
-        registry: &mut ToolRegistry,
-        context: Arc<PlatformTurnContext>,
-    ) {
-        let plugin = self.clone();
-        registry.register(ToolSpec::new(
-            "qq_group_manage_log_query",
-            "Query current-group mute/unmute records.",
-            query_schema(true),
-            move |args| {
-                let plugin = plugin.clone();
-                let context = context.clone();
-                async move { plugin.query_logs(args, &context) }
-            },
-        ));
-    }
-
-    fn register_offender_query(
+    fn register_history_query(
         self: &Arc<Self>,
         registry: &mut ToolRegistry,
         context: Arc<PlatformTurnContext>,
     ) {
         registry.register(ToolSpec::new(
-            "qq_group_manage_offender_history_query",
-            "Query persistent offender statistics for the current QQ group.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "user_id": { "type": "string" },
-                    "min_ban_count": { "type": "integer", "minimum": 1, "default": 1 },
-                    "keyword": { "type": "string" },
-                    "sort_by": { "type": "string", "enum": ["ban_count", "total_duration", "last_ban_at"] },
-                    "sort_order": { "type": "string", "enum": ["asc", "desc"] },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-                },
-                "additionalProperties": false
-            }),
+            "qq_group_manage_history_query",
+            "Query QQ group management records (mute/kick/title). view=events lists individual actions newest-first; view=stats aggregates per member (ban_count, kick_count, total mute duration). Miyu admins may pass group_id to query another group; group_id is required outside that group's chat.",
+            history_query_schema(),
             move |args| {
                 let context = context.clone();
-                async move { query_offenders(args, &context) }
-            },
-        ));
-    }
-
-    fn register_kick_query(
-        self: &Arc<Self>,
-        registry: &mut ToolRegistry,
-        context: Arc<PlatformTurnContext>,
-    ) {
-        registry.register(ToolSpec::new(
-            "qq_group_manage_kick_history_query",
-            "Query persistent kick history for the current QQ group.",
-            query_schema(false),
-            move |args| {
-                let context = context.clone();
-                async move { query_kicks(args, &context) }
+                async move { query_history(args, &context) }
             },
         ));
     }
@@ -405,31 +359,24 @@ impl GroupManagementPlugin {
             reason: reason.to_string(),
             source: "llm_tool".to_string(),
         };
-        if settings.enable_record {
-            let mut runtime = self.runtime.lock().unwrap();
-            let records = runtime
-                .bans
-                .entry(context.conversation.scope_key())
-                .or_default();
-            if duration > 0 {
-                for old in records
-                    .iter_mut()
-                    .filter(|old| old.user_id == user_id && old.status == "active")
-                {
-                    old.status = "overridden".to_string();
-                }
-            } else {
-                for old in records
-                    .iter_mut()
-                    .filter(|old| old.user_id == user_id && old.status == "active")
-                {
-                    old.status = "unmuted".to_string();
-                }
-            }
-            records.push(record.clone());
-            trim_vec(records, settings.max_records_per_group);
-        }
         let mut audit_errors = Vec::new();
+        if settings.enable_record {
+            let event = ManagementEvent {
+                record_id: record_id.clone(),
+                action: if duration == 0 { "unban" } else { "ban" }.to_string(),
+                user_id: user_id.to_string(),
+                user_name: member.display_name().to_string(),
+                duration,
+                happened_at: now,
+                operator_id: context.sender_id.clone(),
+                reason: reason.to_string(),
+                source: "llm_tool".to_string(),
+                detail: String::new(),
+            };
+            if let Err(error) = append_event(context, &event, settings.max_records_per_group) {
+                audit_errors.push(format!("event log: {error}"));
+            }
+        }
         if duration > 0 && settings.enable_offender_history {
             if let Err(error) = update_offender(context, settings, &record) {
                 audit_errors.push(format!("offender history: {error}"));
@@ -456,26 +403,20 @@ impl GroupManagementPlugin {
         result
     }
 
-    async fn kick(
-        &self,
-        args: Value,
-        context: Arc<PlatformTurnContext>,
-        blacklist: bool,
-    ) -> Result<String> {
+    async fn kick(&self, args: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
         let settings = settings(&context)?;
+        let blacklist = args
+            .get("blacklist")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let reason = bounded_reason(&args, &settings)?;
         let targets = resolve_targets(&args, &context)?;
         if targets.is_empty() {
             return json_result(false, "没有解析出踢人目标", Value::Null);
         }
-        let action = if blacklist {
-            "qq_group_manage_kick_black_with_log"
-        } else {
-            "qq_group_manage_kick_with_log"
-        };
         if let Some(prompt) = require_ai_confirmation(
             &context,
-            action,
+            "qq_group_manage_kick_with_log",
             &json!({ "arguments": args, "targets": targets, "blacklist": blacklist }),
         )
         .await?
@@ -530,6 +471,21 @@ impl GroupManagementPlugin {
         let mut audit_errors = Vec::new();
         if let Err(error) = append_kick(context, &record, settings.max_kick_history_per_group) {
             audit_errors.push(format!("kick history: {error}"));
+        }
+        let event = ManagementEvent {
+            record_id: record.record_id.clone(),
+            action: if blacklist { "kick_black" } else { "kick" }.to_string(),
+            user_id: record.user_id.clone(),
+            user_name: record.user_name.clone(),
+            duration: 0,
+            happened_at: record.kicked_at,
+            operator_id: record.operator_id.clone(),
+            reason: record.reason.clone(),
+            source: record.source.clone(),
+            detail: String::new(),
+        };
+        if let Err(error) = append_event(context, &event, settings.max_records_per_group) {
+            audit_errors.push(format!("event log: {error}"));
         }
         if let Err(error) = record_real_context(
             context,
@@ -606,6 +562,26 @@ impl GroupManagementPlugin {
         }
         let id = record_id();
         let mut audit_errors = Vec::new();
+        let event = ManagementEvent {
+            record_id: id.clone(),
+            action: if title.is_empty() {
+                "title_clear"
+            } else {
+                "title_set"
+            }
+            .to_string(),
+            user_id: targets[0].clone(),
+            user_name: member.display_name().to_string(),
+            duration: 0,
+            happened_at: now_unix(),
+            operator_id: context.sender_id.clone(),
+            reason: reason.clone(),
+            source: "llm_tool".to_string(),
+            detail: title.to_string(),
+        };
+        if let Err(error) = append_event(&context, &event, settings.max_records_per_group) {
+            audit_errors.push(format!("event log: {error}"));
+        }
         if let Err(error) = record_real_context(
             &context,
             &id,
@@ -629,39 +605,6 @@ impl GroupManagementPlugin {
         .to_string())
     }
 
-    fn query_logs(&self, args: Value, context: &PlatformTurnContext) -> Result<String> {
-        let include_history = args
-            .get("include_history")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let user_id = optional_id(&args);
-        let limit = limit(&args);
-        let now = now_unix();
-        let mut runtime = self.runtime.lock().unwrap();
-        let records = runtime
-            .bans
-            .entry(context.conversation.scope_key())
-            .or_default();
-        for record in records
-            .iter_mut()
-            .filter(|record| record.status == "active" && record.expires_at <= now)
-        {
-            record.status = "expired".to_string();
-        }
-        let records = records
-            .iter()
-            .rev()
-            .filter(|record| include_history || record.status == "active")
-            .filter(|record| user_id.as_deref().is_none_or(|id| record.user_id == id))
-            .take(limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        json_result(
-            true,
-            "查询成功",
-            json!({ "count": records.len(), "records": records }),
-        )
-    }
 }
 
 impl PlatformPlugin for Arc<GroupManagementPlugin> {
@@ -714,28 +657,19 @@ impl PlatformPlugin for Arc<GroupManagementPlugin> {
                         return Ok(());
                     }
                     let now = event.timestamp.max(now_unix());
-                    let record = BanRecord {
+                    let record = ManagementEvent {
                         record_id: record_id(),
-                        group_id: context.conversation.conversation_id.clone(),
+                        action: if duration == 0 { "unban" } else { "ban" }.to_string(),
                         user_id: event.sender_id.clone(),
                         user_name: event.sender_display_name.clone(),
                         duration,
-                        started_at: now,
-                        expires_at: now.saturating_add(duration as i64),
-                        status: if duration == 0 { "unmuted" } else { "active" }.to_string(),
+                        happened_at: now,
                         operator_id: event.operator_id.clone().unwrap_or_default(),
                         reason: String::new(),
                         source: "onebot_notice".to_string(),
+                        detail: String::new(),
                     };
-                    {
-                        let mut runtime = self.runtime.lock().unwrap();
-                        let records = runtime
-                            .bans
-                            .entry(context.conversation.scope_key())
-                            .or_default();
-                        records.push(record.clone());
-                        trim_vec(records, settings.max_records_per_group);
-                    }
+                    append_event(context, &record, settings.max_records_per_group)?;
                     let member = notice_member(context, event);
                     record_real_context(
                         context,
@@ -771,6 +705,22 @@ impl PlatformPlugin for Arc<GroupManagementPlugin> {
                         source: "onebot_notice".to_string(),
                     };
                     append_kick(context, &record, settings.max_kick_history_per_group)?;
+                    append_event(
+                        context,
+                        &ManagementEvent {
+                            record_id: record.record_id.clone(),
+                            action: "kick".to_string(),
+                            user_id: record.user_id.clone(),
+                            user_name: record.user_name.clone(),
+                            duration: 0,
+                            happened_at: record.kicked_at,
+                            operator_id: record.operator_id.clone(),
+                            reason: String::new(),
+                            source: "onebot_notice".to_string(),
+                            detail: String::new(),
+                        },
+                        settings.max_records_per_group,
+                    )?;
                     let member = notice_member(context, event);
                     record_real_context(context, &record.record_id, "外部踢出", &member, "", None)
                         .await?;
@@ -987,31 +937,284 @@ fn append_kick(context: &PlatformTurnContext, record: &KickRecord, max: usize) -
     Ok(())
 }
 
-fn query_offenders(args: Value, context: &PlatformTurnContext) -> Result<String> {
-    let map = context
-        .state_store
-        .plugin_get_json::<HashMap<String, OffenderHistory>>(
-            &GroupManagementPlugin::scope(context),
-            OFFENDERS_KEY,
-        )?
-        .unwrap_or_default();
-    let user_id = optional_id(&args);
-    let keyword = args
-        .get("keyword")
+fn append_event(context: &PlatformTurnContext, event: &ManagementEvent, max: usize) -> Result<()> {
+    context.state_store.plugin_update_json(
+        &GroupManagementPlugin::scope(context),
+        EVENTS_KEY,
+        |current: Option<Vec<ManagementEvent>>| {
+            let mut events = current.unwrap_or_default();
+            events.push(event.clone());
+            trim_vec(&mut events, max);
+            Ok(Some(events))
+        },
+    )?;
+    Ok(())
+}
+
+/// 解析查询目标群：群聊内默认当前群；带 group_id 且非当前群时要求
+/// Miyu 管理员；群聊之外（私聊/CLI）group_id 必填且仅限管理员。
+fn resolve_query_scope(
+    args: &Value,
+    context: &PlatformTurnContext,
+) -> Result<PlatformPluginScopeKey> {
+    let requested = args
+        .get("group_id")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_lowercase();
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let current = GroupManagementPlugin::scope(context);
+    let Some(id) = requested else {
+        if context.conversation.kind == ConversationKind::Group {
+            return Ok(current);
+        }
+        bail!("群聊之外查询必须提供 group_id");
+    };
+    if !valid_id(id) {
+        bail!("group_id 必须是数字群号");
+    }
+    if context.conversation.kind == ConversationKind::Group
+        && context.conversation.conversation_id == id
+    {
+        return Ok(current);
+    }
+    if !context.is_admin {
+        bail!("跨群查询仅限 Miyu 管理员");
+    }
+    Ok(PlatformPluginScopeKey {
+        conversation_kind: "group".to_string(),
+        conversation_id: id.to_string(),
+        ..current
+    })
+}
+
+/// 汇总三个来源为一条按时间升序的事件流：新事件流为主，旧的
+/// kick_history 与 offender_history.reason_history 按 record_id 去重补入，
+/// 因此事件流上线之前的历史也查得到。
+fn load_all_events(
+    context: &PlatformTurnContext,
+    scope: &PlatformPluginScopeKey,
+) -> Result<Vec<ManagementEvent>> {
+    let mut events = context
+        .state_store
+        .plugin_get_json::<Vec<ManagementEvent>>(scope, EVENTS_KEY)?
+        .unwrap_or_default();
+    let mut seen = events
+        .iter()
+        .map(|event| event.record_id.clone())
+        .collect::<HashSet<_>>();
+    let kicks = context
+        .state_store
+        .plugin_get_json::<Vec<KickRecord>>(scope, KICKS_KEY)?
+        .unwrap_or_default();
+    for kick in kicks {
+        if seen.insert(kick.record_id.clone()) {
+            events.push(ManagementEvent {
+                record_id: kick.record_id,
+                action: if kick.reject_add_request {
+                    "kick_black"
+                } else {
+                    "kick"
+                }
+                .to_string(),
+                user_id: kick.user_id,
+                user_name: kick.user_name,
+                duration: 0,
+                happened_at: kick.kicked_at,
+                operator_id: kick.operator_id,
+                reason: kick.reason,
+                source: kick.source,
+                detail: String::new(),
+            });
+        }
+    }
+    let offenders = context
+        .state_store
+        .plugin_get_json::<HashMap<String, OffenderHistory>>(scope, OFFENDERS_KEY)?
+        .unwrap_or_default();
+    for offender in offenders.into_values() {
+        for entry in &offender.reason_history {
+            if seen.insert(entry.record_id.clone()) {
+                events.push(ManagementEvent {
+                    record_id: entry.record_id.clone(),
+                    action: "ban".to_string(),
+                    user_id: offender.user_id.clone(),
+                    user_name: offender.user_name.clone(),
+                    duration: entry.duration,
+                    happened_at: entry.banned_at,
+                    operator_id: entry.operator_id.clone(),
+                    reason: entry.reason.clone(),
+                    source: "offender_history".to_string(),
+                    detail: String::new(),
+                });
+            }
+        }
+    }
+    events.sort_by_key(|event| event.happened_at);
+    Ok(events)
+}
+
+fn action_matches(filter: &str, action: &str) -> bool {
+    match filter {
+        "all" => true,
+        "ban" => matches!(action, "ban" | "unban"),
+        "kick" => matches!(action, "kick" | "kick_black"),
+        "title" => matches!(action, "title_set" | "title_clear"),
+        _ => false,
+    }
+}
+
+/// 每条禁言事件的当前状态：后续有解禁则 unmuted，后续被再次禁言覆盖则
+/// overridden，否则按到期时间判 active/expired。输入必须按时间升序。
+fn ban_statuses(events: &[ManagementEvent], now: i64) -> HashMap<String, String> {
+    let mut statuses = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.action != "ban" {
+            continue;
+        }
+        let mut status = if event.happened_at.saturating_add(event.duration as i64) <= now {
+            "expired"
+        } else {
+            "active"
+        };
+        for later in &events[index + 1..] {
+            if later.user_id != event.user_id {
+                continue;
+            }
+            match later.action.as_str() {
+                "unban" => {
+                    status = "unmuted";
+                    break;
+                }
+                "ban" => {
+                    status = "overridden";
+                    break;
+                }
+                _ => {}
+            }
+        }
+        statuses.insert(event.record_id.clone(), status.to_string());
+    }
+    statuses
+}
+
+fn query_history(args: Value, context: &PlatformTurnContext) -> Result<String> {
+    let scope = match resolve_query_scope(&args, context) {
+        Ok(scope) => scope,
+        Err(error) => return json_result(false, &error.to_string(), Value::Null),
+    };
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("all");
+    if !matches!(action, "ban" | "kick" | "title" | "all") {
+        return json_result(false, "action 必须是 ban/kick/title/all", Value::Null);
+    }
+    let events = load_all_events(context, &scope)?;
+    match args.get("view").and_then(Value::as_str).unwrap_or("events") {
+        "stats" => query_history_stats(&args, action, &events, &scope.conversation_id),
+        "events" => query_history_events(&args, action, events, &scope.conversation_id),
+        _ => json_result(false, "view 必须是 events 或 stats", Value::Null),
+    }
+}
+
+fn query_history_events(
+    args: &Value,
+    action: &str,
+    events: Vec<ManagementEvent>,
+    group_id: &str,
+) -> Result<String> {
+    let user_id = optional_id(args);
+    let keyword = lowercase_keyword(args);
+    let ascending = args.get("sort_order").and_then(Value::as_str) == Some("asc");
+    let statuses = ban_statuses(&events, now_unix());
+    let mut records = events
+        .into_iter()
+        .filter(|event| action_matches(action, &event.action))
+        .filter(|event| user_id.as_deref().is_none_or(|id| event.user_id == id))
+        .filter(|event| {
+            keyword.is_empty()
+                || event.user_name.to_lowercase().contains(&keyword)
+                || event.reason.to_lowercase().contains(&keyword)
+                || event.detail.to_lowercase().contains(&keyword)
+        })
+        .map(|event| {
+            let status = statuses.get(&event.record_id).cloned();
+            let mut value = serde_json::to_value(&event).unwrap_or_default();
+            if let Some(status) = status {
+                value["status"] = json!(status);
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    if !ascending {
+        records.reverse();
+    }
+    records.truncate(limit(args));
+    json_result(
+        true,
+        "查询成功",
+        json!({ "group_id": group_id, "count": records.len(), "records": records }),
+    )
+}
+
+#[derive(Default, Serialize)]
+struct MemberStats {
+    user_id: String,
+    user_name: String,
+    ban_count: u64,
+    total_ban_duration: u64,
+    kick_count: u64,
+    title_count: u64,
+    last_action_at: i64,
+    last_reason: String,
+}
+
+fn aggregate_member_stats(action: &str, events: &[ManagementEvent]) -> Vec<MemberStats> {
+    let mut map: HashMap<String, MemberStats> = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|event| action_matches(action, &event.action))
+    {
+        let entry = map.entry(event.user_id.clone()).or_default();
+        entry.user_id.clone_from(&event.user_id);
+        if !event.user_name.is_empty() {
+            entry.user_name.clone_from(&event.user_name);
+        }
+        match event.action.as_str() {
+            "ban" => {
+                entry.ban_count += 1;
+                entry.total_ban_duration = entry.total_ban_duration.saturating_add(event.duration);
+            }
+            "kick" | "kick_black" => entry.kick_count += 1,
+            "title_set" | "title_clear" => entry.title_count += 1,
+            _ => {}
+        }
+        if event.happened_at >= entry.last_action_at {
+            entry.last_action_at = event.happened_at;
+            if !event.reason.is_empty() {
+                entry.last_reason.clone_from(&event.reason);
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
+fn query_history_stats(
+    args: &Value,
+    action: &str,
+    events: &[ManagementEvent],
+    group_id: &str,
+) -> Result<String> {
+    let user_id = optional_id(args);
+    let keyword = lowercase_keyword(args);
     let minimum = args
         .get("min_ban_count")
         .and_then(Value::as_u64)
-        .unwrap_or(1);
+        .unwrap_or(0);
     let sort_by = args
         .get("sort_by")
         .and_then(Value::as_str)
         .unwrap_or("ban_count");
     let ascending = args.get("sort_order").and_then(Value::as_str) == Some("asc");
-    let mut items = map
-        .into_values()
+    let mut items = aggregate_member_stats(action, events)
+        .into_iter()
         .filter(|item| item.ban_count >= minimum)
         .filter(|item| user_id.as_deref().is_none_or(|id| item.user_id == id))
         .filter(|item| {
@@ -1021,48 +1224,27 @@ fn query_offenders(args: Value, context: &PlatformTurnContext) -> Result<String>
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|item| match sort_by {
-        "total_duration" => item.total_duration as i64,
-        "last_ban_at" => item.last_ban_at,
+        "kick_count" => item.kick_count as i64,
+        "total_duration" => item.total_ban_duration as i64,
+        "time" | "last_action_at" => item.last_action_at,
         _ => item.ban_count as i64,
     });
     if !ascending {
         items.reverse();
     }
-    items.truncate(limit(&args));
+    items.truncate(limit(args));
     json_result(
         true,
         "查询成功",
-        json!({ "count": items.len(), "records": items }),
+        json!({ "group_id": group_id, "count": items.len(), "records": items }),
     )
 }
 
-fn query_kicks(args: Value, context: &PlatformTurnContext) -> Result<String> {
-    let records = context
-        .state_store
-        .plugin_get_json::<Vec<KickRecord>>(&GroupManagementPlugin::scope(context), KICKS_KEY)?
-        .unwrap_or_default();
-    let user_id = optional_id(&args);
-    let keyword = args
-        .get("keyword")
+fn lowercase_keyword(args: &Value) -> String {
+    args.get("keyword")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_lowercase();
-    let records = records
-        .into_iter()
-        .rev()
-        .filter(|record| user_id.as_deref().is_none_or(|id| record.user_id == id))
-        .filter(|record| {
-            keyword.is_empty()
-                || record.user_name.to_lowercase().contains(&keyword)
-                || record.reason.to_lowercase().contains(&keyword)
-        })
-        .take(limit(&args))
-        .collect::<Vec<_>>();
-    json_result(
-        true,
-        "查询成功",
-        json!({ "count": records.len(), "records": records }),
-    )
+        .to_lowercase()
 }
 
 async fn record_real_context(
@@ -1106,6 +1288,7 @@ fn kick_schema() -> Value {
                 "description": "QQ ids to kick. Prefer this over repeating the tool once per member."
             },
             "user_id": { "type": "string", "description": "Single QQ id, or several separated by spaces/commas. Falls back to mentions/reply when omitted." },
+            "blacklist": { "type": "boolean", "default": false, "description": "true 时踢出并拒绝其后续加群请求（踢黑）。" },
             "reason": { "type": "string" },
             "confirmation_token": { "type": "string" }
         },
@@ -1117,22 +1300,22 @@ fn reason_schema() -> Value {
     json!({ "type": "object", "properties": { "user_id": { "type": "string" }, "reason": { "type": "string" }, "confirmation_token": { "type": "string" } }, "additionalProperties": false })
 }
 
-fn query_schema(include_history: bool) -> Value {
-    let mut properties = serde_json::Map::from_iter([
-        ("user_id".to_string(), json!({ "type": "string" })),
-        ("keyword".to_string(), json!({ "type": "string" })),
-        (
-            "limit".to_string(),
-            json!({ "type": "integer", "minimum": 1, "maximum": 100 }),
-        ),
-    ]);
-    if include_history {
-        properties.insert(
-            "include_history".to_string(),
-            json!({ "type": "boolean", "default": false }),
-        );
-    }
-    json!({ "type": "object", "properties": properties, "additionalProperties": false })
+fn history_query_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ["ban", "kick", "title", "all"], "default": "all", "description": "筛选操作类型；ban 含禁言与解禁，kick 含踢黑。" },
+            "view": { "type": "string", "enum": ["events", "stats"], "default": "events", "description": "events=逐条记录（禁言带 active/expired/unmuted/overridden 状态）；stats=按成员聚合（ban_count、kick_count、total_ban_duration 等）。" },
+            "user_id": { "type": "string" },
+            "keyword": { "type": "string" },
+            "min_ban_count": { "type": "integer", "minimum": 1, "description": "仅 stats 视图：过滤禁言次数下限。" },
+            "sort_by": { "type": "string", "enum": ["time", "ban_count", "kick_count", "total_duration", "last_action_at"], "description": "events 视图按时间排；stats 视图默认按 ban_count。" },
+            "sort_order": { "type": "string", "enum": ["asc", "desc"], "default": "desc" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "group_id": { "type": "string", "description": "跨群查询的目标群号；仅 Miyu 管理员可用，群聊之外调用时必填。" }
+        },
+        "additionalProperties": false
+    })
 }
 
 fn trim_vec<T>(values: &mut Vec<T>, max: usize) {
@@ -1316,6 +1499,75 @@ mod tests {
             Vec::new(),
         )]);
         assert_eq!(all_good["do_not_retry"], true);
+    }
+
+    fn event(action: &str, user: &str, at: i64, duration: u64, reason: &str) -> ManagementEvent {
+        ManagementEvent {
+            record_id: format!("{action}-{user}-{at}"),
+            action: action.to_string(),
+            user_id: user.to_string(),
+            user_name: format!("用户{user}"),
+            duration,
+            happened_at: at,
+            operator_id: "10000".to_string(),
+            reason: reason.to_string(),
+            source: "llm_tool".to_string(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn action_filter_groups_related_event_kinds() {
+        assert!(action_matches("ban", "unban"));
+        assert!(action_matches("kick", "kick_black"));
+        assert!(action_matches("title", "title_clear"));
+        assert!(action_matches("all", "ban"));
+        assert!(!action_matches("ban", "kick"));
+        assert!(!action_matches("bogus", "ban"));
+    }
+
+    #[test]
+    fn ban_status_reflects_later_unban_override_and_expiry() {
+        let now = 1_000_000;
+        let events = vec![
+            event("ban", "11111", now - 100, 3_600, "刷屏"), // 后被解禁
+            event("unban", "11111", now - 50, 0, ""),
+            event("ban", "22222", now - 100, 600, "口嗨"), // 后被再次禁言覆盖
+            event("ban", "22222", now - 50, 3_600, "加重"), // 仍在禁言期
+            event("ban", "33333", now - 7_200, 600, "已过期"),
+        ];
+        let statuses = ban_statuses(&events, now);
+        assert_eq!(statuses[&events[0].record_id], "unmuted");
+        assert_eq!(statuses[&events[2].record_id], "overridden");
+        assert_eq!(statuses[&events[3].record_id], "active");
+        assert_eq!(statuses[&events[4].record_id], "expired");
+    }
+
+    #[test]
+    fn member_stats_aggregate_counts_durations_and_last_reason() {
+        let events = vec![
+            event("ban", "11111", 100, 600, "刷屏"),
+            event("ban", "11111", 200, 1_200, "再犯"),
+            event("unban", "11111", 300, 0, ""), // 解禁不计次
+            event("kick", "11111", 400, 0, "屡教不改"),
+            event("kick_black", "22222", 500, 0, ""),
+            event("title_set", "22222", 600, 0, ""),
+        ];
+        let mut stats = aggregate_member_stats("all", &events);
+        stats.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].ban_count, 2);
+        assert_eq!(stats[0].total_ban_duration, 1_800);
+        assert_eq!(stats[0].kick_count, 1);
+        assert_eq!(stats[0].last_reason, "屡教不改");
+        assert_eq!(stats[0].last_action_at, 400);
+        assert_eq!(stats[1].kick_count, 1);
+        assert_eq!(stats[1].title_count, 1);
+        assert_eq!(stats[1].ban_count, 0);
+
+        // action 过滤只统计对应类别
+        let ban_only = aggregate_member_stats("ban", &events);
+        assert!(ban_only.iter().all(|item| item.kick_count == 0));
     }
 
     #[test]
