@@ -49,8 +49,6 @@ const GENERAL_EXCLUDED: &[&str] = &[
     "roll_dice",
 ];
 
-const EXPLORE_MAX_STEPS: usize = 30;
-const GENERAL_MAX_STEPS: usize = 50;
 const EXPLORE_TOOL_TIMEOUT: u64 = 60;
 const GENERAL_TOOL_TIMEOUT: u64 = 120;
 
@@ -86,13 +84,6 @@ impl SubagentType {
         match self {
             Self::Explore => EXPLORE_SYSTEM_PROMPT,
             Self::General => GENERAL_SYSTEM_PROMPT,
-        }
-    }
-
-    fn default_max_steps(self) -> usize {
-        match self {
-            Self::Explore => EXPLORE_MAX_STEPS,
-            Self::General => GENERAL_MAX_STEPS,
         }
     }
 
@@ -150,7 +141,7 @@ pub fn register(
                 },
                 "max_steps": {
                     "type": "integer",
-                    "description": t("Optional. Override the subagent's tool call budget. explore defaults to 30, general defaults to 50.", "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。")
+                    "description": t("Optional tool-call budget. Unlimited by default: the subagent ends when the task is done. Set a number only when you want a hard cap.", "可选的工具调用步数预算。默认不限，子代理完成任务即自然结束；仅在需要硬性约束时设置。")
                 },
                 "background": {
                     "type": "boolean",
@@ -262,11 +253,13 @@ fn parse_task_params(args: &Value) -> Result<TaskParams> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
+    // 0 = 不限步数(runner 语义):默认让子代理自然结束,预算仅在调用方
+    // 显式给出 max_steps 时生效。
     let max_steps = args
         .get("max_steps")
         .and_then(Value::as_u64)
         .map(|v| v as usize)
-        .unwrap_or_else(|| sa_type.default_max_steps());
+        .unwrap_or(0);
     let tier = args
         .get("tier")
         .and_then(Value::as_str)
