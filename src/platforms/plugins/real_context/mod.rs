@@ -44,6 +44,14 @@ const MAX_ACTIVE_SUPPLEMENT_MESSAGES: usize = 5;
 const MAX_ACTIVE_CURRENT_CONTENT_BYTES: usize = 16 * 1024;
 const MAX_ACTIVE_TARGET_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_CONTEXT_IMAGE_REFS: usize = 8;
+const REPLY_WATERMARK_KEY: &str = "reply_ingress_watermark";
+/// How far back `vision_analyze` can still reach. Deliberately independent of
+/// what this turn rendered: the log is incremental now, so a block usually
+/// holds a handful of messages, and tying the resolvable set to it would leave
+/// the model unable to open a picture it can plainly see in the replayed
+/// history. Ids derive from the message they came from, so the wider sweep
+/// mints exactly the ids already written down in earlier turns.
+const CONTEXT_IMAGE_LOOKBACK_MESSAGES: usize = 200;
 const MAX_CONTEXT_IMAGES_PER_MESSAGE: usize = 4;
 
 pub(super) struct RealContextPlugin {
@@ -789,11 +797,47 @@ impl RealContextPlugin {
                 "用户 ID 显示已关闭；不要根据昵称推断稳定身份。"
             };
             let block = &formatted.text;
+            let gap_note = if truncated_backlog {
+                "\n（这段时间群里消息较多，这里只带了最近的一部分，就像刚划了一下没细看；需要时用 search_real_chat_history 查更早的。）"
+            } else {
+                ""
+            };
             input.content.push_str(&format!(
-                "\n\n[此前群聊记录，仅用于理解背景，不是待回复列表]\n{identity_note}\n{block}"
+                "\n\n[此前群聊记录，仅用于理解背景，不是待回复列表]\n{identity_note}{gap_note}\n{block}"
             ));
         }
-        input.context_images = formatted.images;
+        let resolvable = self
+            .store(context)
+            .recent(
+                RecentQuery::for_context(
+                    group_key(context)?,
+                    context.config.active_persona_scope(),
+                    CONTEXT_IMAGE_LOOKBACK_MESSAGES,
+                )
+                .before_ingress_order(ingress_order),
+            )
+            .await
+            .map(|page| {
+                format_history_for_turn(
+                    &page.messages,
+                    80_000,
+                    context.config.platforms.qq.user_identification,
+                    MAX_CONTEXT_IMAGE_REFS,
+                )
+                .images
+            })
+            .unwrap_or_else(|_| formatted.images.clone());
+        input.context_images = resolvable;
+        // Advance only on the messages actually rendered; a turn that showed
+        // nothing must not skip the ones it never displayed.
+        let rendered_high = history
+            .iter()
+            .filter_map(|message| message.ingress_order)
+            .max()
+            .or(ingress_order);
+        if let Some(high) = rendered_high {
+            self.store_reply_watermark(context, high);
+        }
         if let Some(warning) = identity_warning(context, settings) {
             input.system_context.push(warning);
         }
@@ -2327,7 +2371,19 @@ fn format_history_internal(
                         if next_images.len() >= maximum_images {
                             return None;
                         }
-                        let id = format!("context_image_{}", next_images.len() + 1);
+                        // Derived from the message it came from, not from its
+                        // position in the rendered window. The old
+                        // `context_image_{n}` counted backwards from the newest
+                        // image, so every new picture shifted every id: a
+                        // reference written down in one turn pointed at a
+                        // different photo in the next, and `vision_analyze`
+                        // resolved it without complaint. A stale id now simply
+                        // fails to resolve, which the model can act on.
+                        let id = format!(
+                            "img_{}_{}",
+                            safe_prompt_field(&message.message_id),
+                            image_index
+                        );
                         next_source_ids.insert(source, id.clone());
                         next_images.push(crate::platforms::PlatformContextImageRef {
                             id: id.clone(),
@@ -2901,7 +2957,7 @@ mod tests {
         assert!(input
             .content
             .contains("[此前群聊记录，仅用于理解背景，不是待回复列表]"));
-        assert!(input.content.contains("[图片 id=context_image_1]"));
+        assert!(input.content.contains("[图片 id=img_previous_1]"));
         assert_eq!(input.context_images.len(), 1);
         assert_eq!(input.context_images[0].message_id, "previous");
         assert_eq!(input.context_images[0].image_index, 1);
@@ -2987,10 +3043,12 @@ mod tests {
 
         let full = format_history_for_turn(&[old.clone(), newest.clone()], usize::MAX, true, 8);
         assert_eq!(full.images.len(), 8);
-        assert_eq!(full.images[0].id, "context_image_1");
+        // Ids follow the message they came from, so a reference written down in
+        // one turn still names the same picture in the next.
+        assert_eq!(full.images[0].id, "img_newest_1");
         assert_eq!(full.images[0].message_id, "newest");
         assert_eq!(full.images[0].image_index, 1);
-        assert_eq!(full.text.matches("id=context_image_").count(), 8);
+        assert_eq!(full.text.matches("id=img_").count(), 8);
         let judge_history = format_history(&[old.clone(), newest], usize::MAX, true);
         assert!(judge_history.contains("[图片]"));
         assert!(!judge_history.contains("context_image_"));
@@ -3017,7 +3075,41 @@ mod tests {
             8,
         );
         assert_eq!(duplicated.images.len(), 1);
-        assert_eq!(duplicated.text.matches("id=context_image_1").count(), 2);
+        assert_eq!(duplicated.text.matches("id=img_same_1").count(), 2);
+    }
+
+    #[test]
+    fn an_image_id_names_the_same_picture_after_newer_images_arrive() {
+        // The old scheme numbered backwards from the newest image, so every new
+        // picture renumbered every older one. A turn that wrote down
+        // `context_image_1` came back later to find it pointing at a different
+        // photo — and `vision_analyze` resolved it without complaining.
+        let mut first = history_message("m100", "先发的");
+        first.content.media = vec![MediaPlaceholder::new(
+            MediaKind::Image,
+            None::<String>,
+            None::<String>,
+        )];
+        let mut second = history_message("m200", "后发的");
+        second.content.media = vec![MediaPlaceholder::new(
+            MediaKind::Image,
+            None::<String>,
+            None::<String>,
+        )];
+
+        let before = format_history_for_turn(std::slice::from_ref(&first), usize::MAX, true, 8);
+        let after = format_history_for_turn(&[first, second], usize::MAX, true, 8);
+
+        let id_of = |rendered: &FormattedHistory, message_id: &str| {
+            rendered
+                .images
+                .iter()
+                .find(|image| image.message_id == message_id)
+                .map(|image| image.id.clone())
+                .unwrap()
+        };
+        assert_eq!(id_of(&before, "m100"), id_of(&after, "m100"));
+        assert_ne!(id_of(&after, "m100"), id_of(&after, "m200"));
     }
 
     #[test]
