@@ -296,6 +296,18 @@ pub(crate) trait PlatformPlugin: Send + Sync {
         false
     }
 
+    /// Runs after a preempted message successfully superseded the active
+    /// generation, so plugins can move per-message side effects (reactions,
+    /// pending-reply bookkeeping) onto the new message and refresh their
+    /// supersede window.
+    fn confirm_supersede<'a>(
+        &'a self,
+        _context: &'a PlatformTurnContext,
+        _event: &'a PlatformInboundEvent,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
     fn turn_started(
         &self,
         _context: &PlatformTurnContext,
@@ -511,6 +523,16 @@ impl PlatformPluginRegistry {
     pub(crate) fn turn_is_superseded(&self, context: &PlatformTurnContext) -> bool {
         self.enabled_plugins(context)
             .any(|plugin| plugin.turn_is_superseded(context))
+    }
+
+    pub(crate) async fn confirm_supersede(
+        &self,
+        context: &PlatformTurnContext,
+        event: &PlatformInboundEvent,
+    ) {
+        for plugin in self.enabled_plugins(context) {
+            plugin.confirm_supersede(context, event).await;
+        }
     }
 
     pub(crate) fn turn_started(

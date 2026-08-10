@@ -2485,14 +2485,19 @@ async fn handle_message_with_activity(
                 )
                 .await;
                 match result {
-                    Ok(()) => tracing::info!(
-                        target: "miyu::qq",
-                        session_id,
-                        sender_id = user_id,
-                        message_id = %inbound_event.message_id,
-                        "{}",
-                        t("OneBot message superseded the active generation", "OneBot 消息已取代当前生成")
-                    ),
+                    Ok(()) => {
+                        // 覆盖成功:表情从旧消息转移到新消息,补救窗口从
+                        // 新消息重新起算(链式覆盖)。
+                        context.confirm_supersede(&inbound_event).await;
+                        tracing::info!(
+                            target: "miyu::qq",
+                            session_id,
+                            sender_id = user_id,
+                            message_id = %inbound_event.message_id,
+                            "{}",
+                            t("OneBot message superseded the active generation", "OneBot 消息已取代当前生成")
+                        )
+                    }
                     Err(error) => tracing::warn!(
                         target: "miyu::qq",
                         session_id,

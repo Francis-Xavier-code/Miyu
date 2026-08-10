@@ -887,6 +887,10 @@ impl PlatformTurnContext {
         self.plugins.preempt_inbound(self, event)
     }
 
+    pub(crate) async fn confirm_supersede(&self, event: &PlatformInboundEvent) {
+        self.plugins.confirm_supersede(self, event).await;
+    }
+
     pub(crate) fn turn_is_superseded(&self) -> bool {
         self.plugins.turn_is_superseded(self)
     }

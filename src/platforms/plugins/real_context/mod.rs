@@ -234,14 +234,14 @@ impl RealContextPlugin {
                     TRIGGER_KEY,
                     Value::String(TriggerKind::Direct.as_str().to_string()),
                 );
-                let _ = self.add_reactions(context, event, settings).await;
+                self.commit_direct_reply(context, event, settings).await;
             }
             return Ok(());
         }
         let now = Instant::now();
         let session_key = runtime_session_key(context);
         let preempted_targets = active_targets_from_context(context);
-        let (continuation, inherited, old_reactions, mut inherited_targets, heat) = {
+        let (continuation, inherited, inherited_committed, old_reactions, mut inherited_targets, heat) = {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.prune(now);
             let session = runtime.session_mut(&session_key, now);
@@ -254,6 +254,11 @@ impl RealContextPlugin {
             });
             let inherited = settings.active_reply_supersede_enable
                 && (!preempted_targets.is_empty() || pending.is_some());
+            // 承诺已成立(preempt 回落 = 生成早已开始;或旧 pending 已 committed)
+            // 时,补救消息直接顶替,不再重新判断。
+            let inherited_committed = inherited
+                && (!preempted_targets.is_empty()
+                    || pending.is_some_and(|pending| pending.committed));
             let old_reactions = if inherited {
                 pending
                     .map(|pending| pending.reactions.clone())
@@ -275,6 +280,7 @@ impl RealContextPlugin {
             (
                 continuation,
                 inherited,
+                inherited_committed,
                 old_reactions,
                 inherited_targets,
                 session.heat,
@@ -327,6 +333,22 @@ impl RealContextPlugin {
                 .await;
             return Ok(());
         }
+        if inherited_committed {
+            // 覆盖窗口的语义是「发错了马上改」:回复承诺已成立,补救消息
+            // 沿用结论直接顶替,表情随之转移(旧的已在上方摘除)。
+            context.set_plugin_value(TRIGGER_KEY, Value::String(trigger.as_str().to_string()));
+            decision.should_reply = true;
+            decision.response_target = adaptive_response_target(context, event, settings);
+            let reactions = self.add_reactions(context, event, settings).await;
+            self.register_committed_pending(
+                &session_key,
+                &event.sender_id,
+                trigger,
+                reactions,
+                inherited_targets,
+            );
+            return Ok(());
+        }
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let generation = {
             let mut runtime = self.runtime.lock().unwrap();
@@ -338,6 +360,7 @@ impl RealContextPlugin {
                     generation,
                     started: now,
                     trigger,
+                    committed: false,
                     reactions: Vec::new(),
                     targets: inherited_targets,
                     cancel: cancel_tx,
@@ -575,13 +598,27 @@ impl RealContextPlugin {
             if let Some(fallback) = core_fallback.as_ref() {
                 restore_core_trigger(context, decision, fallback);
             }
-            self.drop_pending(&session_key, &event.sender_id, generation);
             if decision.should_reply {
                 context.set_plugin_value(
                     TRIGGER_KEY,
                     Value::String(TriggerKind::Direct.as_str().to_string()),
                 );
-                let _ = self.add_reactions(context, event, settings).await;
+                // 保留 pending 并标记承诺:直触发的表情记录在案,
+                // 补救窗口内的新消息可以顶替并转移表情。
+                let reactions = self.add_reactions(context, event, settings).await;
+                let mut runtime = self.runtime.lock().unwrap();
+                if let Some(pending) = runtime
+                    .sessions
+                    .get_mut(&session_key)
+                    .and_then(|session| session.pending.get_mut(&event.sender_id))
+                    .filter(|pending| pending.generation == generation)
+                {
+                    pending.committed = true;
+                    pending.trigger = TriggerKind::Direct;
+                    pending.reactions = reactions;
+                }
+            } else {
+                self.drop_pending(&session_key, &event.sender_id, generation);
             }
             return Ok(());
         }
@@ -610,8 +647,82 @@ impl RealContextPlugin {
             .filter(|pending| pending.generation == generation)
         {
             pending.reactions = reactions;
+            pending.committed = true;
         }
         Ok(())
+    }
+
+    /// 直触发确定要回复:接管补救窗口内的旧 pending(表情转移到本消息)、
+    /// 贴表情,并登记一条「已承诺」的 pending,使后续补救消息能够覆盖本次回复。
+    async fn commit_direct_reply(
+        &self,
+        context: &PlatformTurnContext,
+        event: &PlatformInboundEvent,
+        settings: &RealContextPluginSettings,
+    ) {
+        let now = Instant::now();
+        let session_key = runtime_session_key(context);
+        let window = Duration::from_secs(settings.active_reply_supersede_window_seconds);
+        let (old_reactions, mut targets) = {
+            let mut runtime = self.runtime.lock().unwrap();
+            let session = runtime.session_mut(&session_key, now);
+            match session.pending.remove(&event.sender_id) {
+                Some(pending)
+                    if settings.active_reply_supersede_enable
+                        && now.duration_since(pending.started) <= window =>
+                {
+                    (pending.reactions, pending.targets)
+                }
+                _ => (Vec::new(), Vec::new()),
+            }
+        };
+        for (message_id, reaction_id) in old_reactions {
+            self.cancel_reaction_expiration(context, &message_id, &reaction_id);
+            if let Err(error) = context
+                .set_message_reaction(&message_id, &reaction_id, false)
+                .await
+            {
+                tracing::debug!(error = %error, %message_id, "{}", crate::i18n::text("superseded QQ reaction could not be removed", "无法移除已被新消息覆盖的 QQ 表情回应"));
+            }
+        }
+        targets.push(active_reply_target(event));
+        normalize_active_targets(&mut targets, &event.sender_id);
+        set_active_targets(context, &targets);
+        let reactions = self.add_reactions(context, event, settings).await;
+        self.register_committed_pending(
+            &session_key,
+            &event.sender_id,
+            TriggerKind::Direct,
+            reactions,
+            targets,
+        );
+    }
+
+    fn register_committed_pending(
+        &self,
+        session_key: &str,
+        sender_id: &str,
+        trigger: TriggerKind,
+        reactions: Vec<(String, String)>,
+        targets: Vec<ActiveReplyTarget>,
+    ) {
+        let now = Instant::now();
+        let (cancel, _receiver) = tokio::sync::watch::channel(false);
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.next_generation = runtime.next_generation.wrapping_add(1).max(1);
+        let generation = runtime.next_generation;
+        runtime.session_mut(session_key, now).pending.insert(
+            sender_id.to_string(),
+            PendingReply {
+                generation,
+                started: now,
+                trigger,
+                committed: true,
+                reactions,
+                targets,
+                cancel,
+            },
+        );
     }
 
     async fn add_reactions(
@@ -1046,6 +1157,55 @@ impl PlatformPlugin for RealContextPlugin {
             .get(&runtime_session_key(context))
             .and_then(|session| session.pending.get(&context.sender_id))
             .is_some_and(|pending| *pending.cancel.borrow())
+    }
+
+    fn confirm_supersede<'a>(
+        &'a self,
+        context: &'a PlatformTurnContext,
+        event: &'a PlatformInboundEvent,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(settings) = self.settings(context) else {
+                return;
+            };
+            let now = Instant::now();
+            let session_key = runtime_session_key(context);
+            let old_reactions = {
+                let mut runtime = self.runtime.lock().unwrap();
+                let Some(pending) = runtime
+                    .sessions
+                    .get_mut(&session_key)
+                    .and_then(|session| session.pending.get_mut(&event.sender_id))
+                else {
+                    return;
+                };
+                // 链式覆盖:补救窗口从新消息重新起算;目标并入新消息,
+                // 旧表情摘出待转移。
+                pending.started = now;
+                pending.committed = true;
+                pending.targets.push(active_reply_target(event));
+                normalize_active_targets(&mut pending.targets, &event.sender_id);
+                std::mem::take(&mut pending.reactions)
+            };
+            for (message_id, reaction_id) in old_reactions {
+                self.cancel_reaction_expiration(context, &message_id, &reaction_id);
+                if let Err(error) = context
+                    .set_message_reaction(&message_id, &reaction_id, false)
+                    .await
+                {
+                    tracing::debug!(error = %error, %message_id, "{}", crate::i18n::text("superseded QQ reaction could not be removed", "无法移除已被新消息覆盖的 QQ 表情回应"));
+                }
+            }
+            let reactions = self.add_reactions(context, event, &settings).await;
+            let mut runtime = self.runtime.lock().unwrap();
+            if let Some(pending) = runtime
+                .sessions
+                .get_mut(&session_key)
+                .and_then(|session| session.pending.get_mut(&event.sender_id))
+            {
+                pending.reactions = reactions;
+            }
+        })
     }
 
     fn after_turn_aborted<'a>(
@@ -1868,6 +2028,10 @@ struct PendingReply {
     generation: u64,
     started: Instant,
     trigger: TriggerKind,
+    /// 回复承诺已成立(直触发,或主动判断已通过)。补救窗口内的新消息
+    /// 直接顶替目标而不再重新判断;未承诺(仍在判断中)则取消旧判断、
+    /// 对新消息重新判断。
+    committed: bool,
     reactions: Vec<(String, String)>,
     targets: Vec<ActiveReplyTarget>,
     cancel: tokio::sync::watch::Sender<bool>,
@@ -2924,6 +3088,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn correction_within_window_supersedes_committed_reply_and_moves_reactions() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let (_temp, context) = test_context(Arc::new(ReactionAdapter {
+            reactions: recorded.clone(),
+        }));
+        let plugin = RealContextPlugin::new();
+        let settings = RealContextPluginSettings::default();
+        let first = inbound_event();
+        // 已承诺的回复(直触发或判断已通过),表情挂在旧消息上
+        plugin.register_committed_pending(
+            &runtime_session_key(&context),
+            &first.sender_id,
+            TriggerKind::Direct,
+            vec![("message-1".to_string(), "289".to_string())],
+            vec![active_reply_target(&first)],
+        );
+        // 补救窗口内同发送者的新消息:不再判断,直接顶替
+        let mut correction = inbound_event();
+        correction.message_id = "message-2".to_string();
+        correction.text = "说错了,是另一件事".to_string();
+        let mut decision = TriggerDecision {
+            should_reply: false,
+            content: correction.text.clone(),
+            response_target: None,
+        };
+        plugin
+            .decide_group_trigger(&context, &correction, &mut decision, &settings)
+            .await
+            .unwrap();
+        assert!(decision.should_reply, "承诺沿用,补救消息应直接回复");
+        let calls = recorded.lock().unwrap().clone();
+        assert!(
+            calls.contains(&("message-1".to_string(), "289".to_string(), false)),
+            "旧消息的表情应被摘除: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("message-2".to_string(), "289".to_string(), true)),
+            "新消息应贴上表情: {calls:?}"
+        );
+        // pending 已刷新:承诺保持、目标并入两条消息
+        let runtime = plugin.runtime.lock().unwrap();
+        let pending = runtime
+            .sessions
+            .get(&runtime_session_key(&context))
+            .and_then(|session| session.pending.get(&first.sender_id))
+            .expect("补救后 pending 应保留以支持链式覆盖");
+        assert!(pending.committed);
+        assert_eq!(pending.targets.len(), 2);
+        assert_eq!(pending.reactions, vec![("message-2".to_string(), "289".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn confirm_supersede_moves_reactions_and_restarts_the_window() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let (_temp, context) = test_context(Arc::new(ReactionAdapter {
+            reactions: recorded.clone(),
+        }));
+        let plugin = RealContextPlugin::new();
+        let first = inbound_event();
+        let (cancel, _receiver) = tokio::sync::watch::channel(false);
+        let old_started = Instant::now() - Duration::from_secs(3);
+        plugin
+            .runtime
+            .lock()
+            .unwrap()
+            .session_mut(&runtime_session_key(&context), Instant::now())
+            .pending
+            .insert(
+                first.sender_id.clone(),
+                PendingReply {
+                    generation: 7,
+                    started: old_started,
+                    trigger: TriggerKind::Direct,
+                    committed: true,
+                    reactions: vec![("message-1".to_string(), "289".to_string())],
+                    targets: vec![active_reply_target(&first)],
+                    cancel,
+                },
+            );
+        let mut correction = inbound_event();
+        correction.message_id = "message-2".to_string();
+        plugin.confirm_supersede(&context, &correction).await;
+        let calls = recorded.lock().unwrap().clone();
+        assert!(calls.contains(&("message-1".to_string(), "289".to_string(), false)));
+        assert!(calls.contains(&("message-2".to_string(), "289".to_string(), true)));
+        let runtime = plugin.runtime.lock().unwrap();
+        let pending = runtime
+            .sessions
+            .get(&runtime_session_key(&context))
+            .and_then(|session| session.pending.get(&first.sender_id))
+            .expect("覆盖后 pending 应保留");
+        assert!(pending.started > old_started, "补救窗口应从新消息重新起算");
+        assert_eq!(pending.targets.len(), 2);
+        assert_eq!(pending.reactions, vec![("message-2".to_string(), "289".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn direct_trigger_registers_a_committed_pending_for_correction() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let (_temp, context) = test_context(Arc::new(ReactionAdapter {
+            reactions: recorded.clone(),
+        }));
+        let plugin = RealContextPlugin::new();
+        let settings = RealContextPluginSettings {
+            takeover_direct_trigger_enable: false,
+            ..RealContextPluginSettings::default()
+        };
+        let event = inbound_event();
+        let mut decision = TriggerDecision {
+            should_reply: true,
+            content: event.text.clone(),
+            response_target: None,
+        };
+        plugin
+            .decide_group_trigger(&context, &event, &mut decision, &settings)
+            .await
+            .unwrap();
+        assert!(decision.should_reply);
+        let runtime = plugin.runtime.lock().unwrap();
+        let pending = runtime
+            .sessions
+            .get(&runtime_session_key(&context))
+            .and_then(|session| session.pending.get(&event.sender_id))
+            .expect("直触发应登记可被补救的 pending");
+        assert!(pending.committed);
+        assert_eq!(pending.reactions, vec![("message-1".to_string(), "289".to_string())]);
+    }
+
+    #[tokio::test]
     async fn muted_bot_suppresses_direct_group_trigger_while_unknown_fails_open() {
         let plugin = RealContextPlugin::new();
         // The availability check this test is about lives on the path taken
@@ -3422,6 +3715,7 @@ mod tests {
                     generation: 1,
                     started: Instant::now(),
                     trigger: TriggerKind::Probability,
+                    committed: false,
                     reactions: Vec::new(),
                     targets: vec![target],
                     cancel,
