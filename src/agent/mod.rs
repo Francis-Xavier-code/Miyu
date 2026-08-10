@@ -2898,7 +2898,10 @@ impl Agent {
                                 &self.system_prompt,
                                 self.mode,
                             )),
-                            ChatMessage::turn_context(runtime_context(self.mode)),
+                            ChatMessage::turn_context(runtime_context(
+                                self.mode,
+                                self.platform_context.is_some(),
+                            )),
                         ],
                     ));
                 }
@@ -3459,7 +3462,10 @@ impl Agent {
                                     &self.system_prompt,
                                     self.mode,
                                 )),
-                                ChatMessage::turn_context(runtime_context(self.mode)),
+                                ChatMessage::turn_context(runtime_context(
+                                    self.mode,
+                                    self.platform_context.is_some(),
+                                )),
                             ],
                         ));
                     }
@@ -3537,7 +3543,10 @@ impl Agent {
         // cache reuse at the end of the stored history (verified byte-level
         // against DeepSeek prefix caching).
         messages.push(ChatMessage::plain("user", current_input));
-        messages.push(ChatMessage::turn_context(runtime_context(self.mode)));
+        messages.push(ChatMessage::turn_context(runtime_context(
+            self.mode,
+            self.platform_context.is_some(),
+        )));
         Ok(messages)
     }
 
@@ -4036,6 +4045,7 @@ fn replace_request_mode_context(
     messages: &mut [ChatMessage],
     system_prompt: &str,
     mode: AgentMode,
+    platform: bool,
 ) {
     if let Some(system) = messages.first_mut() {
         *system = ChatMessage::system(system_prompt);
@@ -4048,7 +4058,7 @@ fn replace_request_mode_context(
             Some(ChatContent::Text(content)) if content.starts_with("<runtime now=")
         )
     }) {
-        *runtime = ChatMessage::turn_context(runtime_context(mode));
+        *runtime = ChatMessage::turn_context(runtime_context(mode, platform));
     }
 }
 
@@ -5433,7 +5443,19 @@ fn parse_reasoning_title_chunks<'a>(
     (title, output)
 }
 
-fn runtime_context(mode: AgentMode) -> String {
+/// The transient runtime stamp that rides the turn tail.
+///
+/// `platform` strips everything a chat message cannot use. A QQ turn has no
+/// working directory, no shell and no terminal — those attributes were pure
+/// scaffolding there, and they were re-sent at full price on every single
+/// turn (285 chars against a ~45-char timestamp).
+fn runtime_context(mode: AgentMode, platform: bool) -> String {
+    if platform {
+        return format!(
+            "<runtime now=\"{}\"/>",
+            Local::now().format("%Y年%m月%d日 %A %H:%M")
+        );
+    }
     let cwd = crate::tools::workspace::effective_workdir()
         .display()
         .to_string();
@@ -6068,10 +6090,26 @@ mod tests {
 
     #[test]
     fn runtime_context_contains_dynamic_runtime_only() {
-        let context = runtime_context(AgentMode::Normal);
+        let context = runtime_context(AgentMode::Normal, false);
         assert!(context.starts_with("<runtime "));
         assert!(context.contains("now=\""));
         assert!(context.contains("cwd=\""));
+    }
+
+    #[test]
+    fn a_platform_runtime_stamp_carries_nothing_a_chat_message_cannot_use() {
+        // A QQ turn has no working directory, no shell and no terminal. Those
+        // attributes were re-sent at full price on every single turn — 285
+        // chars where a timestamp needs about 45.
+        let platform = runtime_context(AgentMode::Normal, true);
+        assert!(platform.contains("now=\""), "{platform}");
+        for noise in ["cwd=", "shell=", "terminal=", "env=", "note="] {
+            assert!(!platform.contains(noise), "{noise} in {platform}");
+        }
+        assert!(
+            platform.len() * 3 < runtime_context(AgentMode::Normal, false).len(),
+            "{platform}"
+        );
     }
 
     #[test]
