@@ -540,12 +540,26 @@ fn draw(
     }
     if state.on_confirm(request) {
         for (question, selected) in request.questions.iter().zip(&state.answers) {
-            let value = if selected.is_empty() {
-                format!("\x1b[31m{}\x1b[0m", t("unanswered", "未回答"))
-            } else {
-                format!("\x1b[2m{}\x1b[0m", display_inline(&selected.join("、")))
-            };
-            body_lines.push(format!("{}: {value}", question.header));
+            if selected.is_empty() {
+                body_lines.push(format!(
+                    "{}: \x1b[31m{}\x1b[0m",
+                    question.header,
+                    t("unanswered", "未回答")
+                ));
+                continue;
+            }
+            let prefix = format!("{}: ", question.header);
+            let plain = format!("{prefix}{}", display_inline(&selected.join("、")));
+            for (index, line) in wrap_display_text(&plain, content_width)
+                .into_iter()
+                .enumerate()
+            {
+                let rendered = match line.strip_prefix(prefix.as_str()) {
+                    Some(rest) if index == 0 => format!("{prefix}\x1b[2m{rest}\x1b[0m"),
+                    _ => format!("\x1b[2m{line}\x1b[0m"),
+                };
+                body_lines.push(rendered);
+            }
         }
         footer_lines.push(String::new());
         footer_lines.push(format!(
@@ -557,7 +571,11 @@ fn draw(
         ));
     } else {
         let question = &request.questions[state.tab];
-        top_lines.push(format!("\x1b[1m{}\x1b[0m", question.question.trim()));
+        top_lines.extend(
+            wrap_display_text(question.question.trim(), content_width)
+                .into_iter()
+                .map(|line| format!("\x1b[1m{line}\x1b[0m")),
+        );
         top_lines.push(String::new());
         for (index, option) in question.options.iter().enumerate() {
             let picked = state.answers[state.tab].contains(&option.label);
@@ -722,7 +740,15 @@ fn panel_layout(
     current_body_start: usize,
 ) -> PanelLayout {
     let footer_budget = footer_len.min(max_lines);
-    let top_budget = top_len.min(max_lines.saturating_sub(footer_budget));
+    // 长正文折行后 top 可能占满面板；给选项区保底几行，超出的正文由 top_start 保留尾部
+    let reserved_body = body_len
+        .min(3)
+        .min(max_lines.saturating_sub(footer_budget) / 2);
+    let top_budget = top_len.min(
+        max_lines
+            .saturating_sub(footer_budget)
+            .saturating_sub(reserved_body),
+    );
     let body_capacity = max_lines.saturating_sub(top_budget + footer_budget);
     let max_body_start = body_len.saturating_sub(body_capacity);
     let mut body_start = current_body_start.min(max_body_start);
@@ -789,13 +815,26 @@ fn option_lines(
     } else {
         ""
     };
-    let label = if active || picked {
-        format!("\x1b[35m{label}\x1b[0m")
-    } else {
-        label.to_string()
-    };
     let pointer = if active { "\x1b[35m›\x1b[0m " } else { "  " };
-    let mut lines = vec![format!("{pointer}{marker}{label}")];
+    let label_prefix_width = if multiple { 6 } else { 2 };
+    let label_indent = " ".repeat(label_prefix_width);
+    let label_width = content_width.saturating_sub(label_prefix_width).max(1);
+    let mut lines = Vec::new();
+    for (index, part) in wrap_display_text(label, label_width).into_iter().enumerate() {
+        let part = if active || picked {
+            format!("\x1b[35m{part}\x1b[0m")
+        } else {
+            part
+        };
+        if index == 0 {
+            lines.push(format!("{pointer}{marker}{part}"));
+        } else {
+            lines.push(format!("{label_indent}{part}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(format!("{pointer}{marker}"));
+    }
     let description = description.trim();
     if !description.is_empty() {
         let indent = if multiple { "      " } else { "  " };
@@ -1163,6 +1202,24 @@ mod tests {
             assert!(UnicodeWidthStr::width(strip_ansi(line).as_str()) <= 10);
             assert!(strip_ansi(line).starts_with("  "));
         }
+    }
+
+    #[test]
+    fn long_option_label_soft_wraps_within_width() {
+        let lines = option_lines("烧烤烤肉串烤鸡翅烤韭菜拼盘", "", true, false, false, 10);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(strip_ansi(line).as_str()) <= 10);
+        }
+        assert!(strip_ansi(&lines[1]).starts_with("  "));
+        assert!(lines[1].contains("\x1b[35m"));
+    }
+
+    #[test]
+    fn long_top_section_keeps_minimum_body_rows() {
+        let layout = panel_layout(14, 6, 2, 16, Some(0), 0);
+        assert!(layout.body_capacity >= 3);
+        assert_eq!(layout.top_start + layout.top_budget, 14);
     }
 
     #[test]
