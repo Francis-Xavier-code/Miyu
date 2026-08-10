@@ -2779,6 +2779,9 @@ pub struct WebPluginConfig {
     pub firecrawl_api_keys: Vec<String>,
     #[serde(default)]
     pub anysearch_api_keys: Vec<String>,
+    /// Exa 无需 key 也可用（走官方 MCP 免费额度）；配置 key 后走 REST API
+    #[serde(default)]
+    pub exa_api_keys: Vec<String>,
     #[serde(default)]
     pub searxng_base_url: String,
 }
@@ -3203,6 +3206,7 @@ impl Default for WebPluginConfig {
             tavily_api_keys: Vec::new(),
             firecrawl_api_keys: Vec::new(),
             anysearch_api_keys: Vec::new(),
+            exa_api_keys: Vec::new(),
             searxng_base_url: String::new(),
         }
     }

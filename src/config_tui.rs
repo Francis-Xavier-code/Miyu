@@ -676,6 +676,11 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                 config.plugins.web.anysearch_api_keys.join("\n"),
             )
             .sensitive(),
+            Field::textarea(
+                t("Exa API Keys (optional; keyless free quota)", "Exa API Keys（可留空用免费额度）"),
+                config.plugins.web.exa_api_keys.join("\n"),
+            )
+            .sensitive(),
             Field::new("SearXNG URL", config.plugins.web.searxng_base_url.clone()),
         ],
         1 => vec![
@@ -1070,8 +1075,9 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
             config.plugins.web.tavily_api_keys = parse_key_list(&fields[2].value);
             config.plugins.web.firecrawl_api_keys = parse_key_list(&fields[3].value);
             config.plugins.web.anysearch_api_keys = parse_key_list(&fields[4].value);
+            config.plugins.web.exa_api_keys = parse_key_list(&fields[5].value);
             config.plugins.web.searxng_base_url =
-                fields[5].value.trim().trim_end_matches('/').to_string();
+                fields[6].value.trim().trim_end_matches('/').to_string();
         }
         1 => {
             config.plugins.deep_research.enabled = parse_bool_field(&fields[0].value)?;

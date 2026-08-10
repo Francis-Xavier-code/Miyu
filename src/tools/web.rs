@@ -31,6 +31,7 @@ enum SearchProvider {
     Tavily,
     Firecrawl,
     AnySearch,
+    Exa,
     SearXng,
     DuckDuckGo,
 }
@@ -41,6 +42,7 @@ impl SearchProvider {
             Self::Tavily => "tavily",
             Self::Firecrawl => "firecrawl",
             Self::AnySearch => "anysearch",
+            Self::Exa => "exa",
             Self::SearXng => "searxng",
             Self::DuckDuckGo => "duckduckgo",
         }
@@ -129,6 +131,9 @@ fn configured_primary_providers(config: &WebPluginConfig) -> Vec<SearchProvider>
     }
     if has_non_empty_key(&config.anysearch_api_keys) {
         providers.push(SearchProvider::AnySearch);
+    }
+    if has_non_empty_key(&config.exa_api_keys) {
+        providers.push(SearchProvider::Exa);
     }
     if !config.searxng_base_url.trim().is_empty() {
         providers.push(SearchProvider::SearXng);
@@ -249,13 +254,13 @@ pub fn register_fetch(registry: &mut ToolRegistry) {
 fn register_search_tool(registry: &mut ToolRegistry, name: &'static str, config: WebPluginConfig) {
     registry.register(ToolSpec::new(
         name,
-        "Search the web. Prefer configured Tavily, Firecrawl, or AnySearch API keys; fallback to SearXNG, then built-in DuckDuckGo HTML search (with Yahoo/360/Sogou fallback) when providers fail.",
+        "Search the web. Prefer configured Tavily, Firecrawl, AnySearch, or Exa API keys; fallback to SearXNG, then Exa's keyless free quota, then built-in DuckDuckGo HTML search (with Yahoo/360/Sogou fallback) when providers fail.",
         json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "Search query." },
                 "max_results": { "type": "integer", "description": "Maximum results; defaults to plugins.web.max_results." },
-                "provider": { "type": "string", "enum": ["auto", "tavily", "firecrawl", "anysearch", "searxng", "script"], "description": "Search provider." }
+                "provider": { "type": "string", "enum": ["auto", "tavily", "firecrawl", "anysearch", "exa", "searxng", "script"], "description": "Search provider." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -315,6 +320,16 @@ async fn web_search(args: Value, config: WebPluginConfig) -> Result<String> {
 fn search_provider_order(provider: &str, config: &WebPluginConfig) -> Result<Vec<SearchProvider>> {
     if provider == "auto" {
         let mut providers = ordered_providers(&configured_primary_providers(config));
+        // 未配置 key 时 Exa 走官方 MCP 免费公共额度：排在已配置服务之后、爬虫之前；
+        // 报错/429 会通过 cooldown 自动让位给爬虫
+        if !has_non_empty_key(&config.exa_api_keys)
+            && SEARCH_SCHEDULER
+                .lock()
+                .map(|mut scheduler| scheduler.is_ready(&provider_cooldown_id("exa")))
+                .unwrap_or(true)
+        {
+            providers.push(SearchProvider::Exa);
+        }
         if SEARCH_SCHEDULER
             .lock()
             .map(|mut scheduler| scheduler.is_ready(&provider_cooldown_id("duckduckgo")))
@@ -331,6 +346,7 @@ fn search_provider_order(provider: &str, config: &WebPluginConfig) -> Result<Vec
         "tavily" => Ok(vec![SearchProvider::Tavily]),
         "firecrawl" => Ok(vec![SearchProvider::Firecrawl]),
         "anysearch" => Ok(vec![SearchProvider::AnySearch]),
+        "exa" => Ok(vec![SearchProvider::Exa]),
         "searxng" => Ok(vec![SearchProvider::SearXng]),
         "duckduckgo" | "script" => Ok(vec![SearchProvider::DuckDuckGo]),
         _ => bail!("{provider}: unknown provider"),
@@ -354,6 +370,7 @@ async fn search_with_provider(
         SearchProvider::AnySearch => {
             search_anysearch(client, query, max_results, &config.anysearch_api_keys).await
         }
+        SearchProvider::Exa => search_exa(client, query, max_results, &config.exa_api_keys).await,
         SearchProvider::SearXng => {
             search_searxng(client, query, max_results, &config.searxng_base_url).await
         }
@@ -591,6 +608,325 @@ async fn search_anysearch(
         "AnySearch failed for all configured keys: {}",
         errors.join(" | ")
     )
+}
+
+async fn search_exa(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+    keys: &[String],
+) -> Result<String> {
+    let keys = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        // 无 key：走官方 MCP 端点的免费公共额度
+        return search_exa_public(client, query, max_results).await;
+    }
+    let payload = json!({
+        "query": query,
+        "numResults": max_results.min(10),
+        "contents": {"text": true},
+    });
+    let order = ordered_key_positions("exa", keys.len());
+    if order.is_empty() {
+        bail!("all Exa API keys are cooling down")
+    }
+    let mut errors = Vec::new();
+    for index in order {
+        let key = keys[index];
+        let response = match client
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", key)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                let message = format!("key#{} request failed: {err}", index + 1);
+                mark_key_failure("exa", index, &message);
+                errors.push(message);
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let message = format!(
+                "key#{} HTTP {}: {}",
+                index + 1,
+                status.as_u16(),
+                clip(&body, 240)
+            );
+            if let Some(duration) = cooldown_for_status(status.as_u16()) {
+                if let Ok(mut scheduler) = SEARCH_SCHEDULER.lock() {
+                    scheduler.mark_failure(key_cooldown_id("exa", index), duration);
+                }
+            }
+            errors.push(message);
+            continue;
+        }
+        let data: Value = match response.json().await {
+            Ok(data) => data,
+            Err(err) => {
+                errors.push(format!("key#{} invalid JSON: {err}", index + 1));
+                continue;
+            }
+        };
+        let raw = data
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(max_results)
+            .collect::<Vec<_>>();
+        match format_search_results(query, "Exa", raw) {
+            Ok(output) => {
+                mark_key_success("exa", index);
+                return Ok(output);
+            }
+            Err(err) => errors.push(format!("key#{}: {err}", index + 1)),
+        }
+    }
+    bail!("Exa failed for all configured keys: {}", errors.join(" | "))
+}
+
+const EXA_MCP_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
+
+/// 免 key 通道的 MCP 端点，可用 MIYU_EXA_MCP_ENDPOINT 覆盖（自建代理/测试用）
+fn exa_mcp_endpoint() -> String {
+    std::env::var("MIYU_EXA_MCP_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| EXA_MCP_ENDPOINT.to_string())
+}
+
+/// 通过 Exa 官方 MCP 端点使用免费公共额度（无需 API key）。
+/// 额度用尽或被拒会 bail，错误串带 HTTP 状态码，交由上层 cooldown 冷却并回退爬虫。
+async fn search_exa_public(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<String> {
+    let endpoint = exa_mcp_endpoint();
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "miyu", "version": env!("CARGO_PKG_VERSION")},
+        },
+    });
+    let response = client
+        .post(&endpoint)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&initialize)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "Exa free quota initialize HTTP {}: {}",
+            status.as_u16(),
+            clip(&body, 240)
+        );
+    }
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let _ = parse_mcp_body(response).await;
+
+    let with_session = |request: reqwest::RequestBuilder| match &session_id {
+        Some(id) => request.header("mcp-session-id", id.as_str()),
+        None => request,
+    };
+    // 部分服务端要求 initialized 通知；失败不致命
+    let _ = with_session(client.post(&endpoint))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .send()
+        .await;
+
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search_exa",
+            "arguments": {"query": query, "numResults": max_results.min(10)},
+        },
+    });
+    let response = with_session(client.post(&endpoint))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&call)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "Exa free quota HTTP {}: {}",
+            status.as_u16(),
+            clip(&body, 240)
+        );
+    }
+    let body = parse_mcp_body(response).await?;
+    if let Some(error) = body.get("error") {
+        bail!("Exa free quota RPC error: {}", clip(&error.to_string(), 240));
+    }
+    let result = body.get("result").cloned().unwrap_or(Value::Null);
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let text = mcp_content_text(&result);
+        // MCP 把限额错误包在正常响应里，补上 429 字样让 cooldown 识别
+        let hint = if text.to_ascii_lowercase().contains("rate limit")
+            || text.to_ascii_lowercase().contains("quota")
+        {
+            " (HTTP 429)"
+        } else {
+            ""
+        };
+        bail!("Exa free quota tool error{hint}: {}", clip(&text, 240));
+    }
+    let text = mcp_content_text(&result);
+    if text.trim().is_empty() {
+        bail!("Exa free quota returned no usable results")
+    }
+    // 兼容两种返回：JSON 字符串（含 results 数组）或 "Title:/URL:/..." 纯文本块
+    if let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) {
+        let results = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(max_results)
+            .collect::<Vec<_>>();
+        if !results.is_empty() {
+            return format_search_results(query, "Exa (free quota)", results);
+        }
+    }
+    let results = exa_public_results(&text, max_results);
+    if !results.is_empty() {
+        return format_search_results(query, "Exa (free quota)", results);
+    }
+    Ok(format!(
+        "## Search results for: {query}\n**Provider**: Exa (free quota)\n\n{}",
+        clip(&text, 8_000)
+    ))
+}
+
+/// 解析 Exa MCP 免费额度返回的纯文本结果（Title:/URL:/Published:/Author:/Highlights:
+/// 字段行，多条结果以 --- 行分隔）为统一的结果对象。
+fn exa_public_results(text: &str, max_results: usize) -> Vec<Value> {
+    text.split("\n---\n")
+        .filter_map(|block| {
+            let block = block.trim();
+            if block.is_empty() {
+                return None;
+            }
+            let mut title = String::new();
+            let mut url = String::new();
+            let mut published = String::new();
+            let mut author = String::new();
+            let mut body = Vec::new();
+            let mut in_body = false;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("Title: ") {
+                    title = value.trim().to_string();
+                    in_body = false;
+                } else if let Some(value) = line.strip_prefix("URL: ") {
+                    url = value.trim().to_string();
+                } else if let Some(value) = line.strip_prefix("Published: ") {
+                    published = value.trim().to_string();
+                } else if let Some(value) = line.strip_prefix("Author: ") {
+                    author = value.trim().to_string();
+                } else if let Some(rest) = line
+                    .strip_prefix("Highlights:")
+                    .or_else(|| line.strip_prefix("Text:"))
+                    .or_else(|| line.strip_prefix("Summary:"))
+                {
+                    in_body = true;
+                    let rest = rest.trim();
+                    if !rest.is_empty() {
+                        body.push(rest.to_string());
+                    }
+                } else if in_body {
+                    body.push(line.to_string());
+                }
+            }
+            if title.is_empty() && url.is_empty() {
+                return None;
+            }
+            let mut meta = Vec::new();
+            if !published.is_empty() && published != "N/A" {
+                meta.push(format!("Published: {published}"));
+            }
+            if !author.is_empty() && author != "N/A" {
+                meta.push(format!("Author: {author}"));
+            }
+            Some(json!({
+                "title": title,
+                "url": url,
+                "snippet": meta.join(" · "),
+                "raw_content": body.join("\n"),
+            }))
+        })
+        .take(max_results)
+        .collect()
+}
+
+/// 解析 MCP Streamable HTTP 响应：application/json 直接解析，
+/// text/event-stream 取最后一条 data: 行的 JSON。
+async fn parse_mcp_body(response: reqwest::Response) -> Result<Value> {
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let text = response.text().await?;
+    if content_type.contains("text/event-stream") {
+        let mut last = None;
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                    last = Some(value);
+                }
+            }
+        }
+        return last.ok_or_else(|| anyhow::anyhow!("empty MCP event stream"));
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|err| anyhow::anyhow!("invalid MCP JSON: {err}"))
+}
+
+fn mcp_content_text(result: &Value) -> String {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 async fn search_searxng(
@@ -1424,12 +1760,14 @@ fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> Re
             .get("content")
             .or_else(|| item.get("snippet"))
             .or_else(|| item.get("description"))
+            .or_else(|| item.get("summary"))
             .and_then(Value::as_str)
             .unwrap_or("");
         let raw = item
             .get("raw_content")
             .or_else(|| item.get("markdown"))
             .or_else(|| item.get("contentMarkdown"))
+            .or_else(|| item.get("text"))
             .and_then(Value::as_str)
             .unwrap_or("");
         if title == "Untitled" && url.is_empty() && snippet.is_empty() && raw.is_empty() {
@@ -1546,5 +1884,64 @@ mod tests {
     #[test]
     fn keeps_short_fetch_output_unchanged() {
         assert_eq!(clip_fetch_output("abc", 3), "abc");
+    }
+
+    #[test]
+    fn parses_exa_public_text_blocks() {
+        let text = "Title: 第一条结果\nURL: https://example.com/a\nPublished: 2025-09-28T00:00:00.000Z\nAuthor: torvalds\nHighlights:\n第一段\n第二段\n\n---\n\nTitle: 第二条\nURL: https://example.com/b\nAuthor: N/A\nHighlights:\n内容\n";
+        let results = exa_public_results(text, 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["title"], "第一条结果");
+        assert_eq!(results[0]["url"], "https://example.com/a");
+        assert!(results[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Published: 2025-09-28"));
+        assert!(results[0]["snippet"].as_str().unwrap().contains("torvalds"));
+        assert!(results[0]["raw_content"]
+            .as_str()
+            .unwrap()
+            .contains("第二段"));
+        // N/A 作者不进 snippet
+        assert!(!results[1]["snippet"].as_str().unwrap().contains("N/A"));
+
+        let formatted = format_search_results("测试", "Exa (free quota)", results).unwrap();
+        assert!(formatted.contains("### 1. 第一条结果"));
+        assert!(formatted.contains("**URL**: https://example.com/b"));
+    }
+
+    #[test]
+    fn exa_joins_auto_order_without_key() {
+        let config = WebPluginConfig::default();
+        let order = search_provider_order("auto", &config).unwrap();
+        let ids = order.iter().map(|p| p.id()).collect::<Vec<_>>();
+        // 无任何配置时：免 key Exa 优先，爬虫兜底
+        assert_eq!(ids, vec!["exa", "duckduckgo"]);
+    }
+
+    #[test]
+    fn exa_with_key_is_a_primary_provider() {
+        let config = WebPluginConfig {
+            exa_api_keys: vec!["k".to_string()],
+            ..WebPluginConfig::default()
+        };
+        let providers = configured_primary_providers(&config);
+        assert!(providers.iter().any(|p| matches!(p, SearchProvider::Exa)));
+        assert!(search_provider_order("exa", &config).is_ok());
+    }
+
+    /// 真实网络实测：cargo test --bin miyu -- --ignored exa_free_quota
+    #[tokio::test]
+    #[ignore = "hits the real Exa MCP endpoint"]
+    async fn exa_free_quota_live_search() {
+        let client = reqwest::Client::builder()
+            .timeout(CRAWLER_TIMEOUT)
+            .build()
+            .unwrap();
+        let output = search_exa_public(&client, "Arch Linux kernel release", 2)
+            .await
+            .unwrap();
+        assert!(output.contains("**Provider**: Exa (free quota)"));
+        assert!(output.contains("**URL**:"));
     }
 }

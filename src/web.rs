@@ -8113,6 +8113,11 @@ fn config_response(
         "plugins.web.anysearch_api_keys",
         &mut redacted.plugins.web.anysearch_api_keys,
     );
+    redact_secret_list(
+        &mut secret_states,
+        "plugins.web.exa_api_keys",
+        &mut redacted.plugins.web.exa_api_keys,
+    );
     secret_states.insert(
         "plugins.exchange_rate.api_key".to_string(),
         !redacted.plugins.exchange_rate.api_key.trim().is_empty(),
@@ -8411,6 +8416,15 @@ fn restore_config_secrets(
         "plugins.web.anysearch_api_keys",
         |config| &mut config.plugins.web.anysearch_api_keys,
         |config| &config.plugins.web.anysearch_api_keys,
+    )?;
+    restore_secret_list(
+        candidate,
+        current,
+        mutations,
+        &mut recognized,
+        "plugins.web.exa_api_keys",
+        |config| &mut config.plugins.web.exa_api_keys,
+        |config| &config.plugins.web.exa_api_keys,
     )?;
     restore_secret_list(
         candidate,

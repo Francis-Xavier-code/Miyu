@@ -203,7 +203,7 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 
 - 网络搜索
 
-  即使不配置网络搜索 API，Miyu 也仍然拥有基础的网络搜索和网页读取能力。可以在插件配置中设置 Tavily、Firecrawl 、AnySearch、SearXNG 等网络搜索 API 以获得更佳的搜索效果。
+  即使不配置网络搜索 API，Miyu 也仍然拥有基础的网络搜索和网页读取能力：未配置任何搜索服务时会优先使用 Exa 的免 key 公共额度（每日限量，报错或超额后自动冷却并回退到内置爬虫搜索）。可以在插件配置中设置 Tavily、Firecrawl 、AnySearch、Exa、SearXNG 等网络搜索 API 以获得更佳的搜索效果。
 
   ![](./pics/web-search-config.png)
 

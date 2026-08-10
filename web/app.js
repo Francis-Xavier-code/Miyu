@@ -1922,6 +1922,7 @@
     ["web.tavily_api_keys", "plugins.web.tavily_api_keys"],
     ["web.firecrawl_api_keys", "plugins.web.firecrawl_api_keys"],
     ["web.anysearch_api_keys", "plugins.web.anysearch_api_keys"],
+    ["web.exa_api_keys", "plugins.web.exa_api_keys"],
     ["exchange_rate.api_key", "plugins.exchange_rate.api_key"],
     ["image_generation.api_keys", "plugins.image_generation.api_keys"]
   ]);
