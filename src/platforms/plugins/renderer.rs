@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cosmic_text::{
-    Align as TextAlign, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping,
+    Align as TextAlign, Attrs, Buffer, Color, Family, FontSystem, LayoutGlyph, Metrics, Shaping,
     Style as FontStyle, SwashCache, Weight, Wrap,
 };
 use fontdb::Database as FontDatabase;
@@ -1367,6 +1367,7 @@ struct LayoutBlock {
     margin_before: u32,
     margin_after: u32,
     default_color: Color,
+    inline_code_background: [u8; 4],
 }
 
 struct LayoutTable {
@@ -1387,6 +1388,7 @@ struct LayoutTableCell {
     x: u32,
     width: u32,
     default_color: Color,
+    inline_code_background: [u8; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -1430,6 +1432,7 @@ fn layout_block(
             margin_before: 20,
             margin_after: 20,
             default_color: color(palette.text),
+            inline_code_background: palette.code_background,
         });
     }
 
@@ -1486,10 +1489,9 @@ fn layout_block(
         .collect::<Vec<_>>();
 
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(content_width as f32), None);
-    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
+    buffer.set_size(Some(content_width as f32), None);
+    buffer.set_wrap(Wrap::WordOrGlyph);
     buffer.set_rich_text(
-        font_system,
         rich_spans
             .iter()
             .map(|(text, attrs)| (text.as_str(), attrs.clone())),
@@ -1533,6 +1535,7 @@ fn layout_block(
         margin_before,
         margin_after,
         default_color: color(default_color),
+        inline_code_background: palette.code_background,
     })
 }
 
@@ -1616,6 +1619,7 @@ fn layout_table(
         margin_before,
         margin_after,
         default_color: color(palette.text),
+        inline_code_background: palette.code_background,
     })
 }
 
@@ -1657,6 +1661,7 @@ fn layout_table_row(
             x,
             width,
             default_color,
+            inline_code_background: palette.code_background,
         });
         x = x
             .checked_add(width)
@@ -1724,10 +1729,9 @@ fn layout_rich_buffer(
         Alignment::None => None,
     };
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(width.max(1) as f32), None);
-    buffer.set_wrap(font_system, Wrap::WordOrGlyph);
+    buffer.set_size(Some(width.max(1) as f32), None);
+    buffer.set_wrap(Wrap::WordOrGlyph);
     buffer.set_rich_text(
-        font_system,
         rich_spans
             .iter()
             .map(|(text, attrs)| (text.as_str(), attrs.clone())),
@@ -1824,6 +1828,8 @@ fn attrs_for<'a>(
     let family = named.map(Family::Name).unwrap_or(fallback);
     let foreground = if matches!(kind, BlockKind::Code) {
         palette.code_text
+    } else if style.code {
+        palette.code_text
     } else if style.link {
         palette.link
     } else if style.muted {
@@ -1843,8 +1849,36 @@ fn attrs_for<'a>(
     if style.italic {
         attrs = attrs.style(FontStyle::Italic);
     }
+    if style.code && !matches!(kind, BlockKind::Code) {
+        // 行内代码经 metadata 传到 LayoutGlyph,绘制时据此画底色小块;
+        // 代码块整块已有背景,不标。
+        attrs = attrs.metadata(INLINE_CODE_METADATA);
+    }
     attrs
 }
+
+const INLINE_CODE_METADATA: usize = 1;
+
+/// 一条 layout 行内行内代码字形的连续 x 区间(相邻区间合并)。
+fn inline_code_chip_ranges(glyphs: &[LayoutGlyph]) -> Vec<(f32, f32)> {
+    let mut ranges: Vec<(f32, f32)> = Vec::new();
+    for glyph in glyphs {
+        if glyph.metadata != INLINE_CODE_METADATA {
+            continue;
+        }
+        let start = glyph.x;
+        let end = glyph.x + glyph.w;
+        match ranges.last_mut() {
+            Some((_, last_end)) if start - *last_end <= 0.5 => *last_end = end.max(*last_end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    ranges
+}
+
+/// 行内代码底色块的水平/垂直留白。
+const INLINE_CODE_CHIP_PAD_X: f32 = 5.0;
+const INLINE_CODE_CHIP_INSET_RATIO: f32 = 0.10;
 
 fn metrics_for(kind: BlockKind, style: InlineStyle, config: &NormalizedConfig) -> Metrics {
     let body = config.font_size as f32;
@@ -2436,6 +2470,30 @@ fn draw_table_cell_text(
     clip_y_end: u32,
 ) {
     for run in cell.buffer.layout_runs() {
+        for (start_x, end_x) in inline_code_chip_ranges(run.glyphs) {
+            let inset = (run.line_height * INLINE_CODE_CHIP_INSET_RATIO).max(2.0);
+            let top = i64::from(origin_y) + (run.line_top + inset) as i64;
+            let bottom = i64::from(origin_y) + (run.line_top + run.line_height - inset) as i64;
+            let x0 = (i64::from(origin_x) + (start_x - INLINE_CODE_CHIP_PAD_X).floor() as i64)
+                .max(i64::from(origin_x));
+            let x1 = (i64::from(origin_x) + (end_x + INLINE_CODE_CHIP_PAD_X).ceil() as i64)
+                .min(i64::from(clip_x_end));
+            let bottom = bottom.min(i64::from(clip_y_end));
+            let (Ok(x0), Ok(top)) = (u32::try_from(x0), u32::try_from(top)) else {
+                continue;
+            };
+            if x1 <= i64::from(x0) || bottom <= i64::from(top) {
+                continue;
+            }
+            fill_rect(
+                image,
+                x0,
+                top,
+                (x1 - i64::from(x0)) as u32,
+                (bottom - i64::from(top)) as u32,
+                cell.inline_code_background,
+            );
+        }
         for glyph in run.glyphs {
             if swash_cache.image_cache.len() >= MAX_CACHED_GLYPHS {
                 swash_cache.image_cache.clear();
@@ -2568,6 +2626,35 @@ fn draw_text_fragment(
         let run_bottom = run_top + run.line_height;
         if run_bottom <= placement.source_start as f32 || run_top >= placement.source_end as f32 {
             continue;
+        }
+        for (start_x, end_x) in inline_code_chip_ranges(run.glyphs) {
+            let inset = (run.line_height * INLINE_CODE_CHIP_INSET_RATIO).max(2.0);
+            let top = (run_top + inset).max(placement.source_start as f32);
+            let bottom = (run_bottom - inset).min(placement.source_end as f32);
+            if bottom <= top {
+                continue;
+            }
+            let global_y = i64::from(destination_y) + top as i64
+                - i64::from(placement.source_start);
+            let x_base = i64::from(column_x) + i64::from(block.inset_left);
+            let x0 = (x_base + (start_x - INLINE_CODE_CHIP_PAD_X).floor() as i64)
+                .max(i64::from(column_x));
+            let x1 = (x_base + (end_x + INLINE_CODE_CHIP_PAD_X).ceil() as i64)
+                .min(i64::from(clip_x_end));
+            let (Ok(x0), Ok(global_y)) = (u32::try_from(x0), u32::try_from(global_y)) else {
+                continue;
+            };
+            if x1 <= i64::from(x0) {
+                continue;
+            }
+            fill_rect(
+                image,
+                x0,
+                global_y,
+                (x1 - i64::from(x0)) as u32,
+                (bottom - top) as u32,
+                block.inline_code_background,
+            );
         }
         for glyph in run.glyphs {
             if swash_cache.image_cache.len() >= MAX_CACHED_GLYPHS {
@@ -2797,6 +2884,56 @@ fn main() {
             let background = decoded.get_pixel(0, 0);
             assert!(decoded.pixels().any(|pixel| pixel != background));
         }
+    }
+
+    #[test]
+    fn freshly_shaped_cjk_word_keeps_positive_advances() {
+        // cosmic-text 0.15 在冷字体系统上首次整词塑形时,"背景"的首字形
+        // advance 为 0,后续字形全部叠画在同一位置(0.19 修复)。锁死该回归:
+        // 任何字形 advance 归零都会让文字叠加。
+        let mut font_system = FontSystem::new();
+        for text in ["背景", "背 景", "背包"] {
+            let metrics = Metrics::new(36.0, 52.0);
+            let mut buffer = Buffer::new(&mut font_system, metrics);
+            buffer.set_size(Some(960.0), None);
+            let attrs = Attrs::new().family(Family::SansSerif).metrics(metrics);
+            buffer.set_rich_text(
+                [(text, attrs.clone())],
+                &attrs,
+                Shaping::Advanced,
+                None,
+            );
+            buffer.shape_until_scroll(&mut font_system, true);
+            for run in buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    assert!(
+                        glyph.w > 0.0,
+                        "{text:?} 中 start={} 的字形 advance 为 0",
+                        glyph.start
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_code_gets_a_background_chip() {
+        let count_chip_pixels = |markdown: &str| {
+            let pages = render(markdown, &RenderConfig::default()).unwrap();
+            let decoded = image::load_from_memory(&pages[0].png).unwrap().to_rgba8();
+            let palette = Palette::for_theme(&RenderConfig::default().theme);
+            decoded
+                .pixels()
+                .filter(|pixel| **pixel == Rgba(palette.code_background))
+                .count()
+        };
+        let with_code = count_chip_pixels("行内 `code` 提示,以及 `第二段代码` 也要有底色。");
+        let without_code = count_chip_pixels("行内 code 提示,没有任何反引号的对照段落。");
+        assert!(
+            with_code > 200,
+            "行内代码应有底色块,实际命中 {with_code} 像素"
+        );
+        assert_eq!(without_code, 0, "无行内代码时不应出现底色像素");
     }
 
     #[test]
