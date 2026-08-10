@@ -2382,7 +2382,28 @@ fn append_association_section<'a>(
             (MemoryAccess::Principal(_), VISIBILITY_PRINCIPAL) => "当前用户记忆".to_string(),
             _ => "仅管理员".to_string(),
         };
-        let line = format!("- [{label}] {}\n", compact_line(&hit.content));
+        let mut content = compact_line(&hit.content);
+        // 短期日记正文自带 RFC3339 前缀（diary_content），加日期标签后去重
+        if let Some(rest) = content
+            .strip_prefix(hit.timestamp.as_str())
+            .and_then(|rest| rest.strip_prefix('，'))
+        {
+            content = rest.to_string();
+        }
+        let date = association_date(&hit.timestamp);
+        // organizer 写的日记常以「YYYY-MM-DD，」开头，与日期标签相同时也去重
+        if let Some(date) = date.as_deref() {
+            if let Some(rest) = content
+                .strip_prefix(date)
+                .and_then(|rest| rest.strip_prefix('，'))
+            {
+                content = rest.to_string();
+            }
+        }
+        let line = match date {
+            Some(date) => format!("- [{date}] [{label}] {content}\n"),
+            None => format!("- [{label}] {content}\n"),
+        };
         let total = output.chars().count()
             + heading.chars().count()
             + section.chars().count()
@@ -3010,6 +3031,13 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// RFC3339 时间戳 → 本地日期（用于关联记忆展示；解析失败返回 None）
+fn association_date(timestamp: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+}
+
 fn diary_content(created_at: &str, user_message: &str, assistant_message: &str) -> String {
     format!(
         "{}，我被要求：{}；结果：{}",
@@ -3528,6 +3556,45 @@ mod tests {
         });
         assert!(formatted.ends_with("</associative-memory>"));
         assert!(formatted.chars().count() <= 128);
+    }
+
+    #[test]
+    fn association_lines_carry_date_and_dedupe_diary_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        let stamp = now();
+        let date = association_date(&stamp).unwrap();
+        let base = MemoryHit {
+            id: 1,
+            kind: MemoryKind::Fact,
+            content: "知识点内容".to_string(),
+            score: 1.0,
+            timestamp: stamp.clone(),
+            source: "test".to_string(),
+            retention: None,
+            visibility: VISIBILITY_PUBLIC.to_string(),
+            owner_principal: String::new(),
+            owner_display_name: String::new(),
+            subjects: "[]".to_string(),
+            source_episode_ids: Vec::new(),
+        };
+        let diary = MemoryHit {
+            id: 2,
+            kind: MemoryKind::Diary,
+            content: format!("{stamp}，我被要求：测试；结果：通过"),
+            retention: Some(SHORT_TERM.to_string()),
+            ..base.clone()
+        };
+        let formatted = store.format_association(&AssociationContext {
+            facts: vec![base],
+            episodes: vec![diary],
+            organization_due: false,
+        });
+        assert!(formatted.contains(&format!("[{date}] [公共知识] 知识点内容")));
+        assert!(formatted.contains(&format!("[{date}] [公共知识] 我被要求：测试；结果：通过")));
+        assert!(!formatted.contains(&stamp));
     }
 
     #[test]
