@@ -568,31 +568,85 @@ impl MemoryStore {
         self.search_evicted_context_existing(query, limit)
     }
 
-    pub fn search_evicted_context_readonly(&self, query: &str, limit: usize) -> Result<Value> {
+    pub fn search_evicted_context_readonly(
+        &self,
+        query: &str,
+        limit: usize,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Value> {
         if !self.state_db.is_file() {
             return Ok(json!({ "ok": true, "query": query, "results": [] }));
         }
-        self.search_evicted_context_existing(query, limit)
+        self.search_evicted_context_filtered(query, limit, start, end)
     }
 
     fn search_evicted_context_existing(&self, query: &str, limit: usize) -> Result<Value> {
+        self.search_evicted_context_filtered(query, limit, None, None)
+    }
+
+    /// `start`/`end` are RFC 3339 bounds on the stored timestamp. "What were we
+    /// talking about this morning" is a question about *when*, and time is a
+    /// far stronger signal there than any keyword — the log says `[ERRO]` where
+    /// the question says 报错.
+    fn search_evicted_context_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Value> {
         let tokens = query_tokens(query);
         let conn = self.state_conn()?;
-        let access_filter = if self.access.principal_key().is_some() {
-            "WHERE visibility='public' OR (visibility='principal' AND owner_principal=?1)"
+        let mut clauses = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+        if let Some(principal) = self.access.principal_key() {
+            params.push(principal.to_string());
+            clauses.push(format!(
+                "(visibility='public' OR (visibility='principal' AND owner_principal=?{}))",
+                params.len()
+            ));
+        }
+        if let Some(start) = start {
+            params.push(start.to_string());
+            clauses.push(format!("timestamp >= ?{}", params.len()));
+        }
+        if let Some(end) = end {
+            params.push(end.to_string());
+            clauses.push(format!("timestamp <= ?{}", params.len()));
+        }
+        // The trigram index does the filtering, so the scan no longer has to be
+        // capped at the newest 1000 rows — those beyond it used to be stored
+        // forever and reachable never.
+        if !tokens.is_empty() {
+            // Trigram index: terms shorter than three characters cannot be
+            // matched by it, so those fall through to the scoring pass below
+            // rather than narrowing the candidate set.
+            let indexed: Vec<String> = tokens
+                .iter()
+                .filter(|token| token.chars().count() >= 3)
+                .cloned()
+                .collect();
+            if !indexed.is_empty() {
+                params.push(build_evicted_fts_query(&indexed));
+                clauses.push(format!(
+                    "id IN (SELECT rowid FROM evicted_turns_fts WHERE evicted_turns_fts MATCH ?{})",
+                    params.len()
+                ));
+            }
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
         } else {
-            ""
+            format!("WHERE {}", clauses.join(" AND "))
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT id, timestamp, role, content, visibility,
                     owner_principal, owner_display_name
-               FROM evicted_turns {access_filter}
-              ORDER BY id DESC LIMIT 1000"
+               FROM evicted_turns {where_clause}
+              ORDER BY id DESC"
         ))?;
-        let mut rows = match self.access.principal_key() {
-            Some(principal) => stmt.query([principal])?,
-            None => stmt.query([])?,
-        };
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
             let id = row.get::<_, i64>(0)?;
@@ -1781,7 +1835,25 @@ fn init_state_db(conn: &Connection) -> Result<()> {
             visibility TEXT NOT NULL DEFAULT 'privileged',
             owner_principal TEXT NOT NULL DEFAULT '',
             owner_display_name TEXT NOT NULL DEFAULT ''
-        );",
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS evicted_turns_fts USING fts5(
+            content,
+            content='evicted_turns',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS evicted_turns_fts_insert AFTER INSERT ON evicted_turns BEGIN
+            INSERT INTO evicted_turns_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS evicted_turns_fts_delete AFTER DELETE ON evicted_turns BEGIN
+            INSERT INTO evicted_turns_fts(evicted_turns_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS evicted_turns_fts_update AFTER UPDATE OF content ON evicted_turns BEGIN
+            INSERT INTO evicted_turns_fts(evicted_turns_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+            INSERT INTO evicted_turns_fts(rowid, content) VALUES (new.id, new.content);
+        END;",
     )?;
     add_column_if_missing(conn, "evicted_turns", "source_id", "TEXT")?;
     add_column_if_missing(
@@ -2565,6 +2637,17 @@ fn sort_json_hits(hits: &mut [Value]) {
     });
 }
 
+/// FTS5 terms are OR-ed: a paraphrase usually shares only part of its wording
+/// with the record, and requiring every term would push recall to zero on the
+/// exact queries this is for.
+fn build_evicted_fts_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn score_text(text: &str, query: &str, tokens: &[String]) -> f32 {
     if tokens.is_empty() {
         return 0.0;
@@ -2706,6 +2789,59 @@ mod tests {
             scripts_dir: temp.path().join("config/scripts"),
             system_scripts_dir: PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn evicted_search_is_indexed_and_can_be_narrowed_by_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(&AppConfig::default(), &test_paths(&temp));
+        store.init().unwrap();
+        let rows: Vec<EvictedTurn> = (0..1200)
+            .map(|index| EvictedTurn {
+                source_id: format!("t{index}:user"),
+                timestamp: format!("2026-08-{:02}T10:00:00+00:00", (index % 28) + 1),
+                role: "user".to_string(),
+                content: format!("第 {index} 轮，聊到了 蓝色小刺猬 这个话题"),
+                ..EvictedTurn::default()
+            })
+            .collect();
+        store.remember_evicted_turns(&rows).unwrap();
+
+        // The scan used to stop at the newest 1000 rows, so anything older was
+        // stored forever and reachable never.
+        let oldest = store
+            .search_evicted_context_readonly("第 3 轮", 50, None, None)
+            .unwrap();
+        assert!(
+            oldest["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["snippet"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("第 3 轮")),
+            "{oldest}"
+        );
+
+        // "What were we talking about that morning" is a question about when.
+        let ranged = store
+            .search_evicted_context_readonly(
+                "蓝色小刺猬",
+                50,
+                Some("2026-08-05T00:00:00+00:00"),
+                Some("2026-08-05T23:59:59+00:00"),
+            )
+            .unwrap();
+        let hits = ranged["results"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{ranged}");
+        assert!(
+            hits.iter().all(|hit| hit["timestamp"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("2026-08-05")),
+            "{ranged}"
+        );
     }
 
     fn diary_config(batch_size: usize) -> AppConfig {

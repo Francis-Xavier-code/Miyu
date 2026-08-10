@@ -217,6 +217,45 @@ pub(crate) fn register_readonly_with_context(
     ));
 }
 
+/// Records store RFC 3339 timestamps; the model may write a bare date or a
+/// local wall-clock time. `end_of_day` makes a bare end date cover that day.
+fn optional_time_bound(args: &Value, key: &str, end_of_day: bool) -> Result<Option<String>> {
+    let Some(raw) = args.get(key).and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(parsed.to_rfc3339()));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            return Ok(Some(local_rfc3339(value)));
+        }
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let time = if end_of_day {
+            date.and_hms_opt(23, 59, 59)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        }
+        .ok_or_else(|| anyhow::anyhow!("date is outside the supported range"))?;
+        return Ok(Some(local_rfc3339(time)));
+    }
+    anyhow::bail!("invalid {key} {raw:?}; use RFC 3339, YYYY-MM-DD, or YYYY-MM-DD HH:MM[:SS]")
+}
+
+fn local_rfc3339(value: chrono::NaiveDateTime) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .from_local_datetime(&value)
+        .earliest()
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc.from_utc_datetime(&value).to_rfc3339())
+}
+
 async fn search_evicted_context(
     args: Value,
     config: AppConfig,
@@ -227,13 +266,15 @@ async fn search_evicted_context(
 ) -> Result<String> {
     let query = required_str(&args, "query")?;
     let limit = optional_limit(&args);
+    let start = optional_time_bound(&args, "start_time", false)?;
+    let end = optional_time_bound(&args, "end_time", true)?;
     let store = MemoryStore::new(&config, &paths).with_request_context(
         access,
         writer_principal,
         writer_display_name,
     );
     Ok(store
-        .search_evicted_context_readonly(query, limit)?
+        .search_evicted_context_readonly(query, limit, start.as_deref(), end.as_deref())?
         .to_string())
 }
 
