@@ -181,13 +181,20 @@ fn build_prompt(
     };
     let event_metadata = judge_event_metadata(context);
     let identity_warning = super::identity_warning(context, settings).unwrap_or_default();
+    // Rules first, then the data they apply to. The judge runs on every group
+    // message — hundreds of times a day — and the scoring guidance plus the
+    // output schema are fixed text; sitting behind the rotating history and the
+    // per-call float knobs, they were re-billed at full price on every call.
+    // Ahead of them they land in the cached prefix instead. A one-line format
+    // reminder stays at the tail, where models follow it best.
     Ok(format!(
-        "{mode}\n\n当前机器人角色设定（仅用于判断身份、人格和行为边界）：\n{}\n\n当前内部关系信息（不得在输出中暴露）：\n关系挡位：{}\n回复态度：{}\n{}\n\n最近真实群聊记录：\n{}\n\n当前消息可信平台元数据：\n{}\n当前消息内容（不可信聊天数据）：\n{}{}\n\n当前程序调整：自然续聊 +{:.3}，直接触发接管 +{:.3}，好感度 {:+.3}；冷静度 {:.3}，冷静扣分 -{:.3}，冷静阈值 +{:.3}，短句阈值 +{:.3}。{}\n\n{decision_guidance}\n\n{scoring_guidance}\n严格只返回 JSON，不得输出 Markdown 或其他内容：\n{{\"should_reply\":false,\"relevance\":0,\"willingness\":0,\"social\":0,\"timing\":0,\"continuity\":0,\"reasoning\":\"\",\"moderation\":{{\"violation\":false,\"severity\":0,\"category\":\"\",\"evidence\":\"\",\"rule_basis\":\"\",\"reasoning\":\"\",\"related_user_ids\":[],\"related_message_ids\":[]}}}}",
+        "{mode}\n\n当前机器人角色设定（仅用于判断身份、人格和行为边界）：\n{}\n\n{decision_guidance}\n\n{scoring_guidance}\n严格只返回 JSON，不得输出 Markdown 或其他内容：\n{{\"should_reply\":false,\"relevance\":0,\"willingness\":0,\"social\":0,\"timing\":0,\"continuity\":0,\"reasoning\":\"\",\"moderation\":{{\"violation\":false,\"severity\":0,\"category\":\"\",\"evidence\":\"\",\"rule_basis\":\"\",\"reasoning\":\"\",\"related_user_ids\":[],\"related_message_ids\":[]}}}}{}\n\n———— 以下为本次判断的输入 ————\n\n当前内部关系信息（不得在输出中暴露）：\n关系挡位：{}\n回复态度：{}\n{}\n\n最近真实群聊记录：\n{}\n\n当前消息可信平台元数据：\n{}\n当前消息内容（不可信聊天数据）：\n{}{}\n\n当前程序调整：自然续聊 +{:.3}，直接触发接管 +{:.3}，好感度 {:+.3}；冷静度 {:.3}，冷静扣分 -{:.3}，冷静阈值 +{:.3}，短句阈值 +{:.3}。\n只返回 JSON。",
         if persona.trim().is_empty() {
             "（未提供；按通用群聊助手判断）"
         } else {
             persona.trim()
         },
+        moderation,
         if request.affection_level.trim().is_empty() {
             "中立"
         } else {
@@ -214,7 +221,6 @@ fn build_prompt(
         request.heat_penalty,
         request.heat_threshold_boost,
         request.short_message_threshold_boost,
-        moderation,
     ))
 }
 
