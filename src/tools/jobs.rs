@@ -20,8 +20,6 @@ use tokio::process::Command;
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const STATUS_POLL: Duration = Duration::from_millis(250);
-/// job_status wait_seconds is clamped to this bound.
-pub const MAX_WAIT_SECONDS: u64 = 30;
 /// Output chunk cap per job_status call, mirroring script output limits.
 const MAX_STATUS_OUTPUT_CHARS: usize = 20_000;
 const LOG_RETENTION_DAYS: u64 = 7;
@@ -493,7 +491,7 @@ pub async fn spawn_background(
         "job_id": job_id,
         "pid": pid,
         "log": log_path.display().to_string(),
-        "note": t("Background command running. Query with job_status (wait_seconds blocks); never assume its result before it finishes.", "后台命令运行中。用 job_status 查询（可用 wait_seconds 阻塞等待）；命令完成前不要臆测其结果。")
+        "note": t("Background command running. You will be woken automatically when it finishes — do not poll job_status to wait; query it only when you need interim logs. Never assume the result before completion.", "后台命令运行中。完成后会自动唤起你——不要为了等待结果轮询 job_status，只在需要查看中途日志时查询；完成前不要臆测其结果。")
     }))?)
 }
 
@@ -686,25 +684,6 @@ fn ensure_jobs_visible(ids: &[String], current: Option<&str>, all: bool, verb: &
     Ok(())
 }
 
-/// Blocks until any of `ids` reaches a terminal state or the wait elapses.
-async fn wait_for_any_finished(ids: &[String], wait: u64) {
-    if wait == 0 || ids.is_empty() {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_secs(wait);
-    while Instant::now() < deadline {
-        let finished = {
-            let jobs = jobs().lock().unwrap();
-            ids.iter()
-                .any(|id| jobs.get(id).map(|job| job.state.is_terminal()).unwrap_or(true))
-        };
-        if finished {
-            return;
-        }
-        tokio::time::sleep(STATUS_POLL).await;
-    }
-}
-
 fn job_detail_json(job: &JobEntry, offset: u64, budget: usize) -> Value {
     let (content, next, size, truncated) = read_log_slice(&job.log_path, offset, budget);
     json!({
@@ -739,11 +718,6 @@ fn job_visible(job: &JobEntry, current: Option<&str>, all: bool) -> bool {
 
 async fn job_status(args: Value) -> Result<String> {
     let ids = requested_job_ids(&args);
-    let wait = args
-        .get("wait_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(MAX_WAIT_SECONDS);
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let current = super::workspace::try_session();
@@ -753,7 +727,6 @@ async fn job_status(args: Value) -> Result<String> {
         // The log budget is split across the requested ids so asking about
         // five jobs cannot drag back five full logs.
         ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
-        wait_for_any_finished(&ids, wait).await;
         let budget = (MAX_STATUS_OUTPUT_CHARS / ids.len()).max(1);
         let mut rows = Vec::with_capacity(ids.len());
         for id in &ids {
@@ -774,35 +747,7 @@ async fn job_status(args: Value) -> Result<String> {
 
     let Some(job_id) = ids.first().map(String::as_str) else {
         // No job_id: list this session's jobs (all=true lists every
-        // session's). With wait_seconds, block until ANY watched job that
-        // was running at call time finishes (or the wait elapses) — one
-        // call can await a whole batch instead of polling each job.
-        let running_at_start = || {
-            jobs()
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|job| !job.state.is_terminal())
-                .filter(|job| job_visible(job, current.as_deref(), all))
-                .map(|job| job.job_id.clone())
-                .collect::<Vec<_>>()
-        };
-        let watched = running_at_start();
-        if wait > 0 && !watched.is_empty() {
-            let deadline = Instant::now() + Duration::from_secs(wait);
-            while Instant::now() < deadline {
-                let finished = {
-                    let jobs = jobs().lock().unwrap();
-                    watched.iter().any(|id| {
-                        jobs.get(id).map(|job| job.state.is_terminal()).unwrap_or(true)
-                    })
-                };
-                if finished {
-                    break;
-                }
-                tokio::time::sleep(STATUS_POLL).await;
-            }
-        }
+        // session's). 完成会自动唤醒调用方,这里不提供阻塞等待。
         let jobs = jobs().lock().unwrap();
         let mut rows = jobs
             .values()
@@ -830,14 +775,9 @@ async fn job_status(args: Value) -> Result<String> {
     };
 
     ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
-    let deadline = Instant::now() + Duration::from_secs(wait);
-    let mut job = job_snapshot(job_id).with_context(|| {
+    let job = job_snapshot(job_id).with_context(|| {
         format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空")
     })?;
-    while !job.state.is_terminal() && Instant::now() < deadline {
-        tokio::time::sleep(STATUS_POLL).await;
-        job = job_snapshot(job_id).context("job disappeared while waiting")?;
-    }
 
     // Single id keeps the flat shape it always had.
     let mut detail = job_detail_json(&job, offset, MAX_STATUS_OUTPUT_CHARS);
@@ -995,8 +935,8 @@ pub fn register_status(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_status",
             t(
-                "Check background jobs of the current session. Without an id lists this session's jobs (wait_seconds then waits for ANY running job to finish — one call can await a batch); with job_id returns status plus incremental log output from offset; with job_ids returns the same per-job detail for several at once, sharing the log budget. wait_seconds is capped at 30. Pass all=true to see other sessions' jobs.",
-                "查询本会话的后台任务。不带 id 列出本会话全部任务（此时 wait_seconds 表示等待任意一条运行中任务结束，适合一次等待多条）；带 job_id 返回状态和从 offset 起的增量日志输出；带 job_ids 一次返回多条任务的同样明细（日志额度在这些任务间均分）。wait_seconds 上限 30 秒。跨会话查询需传 all=true。",
+                "Check background jobs of the current session. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes. Without an id lists this session's jobs; with job_id returns status plus incremental log output from offset; with job_ids returns the same per-job detail for several at once, sharing the log budget. Pass all=true to see other sessions' jobs.",
+                "查询本会话的后台任务，立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。不带 id 列出本会话全部任务；带 job_id 返回状态和从 offset 起的增量日志输出；带 job_ids 一次返回多条任务的同样明细（日志额度在这些任务间均分）。跨会话查询需传 all=true。",
             ),
             json!({
                 "type": "object",
@@ -1007,7 +947,6 @@ pub fn register_status(registry: &mut ToolRegistry) {
                         "items": { "type": "string" },
                         "description": "一次查询多个后台任务 id。"
                     },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 30, "description": "任务未结束时最多阻塞等待多少秒再返回；多 id 时等待其中任意一条结束。" },
                     "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" },
                     "all": { "type": "boolean", "description": "true 时不限本会话，查询全部会话的后台任务。" }
                 },
@@ -1049,6 +988,20 @@ mod tests {
         });
     }
 
+    /// 测试用:轮询等待任务进入终态(生产路径已无阻塞等待,由完成钩子唤醒)。
+    async fn await_terminal(job_id: &str) {
+        for _ in 0..200 {
+            if job_snapshot(job_id)
+                .map(|job| job.state.is_terminal())
+                .unwrap_or(true)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("job {job_id} did not finish in time");
+    }
+
     #[tokio::test]
     async fn background_job_lifecycle() {
         shared_init();
@@ -1057,8 +1010,9 @@ mod tests {
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
         assert!(spawned["ok"].as_bool().unwrap());
 
+        await_terminal(&job_id).await;
         let status: Value = serde_json::from_str(
-            &job_status(json!({"job_id": job_id, "wait_seconds": 10})).await.unwrap(),
+            &job_status(json!({"job_id": job_id})).await.unwrap(),
         )
         .unwrap();
         assert_eq!(status["status"], "exited(3)");
@@ -1138,17 +1092,12 @@ mod tests {
             ids.push(spawned["job_id"].as_str().unwrap().to_string());
         }
 
-        // `wait_seconds` on a batch returns as soon as *any* job finishes (the
-        // tool says so), so wait on each one individually first. Otherwise the
-        // second job is often still running and this test flakes under load.
         for id in &ids {
-            job_status(json!({"job_id": id, "wait_seconds": 10}))
-                .await
-                .unwrap();
+            await_terminal(id).await;
         }
 
         let status: Value = serde_json::from_str(
-            &job_status(json!({"job_ids": ids, "wait_seconds": 10}))
+            &job_status(json!({"job_ids": ids}))
                 .await
                 .unwrap(),
         )
@@ -1165,7 +1114,7 @@ mod tests {
 
         // A single id keeps the flat shape callers already parse.
         let single: Value = serde_json::from_str(
-            &job_status(json!({"job_id": ids[0], "wait_seconds": 10}))
+            &job_status(json!({"job_id": ids[0]}))
                 .await
                 .unwrap(),
         )
@@ -1194,8 +1143,9 @@ mod tests {
         .unwrap();
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
         assert_eq!(spawned["kind"], "background_subagent");
+        await_terminal(&job_id).await;
         let status: Value = serde_json::from_str(
-            &job_status(json!({"job_id": job_id, "wait_seconds": 10}))
+            &job_status(json!({"job_id": job_id}))
                 .await
                 .unwrap(),
         )
@@ -1227,8 +1177,9 @@ mod tests {
         let spawned: Value =
             serde_json::from_str(&spawn_background("printf 'AAABBB'", None, &test_progress()).await.unwrap()).unwrap();
         let job_id = spawned["job_id"].as_str().unwrap().to_string();
+        await_terminal(&job_id).await;
         let first: Value = serde_json::from_str(
-            &job_status(json!({"job_id": job_id, "wait_seconds": 10})).await.unwrap(),
+            &job_status(json!({"job_id": job_id})).await.unwrap(),
         )
         .unwrap();
         assert_eq!(first["output"]["content"], "AAABBB");
