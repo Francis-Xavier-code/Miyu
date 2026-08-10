@@ -145,6 +145,9 @@ fn jieba_block_character(character: char) -> bool {
 pub struct MemoryStore {
     config: MemoryConfig,
     kb_config: KnowledgeBasePluginConfig,
+    /// Kept whole because the embedding call needs provider lookup and the
+    /// knowledge base's timeout setting.
+    app_config: AppConfig,
     writes_enabled: bool,
     access: MemoryAccess,
     writer_principal: Option<String>,
@@ -379,6 +382,7 @@ impl MemoryStore {
         Self {
             config: config.memory_config().clone(),
             kb_config: config.plugins.knowledge_base.clone(),
+            app_config: config.clone(),
             writes_enabled: true,
             access: MemoryAccess::Privileged,
             writer_principal: None,
@@ -579,6 +583,195 @@ impl MemoryStore {
             return Ok(json!({ "ok": true, "query": query, "results": [] }));
         }
         self.search_evicted_context_filtered(query, limit, start, end)
+    }
+
+    /// Keyword first, semantics only when the keywords came back weak — the
+    /// same shape the knowledge base uses. Exact terms (error codes, package
+    /// names) are what keyword matching is best at and what most of these
+    /// lookups are; the embedding pass is for "what were we talking about",
+    /// where the record says `[ERRO]` and the question says 报错.
+    ///
+    /// Every embedding step is best effort. The service being unreachable, or
+    /// having produced no vectors yet, must never turn a working keyword search
+    /// into a failure.
+    pub async fn search_evicted_context_hybrid(
+        &self,
+        query: &str,
+        limit: usize,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Value> {
+        let mut base = self.search_evicted_context_readonly(query, limit, start, end)?;
+        let strongest = base["results"]
+            .as_array()
+            .and_then(|hits| hits.first())
+            .and_then(|hit| hit["score"].as_f64())
+            .unwrap_or(0.0);
+        if !self.semantic_enabled() || strongest >= SEMANTIC_SKIP_SCORE {
+            return Ok(base);
+        }
+        let semantic = match self.semantic_evicted_hits(query, limit, start, end).await {
+            Ok(hits) => hits,
+            Err(error) => {
+                tracing::debug!(error = %error, "evicted-context semantic pass unavailable");
+                return Ok(base);
+            }
+        };
+        if semantic.is_empty() {
+            return Ok(base);
+        }
+        merge_evicted_hits(&mut base, semantic, limit);
+        Ok(base)
+    }
+
+    /// Rows are embedded on demand rather than at eviction time: pop must not
+    /// wait on a network round trip, and a record nobody ever searches for
+    /// never costs an embedding. Each call tops up a bounded slice of the
+    /// backlog, so coverage fills in over successive searches.
+    async fn semantic_evicted_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Vec<Value>> {
+        let embedding = &self.app_config.embedding;
+        let mut provider = self
+            .config_provider(embedding.provider_id.trim())
+            .context("embedding provider is not configured")?;
+        let model = embedding.model.trim().to_string();
+        provider.default_model = model.clone();
+
+        let corpus = self.semantic_corpus(start, end)?;
+        let missing: Vec<(i64, String)> = {
+            let conn = self.state_conn()?;
+            let mut pending = Vec::new();
+            for (id, content) in &corpus {
+                if pending.len() >= SEMANTIC_EMBED_BATCH {
+                    break;
+                }
+                let known: Option<String> = conn
+                    .query_row(
+                        "SELECT model FROM evicted_embeddings WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if known.as_deref() != Some(model.as_str()) {
+                    pending.push((*id, content.clone()));
+                }
+            }
+            pending
+        };
+        for (id, content) in missing {
+            let Ok(vector) = crate::tools::knowledge_base::embed_text(
+                &self.app_config,
+                &provider,
+                &model,
+                &content,
+            )
+            .await
+            else {
+                break;
+            };
+            let conn = self.state_conn()?;
+            conn.execute(
+                "INSERT INTO evicted_embeddings (id, model, embedding_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE SET
+                    model = excluded.model,
+                    embedding_json = excluded.embedding_json,
+                    created_at = excluded.created_at",
+                params![id, model, serde_json::to_string(&vector)?, now()],
+            )?;
+        }
+
+        let query_vector =
+            crate::tools::knowledge_base::embed_text(&self.app_config, &provider, &model, query)
+                .await?;
+        let conn = self.state_conn()?;
+        let mut hits = Vec::new();
+        for (id, content) in &corpus {
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT embedding_json FROM evicted_embeddings WHERE id = ?1 AND model = ?2",
+                    params![id, model],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(stored) = stored else { continue };
+            let Ok(vector) = serde_json::from_str::<Vec<f32>>(&stored) else {
+                continue;
+            };
+            let score = cosine_similarity(&query_vector, &vector);
+            if score < self.app_config.embedding.min_score {
+                continue;
+            }
+            hits.push(json!({
+                "id": id,
+                "score": score * SEMANTIC_SCORE_WEIGHT,
+                "semantic": true,
+                "snippet": truncate_chars(&compact_line(content), 400),
+            }));
+        }
+        sort_json_hits(&mut hits);
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn config_provider(&self, id: &str) -> Option<crate::config::ProviderConfig> {
+        if id.is_empty() {
+            return None;
+        }
+        self.app_config.provider(Some(id)).ok().cloned()
+    }
+
+    /// Newest rows only, and bounded: this pass answers "what were we talking
+    /// about", which is a recency question, and an unbounded corpus would make
+    /// every miss pay for the whole archive.
+    fn semantic_corpus(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Vec<(i64, String)>> {
+        let conn = self.state_conn()?;
+        let mut clauses = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+        if let Some(principal) = self.access.principal_key() {
+            params.push(principal.to_string());
+            clauses.push(format!(
+                "(visibility='public' OR (visibility='principal' AND owner_principal=?{}))",
+                params.len()
+            ));
+        }
+        if let Some(start) = start {
+            params.push(start.to_string());
+            clauses.push(format!("timestamp >= ?{}", params.len()));
+        }
+        if let Some(end) = end {
+            params.push(end.to_string());
+            clauses.push(format!("timestamp <= ?{}", params.len()));
+        }
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, content FROM evicted_turns {where_clause}
+              ORDER BY id DESC LIMIT {SEMANTIC_CORPUS_LIMIT}"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// No switch of its own: an embedding model being configured is what makes
+    /// the semantic pass available, and the keyword path stands on its own when
+    /// it is not.
+    fn semantic_enabled(&self) -> bool {
+        self.app_config.embedding.is_configured()
     }
 
     fn search_evicted_context_existing(&self, query: &str, limit: usize) -> Result<Value> {
@@ -1836,6 +2029,12 @@ fn init_state_db(conn: &Connection) -> Result<()> {
             owner_principal TEXT NOT NULL DEFAULT '',
             owner_display_name TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS evicted_embeddings (
+            id INTEGER PRIMARY KEY,
+            model TEXT NOT NULL,
+            embedding_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS evicted_turns_fts USING fts5(
             content,
             content='evicted_turns',
@@ -2640,6 +2839,58 @@ fn sort_json_hits(hits: &mut [Value]) {
 /// FTS5 terms are OR-ed: a paraphrase usually shares only part of its wording
 /// with the record, and requiring every term would push recall to zero on the
 /// exact queries this is for.
+/// Keyword hits at or above this are already good enough that the embedding
+/// round trip would only add latency.
+const SEMANTIC_SKIP_SCORE: f64 = 40.0;
+/// Rows embedded per search; the backlog fills in over successive calls rather
+/// than making one unlucky search pay for the whole archive.
+const SEMANTIC_EMBED_BATCH: usize = 64;
+const SEMANTIC_CORPUS_LIMIT: usize = 500;
+/// Semantic hits are supporting evidence, not the primary ranking; keyword
+/// scores run an order of magnitude higher and should keep the top slots when
+/// they matched at all.
+const SEMANTIC_SCORE_WEIGHT: f32 = 30.0;
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (a, b) in left.iter().zip(right.iter()) {
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+/// Semantic hits reinforce a record the keywords already found rather than
+/// displacing it; a record only the embedding saw joins on its own.
+fn merge_evicted_hits(base: &mut Value, semantic: Vec<Value>, limit: usize) {
+    let Some(hits) = base["results"].as_array_mut() else {
+        return;
+    };
+    for item in semantic {
+        let id = item["id"].clone();
+        if let Some(existing) = hits.iter_mut().find(|hit| hit["id"] == id) {
+            let boost = item["score"].as_f64().unwrap_or(0.0) * 0.6;
+            let score = existing["score"].as_f64().unwrap_or(0.0) + boost;
+            existing["score"] = json!(score);
+            existing["semantic"] = json!(true);
+        } else {
+            hits.push(item);
+        }
+    }
+    sort_json_hits(hits);
+    hits.truncate(limit);
+}
+
 fn build_evicted_fts_query(terms: &[String]) -> String {
     terms
         .iter()

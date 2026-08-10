@@ -229,8 +229,11 @@ fn optional_time_bound(args: &Value, key: &str, end_of_day: bool) -> Result<Opti
     if raw.is_empty() {
         return Ok(None);
     }
+    // Bounds are compared against a TEXT column, so both sides have to be in
+    // the same zone or the comparison is lexicographic nonsense: a local
+    // midnight in +09:00 sorts after a UTC instant that actually came later.
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
-        return Ok(Some(parsed.to_rfc3339()));
+        return Ok(Some(to_utc_rfc3339(parsed.with_timezone(&chrono::Utc))));
     }
     for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, format) {
@@ -254,8 +257,12 @@ fn local_rfc3339(value: chrono::NaiveDateTime) -> String {
     chrono::Local
         .from_local_datetime(&value)
         .earliest()
-        .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| chrono::Utc.from_utc_datetime(&value).to_rfc3339())
+        .map(|value| to_utc_rfc3339(value.with_timezone(&chrono::Utc)))
+        .unwrap_or_else(|| to_utc_rfc3339(chrono::Utc.from_utc_datetime(&value)))
+}
+
+fn to_utc_rfc3339(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
 async fn search_evicted_context(
@@ -276,7 +283,8 @@ async fn search_evicted_context(
         writer_display_name,
     );
     Ok(store
-        .search_evicted_context_readonly(query, limit, start.as_deref(), end.as_deref())?
+        .search_evicted_context_hybrid(query, limit, start.as_deref(), end.as_deref())
+        .await?
         .to_string())
 }
 
@@ -372,6 +380,31 @@ fn optional_limit(args: &Value) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn time_bounds_are_normalized_to_utc_before_they_hit_the_text_column() {
+        // The comparison is lexicographic against stored RFC 3339 text, so a
+        // bound carrying a local offset compares as nonsense: midnight in
+        // +09:00 sorts after a UTC instant that actually came later.
+        let args = serde_json::json!({
+            "start_time": "2026-08-06T10:00:00+09:00",
+            "end_time": "2026-08-06"
+        });
+        let start = optional_time_bound(&args, "start_time", false).unwrap().unwrap();
+        assert!(start.ends_with("+00:00"), "{start}");
+        assert!(start.starts_with("2026-08-06T01:00:00"), "{start}");
+
+        let end = optional_time_bound(&args, "end_time", true).unwrap().unwrap();
+        assert!(end.ends_with("+00:00"), "{end}");
+
+        // Absent and blank both mean "no bound".
+        assert!(optional_time_bound(&args, "missing", false).unwrap().is_none());
+        let blank = serde_json::json!({ "start_time": "   " });
+        assert!(optional_time_bound(&blank, "start_time", false).unwrap().is_none());
+        // Garbage is refused rather than silently ignored.
+        let bad = serde_json::json!({ "start_time": "上周三" });
+        assert!(optional_time_bound(&bad, "start_time", false).is_err());
+    }
     use super::*;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
