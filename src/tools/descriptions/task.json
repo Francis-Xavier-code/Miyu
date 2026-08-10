@@ -24,7 +24,7 @@
       },
       "max_steps": {
         "type": "integer",
-        "description": "可选。覆盖子代理的工具调用预算上限。explore 默认 30，general 默认 50。"
+        "description": "可选的工具调用步数预算。默认不限，子代理完成任务即自然结束；仅在需要硬性约束时设置。"
       },
       "tier": {
         "type": "string",
