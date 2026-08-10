@@ -7,7 +7,7 @@ use crate::platforms::{
 use crate::state::PlatformMemeRefRecord;
 use crate::tools::memes::{
     collect_meme_from_local_image, current_persona_library, delete_meme_reference, meme_ref_exists,
-    MemeCollectionOutcome, MemeRef,
+    MemeCollectionOutcome, MemeOrigin, MemeRef,
 };
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
@@ -26,8 +26,19 @@ struct CollectionJob {
     state: crate::state::StateStore,
     conversation: crate::platforms::PlatformConversation,
     message_id: String,
+    origin: MemeOrigin,
     selected_indices: BTreeSet<usize>,
     images: BoxFuture<'static, Result<Vec<crate::platforms::PlatformImageData>>>,
+}
+
+/// 平台消息时间戳（unix 秒）→ RFC3339；无效值返回空串
+fn platform_sent_at(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return String::new();
+    }
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_default()
 }
 
 pub(super) struct MemeCollectorPlugin {
@@ -100,6 +111,16 @@ impl PlatformPlugin for MemeCollectorPlugin {
                 state: context.state_store.clone(),
                 conversation: context.conversation.clone(),
                 message_id: event.message_id.clone(),
+                origin: MemeOrigin {
+                    platform: event.conversation.platform.clone(),
+                    conversation_kind: event.conversation.kind.as_str().to_string(),
+                    conversation_id: event.conversation.conversation_id.clone(),
+                    sender_id: event.sender_id.clone(),
+                    sender_name: event.sender_display_name.clone(),
+                    message_id: event.message_id.clone(),
+                    sent_at: platform_sent_at(event.timestamp),
+                    collected_at: String::new(),
+                },
                 selected_indices,
                 images: context.message_images_task(event.message_id.clone()),
             };
@@ -223,7 +244,14 @@ async fn process_collection_job(job: CollectionJob) -> Result<()> {
         };
         let file = tempfile::Builder::new().suffix(suffix).tempfile()?;
         tokio::fs::write(file.path(), &image.data).await?;
-        match collect_meme_from_local_image(file.path(), &job.config, &job.paths).await? {
+        match collect_meme_from_local_image(
+            file.path(),
+            &job.config,
+            &job.paths,
+            Some(job.origin.clone()),
+        )
+        .await?
+        {
             MemeCollectionOutcome::Accepted { meme }
             | MemeCollectionOutcome::AlreadyExists { meme } => {
                 let record = PlatformMemeRefRecord {
@@ -272,17 +300,44 @@ async fn save_current_message_meme(
     if !(1..=4).contains(&image_index) {
         bail!("image_index must be between 1 and 4");
     }
-    let message_id = if event
+    let from_current_message = event
         .media
         .iter()
-        .any(|media| media.kind == PlatformMediaKind::Image)
-    {
+        .any(|media| media.kind == PlatformMediaKind::Image);
+    let message_id = if from_current_message {
         event.message_id.clone()
     } else {
         event
             .reply_to_message_id
             .clone()
             .context("send an image or directly reply to an image message")?
+    };
+    // 来源者取图片所在消息的发送者：引用保存时是被引用消息的发送者
+    let origin = if from_current_message {
+        MemeOrigin {
+            platform: event.conversation.platform.clone(),
+            conversation_kind: event.conversation.kind.as_str().to_string(),
+            conversation_id: event.conversation.conversation_id.clone(),
+            sender_id: event.sender_id.clone(),
+            sender_name: event.sender_display_name.clone(),
+            message_id: message_id.clone(),
+            sent_at: platform_sent_at(event.timestamp),
+            collected_at: String::new(),
+        }
+    } else {
+        let replied = event.replied_message.as_ref();
+        MemeOrigin {
+            platform: event.conversation.platform.clone(),
+            conversation_kind: event.conversation.kind.as_str().to_string(),
+            conversation_id: event.conversation.conversation_id.clone(),
+            sender_id: replied.map(|m| m.sender_id.clone()).unwrap_or_default(),
+            sender_name: replied
+                .map(|m| m.sender_display_name.clone())
+                .unwrap_or_default(),
+            message_id: message_id.clone(),
+            sent_at: replied.map(|m| platform_sent_at(m.timestamp)).unwrap_or_default(),
+            collected_at: String::new(),
+        }
     };
     let images = context.message_images_task(message_id.clone()).await?;
     let image = images
@@ -299,7 +354,8 @@ async fn save_current_message_meme(
     let file = tempfile::Builder::new().suffix(suffix).tempfile()?;
     tokio::fs::write(file.path(), &image.data).await?;
     let outcome =
-        collect_meme_from_local_image(file.path(), &context.config, &context.paths).await?;
+        collect_meme_from_local_image(file.path(), &context.config, &context.paths, Some(origin))
+            .await?;
     let response = match outcome {
         MemeCollectionOutcome::Accepted { meme } => {
             put_mapping(&context, &message_id, &meme, "inbound")?;

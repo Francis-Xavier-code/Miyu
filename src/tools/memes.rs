@@ -136,6 +136,32 @@ struct MemeItem {
     avoid: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<MemeOrigin>,
+}
+
+/// 表情包的收集来源：从哪个平台会话、谁发的、什么时候发/收的。
+/// 本地 add_meme 入库的表情没有该字段。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct MemeOrigin {
+    #[serde(default)]
+    pub(crate) platform: String,
+    #[serde(default)]
+    pub(crate) conversation_kind: String,
+    #[serde(default)]
+    pub(crate) conversation_id: String,
+    #[serde(default)]
+    pub(crate) sender_id: String,
+    #[serde(default)]
+    pub(crate) sender_name: String,
+    #[serde(default)]
+    pub(crate) message_id: String,
+    /// 消息发送时刻（RFC3339；平台未提供时为空）
+    #[serde(default)]
+    pub(crate) sent_at: String,
+    /// 入库时刻（RFC3339）
+    #[serde(default)]
+    pub(crate) collected_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -398,6 +424,7 @@ async fn search_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Resu
                 "tags": meme.item.tags,
                 "animated": meme.item.animated,
                 "source": source_label(meme.source),
+                "origin": meme.item.origin,
             })
         })
         .collect::<Vec<_>>();
@@ -437,6 +464,7 @@ async fn show_meme(
         "success": true,
         "id": unique_short_id_from_ids(&ids, &meme.item.id),
         "description": meme.item.description,
+        "origin": meme.item.origin,
     })
     .to_string())
 }
@@ -517,6 +545,7 @@ async fn add_meme(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result<
                 mime_type,
                 animated,
                 classification,
+                None,
             ) {
                 Ok(item) => item,
                 Err(err) => {
@@ -686,6 +715,7 @@ pub(crate) async fn collect_meme_from_local_image(
     image: &Path,
     config: &AppConfig,
     paths: &MiyuPaths,
+    origin: Option<MemeOrigin>,
 ) -> Result<MemeCollectionOutcome> {
     let library = current_persona_library(config);
     let image = image.to_path_buf();
@@ -748,12 +778,17 @@ pub(crate) async fn collect_meme_from_local_image(
             target.display()
         )
     })?;
+    let origin = origin.map(|mut origin| {
+        origin.collected_at = chrono::Utc::now().to_rfc3339();
+        origin
+    });
     let item = match item_from_classification(
         prepared.id.clone(),
         format!("images/{target_file}"),
         prepared.format.mime().to_string(),
         prepared.format == ValidatedImageFormat::Gif,
         classification,
+        origin,
     ) {
         Ok(item) => item,
         Err(error) => {
@@ -1426,6 +1461,7 @@ fn item_from_args(
         usage,
         avoid,
         tags,
+        origin: None,
     })
 }
 
@@ -1435,6 +1471,7 @@ fn item_from_classification(
     mime_type: String,
     animated: bool,
     classification: MemeClassification,
+    origin: Option<MemeOrigin>,
 ) -> Result<MemeItem> {
     validate_classification(&classification)?;
     if !classification.save {
@@ -1450,6 +1487,7 @@ fn item_from_classification(
         usage: classification.usage,
         avoid: classification.avoid,
         tags: classification.tags,
+        origin,
     };
     Ok(item)
 }
@@ -1528,6 +1566,7 @@ mod tests {
             usage: "适合 Linux 话题".to_string(),
             avoid: String::new(),
             tags: vec!["Linux".to_string(), "企鹅".to_string()],
+            origin: None,
         };
         assert!(score_meme(&item, "Linux", &[]) > score_meme(&item, "炸鸡", &[]));
     }
@@ -1573,8 +1612,91 @@ mod tests {
             "image/png".to_string(),
             false,
             rejected,
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn meme_item_origin_roundtrips_and_stays_backward_compatible() {
+        let legacy = r#"{"id":"sha256:x","name":{"zh":"名","en":""},"file":"images/x.png","mime_type":"image/png","description":"d","usage":"u","avoid":""}"#;
+        let item: MemeItem = serde_json::from_str(legacy).unwrap();
+        assert!(item.origin.is_none());
+        assert!(!serde_json::to_string(&item).unwrap().contains("origin"));
+
+        let with_origin = MemeItem {
+            origin: Some(MemeOrigin {
+                platform: "onebot".to_string(),
+                sender_id: "10001".to_string(),
+                sender_name: "群友".to_string(),
+                sent_at: "2026-08-10T12:00:00+00:00".to_string(),
+                ..Default::default()
+            }),
+            ..item
+        };
+        let text = serde_json::to_string(&with_origin).unwrap();
+        let back: MemeItem = serde_json::from_str(&text).unwrap();
+        let origin = back.origin.unwrap();
+        assert_eq!(origin.sender_id, "10001");
+        assert_eq!(origin.sender_name, "群友");
+        assert_eq!(origin.sent_at, "2026-08-10T12:00:00+00:00");
+    }
+
+    /// 真实链路实测：cargo test --bin miyu -- --ignored collect_meme_records_origin
+    /// 需要 MIYU_E2E_CONFIG_DIR 指向含识图模型配置的真实 config 目录，
+    /// MIYU_E2E_IMAGE 指向一张能通过表情判定的图片；数据写入临时目录。
+    #[tokio::test]
+    #[ignore = "hits the real vision model; needs MIYU_E2E_CONFIG_DIR + MIYU_E2E_IMAGE"]
+    async fn collect_meme_records_origin_end_to_end() {
+        let config_dir = PathBuf::from(std::env::var("MIYU_E2E_CONFIG_DIR").unwrap());
+        let image = PathBuf::from(std::env::var("MIYU_E2E_IMAGE").unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = MiyuPaths {
+            config_dir: config_dir.clone(),
+            config_file: config_dir.join("config.jsonc"),
+            skills_dir: config_dir.join("skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish/miyu.fish"),
+            bash_hook_file: temp.path().join("shell/bash-hook.sh"),
+            zsh_hook_file: temp.path().join("shell/zsh-hook.zsh"),
+            scripts_dir: config_dir.join("scripts"),
+            system_scripts_dir: PathBuf::new(),
+        };
+        let config = AppConfig::load_or_default(&paths).unwrap();
+        let origin = MemeOrigin {
+            platform: "onebot".to_string(),
+            conversation_kind: "group".to_string(),
+            conversation_id: "123456".to_string(),
+            sender_id: "10001".to_string(),
+            sender_name: "测试群友".to_string(),
+            message_id: "msg-e2e-1".to_string(),
+            sent_at: "2026-08-10T12:00:00+00:00".to_string(),
+            collected_at: String::new(),
+        };
+        let outcome = collect_meme_from_local_image(&image, &config, &paths, Some(origin))
+            .await
+            .unwrap();
+        let meme = match outcome {
+            MemeCollectionOutcome::Accepted { meme } => meme,
+            other => panic!("expected acceptance, got {other:?}"),
+        };
+        let index_path = user_library_dir(&paths, &meme.library).join("index.json");
+        let index: MemeIndex =
+            serde_json::from_str(&std::fs::read_to_string(index_path).unwrap()).unwrap();
+        let saved = index
+            .memes
+            .iter()
+            .find(|item| item.id == meme.id)
+            .expect("saved meme in index");
+        let origin = saved.origin.as_ref().expect("origin recorded");
+        assert_eq!(origin.sender_id, "10001");
+        assert_eq!(origin.sender_name, "测试群友");
+        assert_eq!(origin.sent_at, "2026-08-10T12:00:00+00:00");
+        assert!(!origin.collected_at.is_empty(), "collected_at stamped");
+        println!("E2E origin: {}", serde_json::to_string_pretty(origin).unwrap());
     }
 
     #[test]
@@ -1742,6 +1864,7 @@ mod tests {
                 usage: "测试".to_string(),
                 avoid: String::new(),
                 tags: Vec::new(),
+                origin: None,
             },
             path: PathBuf::from("images/test.png"),
             source: MemeSource::User,
