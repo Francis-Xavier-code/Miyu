@@ -315,6 +315,10 @@ pub(crate) struct RecentQuery {
     pub(crate) respect_context_boundary: bool,
     pub(crate) include_recalled: bool,
     pub(crate) before_ingress_order: Option<i64>,
+    /// Lower bound used by the reply turn: everything the previous turn already
+    /// rendered stays in the conversation history, so a turn only has to carry
+    /// what arrived since.
+    pub(crate) after_ingress_order: Option<i64>,
 }
 
 impl RecentQuery {
@@ -331,6 +335,7 @@ impl RecentQuery {
             respect_context_boundary: true,
             include_recalled: false,
             before_ingress_order: None,
+            after_ingress_order: None,
         }
     }
 
@@ -343,7 +348,13 @@ impl RecentQuery {
             respect_context_boundary: false,
             include_recalled: false,
             before_ingress_order: None,
+            after_ingress_order: None,
         }
+    }
+
+    pub(crate) fn after_ingress_order(mut self, order: Option<i64>) -> Self {
+        self.after_ingress_order = order;
+        self
     }
 
     pub(crate) fn before_ingress_order(mut self, order: Option<i64>) -> Self {
@@ -1324,6 +1335,7 @@ fn query_recent(conn: &Connection, query: RecentQuery) -> Result<HistoryPage> {
            AND (?6 OR m.recalled_at IS NULL)
            AND (m.sent_at < ?7 OR (m.sent_at = ?7 AND m.id < ?8))
            AND (?9 IS NULL OR m.ingress_order IS NULL OR m.ingress_order < ?9)
+           AND (?11 IS NULL OR (m.ingress_order IS NOT NULL AND m.ingress_order > ?11))
           ORDER BY
             CASE WHEN ?9 IS NOT NULL AND m.ingress_order IS NOT NULL THEN 0 ELSE 1 END ASC,
             CASE WHEN ?9 IS NOT NULL THEN m.ingress_order END DESC,
@@ -1344,6 +1356,7 @@ fn query_recent(conn: &Connection, query: RecentQuery) -> Result<HistoryPage> {
             before.row_id,
             query.before_ingress_order,
             fetch_size as i64,
+            query.after_ingress_order,
         ],
         map_message,
     )?;
@@ -2201,6 +2214,46 @@ mod tests {
             Some("Yu yi")
         );
         assert_eq!(stored.group.group_id(), "group-1");
+    }
+
+    #[tokio::test]
+    async fn the_reply_window_can_start_after_what_a_previous_turn_already_showed() {
+        let (_temp, store) = test_store();
+        let key = group("bot-a", "group-1");
+        let mut first = message(key.clone(), "m1", "u1", "One", "已经发过", 10);
+        first.ingress_order = Some(100);
+        let mut second = message(key.clone(), "m2", "u2", "Two", "也发过", 10);
+        second.ingress_order = Some(200);
+        let mut third = message(key.clone(), "m3", "u3", "Three", "新到的", 10);
+        third.ingress_order = Some(300);
+        store
+            .record_messages(vec![first, second, third])
+            .await
+            .unwrap();
+
+        // Everything up to the watermark is already sitting in the replayed
+        // conversation history, so the turn only carries what arrived since.
+        let page = store
+            .recent(
+                RecentQuery::for_context(key.clone(), "default", 20).after_ingress_order(Some(200)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m3"]
+        );
+
+        // No watermark yet — the first turn of a conversation still gets a full
+        // opening snapshot.
+        let page = store
+            .recent(RecentQuery::for_context(key, "default", 20))
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len(), 3);
     }
 
     #[tokio::test]

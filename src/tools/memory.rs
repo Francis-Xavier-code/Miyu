@@ -106,7 +106,9 @@ pub(crate) fn register_readonly_with_context(
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": t("Search keywords or question.", "搜索关键词或问题。") },
-                    "max_results": { "type": "integer", "description": t("Optional result limit.", "可选结果数量限制。") }
+                    "max_results": { "type": "integer", "description": t("Optional result limit.", "可选结果数量限制。") },
+                    "start_time": { "type": "string", "description": t("Optional lower bound: RFC 3339, YYYY-MM-DD, or YYYY-MM-DD HH:MM[:SS].", "可选起始时间：RFC 3339、YYYY-MM-DD 或 YYYY-MM-DD HH:MM[:SS]。") },
+                    "end_time": { "type": "string", "description": t("Optional upper bound, same formats; a bare date covers that whole day.", "可选结束时间，格式同上；仅日期时包含当天。") }
                 },
                 "required": ["query"],
                 "additionalProperties": false

@@ -106,6 +106,37 @@ pub const MAX_PLATFORM_COMMAND_PREFIX_CHARS: usize = 32;
 pub const MAX_PLATFORM_SESSION_RUNNING: usize = 16;
 pub const MAX_PLATFORM_SESSION_QUEUED: usize = 64;
 
+/// Group overflow handling. Groups and terminal sessions want opposite things
+/// here: a coding session benefits from `compact` folding old turns into a
+/// summary it can keep reasoning from, while summarising a group log destroys
+/// the structured record every `回复引用: msg=…` points at. Groups drop whole
+/// turns instead, and drop a lot at once so the surviving prefix stays stable
+/// for a long stretch rather than being clipped every few turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlatformGroupContextConfig {
+    /// `compact` / `pop`; empty inherits `context.on_overflow`.
+    pub on_overflow: String,
+    /// Fraction of the window released in one trim; 0 inherits
+    /// `context.trim_batch_ratio`.
+    pub trim_batch_ratio: f32,
+}
+
+impl Default for PlatformGroupContextConfig {
+    fn default() -> Self {
+        Self {
+            on_overflow: "pop".to_string(),
+            trim_batch_ratio: 0.5,
+        }
+    }
+}
+
+impl PlatformGroupContextConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlatformSessionLimits {
@@ -1935,6 +1966,11 @@ pub struct OneBotConfig {
     pub group_chats: QqGroupChatsConfig,
     #[serde(default, skip_serializing_if = "PlatformSessionLimits::is_default")]
     pub session_limits: PlatformSessionLimits,
+    #[serde(
+        default,
+        skip_serializing_if = "PlatformGroupContextConfig::is_default"
+    )]
+    pub group_context: PlatformGroupContextConfig,
     /// QQ-wide text model pool. None inherits the global pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_models: Option<Vec<ActiveProviderModelConfig>>,
@@ -2099,6 +2135,7 @@ impl Default for OneBotConfig {
             private_chats: QqPrivateChatsConfig::default(),
             group_chats: QqGroupChatsConfig::default(),
             session_limits: PlatformSessionLimits::default(),
+            group_context: PlatformGroupContextConfig::default(),
             text_models: None,
             multimodal_models: None,
             non_whitelist_text_models: None,

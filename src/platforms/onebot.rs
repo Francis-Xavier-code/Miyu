@@ -741,8 +741,15 @@ pub(crate) async fn wake_conversation_for_job(
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),
         memory_write_enabled: context.config.platforms.qq.memory.write_enabled,
-        suppress_session_history: context.conversation.kind == ConversationKind::Group
-            && context.plugin_enabled("real_context", true),
+        // Groups keep their own turn history now. The structured log still
+        // carries who said what — the protocol offers no third role and drops
+        // `name`, so identity can only live in the text — but the log is
+        // additive: each turn appends what arrived since the last one, and
+        // earlier turns replay verbatim. Miyu's own turns become real
+        // assistant messages instead of one `[你]` line in a rolling window.
+        suppress_session_history: false,
+        group_context: (context.conversation.kind == ConversationKind::Group)
+            .then(|| context.config.platforms.qq.group_context.clone()),
         platform: Some(context.clone()),
         followup: None,
     };
@@ -3717,8 +3724,15 @@ async fn build_and_run_turn(
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),
         memory_write_enabled: context.config.platforms.qq.memory.write_enabled,
-        suppress_session_history: context.conversation.kind == ConversationKind::Group
-            && context.plugin_enabled("real_context", true),
+        // Groups keep their own turn history now. The structured log still
+        // carries who said what — the protocol offers no third role and drops
+        // `name`, so identity can only live in the text — but the log is
+        // additive: each turn appends what arrived since the last one, and
+        // earlier turns replay verbatim. Miyu's own turns become real
+        // assistant messages instead of one `[你]` line in a rolling window.
+        suppress_session_history: false,
+        group_context: (context.conversation.kind == ConversationKind::Group)
+            .then(|| context.config.platforms.qq.group_context.clone()),
         platform: Some(context),
         followup: None,
     };

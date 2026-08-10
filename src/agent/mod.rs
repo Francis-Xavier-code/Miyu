@@ -1448,7 +1448,12 @@ impl Agent {
             self.switch_mode(mode, control.tools(mode));
             self.refresh_system_prompt()?;
         }
-        replace_request_mode_context(messages, &self.system_prompt, mode);
+        replace_request_mode_context(
+            messages,
+            &self.system_prompt,
+            mode,
+            self.platform_context.is_some(),
+        );
 
         let consumed = prepared
             .iter()
@@ -3531,6 +3536,15 @@ impl Agent {
             let turns = self.state.load_visible_turns_excluding(current_turn_id)?;
             for turn in &turns {
                 if turn.is_summary {
+                    continue;
+                }
+                // A turn still running holds a placeholder that gets overwritten
+                // with the real reply once it finishes, so replaying it would
+                // put two different byte sequences at the same position and
+                // drop the prefix cache for everyone after it. Roughly a fifth
+                // of this group's turns overlap. The placeholder only ever said
+                // "ignore me" anyway.
+                if turn.status == crate::state::TurnStatus::Running {
                     continue;
                 }
                 self.push_history_turn(&mut messages, turn);
@@ -6264,6 +6278,50 @@ mod tests {
         assert_eq!(messages[user + 2].role, "user");
         assert!(text(&messages[user + 2]).contains("frozen recall"));
         assert!(user + 2 < assistant);
+    }
+
+    #[test]
+    fn a_still_running_turn_stays_out_of_everyone_elses_history() {
+        // A running turn holds a placeholder that is overwritten with the real
+        // reply when it finishes, so replaying it puts two different byte
+        // sequences at the same position and drops the prefix cache for every
+        // turn behind it. About a fifth of this group's turns overlap.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let state = StateStore::new(&paths).unwrap();
+        state
+            .start_turn("t1", "第一条", std::process::id())
+            .unwrap();
+        state
+            .complete_turn_with_usage_and_model(
+                "t1",
+                "答复一",
+                None,
+                None,
+                None,
+                TurnTokens::default(),
+                false,
+            )
+            .unwrap();
+        state
+            .start_turn("t2", "并发的一条", std::process::id())
+            .unwrap();
+
+        let visible = state.load_visible_turns_excluding("t3").unwrap();
+        let running: Vec<&str> = visible
+            .iter()
+            .filter(|turn| turn.status == crate::state::TurnStatus::Running)
+            .map(|turn| turn.turn_id.as_str())
+            .collect();
+        assert_eq!(running, ["t2"], "the store still hands them over");
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|turn| turn.status != crate::state::TurnStatus::Running)
+                .count(),
+            1,
+            "and exactly one is replayable"
+        );
     }
 
     #[test]

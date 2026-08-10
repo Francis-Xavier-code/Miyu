@@ -551,6 +551,8 @@ pub(crate) struct TurnProfile {
     /// Structured platform history replaces ambiguous core user/assistant
     /// replay for shared conversations such as QQ groups.
     pub(crate) suppress_session_history: bool,
+    /// Group overflow handling; `None` inherits the global `context` settings.
+    pub(crate) group_context: Option<crate::config::PlatformGroupContextConfig>,
     pub(crate) followup: Option<Arc<PlatformFollowupRun>>,
 }
 
@@ -568,6 +570,7 @@ impl Default for TurnProfile {
             image_source_label: None,
             memory_write_enabled: true,
             suppress_session_history: false,
+            group_context: None,
             followup: None,
         }
     }

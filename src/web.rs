@@ -6117,6 +6117,17 @@ async fn run_turn_task(
         if let Some(models) = &profile.text_models {
             config.active_provider_models = Some(models.clone());
         }
+        // Groups drop whole turns instead of summarising: a compaction would
+        // fold the structured group log into prose and every
+        // `回复引用: msg=…` in the surviving turns would point at nothing.
+        if let Some(group_context) = &profile.group_context {
+            if !group_context.on_overflow.trim().is_empty() {
+                config.context.on_overflow = group_context.on_overflow.trim().to_string();
+            }
+            if group_context.trim_batch_ratio > 0.0 {
+                config.context.trim_batch_ratio = group_context.trim_batch_ratio;
+            }
+        }
         if let Some(models) = &profile.multimodal_models {
             config.active_multimodal_provider_models = Some(models.clone());
             // A conversation-specific multimodal pool is an explicit

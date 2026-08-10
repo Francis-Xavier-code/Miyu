@@ -105,6 +105,45 @@ impl RealContextPlugin {
         message_history::store_for_paths(&context.paths)
     }
 
+    fn watermark_scope(context: &PlatformTurnContext) -> crate::state::PlatformPluginScopeKey {
+        crate::state::PlatformPluginScopeKey {
+            plugin_id: "real_context".to_string(),
+            platform: context.conversation.platform.clone(),
+            account_id: context.conversation.account_id.clone(),
+            conversation_kind: context.conversation.kind.as_str().to_string(),
+            conversation_id: context.conversation.conversation_id.clone(),
+        }
+    }
+
+    /// Highest ingress order already rendered into this conversation's replayed
+    /// history. Best effort: losing it only costs one oversized turn, never
+    /// correctness, because the block is additive either way.
+    fn reply_watermark(&self, context: &PlatformTurnContext) -> Option<i64> {
+        context
+            .state_store
+            .plugin_get_json::<i64>(&Self::watermark_scope(context), REPLY_WATERMARK_KEY)
+            .ok()
+            .flatten()
+    }
+
+    fn store_reply_watermark(&self, context: &PlatformTurnContext, high: i64) {
+        if let Err(error) = context.state_store.plugin_put_json(
+            &Self::watermark_scope(context),
+            REPLY_WATERMARK_KEY,
+            &high,
+        ) {
+            tracing::warn!(
+                target: "miyu::qq",
+                error = %error,
+                "{}",
+                crate::i18n::text(
+                    "failed to persist the group reply watermark",
+                    "保存群聊回复水位线失败"
+                )
+            );
+        }
+    }
+
     async fn decide_group_trigger(
         &self,
         context: &PlatformTurnContext,
@@ -764,10 +803,17 @@ impl RealContextPlugin {
                     context.config.active_persona_scope(),
                     query_limit,
                 )
-                .before_ingress_order(ingress_order),
+                .before_ingress_order(ingress_order)
+                .after_ingress_order(watermark),
             )
-            .await?
-            .messages;
+            .await?;
+        // More arrived since the last turn than one block carries, and the
+        // watermark is about to move past the remainder. Skipping them is the
+        // intended behaviour — nobody scrolling a busy group reads every line —
+        // but the replayed history reads as continuous, so Miyu is told it
+        // skimmed rather than left to assume it saw everything.
+        let truncated_backlog = watermark.is_some() && page.next_cursor.is_some();
+        let mut history = page.messages;
         let queried_messages = history.len();
         if let Some(event) = context.inbound_event() {
             prepare_history(&mut history, &event.message_id, count);

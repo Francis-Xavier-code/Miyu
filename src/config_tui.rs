@@ -3643,10 +3643,42 @@ fn edit_qq_advanced(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<(
             ),
             qq.max_reply_chars.to_string(),
         ),
+        Field::new(
+            t(
+                "Group overflow (compact / pop)",
+                "群聊上下文溢出策略（compact 摘要 / pop 丢弃最旧）",
+            ),
+            qq.group_context.on_overflow.clone(),
+        ),
+        Field::new(
+            t(
+                "Group trim batch (0-1, share released per trim)",
+                "群聊单次丢弃比例（0-1，一次让出的窗口占比）",
+            ),
+            qq.group_context.trim_batch_ratio.to_string(),
+        ),
     ];
     if run_form(stdout, t(" QQ ADVANCED ", " QQ 高级设置 "), &mut fields)? {
         config.platforms.qq.asset_base_url =
             fields[0].value.trim().trim_end_matches('/').to_string();
+        let overflow = fields[2].value.trim().to_ascii_lowercase();
+        if !matches!(overflow.as_str(), "compact" | "pop") {
+            return Err(anyhow::anyhow!(t(
+                "Group overflow must be compact or pop.",
+                "群聊溢出策略只能是 compact 或 pop。"
+            )));
+        }
+        let batch: f32 = fields[3].value.trim().parse().map_err(|_| {
+            anyhow::anyhow!(t("Invalid group trim batch.", "群聊单次丢弃比例无效。"))
+        })?;
+        if !(0.0..1.0).contains(&batch) {
+            return Err(anyhow::anyhow!(t(
+                "Group trim batch must be between 0 and 1.",
+                "群聊单次丢弃比例必须在 0 与 1 之间。"
+            )));
+        }
+        config.platforms.qq.group_context.on_overflow = overflow;
+        config.platforms.qq.group_context.trim_batch_ratio = batch;
         config.platforms.qq.max_reply_chars = fields[1].value.trim().parse().map_err(|_| {
             anyhow::anyhow!(t("Invalid maximum reply length.", "单条回复最大字数无效。"))
         })?;
