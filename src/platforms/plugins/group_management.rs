@@ -454,8 +454,32 @@ impl GroupManagementPlugin {
             target_id = user_id,
             "recording QQ group management intent"
         );
+        let mut bridge_error = None;
         if let Err(error) = context.set_group_kick(user_id, blacklist).await {
-            return failure_for_target(error, user_id);
+            // NapCat reports a successful kick as `status=failed, retcode=100,
+            // detail=kick member failed: <protobuf>` — and that protobuf starts
+            // `08 00`, field 1 varint 0, the platform's own success code. The
+            // member really is gone; only the envelope says otherwise. Asking
+            // the server who is in the group settles it without having to
+            // pattern-match a bridge's error text, and a genuine failure (an
+            // unresolvable UIN, missing permission) still leaves the member in
+            // place and is still reported as a failure.
+            match context.group_member_fresh(user_id).await {
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "miyu::qq",
+                        user_id,
+                        error = %error,
+                        "{}",
+                        crate::i18n::text(
+                            "the kick bridge reported a failure but the member is gone; treating it as done",
+                            "踢人接口报错但成员已不在群里，按成功处理",
+                        )
+                    );
+                    bridge_error = Some(error.to_string());
+                }
+                _ => return failure_for_target(error, user_id),
+            }
         }
         let record = KickRecord {
             record_id: record_id(),
@@ -503,7 +527,15 @@ impl GroupManagementPlugin {
         {
             audit_errors.push(format!("real context: {error}"));
         }
-        external_operation_result(json!({ "record": record }), audit_errors)
+        let mut data = json!({ "record": record });
+        if let Some(bridge_error) = bridge_error {
+            // Surfaced, not swallowed: the model should say the kick went
+            // through, and an operator reading the transcript should still see
+            // that the bridge disagreed.
+            data["bridge_reported_error"] = Value::String(bridge_error);
+            data["verified_by"] = Value::String("group_member_fresh".to_string());
+        }
+        external_operation_result(data, audit_errors)
     }
 
     async fn title(&self, args: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
