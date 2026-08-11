@@ -77,7 +77,8 @@ const MAX_BASE64_FILE_BYTES: usize = 16 * 1024 * 1024;
 const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const FILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const API_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Ceiling for size-scaled message sends (see `send_timeout_for`).
+/// Backstop for attachment sends (see `send_timeout_for`). Not a budget: it
+/// only exists so a connected-but-silent NapCat cannot wedge a conversation.
 const MAX_SEND_TIMEOUT: Duration = Duration::from_secs(180);
 const QUOTED_MESSAGE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounds parsed/in-flight events per NapCat connection. Same-conversation
@@ -5532,26 +5533,35 @@ fn partial_send_error(error: anyhow::Error, receipt: SendReceipt) -> anyhow::Err
 /// Sends carrying base64 images need far longer than a plain text call: a
 /// 2 MiB picture is ~2.9 MB of JSON that NapCat has to receive, decode and
 /// upload to QQ. Timing out early is worse than waiting — the message is
-/// still delivered, but Miyu records the turn as interrupted and the model
-/// re-sends it, which is exactly the duplicate-image bug.
+/// still delivered, but Miyu treats the send as failed and posts the plain
+/// text fallback, so the group gets the picture *and* the text.
+///
+/// Size-scaling the budget only moved the cliff, and it moved it unevenly: the
+/// old `div_ceil` step gave 0.99 MiB the same 30s as 64 KiB, so payloads just
+/// under a megabyte boundary had the tightest work-to-budget ratio of all. An
+/// attachment send now simply waits for NapCat instead of guessing how long it
+/// should take.
+///
+/// `MAX_SEND_TIMEOUT` stays as a backstop rather than a budget. Losing the
+/// connection already frees an in-flight call — `pending` hangs off the
+/// per-connection `ConnectionHandle`, which `connection_loop` drops on exit,
+/// so every waiting `oneshot` resolves immediately. The backstop only covers
+/// a NapCat that stays connected but never answers this one echo, which would
+/// otherwise wedge the conversation forever (same-conversation turns are
+/// serialized and each in-flight message holds one of `MAX_IN_FLIGHT_MESSAGES`).
 fn send_timeout_for(segments: &[Value]) -> Duration {
-    let payload_bytes: usize = segments
-        .iter()
-        .filter_map(|segment| {
-            segment
-                .get("data")
-                .and_then(|data| data.get("file"))
-                .and_then(Value::as_str)
-        })
-        .map(str::len)
-        .sum();
-    if payload_bytes == 0 {
-        return API_CALL_TIMEOUT;
+    let carries_attachment = segments.iter().any(|segment| {
+        segment
+            .get("data")
+            .and_then(|data| data.get("file"))
+            .and_then(Value::as_str)
+            .is_some_and(|file| !file.is_empty())
+    });
+    if carries_attachment {
+        MAX_SEND_TIMEOUT
+    } else {
+        API_CALL_TIMEOUT
     }
-    let megabytes = (payload_bytes as u64).div_ceil(1024 * 1024);
-    API_CALL_TIMEOUT
-        .saturating_add(Duration::from_secs(20 * megabytes))
-        .min(MAX_SEND_TIMEOUT)
 }
 
 fn image_segment(bytes: &[u8]) -> Value {
@@ -8225,24 +8235,30 @@ mod tests {
         assert!(error.contains("消息已超过撤回时限"));
     }
 
-    /// Regression: a 2 MiB picture is ~2.9 MB of base64 JSON that NapCat
-    /// needs far longer than the plain 10s API budget to upload. Timing out
-    /// early made Miyu record a delivered reply as interrupted, and the
-    /// recovery turn re-sent the same image.
+    /// Regression: a picture is megabytes of base64 JSON that NapCat has to
+    /// receive, decode and upload to QQ. Any budget short of the backstop made
+    /// Miyu treat a delivered image as failed and post the text fallback on top
+    /// of it. Size scaling was not enough — the old `div_ceil` step handed a
+    /// 0.99 MiB payload the same 30s as a 64 KiB one.
     #[test]
-    fn image_sends_get_a_size_scaled_timeout() {
+    fn attachment_sends_wait_for_napcat_instead_of_a_size_budget() {
         let text_only = vec![text_segment("hello")];
         assert_eq!(send_timeout_for(&text_only), API_CALL_TIMEOUT);
 
         let small_image = vec![image_segment(&vec![0u8; 64 * 1024])];
-        assert!(send_timeout_for(&small_image) > API_CALL_TIMEOUT);
+        assert_eq!(send_timeout_for(&small_image), MAX_SEND_TIMEOUT);
 
-        let big_image = vec![image_segment(&vec![0u8; 2 * 1024 * 1024])];
-        assert!(send_timeout_for(&big_image) > send_timeout_for(&small_image));
-        assert!(send_timeout_for(&big_image) <= MAX_SEND_TIMEOUT);
+        // The old boundary case: just under a megabyte used to share the
+        // smallest budget with a thumbnail.
+        let boundary_image = vec![image_segment(&vec![0u8; 700 * 1024])];
+        assert_eq!(send_timeout_for(&boundary_image), MAX_SEND_TIMEOUT);
 
         let huge_image = vec![image_segment(&vec![0u8; 19 * 1024 * 1024])];
         assert_eq!(send_timeout_for(&huge_image), MAX_SEND_TIMEOUT);
+
+        // Mixed frames follow the attachment, not the text.
+        let mixed = vec![text_segment("看图"), image_segment(&vec![0u8; 4096])];
+        assert_eq!(send_timeout_for(&mixed), MAX_SEND_TIMEOUT);
     }
 
     #[tokio::test]
