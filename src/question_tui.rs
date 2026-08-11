@@ -7,8 +7,7 @@ use anyhow::{bail, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyModifiers, PopKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
@@ -369,17 +368,15 @@ impl QuestionSession {
             let _ = terminal::disable_raw_mode();
             return Err(err.into());
         }
-        // 1. 尽量启用键盘增强，使 Shift+Enter 可被识别
-        // 2. Windows 旧控制台可能不支持，失败时仍保持普通输入
-        let keyboard_enhancement_active = if cfg!(windows) {
-            false
-        } else {
-            execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-            .is_ok()
-        };
+        // 这里曾经 push DISAMBIGUATE_ESCAPE_CODES(kitty 键盘协议)，只为让
+        // Shift+Enter 可被识别。代价不成比例：协议一开，终端把每个按键报成
+        // CSI u 序列(`ESC[17u`、`ESC[5u`)，而 Pop 只在 `Drop` 里发生——面板
+        // 没能正常析构、Pop 写失败、或终端/复用器不实现这个栈，任何一种情况
+        // 都会让协议留在开着的状态，此后 REPL 输入框里敲什么都变成 `[17u`
+        // 这类字符，回合也跟着卡死。换行是便利，终端可用性不是。
+        //
+        // Shift+Enter 因此退化为普通 Enter(提交)，多行答案改用面板自身的编辑键。
+        let keyboard_enhancement_active = false;
         let (_, cursor_y) =
             crossterm::cursor::position().unwrap_or((0, panel_lines.saturating_sub(1)));
         let anchor_y = cursor_y.saturating_sub(panel_lines.saturating_sub(1));
@@ -510,10 +507,13 @@ impl Drop for QuestionSession {
         // 2. 若启用过键盘增强则 Pop
         // 3. 退出 raw mode
         let _ = execute!(self.stdout, DisableBracketedPaste, Show);
-        if self.keyboard_enhancement_active {
-            let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
-            self.keyboard_enhancement_active = false;
-        }
+        // Defensive, not symmetric: this build never pushes, but a terminal an
+        // older build left in kitty keyboard mode is otherwise stuck for the
+        // rest of its life. Popping an empty stack is a no-op on terminals that
+        // implement the protocol and ignored by those that do not, so this can
+        // only repair.
+        let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
+        self.keyboard_enhancement_active = false;
         let _ = terminal::disable_raw_mode();
     }
 }
