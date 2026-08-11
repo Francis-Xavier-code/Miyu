@@ -9781,6 +9781,7 @@ mod tests {
 
     fn test_paths(root: &FilePath) -> MiyuPaths {
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
@@ -11178,6 +11179,7 @@ mod tests {
         config.plugins.api_quota.openrouter.api_key = "openrouter-secret".to_string();
         let paths = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: paths.path().to_path_buf(),
             config_dir: paths.path().join("config"),
             config_file: paths.path().join("config/config.jsonc"),
             skills_dir: paths.path().join("config/skills"),

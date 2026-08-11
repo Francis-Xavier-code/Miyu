@@ -3101,6 +3101,7 @@ mod tests {
 
     fn test_paths(temp: &tempfile::TempDir) -> MiyuPaths {
         MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),

@@ -488,8 +488,8 @@ async fn linux_system_facts(config: &DiagnosticsPluginConfig, report: &mut Evide
     ] {
         fact_env(report, &format!("env.{key}"), key);
     }
-    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
-        if let Some(name) = os_release_value(&text, "PRETTY_NAME") {
+    if let Some(text) = crate::host_info::os_release_text() {
+        if let Some(name) = crate::host_info::os_release_value(&text, "PRETTY_NAME") {
             report
                 .facts
                 .insert("os.pretty_name".to_string(), json!(name));
@@ -1948,13 +1948,6 @@ fn extract_lspci_gpu_blocks(text: &str) -> Vec<String> {
         .take(80)
         .map(redact)
         .collect()
-}
-
-fn os_release_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let (name, value) = line.split_once('=')?;
-        (name == key).then(|| value.trim_matches('"').to_string())
-    })
 }
 
 fn mask_network_addresses(text: &str) -> String {

@@ -1,4 +1,5 @@
 use super::{CommandOutputStream, ToolProgress, ToolRegistry, ToolSpec};
+use crate::host_info::{parse_macos_system_version, read_small_file};
 use crate::i18n::agent_text as t;
 use crate::tools::patch_preview::write_with_patch_preview;
 use anyhow::{bail, Result};
@@ -93,13 +94,16 @@ fn check_os_info() -> Result<String> {
             }
         }
     }
-    let os_release = read_small_file("/etc/os-release");
+    // Shared with the `<host-environment/>` prompt block so the two never
+    // disagree about what OS this is; `os_release_text` also covers the
+    // `/usr/lib/os-release` fallback that image-based distros rely on.
+    let os_release = crate::host_info::os_release_text();
     let arch_release = read_small_file("/etc/arch-release").is_some();
     let debian_version = read_small_file("/etc/debian_version");
     let fedora_release = read_small_file("/etc/fedora-release");
     let proc_version = read_small_file("/proc/version");
     let proc_cmdline = read_small_file("/proc/cmdline");
-    let macos_system_version = read_small_file("/System/Library/CoreServices/SystemVersion.plist");
+    let macos_system_version = crate::host_info::macos_system_version_text();
     let macos = parse_macos_system_version(macos_system_version.as_deref());
     let package_manager_guess = package_manager_guess(
         &os_release,
@@ -130,17 +134,6 @@ fn check_os_info() -> Result<String> {
             "This only reports basic OS context. For concrete Linux input method issues, load the linux-input-method-diagnose skill."
         ],
     }))?)
-}
-
-fn read_small_file(path: &str) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > 64 * 1024 {
-        return None;
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn package_manager_guess(
@@ -186,29 +179,6 @@ fn package_manager_guess(
         managers.push("unknown");
     }
     managers
-}
-
-fn parse_macos_system_version(raw: Option<&str>) -> Value {
-    let Some(raw) = raw else {
-        return Value::Null;
-    };
-    json!({
-        "product_name": plist_value(raw, "ProductName"),
-        "product_version": plist_value(raw, "ProductVersion"),
-        "product_build_version": plist_value(raw, "ProductBuildVersion"),
-    })
-}
-
-fn plist_value(raw: &str, key: &str) -> Option<String> {
-    let marker = format!("<key>{key}</key>");
-    let after_key = raw.split(&marker).nth(1)?;
-    let after_string = after_key.split("<string>").nth(1)?;
-    after_string
-        .split("</string>")
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 pub(crate) fn read_file(args: Value) -> Result<String> {

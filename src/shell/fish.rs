@@ -411,6 +411,7 @@ mod tests {
     fn uninstall_reports_only_existing_hook() {
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().to_path_buf(),
             config_file: temp.path().join("config.json"),
             skills_dir: temp.path().join("skills"),

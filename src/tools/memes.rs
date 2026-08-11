@@ -1652,6 +1652,7 @@ mod tests {
         let image = PathBuf::from(std::env::var("MIYU_E2E_IMAGE").unwrap());
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: config_dir.clone(),
             config_dir: config_dir.clone(),
             config_file: config_dir.join("config.jsonc"),
             skills_dir: config_dir.join("skills"),

@@ -14,6 +14,11 @@ const RESOURCE_MIGRATION_JOURNAL: &str = ".resource-layout-v1.journal.json";
 
 #[derive(Debug, Clone)]
 pub struct MiyuPaths {
+    /// Everything below lives under this root (`~/.miyu`, or `MIYU_HOME`).
+    /// Kept as its own field because the model is told where Miyu's files are
+    /// and guessing it back from a child directory would silently break the
+    /// day the layout changes.
+    pub root_dir: PathBuf,
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
     pub skills_dir: PathBuf,
@@ -134,6 +139,10 @@ impl MiyuPaths {
         let system_scripts_dir = PathBuf::from("/usr/share/miyu/scripts");
 
         Ok(Self {
+            // The canonical home even inside the transient legacy window: that
+            // window only exists while an old daemon still holds the XDG files
+            // open, and it closes as soon as the new daemon migrates them here.
+            root_dir,
             config_file: config_dir.join("config.jsonc"),
             skills_dir: resource_config_dir.join("skills"),
             config_dir,
@@ -2092,6 +2101,7 @@ mod tests {
         let base = BaseDirs::new().unwrap();
         let root = base.home_dir().join(".miyu");
         let paths = MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("data/skills"),

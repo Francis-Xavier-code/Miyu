@@ -555,6 +555,7 @@ mod tests {
 
     fn test_paths(state_dir: PathBuf) -> MiyuPaths {
         MiyuPaths {
+            root_dir: PathBuf::new(),
             config_dir: PathBuf::new(),
             config_file: PathBuf::new(),
             skills_dir: PathBuf::new(),

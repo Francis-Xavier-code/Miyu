@@ -2640,6 +2640,7 @@ fn append_alarm_log(paths: &MiyuPaths, line: &str) -> Result<()> {
 
 fn alarm_worker_paths(state_dir: PathBuf, cache_dir: PathBuf) -> MiyuPaths {
     MiyuPaths {
+        root_dir: PathBuf::new(),
         config_dir: PathBuf::new(),
         config_file: PathBuf::new(),
         skills_dir: PathBuf::new(),
@@ -13314,6 +13315,7 @@ mod repl_input_tests {
 
     fn pop_test_paths(root: &std::path::Path) -> MiyuPaths {
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
@@ -13424,6 +13426,7 @@ mod repl_input_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let paths = MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
@@ -15444,6 +15447,7 @@ mod repl_input_tests {
     fn repl_history_loads_user_messages_from_state() {
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: PathBuf::new(),
             config_dir: PathBuf::new(),
             config_file: PathBuf::new(),
             skills_dir: PathBuf::new(),

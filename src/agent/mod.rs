@@ -4,6 +4,7 @@ pub(crate) mod overflow;
 
 use crate::clipboard::{ClipboardImage, PastedImage};
 use crate::config::{AppConfig, PromptAudience};
+use crate::host_info::xml_attr_escape;
 use crate::llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatResult, ChatStreamChunk, ChatStreamKind,
     ImageUrlContent, OpenAiCompatibleClient, ToolCall, ToolCallFunction, TurnTokens, Usage,
@@ -996,7 +997,11 @@ impl Agent {
         // maintenance (prompt-change reset, stale-turn recovery) lives in
         // `prepare_for_turn`.
         let base_system_prompt = config.system_prompt_for(paths, prompt_audience)?;
-        let system_prompt = with_mode_reminder(base_system_prompt, mode);
+        let system_prompt = with_host_environment(
+            with_mode_reminder(base_system_prompt, mode),
+            prompt_audience,
+            paths,
+        );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
         let memory = MemoryStore::new(&config, paths);
@@ -1108,9 +1113,13 @@ impl Agent {
             self.state.recover_stale_turns()?;
             self.maybe_cold_resume_prune()?;
         }
-        self.system_prompt = with_runtime_system_context(
-            with_mode_reminder(effective_system_prompt, self.mode),
-            &self.runtime_system_context,
+        self.system_prompt = with_host_environment(
+            with_runtime_system_context(
+                with_mode_reminder(effective_system_prompt, self.mode),
+                &self.runtime_system_context,
+            ),
+            self.prompt_audience,
+            &self.paths,
         );
         Ok(())
     }
@@ -1385,9 +1394,13 @@ impl Agent {
         let base_system_prompt = self
             .config
             .system_prompt_for(&self.paths, self.prompt_audience)?;
-        self.system_prompt = with_runtime_system_context(
-            with_mode_reminder(base_system_prompt, self.mode),
-            &self.runtime_system_context,
+        self.system_prompt = with_host_environment(
+            with_runtime_system_context(
+                with_mode_reminder(base_system_prompt, self.mode),
+                &self.runtime_system_context,
+            ),
+            self.prompt_audience,
+            &self.paths,
         );
         Ok(())
     }
@@ -5286,6 +5299,31 @@ fn with_runtime_system_context(mut system_prompt: String, context: &[String]) ->
     system_prompt
 }
 
+/// Appends the static host block to the stable prefix.
+///
+/// It belongs here rather than in the per-turn `<runtime …/>` tail: the tail is
+/// fossilized into `turns.context_messages` and replayed byte-for-byte by every
+/// later turn, so a process-constant put there is re-sent once per turn and
+/// piles up in the request; in the system prompt it is paid once and then
+/// served from the provider's prefix cache.
+///
+/// Only owner sessions get it. A QQ reply has no use for kernel versions, and
+/// skipping the append outright — rather than adding an empty block — keeps
+/// those sessions' system prompt byte-identical to what the provider already
+/// has cached, so the platform side sees no cold start at all.
+fn with_host_environment(
+    mut system_prompt: String,
+    audience: PromptAudience,
+    paths: &MiyuPaths,
+) -> String {
+    if audience != PromptAudience::Owner {
+        return system_prompt;
+    }
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(&crate::host_info::host_environment_block(&paths.root_dir));
+    system_prompt
+}
+
 fn active_text_pool_supports_vision(config: &AppConfig) -> bool {
     let choices = config.active_provider_model_choices();
     !choices.is_empty()
@@ -5618,14 +5656,6 @@ fn terminal_runtime_context() -> String {
         xml_attr_escape(&shell),
         xml_attr_escape(&terminal)
     )
-}
-
-fn xml_attr_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn clean_user_visible_text(input: &str) -> String {
@@ -6215,6 +6245,42 @@ mod tests {
             platform.len() * 3 < runtime_context(AgentMode::Normal, false).len(),
             "{platform}"
         );
+    }
+
+    #[test]
+    fn host_environment_rides_the_system_prompt_for_owners_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+
+        let owner = with_host_environment("base".to_string(), PromptAudience::Owner, &paths);
+        assert!(owner.starts_with("base\n\n<host-environment os=\""));
+        assert!(owner.ends_with("/>"));
+        assert!(owner.contains(&format!(" miyu_home=\"{}\"", paths.root_dir.display())));
+        // The static block must not be mistaken for the per-turn stamp, and
+        // `mode_reminder_does_not_inject_a_reasoning_title_protocol` asserts the
+        // system prompt never carries a `<runtime` tag.
+        assert!(!owner.contains("<runtime"));
+
+        // Platform and judge sessions come out byte-identical to today's prompt,
+        // so they take no prefix-cache cold start from this change at all.
+        for audience in [PromptAudience::External, PromptAudience::Internal] {
+            assert_eq!(
+                with_host_environment("base".to_string(), audience, &paths),
+                "base",
+                "{audience:?} must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn host_environment_is_byte_stable_across_prompt_rebuilds() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        // Rebuilt on every turn by `prepare_for_turn`; a value that drifted
+        // between rebuilds would move the prefix and cost a cache miss a turn.
+        let first = with_host_environment(String::new(), PromptAudience::Owner, &paths);
+        let second = with_host_environment(String::new(), PromptAudience::Owner, &paths);
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -8503,6 +8569,7 @@ mod tests {
 
     fn test_paths(root: &std::path::Path) -> MiyuPaths {
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),

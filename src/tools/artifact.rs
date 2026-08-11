@@ -381,6 +381,7 @@ mod tests {
     fn artifact_manifest_lists_names_without_file_contents() {
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),

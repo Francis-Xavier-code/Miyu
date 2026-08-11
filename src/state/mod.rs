@@ -2032,6 +2032,7 @@ mod tests {
     fn turn_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2066,6 +2067,7 @@ mod tests {
     fn question_exchange_persists_with_user_role_history() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2111,6 +2113,7 @@ mod tests {
     fn interrupt_turn() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2137,6 +2140,7 @@ mod tests {
     fn interrupted_turn_materializes_persisted_journal_output() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2259,6 +2263,7 @@ mod tests {
     fn recover_stale_running() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2443,6 +2448,7 @@ mod tests {
     fn undo_removes_last_turn() {
         let temp = tempfile::tempdir().unwrap();
         let store = StateStore::new(&MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),
@@ -2474,6 +2480,7 @@ mod tests {
 
     fn test_paths(root: &Path) -> MiyuPaths {
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
@@ -3971,6 +3978,7 @@ mod tests {
         drop(store);
 
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("config/skills"),

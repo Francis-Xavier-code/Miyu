@@ -7835,6 +7835,7 @@ mod tests {
         )
         .unwrap();
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().to_path_buf(),
             config_file,
             skills_dir: temp.path().join("skills"),
@@ -7944,6 +7945,7 @@ mod tests {
     fn default_prompt_resources_follow_the_data_resource_layout() {
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("data/skills"),
@@ -8111,6 +8113,7 @@ mod tests {
     fn reserved_system_prompt_file_is_not_a_persona() {
         let temp = tempfile::tempdir().unwrap();
         let paths = MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
             config_dir: temp.path().join("config"),
             config_file: temp.path().join("config/config.jsonc"),
             skills_dir: temp.path().join("data/skills"),

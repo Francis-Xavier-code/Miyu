@@ -412,6 +412,7 @@ mod tests {
     fn test_paths() -> MiyuPaths {
         let root = PathBuf::from("/tmp/miyu-memory-tool-test");
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
