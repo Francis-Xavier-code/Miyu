@@ -943,6 +943,12 @@ pub struct StreamRenderer {
     wait_spinner: Option<WaitSpinner>,
     last_tick: Option<std::time::Instant>,
     preparing_question_started_at: Option<std::time::Instant>,
+    /// Phase text and start time for the "still receiving arguments" hint.
+    /// Sticky like `preparing_question_started_at` and for the same reason:
+    /// `tick_spinner` re-derives the phase from renderer state on every tick,
+    /// so a phase merely pushed into the spinner is overwritten before it can
+    /// be drawn.
+    tool_preparing: Option<(&'static str, std::time::Instant)>,
     subagent_mode: Option<ChatStreamKind>,
     sent_meme_filter: SentMemeStreamFilter,
 }
@@ -981,6 +987,7 @@ impl StreamRenderer {
             wait_spinner: None,
             last_tick: None,
             preparing_question_started_at: None,
+            tool_preparing: None,
             subagent_mode: None,
             sent_meme_filter: SentMemeStreamFilter::default(),
         }
@@ -1019,6 +1026,7 @@ impl StreamRenderer {
 
     pub fn start_reasoning_phase(&mut self, received_at: std::time::Instant) -> Result<()> {
         self.preparing_question_started_at = None;
+        self.tool_preparing = None;
         if self.reasoning_mode == ReasoningDisplayMode::Summary {
             self.reasoning_started_at = Some(received_at);
             self.reasoning_elapsed = None;
@@ -1040,6 +1048,12 @@ impl StreamRenderer {
             return format!(
                 "{} · {}",
                 t("~ Preparing question", "~ 准备问题"),
+                format_reasoning_elapsed(started_at.elapsed())
+            );
+        }
+        if let Some((phase, started_at)) = self.tool_preparing {
+            return format!(
+                "~ {phase} · {}",
                 format_reasoning_elapsed(started_at.elapsed())
             );
         }
@@ -1126,7 +1140,13 @@ impl StreamRenderer {
             .unwrap_or(true);
         if should_tick {
             let subagent_timer_active = self.has_running_subagent_timer();
-            if self.preparing_question_started_at.is_some() && self.wait_spinner.is_some() {
+            // Both sticky hints win over the tool/reasoning summaries below:
+            // they describe what the turn is blocked on right now, and the
+            // summaries would otherwise overwrite them on the very first tick
+            // after they are set — before the spinner has drawn once.
+            if (self.preparing_question_started_at.is_some() || self.tool_preparing.is_some())
+                && self.wait_spinner.is_some()
+            {
                 self.set_waiting_phase(self.waiting_phase_text());
             } else if self.tool_call_mode == ToolCallDisplayMode::Summary
                 && !self.tool_stats.is_empty()
@@ -1223,6 +1243,9 @@ impl StreamRenderer {
     }
 
     pub fn write_tool_call(&mut self, name: &str, arguments: &str) -> Result<()> {
+        // The arguments finished arriving, so the "still receiving" hint has
+        // done its job and hands the spinner back to the tool summary.
+        self.tool_preparing = None;
         if self.plain {
             return Ok(());
         }
@@ -1275,9 +1298,14 @@ impl StreamRenderer {
             return Ok(());
         };
         self.release_transient_output()?;
+        // Set before the spinner exists: `ensure_waiting_phase` ticks
+        // immediately, and that tick re-derives the phase from renderer state.
+        // Without the sticky field the tool summary or the reasoning timer wins
+        // there and the hint never reaches the screen.
+        self.tool_preparing = Some((phase, std::time::Instant::now()));
         // Braille + the dim tool palette: this is a tool starting up, not the
         // model thinking, and the scanner/green pair reads as the latter.
-        self.ensure_waiting_phase(format!("~ {phase}"), SpinnerStyle::Braille)
+        self.ensure_waiting_phase(self.waiting_phase_text(), SpinnerStyle::Braille)
     }
 
     pub fn write_tool_result(&mut self, name: &str, ok: bool, output: &str) -> Result<()> {
@@ -1544,6 +1572,7 @@ impl StreamRenderer {
 
     pub fn prepare_for_external_output(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
+        self.tool_preparing = None;
         self.release_transient_output()?;
         self.finalize_tools_summary()?;
         self.show_cursor()?;
@@ -1583,6 +1612,7 @@ impl StreamRenderer {
 
     pub fn finish(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
+        self.tool_preparing = None;
         self.stop_waiting()?;
         if let Some(mut display) = self.command_display.take() {
             display.commit(
@@ -5857,6 +5887,51 @@ mod tests {
         }
         assert!(phase_for("run_command").contains(t("~ Preparing command", "~ 准备执行")));
         assert!(phase_for("read_file").is_empty());
+    }
+
+    /// Regression: the hint above is announced mid-turn, when a reasoning
+    /// spinner is already up and earlier tools have filled `tool_stats`. Every
+    /// tick re-derives the phase from renderer state, so pushing the text into
+    /// the spinner was not enough — the tool summary overwrote it inside the
+    /// very `tick_spinner` that `ensure_waiting_phase` performs, and the hint
+    /// never reached the screen for anything except `ask_question` (which has
+    /// its own sticky flag).
+    #[test]
+    fn tool_preparing_survives_the_tick_that_re_derives_the_phase() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            false,
+            true,
+            10,
+        );
+        renderer.use_external_cursor_control();
+        renderer.use_buffered_output();
+        renderer.live_summary = true;
+        // Mid-turn state: the model has been thinking and already ran a tool.
+        renderer.reasoning_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        renderer.tool_stats_entry("read_file").calls += 1;
+
+        renderer.write_tool_preparing("run_command").unwrap();
+        assert!(renderer
+            .waiting_phase_text()
+            .starts_with(t("~ Preparing command · ", "~ 准备执行 · ")));
+        renderer.last_tick = None;
+        renderer.tick_spinner().unwrap();
+        assert!(
+            renderer
+                .waiting_phase_text()
+                .contains(t("Preparing command", "准备执行")),
+            "a tick must not hand the spinner back to the tool summary"
+        );
+
+        // The arguments arrived: the hint steps aside for the tool summary.
+        renderer.write_tool_call("run_command", "{}").unwrap();
+        assert!(renderer.tool_preparing.is_none());
+        assert!(!renderer
+            .waiting_phase_text()
+            .contains(t("Preparing command", "准备执行")));
     }
 
     #[test]
