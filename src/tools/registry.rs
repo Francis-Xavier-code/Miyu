@@ -36,13 +36,6 @@ pub enum ToolProgressEvent {
         stream: CommandOutputStream,
         chunk: Vec<u8>,
     },
-    /// A tool is about to do something irreversible and wants the user to look
-    /// at it first. Carries the responder the tool blocks on, the same way
-    /// `PrepareForExternalOutput` does.
-    ApprovalRequested {
-        request: crate::question::QuestionRequest,
-        responder: oneshot::Sender<crate::question::QuestionResponse>,
-    },
 }
 
 #[derive(Clone, Default)]
@@ -85,30 +78,6 @@ impl ToolProgress {
                 title: title.into(),
             });
         }
-    }
-
-    /// Puts a question to whoever is driving this turn and waits for the
-    /// answer. Returns `Unavailable` when nobody can answer — a background job
-    /// or a platform turn — so callers can fail closed instead of hanging on a
-    /// reply that will never come.
-    pub async fn request_approval(
-        &self,
-        request: crate::question::QuestionRequest,
-    ) -> crate::question::QuestionResponse {
-        use crate::question::QuestionResponse;
-        let Some(sender) = &self.sender else {
-            return QuestionResponse::Unavailable("no interactive session".to_string());
-        };
-        let (responder, receiver) = oneshot::channel();
-        if sender
-            .send(ToolProgressEvent::ApprovalRequested { request, responder })
-            .is_err()
-        {
-            return QuestionResponse::Unavailable("no interactive session".to_string());
-        }
-        receiver.await.unwrap_or_else(|_| {
-            QuestionResponse::Unavailable("no interactive session".to_string())
-        })
     }
 
     pub async fn prepare_for_external_output(&self) -> bool {

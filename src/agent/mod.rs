@@ -876,16 +876,6 @@ where
                 chunk,
             })
         }
-        // Reuses the question plumbing wholesale: broker, SSE/IPC hop, the
-        // REPL suspend/resume dance and the desktop notification are all
-        // already wired for AskQuestion.
-        tools::ToolProgressEvent::ApprovalRequested { request, responder } => {
-            on_event(AgentEvent::AskQuestion {
-                call_id: call_id.to_string(),
-                request,
-                responder,
-            })
-        }
     }
 }
 
