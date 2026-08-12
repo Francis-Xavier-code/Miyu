@@ -167,7 +167,6 @@ pub struct RedoPromptInput {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AgentMode {
     Normal,
-    Plan,
     Chat,
 }
 
@@ -175,7 +174,6 @@ pub enum AgentMode {
 pub struct AgentTurnControl {
     mode: Arc<Mutex<AgentMode>>,
     normal_tools: ToolRegistry,
-    plan_tools: ToolRegistry,
     chat_tools: ToolRegistry,
     queue_ingress: Option<Arc<QueueIngressBarrier>>,
     supersede: Option<Arc<TurnSupersedeSignal>>,
@@ -281,13 +279,11 @@ impl AgentTurnControl {
     pub fn new(
         mode: AgentMode,
         normal_tools: ToolRegistry,
-        plan_tools: ToolRegistry,
         chat_tools: ToolRegistry,
     ) -> Self {
         Self {
             mode: Arc::new(Mutex::new(mode)),
             normal_tools,
-            plan_tools,
             chat_tools,
             queue_ingress: None,
             supersede: None,
@@ -323,7 +319,6 @@ impl AgentTurnControl {
     fn tools(&self, mode: AgentMode) -> ToolRegistry {
         match mode {
             AgentMode::Normal => self.normal_tools.clone(),
-            AgentMode::Plan => self.plan_tools.clone(),
             AgentMode::Chat => self.chat_tools.clone(),
         }
     }
@@ -334,13 +329,11 @@ impl AgentMode {
         if crate::i18n::is_zh() {
             match self {
                 Self::Normal => "普通",
-                Self::Plan => "计划",
                 Self::Chat => "闲聊",
             }
         } else {
             match self {
                 Self::Normal => "NORMAL",
-                Self::Plan => "PLAN",
                 Self::Chat => "CHAT",
             }
         }
@@ -349,7 +342,6 @@ impl AgentMode {
     fn reminder(self) -> Option<&'static str> {
         match self {
             Self::Normal => None,
-            Self::Plan => Some(crate::prompts::PLAN_REMINDER),
             Self::Chat => Some(crate::prompts::CHAT_REMINDER),
         }
     }
@@ -1963,7 +1955,7 @@ impl Agent {
                 }
             }
         }
-        if self.mode != AgentMode::Plan {
+        {
             if let Some(reminder) = memes::auto_meme_reminder(&self.config, &input) {
                 messages.push(ChatMessage::turn_context(reminder));
             }
@@ -3129,7 +3121,7 @@ impl Agent {
             // Multiple `task` calls in one batch run concurrently (subagents
             // are independent by design); everything else stays serial.
             let mut parallel_task_outputs =
-                if defer_sibling_tools || matches!(self.mode, AgentMode::Plan | AgentMode::Chat) {
+                if defer_sibling_tools || self.mode == AgentMode::Chat {
                     std::collections::HashMap::new()
                 } else {
                     self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
@@ -3797,10 +3789,6 @@ fn tool_output_succeeded(output: &str) -> bool {
 fn mode_allows_tool_permission(mode: AgentMode, permission: ToolPermission) -> bool {
     match mode {
         AgentMode::Normal => true,
-        AgentMode::Plan => matches!(
-            permission,
-            ToolPermission::ReadOnly | ToolPermission::Presentation
-        ),
         AgentMode::Chat => permission == ToolPermission::ReadOnly,
     }
 }
@@ -4173,7 +4161,6 @@ fn replace_request_mode_context(
 fn continuation_system_prompt(system_prompt: &str, mode: AgentMode) -> String {
     let mode = match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Plan => "plan",
         AgentMode::Chat => "chat",
     };
     format!(
@@ -5686,19 +5673,24 @@ mod tests {
 
     struct NoopPlatformAdapter;
 
+    /// 闲聊模式比普通模式更紧:连 Presentation 都不放行,只留只读。
     #[test]
-    fn plan_allows_presentation_without_allowing_workspace_writes() {
+    fn chat_mode_allows_read_only_tools_and_nothing_else() {
         assert!(mode_allows_tool_permission(
-            AgentMode::Plan,
-            ToolPermission::Presentation
-        ));
-        assert!(!mode_allows_tool_permission(
-            AgentMode::Plan,
-            ToolPermission::Writes
+            AgentMode::Chat,
+            ToolPermission::ReadOnly
         ));
         assert!(!mode_allows_tool_permission(
             AgentMode::Chat,
             ToolPermission::Presentation
+        ));
+        assert!(!mode_allows_tool_permission(
+            AgentMode::Chat,
+            ToolPermission::Writes
+        ));
+        assert!(mode_allows_tool_permission(
+            AgentMode::Normal,
+            ToolPermission::Writes
         ));
     }
 
@@ -5925,9 +5917,9 @@ mod tests {
         assert_eq!(prompt, "base");
         assert!(!prompt.contains("<runtime"));
 
-        let prompt = with_mode_reminder("base".to_string(), AgentMode::Plan);
+        let prompt = with_mode_reminder("base".to_string(), AgentMode::Chat);
         assert!(prompt.contains("base"));
-        assert!(prompt.contains(crate::prompts::PLAN_REMINDER));
+        assert!(prompt.contains(crate::prompts::CHAT_REMINDER));
         assert!(!prompt.contains("<runtime"));
     }
 
@@ -7781,7 +7773,6 @@ mod tests {
             AgentMode::Normal,
             ToolRegistry::new(),
             ToolRegistry::new(),
-            ToolRegistry::new(),
         );
         let server_control = control.clone();
         let (request_tx, request_rx) = oneshot::channel();
@@ -7789,7 +7780,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let _ = read_test_http_request(&mut first).await;
-            server_control.set_mode(AgentMode::Plan);
+            server_control.set_mode(AgentMode::Chat);
             write_test_sse(
                 &mut first,
                 concat!(
@@ -7859,7 +7850,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "continued answer");
-        assert_eq!(agent.mode(), AgentMode::Plan);
+        assert_eq!(agent.mode(), AgentMode::Chat);
         let request: serde_json::Value =
             serde_json::from_slice(&request_rx.await.unwrap()).unwrap();
         let messages = request["messages"].as_array().unwrap();
@@ -8012,7 +8003,6 @@ mod tests {
             AgentMode::Normal,
             ToolRegistry::new(),
             ToolRegistry::new(),
-            ToolRegistry::new(),
         );
         control.set_supersede_signal(signal.clone());
         let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
@@ -8072,7 +8062,6 @@ mod tests {
             AgentMode::Normal,
             tools.clone(),
             tools.clone(),
-            tools.clone(),
         );
         let server_control = control.clone();
 
@@ -8082,7 +8071,7 @@ mod tests {
             let (mut first, _) = listener.accept().await.unwrap();
             let first_request = read_test_http_request(&mut first).await;
             let _ = first_request_tx.send(first_request);
-            server_control.set_mode(AgentMode::Plan);
+            server_control.set_mode(AgentMode::Chat);
             write_test_sse(
                 &mut first,
                 concat!(
@@ -8132,7 +8121,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "final answer");
-        assert_eq!(agent.mode(), AgentMode::Plan);
+        assert_eq!(agent.mode(), AgentMode::Chat);
         assert!(result.responses_continuation.is_none());
         assert!(result.usage_estimated);
         let tool_only_tokens =
@@ -8177,8 +8166,8 @@ mod tests {
         let is_mode_update = |item: &Value| {
             let text = item_text(item);
             item["role"] == "user"
-                && text.contains("<mode-update active=\"plan\">")
-                && text.contains(crate::prompts::PLAN_REMINDER)
+                && text.contains("<mode-update active=\"chat\">")
+                && text.contains(crate::prompts::CHAT_REMINDER)
         };
         let mode_index = input.iter().position(is_mode_update).unwrap();
         assert!(input.iter().any(is_mode_update));
@@ -8238,7 +8227,6 @@ mod tests {
         let control = AgentTurnControl::new(
             AgentMode::Normal,
             normal_tools.clone(),
-            ToolRegistry::new(),
             ToolRegistry::new(),
         );
         let server_control = control.clone();

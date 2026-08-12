@@ -45,13 +45,9 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     ).writes());
 }
 
+/// 只读工具集。计划模式移除后这里不再注册 `run_command`——它在
+/// `register` 里紧接着就会被可写版覆盖,留着只是一份读不到的死描述。
 pub fn register_readonly(registry: &mut ToolRegistry) {
-    registry.register(ToolSpec::new_with_progress(
-        "run_command",
-        t("Run an explicitly read-only shell command for inspection. Mutating commands are blocked in plan mode.", "运行明确只读的 shell 命令用于检查。计划模式会阻止修改性命令。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Read-only command to run.", "要运行的只读命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds.", "可选超时时间，单位秒。")}},"required":["command"],"additionalProperties":false}),
-        |args, progress| async move { run_readonly_command(args, progress).await },
-    ));
     registry.register(ToolSpec::new(
         "check_os_info",
         t("Check basic read-only OS, shell, desktop session, kernel, host, and package-manager context. For concrete Linux input method issues, load the linux-input-method-diagnose skill.", "查看只读基础系统信息，包括 OS、shell、桌面会话、内核、主机和包管理器上下文。排查具体 Linux 输入法问题时先加载 linux-input-method-diagnose 技能。"),
@@ -531,17 +527,6 @@ async fn run_command(args: Value, allowed: bool, progress: ToolProgress) -> Resu
     execute_command(&command, timeout, progress).await
 }
 
-async fn run_readonly_command(args: Value, progress: ToolProgress) -> Result<String> {
-    let command = required(&args, "command")?;
-    ensure_readonly_command(&command)?;
-    let timeout = args
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(30)
-        .min(120);
-    execute_command(&command, timeout, progress).await
-}
-
 async fn execute_command(command: &str, timeout: u64, progress: ToolProgress) -> Result<String> {
     let mut command_process = Command::new("sh");
     command_process
@@ -676,70 +661,6 @@ async fn read_command_output(
     Ok(output)
 }
 
-fn ensure_readonly_command(command: &str) -> Result<()> {
-    let lower = command.to_ascii_lowercase();
-    let forbidden = [
-        ">",
-        ">>",
-        " 2>",
-        "tee ",
-        "tee -",
-        "rm ",
-        "mv ",
-        "cp ",
-        "mkdir ",
-        "rmdir ",
-        "touch ",
-        "chmod ",
-        "chown ",
-        "chgrp ",
-        "ln ",
-        "truncate ",
-        "dd ",
-        "mkfs",
-        "mount ",
-        "umount ",
-        "systemctl ",
-        "service ",
-        "kill ",
-        "pkill ",
-        "reboot",
-        "shutdown",
-        "poweroff",
-        "pacman -s",
-        "pacman -r",
-        "pacman -u",
-        "paru -s",
-        "yay -s",
-        "apt install",
-        "apt remove",
-        "apt update",
-        "dnf install",
-        "brew install",
-        "sed -i",
-        "git add",
-        "git commit",
-        "git push",
-        "git reset",
-        "git checkout",
-        "cargo build",
-        "cargo test",
-        "make ",
-        "npm install",
-        "pnpm install",
-        "yarn install",
-    ];
-    if forbidden.iter().any(|needle| lower.contains(needle)) {
-        bail!(
-            "{}",
-            t(
-                "Plan mode only allows read-only inspection commands",
-                "计划模式只允许只读检查命令"
-            )
-        );
-    }
-    Ok(())
-}
 
 fn command_output(
     status: std::process::ExitStatus,
@@ -1143,19 +1064,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(gone, "descendant process {pid} survived command timeout");
-    }
-
-    #[test]
-    fn readonly_command_allows_inspection() {
-        assert!(ensure_readonly_command("git status --short").is_ok());
-        assert!(ensure_readonly_command("pacman -Q miyu").is_ok());
-    }
-
-    #[test]
-    fn readonly_command_blocks_mutation() {
-        assert!(ensure_readonly_command("rm file").is_err());
-        assert!(ensure_readonly_command("sed -i 's/a/b/' file").is_err());
-        assert!(ensure_readonly_command("cargo test").is_err());
     }
 
     #[test]

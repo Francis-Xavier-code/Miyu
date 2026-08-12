@@ -107,7 +107,6 @@ mod tests {
             include_str!("prompts/miyu.md"),
             include_str!("prompts/compact.md"),
             include_str!("prompts/compact_chat.md"),
-            include_str!("prompts/plan.md"),
             include_str!("prompts/chat.md"),
             include_str!("../README.md"),
         ] {

@@ -26,7 +26,6 @@
   const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
   const CONVERSATION_MODES = [
     { id: "normal", label: "普通" },
-    { id: "plan", label: "计划" },
     { id: "chat", label: "闲聊" }
   ];
   const THINKING_VARIANT_LABELS = Object.freeze({
@@ -7551,7 +7550,7 @@
     live.tools = new Map();
     live.questions = new Map();
     live.contextOperation = null;
-    if (["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+    if (["normal", "chat"].includes(data?.mode)) setMode(data.mode, false);
     showTypingIndicator(live);
     contentAdded();
   }
@@ -7799,7 +7798,7 @@
     }
 
     if (name === "run.started") {
-      if (live && ["normal", "plan", "chat"].includes(data?.mode)) setMode(data.mode, false);
+      if (live && ["normal", "chat"].includes(data?.mode)) setMode(data.mode, false);
       if (live) {
         live.operation = String(data?.operation || live.operation || "create");
         live.turnId = String(data?.turn_id || live.turnId || "") || null;

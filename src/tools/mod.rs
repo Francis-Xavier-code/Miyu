@@ -423,54 +423,6 @@ pub(crate) fn rescope_platform_memory_tools(
     }
 }
 
-pub fn readonly_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    default_tools::register_readonly(&mut registry);
-    jobs::register_status(&mut registry);
-    clipboard::register(&mut registry, paths.clone());
-    web::register_fetch(&mut registry);
-    fcitx_wiki::register(&mut registry);
-    caniplayonlinux_query::register(&mut registry);
-    protondb_query::register(&mut registry);
-    if config.plugins.archlinux.enabled {
-        archlinux::register(&mut registry, paths);
-    }
-    if config.plugins.man.enabled {
-        man::register(&mut registry);
-    }
-    if config.plugins.api_quota.enabled {
-        api_quota::register(&mut registry, config.plugins.api_quota.clone());
-    }
-    if config.plugins.web.enabled {
-        web::register(&mut registry, config.plugins.web.clone());
-    }
-    if config.plugins.web_images.enabled {
-        web_images::register(&mut registry, config.clone(), paths.clone(), false);
-    }
-    if config.plugins.vision.enabled {
-        vision::register(&mut registry, config.clone(), paths.clone(), true);
-    }
-    if config.plugins.knowledge_base.enabled {
-        knowledge_base::register_readonly(&mut registry, config.clone(), paths.clone());
-    }
-    if config.plugins.package_advisor.enabled {
-        package_advisor::register(&mut registry, paths.clone());
-    }
-    if config.plugins.diagnostics.enabled {
-        diagnostics::register(&mut registry, config.clone());
-    }
-    if config.memory_config().enabled {
-        memory::register_readonly(&mut registry, config.clone(), paths.clone());
-    }
-    if uses_load_tools(&config.tools.loading_mode) {
-        load_tools::register(&mut registry);
-    }
-    if config.mcp.enabled {
-        mcp::register(&mut registry, config.clone());
-    }
-    registry
-}
-
 pub fn is_hybrid_loading_mode(mode: &str) -> bool {
     matches!(mode.trim(), "hybrid" | "lazy")
 }
@@ -707,9 +659,6 @@ mod tests {
             false,
         )
         .unwrap();
-        let plan =
-            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Plan, false)
-                .unwrap();
         let chat =
             crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Chat, false)
                 .unwrap();
@@ -722,11 +671,9 @@ mod tests {
             "list_skill_drafts",
         ] {
             assert!(normal.contains(name), "{name}");
-            assert!(!plan.contains(name), "{name}");
             assert!(!chat.contains(name), "{name}");
         }
         assert!(normal.contains("load_skill"));
-        assert!(plan.contains("load_skill"));
         assert!(chat.contains("load_skill"));
     }
 

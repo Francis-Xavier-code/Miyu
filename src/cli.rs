@@ -345,7 +345,6 @@ fn colored_footer_mode_label(mode: AgentMode) -> String {
     let label = mode.label();
     match mode {
         AgentMode::Normal => primary_footer_text(label),
-        AgentMode::Plan => format!("\x1b[1m\x1b[35m{label}\x1b[0m"),
         AgentMode::Chat => format!("\x1b[1m\x1b[32m{label}\x1b[0m"),
     }
 }
@@ -357,9 +356,6 @@ fn primary_footer_text(text: &str) -> String {
 #[derive(Debug, Parser)]
 #[command(name = "miyu", version, about = "Miyu CLI AI Agent")]
 pub struct Cli {
-    #[arg(long)]
-    pub plan: bool,
-
     #[arg(long, global = true)]
     pub debug: bool,
 
@@ -515,9 +511,6 @@ fn apply_chinese_help_template(mut command: clap::Command) -> clap::Command {
 
 fn localize_top_args(command: clap::Command) -> clap::Command {
     command
-        .mut_arg("plan", |arg| {
-            arg.help(t("Run in read-only planning mode", "使用只读计划模式运行"))
-        })
         .mut_arg("debug", |arg| {
             arg.help(t(
                 "Write detailed diagnostics to the Miyu log directory",
@@ -1363,11 +1356,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
             }
         }
     };
-    let mode = if cli.plan {
-        AgentMode::Plan
-    } else {
-        AgentMode::Normal
-    };
+    let mode = AgentMode::Normal;
 
     if cli.shell_intercept {
         let shell_name = cli.shell.as_deref().unwrap_or("fish");
@@ -5620,7 +5609,6 @@ async fn try_run_remote_chat(
                         })
                         .unwrap_or_default();
                     let consumed_mode = match ipc_text(&data, "mode") {
-                        "plan" => AgentMode::Plan,
                         "chat" => AgentMode::Chat,
                         _ => AgentMode::Normal,
                     };
@@ -6686,7 +6674,6 @@ fn remote_image_preview(asset: &crate::state::ImageAssetData) -> Result<tempfile
 fn ipc_mode_name(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Plan => "plan",
         AgentMode::Chat => "chat",
     }
 }
@@ -8363,12 +8350,6 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             build_tool_registry(
                 &config,
                 paths,
-                AgentMode::Plan,
-                crate::question_tui::available(false),
-            )?,
-            build_tool_registry(
-                &config,
-                paths,
                 AgentMode::Chat,
                 crate::question_tui::available(false),
             )?,
@@ -9104,8 +9085,8 @@ fn print_repl_help() {
     println!(
         "  Tab         {}",
         t(
-            "cycle NORMAL/PLAN/CHAT, or complete slash commands",
-            "循环切换 普通/计划/闲聊，或补全斜杠菜单"
+            "cycle NORMAL/CHAT, or complete slash commands",
+            "循环切换 普通/闲聊，或补全斜杠菜单"
         )
     );
     println!("  Enter       {}", t("send message", "发送消息"));
@@ -9291,8 +9272,7 @@ impl LiveReplEditor {
                         }
                     } else {
                         self.mode = match self.mode {
-                            AgentMode::Normal => AgentMode::Plan,
-                            AgentMode::Plan => AgentMode::Chat,
+                            AgentMode::Normal => AgentMode::Chat,
                             AgentMode::Chat => AgentMode::Normal,
                         };
                     }
@@ -11381,7 +11361,6 @@ async fn follow_wake_run(
                     })
                     .unwrap_or_default();
                 let consumed_mode = match ipc_text(&data, "mode") {
-                    "plan" => AgentMode::Plan,
                     "chat" => AgentMode::Chat,
                     _ => AgentMode::Normal,
                 };
@@ -11718,8 +11697,7 @@ fn read_repl_input(
                         }
                     } else {
                         mode = match mode {
-                            AgentMode::Normal => AgentMode::Plan,
-                            AgentMode::Plan => AgentMode::Chat,
+                            AgentMode::Normal => AgentMode::Chat,
                             AgentMode::Chat => AgentMode::Normal,
                         };
                     }
@@ -12371,7 +12349,6 @@ fn submitted_echo_lines(mode: AgentMode, input: &str, cols: usize) -> Vec<String
 fn submitted_echo_bar(mode: AgentMode) -> String {
     match mode {
         AgentMode::Normal => "\x1b[1m\x1b[34m┃\x1b[0m".to_string(),
-        AgentMode::Plan => "\x1b[1m\x1b[35m┃\x1b[0m".to_string(),
         AgentMode::Chat => "\x1b[1m\x1b[32m┃\x1b[0m".to_string(),
     }
 }
@@ -14518,7 +14495,7 @@ mod repl_input_tests {
         let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
         footer.update_thinking_variant(Some("high"));
 
-        for mode in [AgentMode::Normal, AgentMode::Plan, AgentMode::Chat] {
+        for mode in [AgentMode::Normal, AgentMode::Chat] {
             let line = repl_footer_left(mode, &footer, 120);
             assert!(line.contains("\x1b[1m\x1b[34mhigh\x1b[0m"));
             assert_eq!(
@@ -14597,18 +14574,18 @@ mod repl_input_tests {
         };
 
         let normal = queued_prompt_lines(std::slice::from_ref(&prompt), AgentMode::Normal, 80);
-        let plan = queued_prompt_lines(&[prompt], AgentMode::Plan, 80);
+        let chat = queued_prompt_lines(&[prompt], AgentMode::Chat, 80);
 
         assert_eq!(normal.len(), 4);
         assert_eq!(normal[0], submitted_echo_bar(AgentMode::Normal));
         assert_eq!(normal[2], submitted_echo_bar(AgentMode::Normal));
         assert!(normal[3].starts_with(&submitted_echo_bar(AgentMode::Normal)));
         assert!(normal[3].contains(&primary_footer_text(t("Queued", "排队中"))));
-        assert!(plan
+        assert!(chat
             .iter()
             .filter(|line| !line.is_empty())
-            .all(|line| line.starts_with(&submitted_echo_bar(AgentMode::Plan))));
-        assert_ne!(normal[0], plan[0]);
+            .all(|line| line.starts_with(&submitted_echo_bar(AgentMode::Chat))));
+        assert_ne!(normal[0], chat[0]);
     }
 
     #[test]
@@ -15829,7 +15806,6 @@ pub(crate) fn build_tool_registry(
     let mut registry = if config.tools.enabled {
         match mode {
             AgentMode::Normal => tools::builtin_registry(config, paths),
-            AgentMode::Plan => tools::readonly_registry(config, paths),
             AgentMode::Chat => tools::chat_registry(config, paths),
         }
     } else {

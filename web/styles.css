@@ -937,13 +937,6 @@ textarea:disabled {
   transition: background 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
 }
 
-.mode-cycle[data-mode="plan"] {
-  --mode-bg: var(--gold-soft);
-  --mode-hover-bg: color-mix(in srgb, var(--mode-fg) 8%, var(--mode-bg));
-  --mode-fg: var(--md-sys-color-on-secondary-container);
-  --mode-edge: var(--gold);
-}
-
 .mode-cycle[data-mode="chat"] {
   --mode-bg: var(--surface-2);
   --mode-hover-bg: var(--surface-3);

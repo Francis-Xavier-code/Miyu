@@ -1030,7 +1030,7 @@ pub fn register_management(registry: &mut ToolRegistry) {
     );
 }
 
-/// job_status only, for read-only registries (Plan mode).
+/// job_status only, for registries that must stay read-only (chat / platform).
 pub fn register_status(registry: &mut ToolRegistry) {
     registry.register(
         ToolSpec::new(

@@ -224,7 +224,6 @@ impl TurnEngineState {
 struct TurnResources {
     client: OpenAiCompatibleClient,
     normal_tools: tools::ToolRegistry,
-    plan_tools: tools::ToolRegistry,
     chat_tools: tools::ToolRegistry,
     restricted_tools: tools::ToolRegistry,
 }
@@ -279,7 +278,6 @@ impl TurnResourceCache {
         let resources = Arc::new(TurnResources {
             client: OpenAiCompatibleClient::from_config(config, paths)?,
             normal_tools: build_tool_registry(config, paths, AgentMode::Normal, false)?,
-            plan_tools: build_tool_registry(config, paths, AgentMode::Plan, false)?,
             chat_tools: build_tool_registry(config, paths, AgentMode::Chat, false)?,
             restricted_tools,
         });
@@ -6201,11 +6199,6 @@ async fn run_turn_task(
         } else {
             resources.normal_tools.clone()
         };
-        let mut plan_tools = if restricted {
-            resources.restricted_tools.clone()
-        } else {
-            resources.plan_tools.clone()
-        };
         let mut chat_tools = if restricted {
             resources.restricted_tools.clone()
         } else {
@@ -6220,30 +6213,20 @@ async fn run_turn_task(
                     context,
                     false,
                 );
-                tools::rescope_platform_memory_tools(
-                    &mut plan_tools,
-                    &config,
-                    &paths,
-                    context,
-                    true,
-                );
             }
         }
         if local_webui && config.tools.enabled {
             tools::register_webui_artifact_tools(&mut normal_tools, &paths, &session_id);
-            tools::register_webui_artifact_tools(&mut plan_tools, &paths, &session_id);
         }
         if profile
             .as_ref()
             .is_some_and(|profile| !profile.memory_write_enabled)
         {
             normal_tools.unregister("remember_fact");
-            plan_tools.unregister("remember_fact");
             chat_tools.unregister("remember_fact");
         }
         if platform_context.is_none() && config.tools.enabled {
             tools::register_ask_question(&mut normal_tools);
-            tools::register_ask_question(&mut plan_tools);
             tools::register_ask_question(&mut chat_tools);
         }
         if config.tools.enabled {
@@ -6252,13 +6235,11 @@ async fn run_turn_task(
                 .and_then(|profile| profile.platform.clone())
             {
                 platforms::register_platform_tools(&mut normal_tools, context.clone());
-                platforms::register_platform_tools(&mut plan_tools, context.clone());
                 platforms::register_platform_tools(&mut chat_tools, context);
             }
         }
         let active_tools = match mode {
             AgentMode::Normal => normal_tools.clone(),
-            AgentMode::Plan => plan_tools.clone(),
             AgentMode::Chat => chat_tools.clone(),
         };
         let mut agent = Agent::new_for_audience(
@@ -6285,7 +6266,7 @@ async fn run_turn_task(
             .as_ref()
             .map(|profile| profile.turn_system_context.clone())
             .unwrap_or_default();
-        if local_webui && matches!(mode, AgentMode::Normal | AgentMode::Plan) {
+        if local_webui && mode == AgentMode::Normal {
             let manifest = tools::webui_artifact_manifest(&paths, &session_id)
                 .unwrap_or_else(|_| "（Artifact 清单暂时不可用）".to_string());
             // v7 Phase 2.1: the manifest changes whenever artifacts change, so
@@ -6357,7 +6338,7 @@ async fn run_turn_task(
             agent.set_memory_organizer(organizer);
         }
         agent.prepare_for_turn()?;
-        let mut control = AgentTurnControl::new(mode, normal_tools, plan_tools, chat_tools);
+        let mut control = AgentTurnControl::new(mode, normal_tools, chat_tools);
         if let Some(signal) = manager
             .lock()
             .unwrap()
@@ -9645,11 +9626,12 @@ fn validate_thinking_variant_updates(
 fn parse_mode(mode: &str) -> std::result::Result<AgentMode, ApiError> {
     match mode {
         "normal" => Ok(AgentMode::Normal),
-        "plan" => Ok(AgentMode::Plan),
+        // 历史会话可能存过 plan：模式已移除，回落到普通模式而不是让会话打不开。
+        "plan" => Ok(AgentMode::Normal),
         "chat" => Ok(AgentMode::Chat),
         _ => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "mode must be normal, plan, or chat",
+            "mode must be normal or chat",
         )),
     }
 }
@@ -9657,7 +9639,6 @@ fn parse_mode(mode: &str) -> std::result::Result<AgentMode, ApiError> {
 fn mode_name(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Plan => "plan",
         AgentMode::Chat => "chat",
     }
 }
