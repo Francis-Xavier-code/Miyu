@@ -17,6 +17,9 @@ const MAX_READ_LINES: usize = 2_000;
 const MAX_LINE_CHARS: usize = 2_000;
 const MAX_COMMAND_OUTPUT_CHARS: usize = 20_000;
 const SEARCH_TIMEOUT_SECONDS: u64 = 30;
+/// 进度消息前缀:带它的内容是「本次调用的最终摘要」,由渲染层原样按行展示,
+/// 而不是当成一闪而过的进度。回收站用它交代失败清单。
+pub(crate) const TOOL_SUMMARY_PREFIX: &str = "__tool_summary__";
 
 pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     register_readonly(registry);
@@ -34,11 +37,11 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
         json!({"type":"object","properties":{"path":{"type":"string","description": t("Workspace-relative or absolute file path.", "工作区相对路径或绝对文件路径。")},"start_line":{"type":"integer","description": t("1-based first line to replace.", "要替换的第一行，1 起始。")},"end_line":{"type":"integer","description": t("1-based last line to replace, inclusive.", "要替换的最后一行，闭区间。")},"replacement":{"type":"string","description": t("Replacement text. May contain multiple lines. Empty text deletes the line range.", "替换文本，可包含多行；空文本会删除指定行范围。")}},"required":["path","start_line","end_line","replacement"],"additionalProperties":false}),
         |args, progress| async move { edit_file(args, progress) },
     ).writes());
-    registry.register(ToolSpec::new(
+    registry.register(ToolSpec::new_with_progress(
         "trash_path",
-        t("Move a file, directory, or symlink to the system Trash instead of permanently deleting it. Use this when the user asks to delete/remove/clean up a local path; do not use rm unless explicitly requested. Only claim success when exists_after is false.", "把文件、目录或符号链接移入系统回收站，而不是永久删除。用户要求删除/移除/清理本地路径时优先使用它；除非用户明确要求，不要使用 rm。只有 exists_after 为 false 时才说明已处理。"),
-        json!({"type":"object","properties":{"path":{"type":"string","description": t("File, directory, or symlink path to move to Trash. Supports absolute paths, workspace-relative paths, and ~/ paths.", "要移入回收站的文件、目录或符号链接路径。支持绝对路径、工作区相对路径和 ~/ 路径。")}},"required":["path"],"additionalProperties":false}),
-        |args| async move { trash_path(args) },
+        t("Move files, directories, or symlinks to the system Trash instead of permanently deleting them. Pass every path in one call — one call per path floods the transcript. Use this when the user asks to delete/remove/clean up local paths; do not use rm unless explicitly requested.", "把文件、目录或符号链接移入系统回收站，而不是永久删除。要删多个时一次性全部传入，逐个调用会刷屏。用户要求删除/移除/清理本地路径时优先使用它；除非用户明确要求，不要使用 rm。"),
+        json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"description": t("Paths to move to Trash. Absolute, workspace-relative, and ~/ paths are all accepted.", "要移入回收站的路径列表。支持绝对路径、工作区相对路径和 ~/ 路径。")}},"required":["paths"],"additionalProperties":false}),
+        |args, progress| async move { trash_paths(args, progress) },
     ).writes());
 }
 
@@ -320,42 +323,122 @@ fn edit_file(args: Value, progress: ToolProgress) -> Result<String> {
     )
 }
 
-fn trash_path(args: Value) -> Result<String> {
-    trash_path_with(
+fn trash_paths(args: Value, progress: ToolProgress) -> Result<String> {
+    trash_paths_with(
         args,
+        &progress,
         |path| trash::delete(path).map_err(|err| anyhow::anyhow!("failed to move to trash: {err}")),
         find_recent_trash_item,
     )
 }
 
-fn trash_path_with(
+/// 一次处理整批路径。
+///
+/// 逐条一次调用时,每条都要回一份带 `note`/`restore_hint` 的完整 JSON——删 12
+/// 个就是 12 份几乎相同的文本刷屏,也白占模型上下文。改成整批之后,那两句提示
+/// 整次只出现一次,终端上成功也只占一行。
+///
+/// 单条失败不中断后面的:删一批文件时,因为第 3 条没权限就把剩下 9 条也丢下,
+/// 只会让模型再发一轮重试。失败项逐条收集,最后一并交代。
+fn trash_paths_with(
     args: Value,
-    move_to_trash: impl FnOnce(&Path) -> Result<()>,
-    locate_trash_item: impl FnOnce(&Path, i64) -> Option<String>,
+    progress: &ToolProgress,
+    mut move_to_trash: impl FnMut(&Path) -> Result<()>,
+    mut locate_trash_item: impl FnMut(&Path, i64) -> Option<String>,
 ) -> Result<String> {
-    let input = path_arg(&args, "path")?;
-    let resolved = resolve_existing_path_without_following_leaf(&input)?;
+    let inputs = paths_arg(&args)?;
+    let total = inputs.len();
+    let mut moved_paths = Vec::new();
+    let mut failures = Vec::new();
+    // 不逐条报进度:同文件系统上移入回收站就是一次 rename,十几条也在毫秒内
+    // 走完,那行进度还没被画出来就被下一条覆盖了,白发一串消息。真正慢的是
+    // 模型吐这串路径的时间,那段由 `preparing_phase` 的「准备删除」盖住。
+    for input in &inputs {
+        match trash_one(input, &mut move_to_trash, &mut locate_trash_item) {
+            Ok(path) => moved_paths.push(path),
+            Err(error) => failures.push(json!({
+                "path": input.display().to_string(),
+                "error": error.to_string(),
+            })),
+        }
+    }
+    // 失败清单走终端的最终摘要通道:成功时一行不多,失败时逐条列出来。
+    if !failures.is_empty() {
+        let lines = failures
+            .iter()
+            .map(|failure| {
+                format!(
+                    "✗ {}  {}",
+                    failure["path"].as_str().unwrap_or_default(),
+                    failure["error"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        progress.report(format!("{TOOL_SUMMARY_PREFIX}{lines}"));
+    }
+    let moved = moved_paths.len();
+    Ok(serde_json::to_string_pretty(&json!({
+        "ok": moved > 0,
+        "moved": moved,
+        "failed": failures.len(),
+        "total": total,
+        "moved_paths": moved_paths,
+        "failures": failures,
+        "note": t("The paths were moved to Trash, not permanently deleted.", "这些路径已移入回收站，并未永久删除。"),
+        "restore_hint": t("Open the system Trash and restore an item if needed.", "如需恢复，请打开系统回收站并还原对应项目。"),
+    }))?)
+}
+
+/// 校验并移动单条路径,成功时返回它的原始绝对路径。
+fn trash_one(
+    input: &Path,
+    move_to_trash: &mut impl FnMut(&Path) -> Result<()>,
+    locate_trash_item: &mut impl FnMut(&Path, i64) -> Option<String>,
+) -> Result<String> {
+    let resolved = resolve_existing_path_without_following_leaf(input)?;
     ensure_safe_trash_target(&resolved)?;
-    let metadata = std::fs::symlink_metadata(&resolved)?;
-    let kind = path_kind(&metadata);
-    let existed_before = true;
+    std::fs::symlink_metadata(&resolved)?;
     let original_path = resolved.display().to_string();
     let timestamp_before = current_unix_seconds();
-
     move_to_trash(&resolved)?;
+    if std::fs::symlink_metadata(&resolved).is_ok() {
+        bail!(
+            "{}",
+            t(
+                "the path is still present after the move",
+                "移动之后该路径依然存在"
+            )
+        );
+    }
+    let _ = locate_trash_item(&resolved, timestamp_before);
+    Ok(original_path)
+}
 
-    let exists_after = std::fs::symlink_metadata(&resolved).is_ok();
-    let trash_item_id = locate_trash_item(&resolved, timestamp_before);
-    Ok(serde_json::to_string_pretty(&json!({
-        "ok": !exists_after,
-        "kind": kind,
-        "original_path": original_path,
-        "existed_before": existed_before,
-        "exists_after": exists_after,
-        "trash_item_id": trash_item_id,
-        "restore_hint": t("Open the system Trash and restore the item if needed.", "如需恢复，请打开系统回收站并还原该项目。"),
-        "note": t("The path was moved to Trash, not permanently deleted.", "该路径已移入回收站，并未永久删除。")
-    }))?)
+fn paths_arg(args: &Value) -> Result<Vec<PathBuf>> {
+    let Some(values) = args.get("paths").and_then(Value::as_array) else {
+        bail!(
+            "{}",
+            t(
+                "paths must be an array of path strings",
+                "paths 必须是一个路径字符串数组"
+            )
+        );
+    };
+    let paths = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_path)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!(
+            "{}",
+            t("paths must contain at least one path", "paths 至少要有一条路径")
+        );
+    }
+    Ok(paths)
 }
 
 async fn glob_files(args: Value) -> Result<String> {
@@ -986,9 +1069,11 @@ fn required(args: &Value, key: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn fake_trash_path(args: Value) -> Result<String> {
-        trash_path_with(
+    fn fake_trash(args: Value) -> Result<String> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        trash_paths_with(
             args,
+            &ToolProgress::new(tx),
             |path| {
                 if std::fs::symlink_metadata(path)?.file_type().is_dir() {
                     std::fs::remove_dir_all(path)?;
@@ -1193,31 +1278,68 @@ mod tests {
     }
 
     #[test]
-    fn trash_path_moves_file_to_trash() {
+    fn trash_moves_files_and_directories_in_one_call() {
         let cwd = std::env::current_dir().unwrap();
         let temp = tempfile::tempdir_in(cwd).unwrap();
-        let path = temp.path().join("trash-me.txt");
-        std::fs::write(&path, "bye").unwrap();
-        let result = fake_trash_path(json!({"path": path.display().to_string()})).unwrap();
+        let file = temp.path().join("trash-me.txt");
+        std::fs::write(&file, "bye").unwrap();
+        let dir = temp.path().join("trash-dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("child.txt"), "bye").unwrap();
+
+        let result = fake_trash(json!({"paths": [
+            file.display().to_string(),
+            dir.display().to_string(),
+        ]}))
+        .unwrap();
         let data: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(data["ok"], true);
-        assert_eq!(data["kind"], "file");
-        assert_eq!(data["exists_after"], false);
-        assert!(!path.exists());
+        assert_eq!(data["moved"], 2);
+        assert_eq!(data["failed"], 0);
+        assert_eq!(data["total"], 2);
+        assert!(!file.exists());
+        assert!(!dir.exists());
+        // 提示语整次一份,不再逐条重复——这是返回体积的大头。
+        assert!(data["note"].is_string());
+        assert_eq!(data["failures"].as_array().unwrap().len(), 0);
+    }
+
+    /// 一条失败不该带走整批:因为第 2 条不存在就放弃第 3 条,只会让模型再发一轮。
+    #[test]
+    fn trash_reports_each_failure_and_keeps_going() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(cwd).unwrap();
+        let first = temp.path().join("a.txt");
+        let last = temp.path().join("b.txt");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&last, "b").unwrap();
+        let missing = temp.path().join("nope.txt");
+
+        let result = fake_trash(json!({"paths": [
+            first.display().to_string(),
+            missing.display().to_string(),
+            last.display().to_string(),
+        ]}))
+        .unwrap();
+        let data: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(data["moved"], 2);
+        assert_eq!(data["failed"], 1);
+        assert_eq!(data["ok"], true, "还有成功的就不算整体失败");
+        assert!(!first.exists());
+        assert!(!last.exists(), "失败项之后的路径仍要处理");
+        let failures = data["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("nope.txt"));
+        assert!(!failures[0]["error"].as_str().unwrap().is_empty());
     }
 
     #[test]
-    fn trash_path_moves_directory_to_trash() {
-        let cwd = std::env::current_dir().unwrap();
-        let temp = tempfile::tempdir_in(cwd).unwrap();
-        let path = temp.path().join("trash-dir");
-        std::fs::create_dir(&path).unwrap();
-        std::fs::write(path.join("child.txt"), "bye").unwrap();
-        let result = fake_trash_path(json!({"path": path.display().to_string()})).unwrap();
-        let data: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(data["ok"], true);
-        assert_eq!(data["kind"], "directory");
-        assert_eq!(data["exists_after"], false);
-        assert!(!path.exists());
+    fn trash_rejects_an_empty_or_missing_path_list() {
+        assert!(fake_trash(json!({"paths": []})).is_err());
+        assert!(fake_trash(json!({"paths": ["", "   "]})).is_err());
+        assert!(fake_trash(json!({"path": "/tmp/x"})).is_err());
     }
 }

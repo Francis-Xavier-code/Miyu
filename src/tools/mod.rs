@@ -10,6 +10,7 @@ mod clipboard;
 mod deep_research;
 mod deepseek_status;
 mod default_tools;
+pub(crate) use default_tools::TOOL_SUMMARY_PREFIX;
 mod diagnostics;
 mod edit_replace;
 mod exchange_rate;
@@ -140,6 +141,9 @@ pub fn preparing_phase(name: &str) -> Option<&'static str> {
         | "edit_file"
         | "edit_string" => t("Preparing edit", "准备编辑"),
         "run_command" => t("Preparing command", "准备执行"),
+        // 批量删的参数是一整串路径,条数一多就是几百字节,正好落在
+        // 「工具名已解码、参数还在流」的那个窗口里。
+        "trash_path" => t("Preparing delete", "准备删除"),
         // A subagent brief is long, and its own timed block only appears once
         // the arguments have all arrived.
         "task" | "deep_research" => t("Preparing task", "准备任务"),
@@ -584,6 +588,10 @@ mod tests {
         assert_eq!(
             preparing_phase("run_command"),
             Some(crate::i18n::text("Preparing command", "准备执行"))
+        );
+        assert_eq!(
+            preparing_phase("trash_path"),
+            Some(crate::i18n::text("Preparing delete", "准备删除"))
         );
         for name in ["task", "deep_research"] {
             assert_eq!(

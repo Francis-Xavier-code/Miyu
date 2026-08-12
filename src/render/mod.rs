@@ -1448,6 +1448,20 @@ impl StreamRenderer {
             }
             return Ok(());
         }
+        if let Some(text) = message.strip_prefix(crate::tools::TOOL_SUMMARY_PREFIX) {
+            if self.tool_call_mode == ToolCallDisplayMode::Full {
+                self.release_transient_output()?;
+                let stdout = &mut self.output;
+                for line in text.lines() {
+                    writeln!(stdout, "{line}")?;
+                }
+                stdout.flush()?;
+            } else if self.tool_call_mode == ToolCallDisplayMode::Summary {
+                self.tool_stats_entry(name).final_progress = Some(text.to_string());
+                self.update_tool_summary_display()?;
+            }
+            return Ok(());
+        }
         if let Some(text) = message.strip_prefix("__subagent_stats__") {
             if self.tool_call_mode == ToolCallDisplayMode::Full {
                 self.release_transient_output()?;
@@ -1938,7 +1952,13 @@ impl StreamRenderer {
                 } else {
                     clip_progress_line(line, 120)
                 };
-                lines.push(format!("{detail_indent}{progress_prefix} {line}"));
+                // 自带记号的行原样保留:失败清单是 `✗ …`,再套一个 `✓` 就成了
+                // 「✓ ✗ 权限不足」。
+                if line.starts_with('✗') {
+                    lines.push(format!("{detail_indent}{line}"));
+                } else {
+                    lines.push(format!("{detail_indent}{progress_prefix} {line}"));
+                }
             }
         }
         lines
@@ -2413,7 +2433,9 @@ fn tool_event_base_name(name: &str) -> &str {
 }
 
 fn inline_tool_subject(name: &str) -> bool {
-    tool_event_base_name(name) == "load_tools"
+    // 回收站的 subject 是条数,贴在标题上比单占一行更紧凑,
+    // 而成功时整个块本来就只有这一行。
+    matches!(tool_event_base_name(name), "load_tools" | "trash_path")
 }
 
 pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
@@ -2442,8 +2464,17 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
                 None => path,
             })
         }
-        "write_file" | "edit_file" | "edit_string" | "trash_path" | "register_script" => {
+        "write_file" | "edit_file" | "edit_string" | "register_script" => {
             string_arg(&args, &["path"])
+        }
+        "trash_path" => {
+            let paths = args.get("paths").and_then(Value::as_array)?;
+            match paths.len() {
+                0 => None,
+                // 只删一个时报路径更有用;成堆删时路径无信息量,报条数。
+                1 => paths[0].as_str().map(str::to_string),
+                count => Some(format!("{count} {}", t("items", "项"))),
+            }
         }
         "run_command" => {
             let command = string_arg(&args, &["command"])?;
@@ -5356,6 +5387,47 @@ mod tests {
     }
 
     #[test]
+    fn trash_subject_counts_items_but_names_a_lone_path() {
+        assert_eq!(
+            tool_subject("trash_path", r#"{"paths":["/tmp/a","/tmp/b","/tmp/c"]}"#).as_deref(),
+            Some(t("3 items", "3 项"))
+        );
+        // 只删一个时路径比「1 项」有用。
+        assert_eq!(
+            tool_subject("trash_path", r#"{"paths":["/tmp/only.txt"]}"#).as_deref(),
+            Some("/tmp/only.txt")
+        );
+        assert_eq!(tool_subject("trash_path", r#"{"paths":[]}"#), None);
+    }
+
+    /// 失败清单自带 `✗`,不能再被套一个 `✓` 变成「✓ ✗ 权限不足」。
+    #[test]
+    fn final_progress_keeps_lines_that_carry_their_own_marker() {
+        let renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            false,
+            true,
+            10,
+        );
+        let stats = ToolStats {
+            calls: 1,
+            ok: 1,
+            final_progress: Some("✗ /etc/hosts  权限不足\n收尾完成".to_string()),
+            ..Default::default()
+        };
+        let lines = renderer.tool_block_lines("trash_path", &stats, false);
+        assert!(
+            lines.iter().any(|line| line.trim() == "✗ /etc/hosts  权限不足"),
+            "失败行应原样保留：{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.trim() == "✓ 收尾完成"),
+            "普通行仍要套 ✓：{lines:?}"
+        );
+    }
+
+    #[test]
     fn tool_subject_extracts_safe_operation_targets() {
         assert_eq!(
             tool_subject("web_search", r#"{"query":"OpenCode 工具摘要"}"#).as_deref(),
@@ -5886,6 +5958,7 @@ mod tests {
             assert!(!phase.contains("\x1b[38;5;10m"), "{name}");
         }
         assert!(phase_for("run_command").contains(t("~ Preparing command", "~ 准备执行")));
+        assert!(phase_for("trash_path").contains(t("~ Preparing delete", "~ 准备删除")));
         assert!(phase_for("read_file").is_empty());
     }
 
