@@ -7392,21 +7392,28 @@ fn wake_local_session_for_job(
     } else {
         "后台命令"
     };
-    let action_hint = if completion.is_subagent {
-        "先用 job_status 读取日志（结尾的「子代理结果」段是最终结论，必要时用 offset 分页），然后向用户简要汇报；如果失败，指出原因并给出建议。"
-    } else {
-        "先用 job_status 读取输出（必要时用 offset 分页），然后向用户简要汇报结果；如果命令失败，指出原因并给出建议。"
-    };
+    // 结果直接附在唤醒里,不再让模型「先去查一次再汇报」。子代理给完整结论
+    // (它就是交付物),命令给日志尾部;剩下的自己判断——只给事实和日志路径,
+    // 不给动作指示。
+    let result_block = tools::jobs::completion_result(
+        &completion.log_path,
+        completion.is_subagent,
+        completion.exit_code == Some(0),
+    )
+    .map(|(label, body)| format!("- {label}:\n{body}\n"))
+    .unwrap_or_default();
     let content = format!(
-        "<background-job-report>{noun}「{}」已执行完毕，请自主跟进：\n\
+        "<background-job-report>{noun}「{}」已执行完毕：\n\
          - job_id: {}\n- 任务: {}\n- 状态: {}（运行 {} 秒）\n\
-         {action_hint}这是系统自动触发的跟进，不是用户消息。\
+         - 日志: {}\n{result_block}\
+         这是系统自动触发的跟进，不是用户消息。\
          </background-job-report>",
         completion.title,
         completion.job_id,
         command_short,
         completion.state_label,
-        completion.runtime_seconds
+        completion.runtime_seconds,
+        completion.log_path.display(),
     );
     let display_content = format!(
         "[后台任务完成] {}完成 {} · {}",

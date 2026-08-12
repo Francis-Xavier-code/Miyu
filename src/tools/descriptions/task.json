@@ -19,7 +19,7 @@
           "explore",
           "general"
         ],
-        "description": "子代理类型。explore：只读搜索，适合代码库探索和信息收集；general：通用多步任务，可读写文件和运行命令。默认 general。",
+        "description": "子代理类型。explore 只有这 7 个工具：read_file、glob、grep、web_search、web_fetch、check_os_info、read_clipboard——适合读代码、查资料，别的一律没有。需要其它任何工具（天气、知识库、生图、运行命令等）就必须用 general，它继承你当前的全部工具。默认 general。",
         "default": "general"
       },
       "max_steps": {

@@ -136,7 +136,10 @@ pub fn register(
                 "subagent_type": {
                     "type": "string",
                     "enum": ["explore", "general"],
-                    "description": t("Subagent type. explore: read-only search for codebase exploration and info gathering; general: multi-step tasks with file read/write and command execution. Defaults to general.", "子代理类型。explore：只读搜索，适合代码库探索和信息收集；general：通用多步任务，可读写文件和运行命令。默认 general。"),
+                    // explore 是一份硬白名单(见 EXPLORE_ALLOWED),不是「所有只读工具」。
+                    // 说成「只读搜索」会让模型以为 get_weather 这类只读工具也在里面,
+                    // 于是拿 explore 去干需要专用工具的活,再自己用 web_fetch 硬凑。
+                    "description": t("Subagent type. explore has exactly these 7 tools: read_file, glob, grep, web_search, web_fetch, check_os_info, read_clipboard — good for reading code and looking things up, nothing else is available. Anything needing another tool (weather, knowledge base, image generation, running commands) must use general, which inherits your full tool set. Defaults to general.", "子代理类型。explore 只有这 7 个工具：read_file、glob、grep、web_search、web_fetch、check_os_info、read_clipboard——适合读代码、查资料，别的一律没有。需要其它任何工具（天气、知识库、生图、运行命令等）就必须用 general，它继承你当前的全部工具。默认 general。"),
                     "default": "general"
                 },
                 "max_steps": {
@@ -317,8 +320,14 @@ async fn spawn_background_task(
                 Err(_) => "error".to_string(),
             };
             let tail = match &output {
-                Ok(json) => format!("\n===== 子代理结果 =====\n{json}\n"),
-                Err(error) => format!("\n===== 子代理失败 =====\n{error}\n"),
+                Ok(json) => format!(
+                    "\n{}\n{json}\n",
+                    crate::tools::jobs::SUBAGENT_RESULT_MARKER
+                ),
+                Err(error) => format!(
+                    "\n{}\n{error}\n",
+                    crate::tools::jobs::SUBAGENT_ERROR_MARKER
+                ),
             };
             let _ = std::fs::OpenOptions::new()
                 .append(true)

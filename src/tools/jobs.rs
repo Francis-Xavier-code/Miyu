@@ -22,6 +22,12 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const STATUS_POLL: Duration = Duration::from_millis(250);
 /// Output chunk cap per job_status call, mirroring script output limits.
 const MAX_STATUS_OUTPUT_CHARS: usize = 20_000;
+/// 列表模式里单行日志的上限,防止一行超长把整条任务的额度吃光。
+const MAX_TAIL_LINE_CHARS: usize = 200;
+/// 分离子代理把最终结论追加到日志末尾时用的分隔符。写在 `task.rs`,读在这里,
+/// 所以常量放在两边都够得着的位置——分头写死过一次就会悄悄对不上。
+pub(crate) const SUBAGENT_RESULT_MARKER: &str = "===== 子代理结果 =====";
+pub(crate) const SUBAGENT_ERROR_MARKER: &str = "===== 子代理失败 =====";
 const LOG_RETENTION_DAYS: u64 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,14 +184,21 @@ pub fn set_started_hook(hook: StartedHook) {
     *started_hook().lock().unwrap() = Some(hook);
 }
 
+impl JobEntry {
+    /// 命令还是子代理。UI 的任务条与工具返回值共用同一份判定,免得两处措辞跑偏。
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            JobKind::Command { .. } => "command",
+            JobKind::Subagent { .. } => "subagent",
+        }
+    }
+}
+
 fn overview_of(job: &JobEntry) -> JobOverview {
     JobOverview {
         job_id: job.job_id.clone(),
         title: job.title.clone(),
-        kind: match job.kind {
-            JobKind::Command { .. } => "command".to_string(),
-            JobKind::Subagent { .. } => "subagent".to_string(),
-        },
+        kind: job.kind_label().to_string(),
         session_id: job.session_id.as_deref().map(str::to_string),
         status: job.state.label(),
         running: !job.state.is_terminal(),
@@ -639,6 +652,81 @@ fn read_log_slice(path: &PathBuf, offset: u64, budget: usize) -> (String, u64, u
     (slice, end as u64, size, truncated)
 }
 
+/// 日志尾部的最后 `lines` 行,给列表模式用。
+///
+/// 和 `read_log_slice` 是两种语义:那个从 `offset` 向后增量读,用来追新输出;
+/// 这个取的是最新的一段,回答「现在跑成什么样了」。所以列表模式**不返回**
+/// next_offset——把尾部片段的末尾当成续读起点会漏掉中间那一大段。
+///
+/// 单行超过 `MAX_TAIL_LINE_CHARS` 会被截断,免得某行是一整坨 JSON 就把
+/// 整条任务的额度吃光。前面还有内容时开头补一个 `…`。
+fn read_log_tail(path: &PathBuf, lines: usize) -> (String, u64) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (String::new(), 0);
+    };
+    let size = bytes.len() as u64;
+    let text = String::from_utf8_lossy(&bytes);
+    let all = text.lines().collect::<Vec<_>>();
+    let start = all.len().saturating_sub(lines);
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str("…\n");
+    }
+    for line in &all[start..] {
+        if line.chars().count() > MAX_TAIL_LINE_CHARS {
+            let clipped = line
+                .chars()
+                .take(MAX_TAIL_LINE_CHARS)
+                .collect::<String>();
+            out.push_str(&clipped);
+            out.push('…');
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    (out, size)
+}
+
+/// 后台任务完成时,交给模型的「结果」。
+///
+/// 按任务类型分开取,因为两者的产物根本不同:子代理有明确的最终结论(它就是
+/// 这次任务的交付物,**不截断**——截了模型还得回头读日志,等于没给);后台命令
+/// 没有结论,日志尾部就是结果,失败时给得比成功时多,因为报错的根因常常要往上
+/// 翻十几行。
+pub fn completion_result(log_path: &PathBuf, is_subagent: bool, ok: bool) -> Option<(String, String)> {
+    if is_subagent {
+        let text = std::fs::read_to_string(log_path).ok()?;
+        for marker in [SUBAGENT_RESULT_MARKER, SUBAGENT_ERROR_MARKER] {
+            if let Some(index) = text.rfind(marker) {
+                let body = text[index + marker.len()..].trim();
+                if body.is_empty() {
+                    continue;
+                }
+                let label = if marker == SUBAGENT_RESULT_MARKER {
+                    "子代理结论"
+                } else {
+                    "子代理失败"
+                };
+                return Some((label.to_string(), body.to_string()));
+            }
+        }
+        return None;
+    }
+    let (tail, _) = read_log_tail(log_path, if ok { 10 } else { 30 });
+    let tail = tail.trim_end();
+    (!tail.is_empty()).then(|| ("输出结尾".to_string(), tail.to_string()))
+}
+
+/// 任务越多每条给得越少,总量始终有界:最坏 20 条 × 3 行 × 200 字符 ≈ 12 K。
+fn tail_lines_for(job_count: usize) -> usize {
+    match job_count {
+        0..=6 => 10,
+        7..=15 => 5,
+        _ => 3,
+    }
+}
+
 /// Job ids a call is asking about: the `job_ids` array first, then a scalar
 /// `job_id`, de-duplicated while keeping the caller's order. Shared by
 /// `job_status` and `job_stop` — a plain `dedup()` only drops *adjacent*
@@ -688,9 +776,13 @@ fn job_detail_json(job: &JobEntry, offset: u64, budget: usize) -> Value {
     let (content, next, size, truncated) = read_log_slice(&job.log_path, offset, budget);
     json!({
         "job_id": job.job_id,
+        "kind": job.kind_label(),
+        "title": job.title,
         "status": job.state.label(),
         "running": !job.state.is_terminal(),
         "command": truncate_command(&job.command),
+        // 完整翻阅走 read_file 读这个路径,不在这里重造一套分页。
+        "log_path": job.log_path.display().to_string(),
         "runtime_seconds": job.finished.unwrap_or_else(Instant::now)
             .duration_since(job.started).as_secs(),
         "output": {
@@ -754,16 +846,25 @@ async fn job_status(args: Value) -> Result<String> {
             .filter(|job| job_visible(job, current.as_deref(), all))
             .collect::<Vec<_>>();
         rows.sort_by_key(|job| job.started_wall);
+        // 每条带一段日志尾部:否则模型看完列表还得逐个再查一轮才知道进展,
+        // 而子代理的提示语本来就写着「日志即其进度」。
+        let tail_lines = tail_lines_for(rows.len());
         let rows = rows
             .into_iter()
             .map(|job| {
+                let (recent_output, log_size) = read_log_tail(&job.log_path, tail_lines);
                 json!({
                     "job_id": job.job_id,
+                    "kind": job.kind_label(),
                     "title": job.title,
                     "status": job.state.label(),
+                    "running": !job.state.is_terminal(),
                     "command": truncate_command(&job.command),
                     "runtime_seconds": job.finished.unwrap_or_else(Instant::now)
                         .duration_since(job.started).as_secs(),
+                    "recent_output": recent_output,
+                    "log_size": log_size,
+                    "log_path": job.log_path.display().to_string(),
                     "workspace": job.workspace.display().to_string(),
                 })
             })
@@ -935,20 +1036,20 @@ pub fn register_status(registry: &mut ToolRegistry) {
         ToolSpec::new(
             "job_status",
             t(
-                "Check background jobs of the current session. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes. Without an id lists this session's jobs; with job_id returns status plus incremental log output from offset; with job_ids returns the same per-job detail for several at once, sharing the log budget. Pass all=true to see other sessions' jobs.",
-                "查询本会话的后台任务，立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。不带 id 列出本会话全部任务；带 job_id 返回状态和从 offset 起的增量日志输出；带 job_ids 一次返回多条任务的同样明细（日志额度在这些任务间均分）。跨会话查询需传 all=true。",
+                "Call it with no arguments to list every background job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.",
+                "不带参数直接调用，就会列出本会话全部后台任务——每条都带 recent_output（该任务日志的尾部片段）和 log_size，想知道「都跑成什么样了」一次调用就够。要某个任务的增量输出，带 job_id 加 offset；要同时看多个，带 job_ids（日志额度在它们之间均分）。想完整翻阅或从头读某份日志，用 read_file 读它的 log_path（支持按行分页）。跨会话加 all=true。立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "job_id": { "type": "string", "description": "单个后台任务 id；与 job_ids 都省略则列出本会话全部任务。" },
+                    "all": { "type": "boolean", "description": "true 时不限本会话，列出/查询全部会话的后台任务。" },
+                    "job_id": { "type": "string", "description": "只看某一个任务时用。省略它和 job_ids 就是列出全部任务（含每条的日志尾部）。" },
                     "job_ids": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "一次查询多个后台任务 id。"
+                        "description": "一次查询多个任务的明细，日志额度在它们之间均分。"
                     },
-                    "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移；用上次返回的 next_offset 增量读取。" },
-                    "all": { "type": "boolean", "description": "true 时不限本会话，查询全部会话的后台任务。" }
+                    "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移，配合 job_id 增量追新输出；用上次返回的 next_offset。列表模式的 recent_output 是尾部片段，不能当作续读起点。" }
                 },
                 "additionalProperties": false
             }),
@@ -1077,6 +1178,143 @@ mod tests {
             .into_iter()
             .filter(Result::is_ok)
             .count()
+    }
+
+    /// 尾部读取只取最后 N 行,超长行截断,前面还有内容时开头补 `…`。
+    #[test]
+    fn log_tail_keeps_the_last_lines_and_clips_long_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.log");
+
+        // 行数不足时全给,且开头不加省略号。
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let (tail, size) = read_log_tail(&path, 10);
+        assert_eq!(tail, "one\ntwo\n");
+        assert_eq!(size, 8);
+        assert!(!tail.starts_with('…'));
+
+        // 超出时只留最后几行,并标出前面还有。
+        let many = (1..=20).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &many).unwrap();
+        let (tail, _) = read_log_tail(&path, 3);
+        assert!(tail.starts_with("…\n"), "{tail:?}");
+        assert!(tail.contains("line18\nline19\nline20"), "{tail:?}");
+        assert!(!tail.contains("line17"), "{tail:?}");
+
+        // 单行超长要截断,不能把额度吃光。
+        std::fs::write(&path, "x".repeat(MAX_TAIL_LINE_CHARS * 3)).unwrap();
+        let (tail, _) = read_log_tail(&path, 10);
+        assert!(tail.chars().count() <= MAX_TAIL_LINE_CHARS + 2, "{}", tail.chars().count());
+        assert!(tail.trim_end().ends_with('…'));
+
+        // 日志不存在时是空的,不是报错。
+        let (tail, size) = read_log_tail(&dir.path().join("missing.log"), 10);
+        assert!(tail.is_empty());
+        assert_eq!(size, 0);
+    }
+
+    /// 子代理的结论是交付物,必须整段取回、不截断——截了模型还得回头读日志。
+    #[test]
+    fn completion_result_returns_the_whole_subagent_conclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.log");
+        let conclusion = format!("{{\"answer\":\"{}\"}}", "长".repeat(20_000));
+        std::fs::write(
+            &path,
+            format!("过程日志第一行\n第二行\n\n{SUBAGENT_RESULT_MARKER}\n{conclusion}\n"),
+        )
+        .unwrap();
+
+        let (label, body) = completion_result(&path, true, true).unwrap();
+        assert_eq!(label, "子代理结论");
+        assert_eq!(body, conclusion, "结论不能被截断");
+        assert!(!body.contains("过程日志"), "只要标记之后的部分");
+    }
+
+    #[test]
+    fn completion_result_recognises_a_failed_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.log");
+        std::fs::write(&path, format!("…\n{SUBAGENT_ERROR_MARKER}\nmodel refused\n")).unwrap();
+        let (label, body) = completion_result(&path, true, false).unwrap();
+        assert_eq!(label, "子代理失败");
+        assert_eq!(body, "model refused");
+    }
+
+    /// 命令没有「结论」,日志尾部就是结果;失败时给得多,因为报错根因常在上面几行。
+    #[test]
+    fn completion_result_gives_a_command_more_lines_when_it_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        let body = (1..=40).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let (label, ok_tail) = completion_result(&path, false, true).unwrap();
+        assert_eq!(label, "输出结尾");
+        assert!(ok_tail.contains("line40") && !ok_tail.contains("line30"));
+
+        let (_, err_tail) = completion_result(&path, false, false).unwrap();
+        assert!(err_tail.contains("line11"), "失败时要往上多给一些");
+        assert!(err_tail.lines().count() > ok_tail.lines().count());
+    }
+
+    /// 日志为空时不硬塞一段空白进唤醒。
+    #[test]
+    fn completion_result_is_absent_when_there_is_nothing_to_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.log");
+        std::fs::write(&path, "").unwrap();
+        assert!(completion_result(&path, false, true).is_none());
+        assert!(completion_result(&path, true, true).is_none());
+        assert!(completion_result(&dir.path().join("missing.log"), true, true).is_none());
+    }
+
+    /// 任务越多每条给得越少,总量有界。
+    #[test]
+    fn tail_budget_shrinks_as_jobs_pile_up() {
+        assert_eq!(tail_lines_for(1), 10);
+        assert_eq!(tail_lines_for(6), 10);
+        assert_eq!(tail_lines_for(7), 5);
+        assert_eq!(tail_lines_for(15), 5);
+        assert_eq!(tail_lines_for(40), 3);
+    }
+
+    /// 列表模式必须自带日志尾部:否则模型看完列表还得逐个再查一轮,
+    /// 而子代理的提示语本来就写着「日志即其进度」。
+    #[tokio::test]
+    async fn job_status_list_carries_recent_output_and_log_path() {
+        shared_init();
+        let spawned: Value = serde_json::from_str(
+            &spawn_background("echo listed-marker", Some("列表用"), &test_progress())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = spawned["job_id"].as_str().unwrap().to_string();
+        await_terminal(&id).await;
+
+        let status: Value =
+            serde_json::from_str(&job_status(json!({})).await.unwrap()).unwrap();
+        let row = status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["job_id"].as_str() == Some(id.as_str()))
+            .expect("列表里应当有这条任务");
+
+        assert!(row["recent_output"]
+            .as_str()
+            .unwrap()
+            .contains("listed-marker"));
+        assert!(row["log_size"].as_u64().unwrap() > 0);
+        // 完整翻阅走 read_file 读它,所以路径必须给出来。
+        assert!(row["log_path"].as_str().unwrap().ends_with(".log"));
+        // 模型不必再去解析 "exited(0)" 这种字符串猜状态。
+        assert_eq!(row["running"], false);
+        assert_eq!(row["kind"], "command");
+        assert!(row["title"].is_string());
+        // 列表给的是尾部快照,不是续读起点——给了 next_offset 会被拿去续读并漏掉中间。
+        assert!(row.get("next_offset").is_none());
     }
 
     #[tokio::test]
