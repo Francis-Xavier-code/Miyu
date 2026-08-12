@@ -998,8 +998,7 @@ fn migrate_legacy_layout(legacy: &LegacyLayout, next: &Layout) -> Result<()> {
         return Ok(());
     }
     let mappings = legacy_migration_mappings(legacy, next);
-    let initial = existing_mappings(&mappings)?;
-    preflight_mappings(&initial)?;
+    preflight_with_disposable_cache(&mappings, &legacy.cache_dir)?;
 
     ensure_private_dir(&next.root_dir)?;
     for directory in [
@@ -1017,8 +1016,7 @@ fn migrate_legacy_layout(legacy: &LegacyLayout, next: &Layout) -> Result<()> {
     // Repeat the full preflight while holding the layout lock. The first pass
     // guarantees a known conflict does not even create ~/.miyu; this pass
     // closes the race with another new Miyu process before any data moves.
-    let active = existing_mappings(&mappings)?;
-    preflight_mappings(&active)?;
+    let active = preflight_with_disposable_cache(&mappings, &legacy.cache_dir)?;
     let next_bash_hook = next.config_dir.join("shell/bash-hook.sh");
     let next_zsh_hook = next.config_dir.join("shell/zsh-hook.zsh");
     let had_bash_hook = entry_exists(&legacy.config_dir.join("shell/bash-hook.sh"))?
@@ -1206,6 +1204,59 @@ fn migrate_entry(source: &Path, destination: &Path) -> Result<()> {
         return Ok(());
     };
     migrate_entry_unchecked(&mapping.source, &mapping.destination)
+}
+
+/// Runs `existing_mappings` + `preflight_mappings`, except that the cache is
+/// treated as disposable: caches routinely contain relative symlinks (for
+/// example HuggingFace-style blob layouts), and refusing to move one would
+/// otherwise brick startup forever over data Miyu can rebuild. When the cache
+/// tree alone fails preflight it is discarded and dropped from the migration
+/// instead of failing it.
+fn preflight_with_disposable_cache(
+    mappings: &[MigrationMapping],
+    legacy_cache: &Path,
+) -> Result<Vec<MigrationMapping>> {
+    let mut active = existing_mappings(mappings)?;
+    if let Some(index) = active
+        .iter()
+        .position(|mapping| mapping.source == legacy_cache)
+    {
+        let projections = active
+            .iter()
+            .map(|mapping| (mapping.source.clone(), mapping.destination.clone()))
+            .collect::<Vec<_>>();
+        let cache = &active[index];
+        let migratable = ensure_supported_entry_tree(&cache.source)
+            .and_then(|_| ensure_absolute_symlink_targets_stable(&cache.source, &projections))
+            .and_then(|_| ensure_no_conflicts(&cache.source, &cache.destination));
+        if let Err(reason) = migratable {
+            eprintln!(
+                "{}: {reason:#}",
+                t(
+                    "discarding the legacy Miyu cache instead of migrating it",
+                    "旧版 Miyu 缓存无法迁移，已直接丢弃"
+                )
+            );
+            discard_legacy_cache(&cache.source);
+            active.remove(index);
+        }
+    }
+    preflight_mappings(&active)?;
+    Ok(active)
+}
+
+/// Best effort: a leftover legacy cache is only cold-start overhead, never a
+/// reason to fail the migration. `symlink_metadata` keeps a symlinked cache
+/// directory from being deleted through the link.
+fn discard_legacy_cache(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    let _ = if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
 }
 
 fn preflight_mappings(mappings: &[MigrationMapping]) -> Result<()> {
@@ -1919,6 +1970,94 @@ mod tests {
             "upper"
         );
         assert!(next.marker().exists());
+    }
+
+    #[test]
+    fn unified_layout_discards_cache_with_relative_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let (legacy, next) = test_layouts(temp.path());
+        fs::create_dir_all(&legacy.config_dir).unwrap();
+        fs::create_dir_all(legacy.cache_dir.join("blobs")).unwrap();
+        fs::write(legacy.config_dir.join("config.jsonc"), "config").unwrap();
+        fs::write(legacy.cache_dir.join("blobs/blob"), "blob").unwrap();
+        symlink("blobs/blob", legacy.cache_dir.join("snapshot")).unwrap();
+
+        migrate_legacy_layout(&legacy, &next).unwrap();
+
+        assert!(!legacy.cache_dir.exists());
+        assert!(!next.cache_dir.join("snapshot").exists());
+        assert_eq!(
+            fs::read_to_string(next.config_dir.join("config.jsonc")).unwrap(),
+            "config"
+        );
+        assert!(next.marker().exists());
+    }
+
+    #[test]
+    fn unified_layout_discards_symlinked_cache_without_touching_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (legacy, next) = test_layouts(temp.path());
+        fs::create_dir_all(&legacy.config_dir).unwrap();
+        fs::write(legacy.config_dir.join("config.jsonc"), "config").unwrap();
+        let target = temp.path().join("real-cache");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("cache.bin"), "keep me").unwrap();
+        symlink("../real-cache", &legacy.cache_dir).unwrap();
+
+        migrate_legacy_layout(&legacy, &next).unwrap();
+
+        assert!(fs::symlink_metadata(&legacy.cache_dir).is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("cache.bin")).unwrap(),
+            "keep me"
+        );
+        assert!(next.marker().exists());
+    }
+
+    #[test]
+    fn unified_layout_discards_cache_whose_absolute_symlink_target_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let (legacy, next) = test_layouts(temp.path());
+        fs::create_dir_all(&legacy.config_dir).unwrap();
+        fs::create_dir_all(&legacy.data_dir).unwrap();
+        fs::create_dir_all(&legacy.cache_dir).unwrap();
+        fs::write(legacy.config_dir.join("config.jsonc"), "config").unwrap();
+        fs::write(legacy.data_dir.join("data.bin"), "data").unwrap();
+        symlink(
+            legacy.data_dir.join("data.bin"),
+            legacy.cache_dir.join("link"),
+        )
+        .unwrap();
+
+        migrate_legacy_layout(&legacy, &next).unwrap();
+
+        assert!(!legacy.cache_dir.exists());
+        assert_eq!(
+            fs::read_to_string(next.data_dir.join("data.bin")).unwrap(),
+            "data"
+        );
+        assert!(next.marker().exists());
+    }
+
+    #[test]
+    fn unified_layout_still_refuses_relative_symlink_outside_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let (legacy, next) = test_layouts(temp.path());
+        fs::create_dir_all(&legacy.config_dir).unwrap();
+        fs::create_dir_all(&legacy.cache_dir).unwrap();
+        fs::write(legacy.config_dir.join("config.jsonc"), "config").unwrap();
+        fs::write(legacy.cache_dir.join("cache.bin"), "cache").unwrap();
+        symlink("config.jsonc", legacy.config_dir.join("alias")).unwrap();
+
+        let error = migrate_legacy_layout(&legacy, &next).unwrap_err();
+
+        assert!(error.to_string().contains("relative symbolic link"));
+        // A healthy cache must survive an aborted migration untouched.
+        assert_eq!(
+            fs::read_to_string(legacy.cache_dir.join("cache.bin")).unwrap(),
+            "cache"
+        );
+        assert!(!next.root_dir.exists());
     }
 
     #[test]
