@@ -474,23 +474,6 @@ impl ToolRegistry {
     }
 
     pub async fn call(&self, name: &str, arguments: &str) -> Result<String> {
-        self.call_with_progress(name, arguments, ToolProgress::default())
-            .await
-    }
-
-    /// Runs a tool on a caller-supplied progress channel.
-    ///
-    /// The plain `call` above hands the tool a channel with no receiver, which
-    /// is fine for output but silently swallows anything the tool needs an
-    /// answer to. Callers that sit under a live turn — subagents, chiefly —
-    /// must pass their own channel through, or a tool asking the user for
-    /// confirmation gets no reply and fails closed forever.
-    pub async fn call_with_progress(
-        &self,
-        name: &str,
-        arguments: &str,
-        progress: ToolProgress,
-    ) -> Result<String> {
         let Some(tool) = self.tools.get(name) else {
             bail!("unknown tool: {name}");
         };
@@ -502,7 +485,7 @@ impl ToolRegistry {
         if name == "load_tools" {
             return super::load_tools::execute(args, self);
         }
-        tool.call(args, progress).await
+        tool.call(args, ToolProgress::default()).await
     }
 
     pub fn call_with_progress_future(

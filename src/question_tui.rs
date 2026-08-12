@@ -358,20 +358,48 @@ struct QuestionSession {
     anchor_y: u16,
     panel_lines: u16,
     keyboard_enhancement_active: bool,
+    /// 面板是不是终端模式的所有者。
+    ///
+    /// REPL 的 `LiveRawMode` 早就把终端切进了 raw,面板是嵌在它里面跑的。
+    /// 此前 `start` 无条件 `enable_raw_mode`、`Drop` 无条件
+    /// `disable_raw_mode`,退出时把 REPL 的 raw 一起关掉,终端落回
+    /// canonical——内核开始回显、Ctrl+C 显示成 `^C`、按键要等 Enter 才整行
+    /// 送进来,回车后回显被重绘抹掉,只剩正文发出去。实测回答完毕后 pty 是
+    /// `ICANON=True ECHO=True`,修复后是 `False/False`。
+    ///
+    /// bracketed paste 与键盘增强同理:关掉了自己没开的东西;键盘协议多推
+    /// 一层就得多弹一层,数量对不上终端就停在错误的协议上。
+    ///
+    /// 因此只有「进来时终端还没被切进 raw」才动这些开关,嵌套运行时一概
+    /// 不碰,原样交还。
+    owns_terminal: bool,
 }
 
 impl QuestionSession {
     fn start(panel_lines: u16) -> Result<Self> {
-        terminal::enable_raw_mode()?;
+        let owns_terminal = !terminal::is_raw_mode_enabled().unwrap_or(false);
+        if owns_terminal {
+            terminal::enable_raw_mode()?;
+        }
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnableBracketedPaste, Hide) {
-            let _ = execute!(stdout, DisableBracketedPaste, Show);
-            let _ = terminal::disable_raw_mode();
+        let entered = if owns_terminal {
+            execute!(stdout, EnableBracketedPaste, Hide)
+        } else {
+            // 嵌套在 REPL 里:bracketed paste 已经由 `LiveRawMode` 开着。
+            execute!(stdout, Hide)
+        };
+        if let Err(err) = entered {
+            if owns_terminal {
+                let _ = execute!(stdout, DisableBracketedPaste);
+                let _ = terminal::disable_raw_mode();
+            }
+            let _ = execute!(stdout, Show);
             return Err(err.into());
         }
         // 1. 尽量启用键盘增强，使 Shift+Enter 可被识别
         // 2. Windows 旧控制台可能不支持，失败时仍保持普通输入
-        let keyboard_enhancement_active = if cfg!(windows) {
+        // 嵌套时 REPL 已经 push 过一层,不再叠加。
+        let keyboard_enhancement_active = if cfg!(windows) || !owns_terminal {
             false
         } else {
             execute!(
@@ -388,6 +416,7 @@ impl QuestionSession {
             anchor_y,
             panel_lines,
             keyboard_enhancement_active,
+            owns_terminal,
         })
     }
 
@@ -509,12 +538,16 @@ impl Drop for QuestionSession {
         // 1. 恢复括号粘贴与光标
         // 2. 若启用过键盘增强则 Pop
         // 3. 退出 raw mode
-        let _ = execute!(self.stdout, DisableBracketedPaste, Show);
-        if self.keyboard_enhancement_active {
-            let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
-            self.keyboard_enhancement_active = false;
+        // 光标一定要交还;raw / bracketed paste / 键盘协议只还自己借的那份。
+        let _ = execute!(self.stdout, Show);
+        if self.owns_terminal {
+            let _ = execute!(self.stdout, DisableBracketedPaste);
+            if self.keyboard_enhancement_active {
+                let _ = execute!(self.stdout, PopKeyboardEnhancementFlags);
+                self.keyboard_enhancement_active = false;
+            }
+            let _ = terminal::disable_raw_mode();
         }
-        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -1229,6 +1262,7 @@ mod tests {
             anchor_y: 8,
             panel_lines: 12,
             keyboard_enhancement_active: false,
+            owns_terminal: false,
         });
         session.resize_to_terminal(3);
         assert_eq!(session.panel_lines, 2);
