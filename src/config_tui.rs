@@ -3371,7 +3371,7 @@ fn edit_platform_session_limits(
         ),
         Field::new(t("Queued turns", "等待队列数量"), limits.queued.to_string()),
     ];
-    if !run_form(
+    if !run_form_editing(
         stdout,
         t(" CONVERSATION CONCURRENCY ", " 会话并发 "),
         &mut fields,
@@ -3408,72 +3408,49 @@ fn rate_limit_label(limit: PlatformRateLimit) -> String {
     )
 }
 
+/// Both numbers live on one form, the way `edit_platform_session_limits`
+/// already does it. The menu row above already renders "N / M 秒", so routing
+/// Enter through a two-item submenu only restated that summary before letting
+/// anyone type — two keypresses to reach a field that was never in doubt.
 fn edit_platform_rate_limit(stdout: &mut io::Stdout, limit: &mut PlatformRateLimit) -> Result<()> {
-    let mut selected = 0usize;
-    loop {
-        let options = vec![
-            format!(
-                "{}: {}",
-                t(
-                    "Maximum messages (0 = unlimited)",
-                    "窗口内消息上限（0 = 不限）"
-                ),
-                limit.max_messages
+    let mut fields = vec![
+        Field::new(
+            t(
+                "Maximum messages (0 = unlimited)",
+                "窗口内消息上限（0 = 不限）",
             ),
-            format!(
-                "{}: {}",
-                t("Window seconds", "窗口秒数"),
-                limit.window_seconds
-            ),
-        ];
-        draw_menu(
-            stdout,
-            t(" RATE LIMIT ", " 限流配置 "),
-            &options,
-            selected,
-            t("Enter edits the selected value", "回车编辑选中的数值"),
-        )?;
-        match read_key()? {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => match selected {
-                0 => {
-                    if let Some(value) = edit_u32_value(
-                        stdout,
-                        t(
-                            "Maximum messages (0 = unlimited)",
-                            "窗口内消息上限（0 = 不限）",
-                        ),
-                        limit.max_messages,
-                    )? {
-                        limit.max_messages = value;
-                    }
-                }
-                1 => {
-                    if let Some(value) = edit_u32_value(
-                        stdout,
-                        t("Window seconds (1-86400)", "窗口秒数（1-86400）"),
-                        limit.window_seconds,
-                    )? {
-                        if (1..=86_400).contains(&value) {
-                            limit.window_seconds = value;
-                        } else {
-                            message(
-                                stdout,
-                                t(
-                                    "Window seconds must be between 1 and 86400.",
-                                    "窗口秒数必须在 1 到 86400 之间。",
-                                ),
-                            )?;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
-        }
+            limit.max_messages.to_string(),
+        ),
+        Field::new(
+            t("Window seconds (1-86400)", "窗口秒数（1-86400）"),
+            limit.window_seconds.to_string(),
+        ),
+    ];
+    if !run_form_editing(stdout, t(" RATE LIMIT ", " 限流配置 "), &mut fields)? {
+        return Ok(());
     }
+    let (Ok(max_messages), Ok(window_seconds)) = (
+        fields[0].value.trim().parse::<u32>(),
+        fields[1].value.trim().parse::<u32>(),
+    ) else {
+        message(stdout, t("Invalid number.", "数值无效。"))?;
+        return Ok(());
+    };
+    if !(1..=86_400).contains(&window_seconds) {
+        message(
+            stdout,
+            t(
+                "Window seconds must be between 1 and 86400.",
+                "窗口秒数必须在 1 到 86400 之间。",
+            ),
+        )?;
+        return Ok(());
+    }
+    *limit = PlatformRateLimit {
+        max_messages,
+        window_seconds,
+    };
+    Ok(())
 }
 
 fn edit_u16_value(
@@ -3482,25 +3459,7 @@ fn edit_u16_value(
     current: u16,
 ) -> Result<Option<u16>> {
     let mut fields = vec![Field::new(label, current.to_string())];
-    if !run_form(stdout, t(" EDIT VALUE ", " 编辑数值 "), &mut fields)? {
-        return Ok(None);
-    }
-    match fields[0].value.trim().parse() {
-        Ok(value) => Ok(Some(value)),
-        Err(_) => {
-            message(stdout, t("Invalid number.", "数值无效。"))?;
-            Ok(None)
-        }
-    }
-}
-
-fn edit_u32_value(
-    stdout: &mut io::Stdout,
-    label: &'static str,
-    current: u32,
-) -> Result<Option<u32>> {
-    let mut fields = vec![Field::new(label, current.to_string())];
-    if !run_form(stdout, t(" EDIT VALUE ", " 编辑数值 "), &mut fields)? {
+    if !run_form_editing(stdout, t(" EDIT VALUE ", " 编辑数值 "), &mut fields)? {
         return Ok(None);
     }
     match fields[0].value.trim().parse() {
@@ -6899,9 +6858,35 @@ fn draw_inline_editor(
 }
 
 fn run_form(stdout: &mut io::Stdout, title: &str, fields: &mut [Field]) -> Result<bool> {
+    run_form_from(stdout, title, fields, false)
+}
+
+/// `start_editing` puts the caret in the first field straight away, for forms
+/// reached from a menu row that already showed the value: the row said what it
+/// was, Enter said "change it", so a second Enter to begin typing is a keypress
+/// that asks a question nobody had.
+fn run_form_editing(stdout: &mut io::Stdout, title: &str, fields: &mut [Field]) -> Result<bool> {
+    run_form_from(stdout, title, fields, true)
+}
+
+fn run_form_from(
+    stdout: &mut io::Stdout,
+    title: &str,
+    fields: &mut [Field],
+    start_editing: bool,
+) -> Result<bool> {
     let mut selected = 0usize;
-    let mut editing = false;
     let mut fcitx = FcitxState::new();
+    // Only a plain text field can be typed into directly; the others open
+    // their own picker on Enter, so landing "inside" them would mean typing
+    // free text where a choice was expected.
+    let mut editing = start_editing
+        && fields.first().is_some_and(|field| {
+            !field.boolean && !field.textarea && !field.modalities && field.choices.is_empty()
+        });
+    if editing {
+        fcitx.enter_editing();
+    }
     let mut cursors = fields
         .iter()
         .map(|field| field.value.chars().count())

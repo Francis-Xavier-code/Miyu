@@ -787,6 +787,17 @@ impl LlmScheduler {
         }
     }
 
+    /// The endpoint whose cooldown lifts first, for the single probe sent when
+    /// every endpoint is cooling down. `None` sorts ahead of any deadline, so
+    /// an endpoint with no cooldown recorded wins outright.
+    fn soonest_ready_index(&self, endpoints: &[LlmEndpoint]) -> Option<usize> {
+        endpoints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, endpoint)| self.cooldowns.get(&endpoint.id()).copied())
+            .map(|(index, _)| index)
+    }
+
     fn mark_success(&mut self, id: &str) {
         self.cooldowns.remove(id);
     }
@@ -810,6 +821,14 @@ fn ordered_endpoint_indices(endpoints: &[LlmEndpoint]) -> Vec<usize> {
         .lock()
         .map(|mut scheduler| scheduler.ordered_indices(endpoints))
         .unwrap_or_else(|_| (0..endpoints.len()).collect())
+}
+
+fn soonest_ready_endpoint_index(endpoints: &[LlmEndpoint]) -> Option<usize> {
+    LLM_SCHEDULER
+        .lock()
+        .ok()
+        .and_then(|scheduler| scheduler.soonest_ready_index(endpoints))
+        .or_else(|| (!endpoints.is_empty()).then_some(0))
 }
 
 fn mark_endpoint_success(endpoint: &LlmEndpoint) {
@@ -857,6 +876,23 @@ fn endpoint_failover_allowed(error: &anyhow::Error) -> bool {
     !error
         .downcast_ref::<HttpStatusFailure>()
         .is_some_and(|failure| failure.kind == HttpFailureKind::InvalidRequest)
+}
+
+/// Whether the *same* endpoint may be tried again inside one request. A 429 or
+/// a rejected key is a verdict on that provider/model/key, not a moment in
+/// time: the retries `MIN_ENDPOINT_ATTEMPTS` pads in would fire back-to-back
+/// with no backoff and spend more of a quota that already said no — which on a
+/// shared free tier is what exhausted it. Failover to a *different* endpoint is
+/// unaffected; that is `endpoint_failover_allowed`'s job.
+fn same_endpoint_retry_allowed(error: &anyhow::Error) -> bool {
+    !error
+        .downcast_ref::<HttpStatusFailure>()
+        .is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                HttpFailureKind::Authentication | HttpFailureKind::RateLimit
+            )
+        })
 }
 
 fn endpoint_client(provider: &ProviderConfig) -> Result<Client> {
@@ -1515,18 +1551,27 @@ impl OpenAiCompatibleClient {
         } else {
             ordered_endpoint_indices(endpoints)
         };
-        if order.is_empty() {
+        // Every endpoint is cooling down. Refusing outright would strand a
+        // single-endpoint user for the whole cooldown, so one probe still goes
+        // out — but exactly one, and to whichever endpoint recovers first.
+        // Refilling the pool here (and then padding it below) meant a rate
+        // limit cost three requests per turn *for the entire cooldown*, which
+        // made the cooldown worse than useless.
+        let probe_only = order.is_empty();
+        if probe_only {
             tracing::warn!(
                 request_id,
                 endpoint_count = endpoints.len(),
                 all_endpoints_cooling_down = true,
                 "{}",
                 t(
-                    "All LLM endpoints are cooling down; attempting the full pool",
-                    "所有 LLM 端点均在冷却；将尝试完整端点池"
+                    "All LLM endpoints are cooling down; sending a single probe",
+                    "所有 LLM 端点均在冷却；仅发送一次探测请求"
                 )
             );
-            order = (0..endpoints.len()).collect();
+            order = soonest_ready_endpoint_index(endpoints)
+                .into_iter()
+                .collect();
         }
         // A dropped stream or a 5xx is a moment in time, not a verdict on the
         // endpoint. Tying the number of attempts to the number of configured
@@ -1534,8 +1579,10 @@ impl OpenAiCompatibleClient {
         // which is backwards: they are the ones with nowhere else to go. Pad
         // the attempt list by cycling so every setup gets the same budget.
         // Errors that a retry cannot fix still stop on the first attempt —
-        // `endpoint_failover_allowed` returns before the next one is tried.
-        if !order.is_empty() && order.len() < MIN_ENDPOINT_ATTEMPTS {
+        // `endpoint_failover_allowed` returns before the next one is tried,
+        // and `same_endpoint_retry_allowed` skips the padded repeats of an
+        // endpoint that answered 429/401.
+        if !probe_only && !order.is_empty() && order.len() < MIN_ENDPOINT_ATTEMPTS {
             let cycle: Vec<usize> = order.clone();
             while order.len() < MIN_ENDPOINT_ATTEMPTS {
                 order.extend(cycle.iter().copied());
@@ -1551,8 +1598,12 @@ impl OpenAiCompatibleClient {
             "{}",
             t("LLM request started", "LLM 请求已开始")
         );
+        let mut exhausted: Vec<String> = Vec::new();
         for (attempt, index) in order.into_iter().enumerate() {
             let endpoint = &endpoints[index];
+            if exhausted.contains(&endpoint.id()) {
+                continue;
+            }
             let client = self.with_endpoint(endpoint);
             if attempt > 0 {
                 on_chunk(ChatStreamChunk {
@@ -1674,6 +1725,9 @@ impl OpenAiCompatibleClient {
                         endpoint.provider.default_model,
                         endpoint.key_index + 1
                     ));
+                    if !same_endpoint_retry_allowed(&err) {
+                        exhausted.push(endpoint.id());
+                    }
                     if attempt_committed {
                         return Err(err.context(
                             "LLM stream failed after emitting output; endpoint failover was suppressed",
@@ -5213,6 +5267,7 @@ fn clean_plain_text(mut text: String) -> String {
 mod tests {
     use super::*;
     use crate::llm::{ChatContent, ChatContentPart, ImageUrlContent};
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -7638,6 +7693,138 @@ mod tests {
             body
         );
         stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    /// Serves an endless stream of opencode-zen-shaped 429s, counting hits.
+    /// The listener is bound before the task is spawned: `#[tokio::test]` runs
+    /// a current-thread runtime, so handing the address back over a blocking
+    /// channel would deadlock the only thread that could serve it.
+    async fn spawn_rate_limited_endpoint() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let body = concat!(
+                    r#"{"type":"error","error":{"type":"FreeUsageLimitError","#,
+                    r#""message":"Error from provider (Console): Rate limit exceeded."}}"#
+                );
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (url, hits, server)
+    }
+
+    fn rate_limit_test_endpoint(id: &str, url: &str) -> LlmEndpoint {
+        let mut provider = test_provider(id, url);
+        provider.protocol = "openai-chat".to_string();
+        provider.default_model = "big-pickle".to_string();
+        LlmEndpoint {
+            client: reqwest::Client::new(),
+            provider,
+            api_key: "public".to_string(),
+            key_index: 0,
+        }
+    }
+
+    fn client_over(endpoints: Vec<LlmEndpoint>) -> OpenAiCompatibleClient {
+        let first = endpoints[0].clone();
+        OpenAiCompatibleClient {
+            client: first.client.clone(),
+            provider: first.provider.clone(),
+            api_key: first.api_key.clone(),
+            endpoints: Arc::new(endpoints),
+            thinking_variants: HashMap::new(),
+            reasoning_visibility: ReasoningVisibility::Summary,
+            buffered_delivery: false,
+            detailed_reasoning_summary: false,
+            request_timeouts: None,
+            max_tokens_override: None,
+            request_scope: "chat",
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_endpoint_costs_one_request_per_turn_not_three() {
+        // Regression: `MIN_ENDPOINT_ATTEMPTS` padded the attempt list by
+        // cycling the only endpoint, so a single 429 fired three back-to-back
+        // requests with no backoff — and the 600s cooldown then refilled the
+        // whole pool, repeating the triple every turn for the entire cooldown.
+        let (url, hits, server) = spawn_rate_limited_endpoint().await;
+        let client = client_over(vec![rate_limit_test_endpoint(
+            "rate-limit-single-endpoint-test",
+            &url,
+        )]);
+
+        for turn in 1..=3 {
+            let before = hits.load(Ordering::SeqCst);
+            let error = client
+                .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("429"),
+                "turn {turn} did not surface the rate limit: {error:#}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst) - before,
+                1,
+                "turn {turn} spent more than one request on a rate-limited endpoint"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_endpoint_still_fails_over_to_a_different_one() {
+        // The same-endpoint suppression must not cost cross-endpoint failover:
+        // each distinct endpoint is still tried exactly once.
+        let (first_url, first_hits, first_server) = spawn_rate_limited_endpoint().await;
+        let (second_url, second_hits, second_server) = spawn_rate_limited_endpoint().await;
+        let client = client_over(vec![
+            rate_limit_test_endpoint("rate-limit-failover-first-test", &first_url),
+            rate_limit_test_endpoint("rate-limit-failover-second-test", &second_url),
+        ]);
+
+        let error = client
+            .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        let rendered = format!("{error:#}");
+        for id in [
+            "rate-limit-failover-first-test",
+            "rate-limit-failover-second-test",
+        ] {
+            assert!(
+                rendered.contains(id),
+                "{id} missing from the failure report: {rendered}"
+            );
+        }
+
+        first_server.abort();
+        second_server.abort();
     }
 
     fn test_client(provider: ProviderConfig) -> OpenAiCompatibleClient {

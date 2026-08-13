@@ -43,7 +43,23 @@ struct ApiLimit {
     #[serde(default)]
     context: Option<u64>,
     #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
     output: Option<u64>,
+}
+
+impl ApiLimit {
+    /// The window Miyu may actually fill. Some catalogue entries advertise a
+    /// total `context` larger than the `input` the provider will accept —
+    /// opencode's big-pickle reports 200k context against a 160k input cap —
+    /// and budgeting against the larger number puts compaction 20k of tokens
+    /// too late, so the request overflows before it is ever compacted.
+    fn usable_context(&self) -> Option<u64> {
+        match (self.context, self.input.filter(|input| *input > 0)) {
+            (Some(context), Some(input)) => Some(context.min(input)),
+            (context, input) => context.or(input),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +158,7 @@ fn parse_api_response(text: &str) -> Result<HashMap<String, HashMap<String, Mode
             let input = model.modalities.map(|m| m.input).unwrap_or_default();
             let limit = model.limit.unwrap_or(ApiLimit {
                 context: None,
+                input: None,
                 output: None,
             });
             let variants = reasoning_variants(&model.reasoning_options, limit.output);
@@ -149,7 +166,7 @@ fn parse_api_response(text: &str) -> Result<HashMap<String, HashMap<String, Mode
                 model_id,
                 ModelInfo {
                     input_modalities: input,
-                    context_window: limit.context,
+                    context_window: limit.usable_context(),
                     reasoning: (!variants.is_empty()).then_some(ModelReasoningInfo {
                         provider_npm: model
                             .provider
@@ -706,6 +723,30 @@ mod tests {
             context_window: Some(window),
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn catalogue_context_window_is_capped_by_the_input_limit() {
+        // opencode's big-pickle advertises a 200k context against a 160k input
+        // cap; budgeting against 200k puts compaction past the point the
+        // provider still accepts the request.
+        let parsed = parse_api_response(
+            r#"{"opencode":{"models":{
+                "big-pickle":{"limit":{"context":200000,"input":160000,"output":32000}},
+                "context-only":{"limit":{"context":128000,"output":8000}},
+                "input-only":{"limit":{"input":64000}},
+                "input-zero":{"limit":{"context":32000,"input":0}},
+                "no-limit":{}
+            }}}"#,
+        )
+        .unwrap();
+        let models = &parsed["opencode"];
+
+        assert_eq!(models["big-pickle"].context_window, Some(160_000));
+        assert_eq!(models["context-only"].context_window, Some(128_000));
+        assert_eq!(models["input-only"].context_window, Some(64_000));
+        assert_eq!(models["input-zero"].context_window, Some(32_000));
+        assert_eq!(models["no-limit"].context_window, None);
     }
 
     #[test]

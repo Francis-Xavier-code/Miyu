@@ -2541,16 +2541,23 @@ async fn handle_message_with_activity(
     let session_turn = match session_turn_ticket {
         Some(ticket) => match ticket.acquire().await {
             Ok(lease) => Some(lease),
+            // Dropped in silence. Announcing a full queue told the group
+            // nothing it could act on — the backlog clears on its own — and
+            // the apology itself cost a message at the exact moment the
+            // conversation was already saturated. The log keeps it visible to
+            // whoever runs the bot.
             Err(super::SessionTurnAcquireError::Full) => {
-                let _ = context
-                    .send_bypass_plugins(OutboundMessage::text(
-                        OutboundOrigin::Command,
-                        t(
-                            "This conversation has too many pending requests. Please try again shortly.",
-                            "当前会话等待中的请求过多，请稍后再试。",
-                        ),
-                    ))
-                    .await;
+                tracing::debug!(
+                    target: "miyu::qq",
+                    session_id = ?session_id,
+                    sender_id = user_id,
+                    message_id = %inbound_event.message_id,
+                    "{}",
+                    t(
+                        "OneBot message discarded: the conversation queue is full",
+                        "OneBot 消息已丢弃：当前会话等待队列已满"
+                    )
+                );
                 return;
             }
             Err(super::SessionTurnAcquireError::Closed) => return,
