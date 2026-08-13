@@ -5348,13 +5348,6 @@ fn with_host_environment(
     system_prompt.push_str(
         "\n\n输出数学公式时使用 LaTeX:重要公式用块级定界符(`$$…$$` 或 `\\[…\\]`,独立成段)会渲染成排版图;行内用 `$…$` 或 `\\(…\\)`,会转写为 Unicode 数学文本;表格单元格内的公式同样支持,分式会排成上下结构。不要用裸 Unicode 或 ASCII 手拼公式。",
     );
-    // 反编造事实陈述:flash 级模型会模仿历史里的任务播报,凭空宣称起了后台
-    // 任务。按注入 hint 经验只陈述机制事实,不写祈使句。
-    system_prompt.push_str(
-        "
-
-后台任务只在本轮实际调用 run_command(background=true) 并从返回值拿到 job_id 之后才存在;job_id 由系统随机生成,无法预知。没有那次工具调用就没有任务,也不会有任何自动汇报。",
-    );
     system_prompt
 }
 

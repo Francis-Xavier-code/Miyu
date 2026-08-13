@@ -7662,7 +7662,6 @@ async fn stream_job_wake_to_origin_tty(
         return;
     }
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
     let tty = match std::fs::OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_NOCTTY)
@@ -7673,14 +7672,6 @@ async fn stream_job_wake_to_origin_tty(
             tracing::debug!(job_id = %completion.job_id, %error, "origin tty open failed");
             notify_fallback("tty open failed");
             return;
-        }
-    };
-    let cols = unsafe {
-        let mut size: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0 {
-            size.ws_col as usize
-        } else {
-            80
         }
     };
     tracing::info!(
@@ -7703,12 +7694,9 @@ async fn stream_job_wake_to_origin_tty(
 
     let reasoning_mode =
         crate::render::ReasoningDisplayMode::from_config(&config.display.reasoning);
-    let rule = "─".repeat(cols.clamp(20, 72));
-    let dim = |text: &str| format!("\x1b[2m{text}\x1b[0m");
     // 落笔即有反馈:头部先行,正文随事件到达逐行追加。
     let _ = ops_tx.send(TtyWriteOp::Write(format!(
-        "\r\n{}\r\n\x1b[1m✦ Miyu 后台任务跟进\x1b[0m \x1b[2m· {}\x1b[0m\r\n\r\n",
-        dim(&rule),
+        "\r\n\x1b[1m✦ Miyu 后台任务跟进\x1b[0m \x1b[2m· {}\x1b[0m\r\n\r\n",
         completion.title
     )));
 
@@ -7771,11 +7759,10 @@ async fn stream_job_wake_to_origin_tty(
         let mut chunk_out = String::new();
         match record.kind.as_str() {
             "reasoning.title" => {
-                if !matches!(reasoning_mode, crate::render::ReasoningDisplayMode::Hidden) {
+                if matches!(reasoning_mode, crate::render::ReasoningDisplayMode::Summary) {
                     if let Some(title) = data.get("title").and_then(Value::as_str) {
-                        flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
-                        chunk_out.push_str(&dim(&format!("∴ {title}")));
-                        chunk_out.push_str("\r\n");
+                        flush_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
+                        push_rendered_line(&format!("∴ {title}"), WriteLineStyle::Reasoning, &mut chunk_out);
                         wrote_reasoning = true;
                         reasoning_open = true;
                     }
@@ -7785,17 +7772,17 @@ async fn stream_job_wake_to_origin_tty(
                 if matches!(reasoning_mode, crate::render::ReasoningDisplayMode::Full) {
                     if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                         reasoning_buf.push_str(delta);
-                        drain_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                        drain_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
                         wrote_reasoning = true;
                         reasoning_open = true;
                     }
                 }
             }
             "reasoning.part_end" | "reasoning.reset" => {
-                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                flush_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
             }
             "tool.started" => {
-                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                flush_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
                 if reasoning_open {
                     chunk_out.push_str("\r\n");
                     reasoning_open = false;
@@ -7805,8 +7792,7 @@ async fn stream_job_wake_to_origin_tty(
                     .or_else(|| data.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("工具");
-                chunk_out.push_str(&dim(&format!("⚙ {name} …")));
-                chunk_out.push_str("\r\n");
+                push_rendered_line(&format!("⚙ {name} …"), WriteLineStyle::Note, &mut chunk_out);
             }
             "tool.finished" => {
                 if data.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -7815,12 +7801,11 @@ async fn stream_job_wake_to_origin_tty(
                         .or_else(|| data.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("工具");
-                    chunk_out.push_str(&dim(&format!("⚙ {name} 失败")));
-                    chunk_out.push_str("\r\n");
+                    push_rendered_line(&format!("⚙ {name} 失败"), WriteLineStyle::Note, &mut chunk_out);
                 }
             }
             "assistant.delta" => {
-                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                flush_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
                 if reasoning_open || (wrote_reasoning && content_buf.is_empty() && chunk_out.is_empty()) {
                     chunk_out.push_str("\r\n");
                     reasoning_open = false;
@@ -7828,20 +7813,19 @@ async fn stream_job_wake_to_origin_tty(
                 }
                 if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                     content_buf.push_str(delta);
-                    drain_line_buf(&mut content_buf, false, &mut chunk_out);
+                    drain_line_buf(&mut content_buf, WriteLineStyle::Content, &mut chunk_out);
                 }
             }
             "run.completed" | "run.failed" | "run.cancelled" => {
-                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
-                flush_line_buf(&mut content_buf, false, &mut chunk_out);
+                flush_line_buf(&mut reasoning_buf, WriteLineStyle::Reasoning, &mut chunk_out);
+                flush_line_buf(&mut content_buf, WriteLineStyle::Content, &mut chunk_out);
                 if record.kind != "run.completed" {
-                    chunk_out.push_str(&dim("(跟进中断)"));
-                    chunk_out.push_str("\r\n");
+                    push_rendered_line("(跟进中断)", WriteLineStyle::Note, &mut chunk_out);
                 }
                 // fish/zsh 收到 SIGWINCH 重绘提示符时,会从光标行向上清掉
                 // 自家提示符高度的行数再画(starship 双行提示符实测清 2 行)。
-                // 垫两行空白当牺牲品,免得清到正文和底部分隔线。
-                chunk_out.push_str(&format!("\r\n{}\r\n\r\n\r\n", dim(&rule)));
+                // 垫两行空白当牺牲品,免得清到正文末行。
+                chunk_out.push_str("\r\n\r\n\r\n");
                 let _ = ops_tx.send(TtyWriteOp::Write(chunk_out));
                 let _ = ops_tx.send(TtyWriteOp::Finish);
                 tracing::info!(
@@ -7868,31 +7852,46 @@ async fn stream_job_wake_to_origin_tty(
     }
 }
 
-/// 行缓冲落盘:凑满整行才渲染(思考行统一暗色,正文行走 Markdown 渲染)。
-fn drain_line_buf(buf: &mut String, dim_style: bool, out: &mut String) {
+/// 回写行的三种笔触:正文走 Markdown 渲染;思考用与 REPL 正常思考一致的
+/// 绿色(write_full_reasoning_chunk 同款 ANSI 10);注记(工具行/中断标记)暗色。
+#[derive(Clone, Copy, PartialEq)]
+enum WriteLineStyle {
+    Content,
+    Reasoning,
+    Note,
+}
+
+/// 行缓冲落盘:凑满整行才渲染。
+fn drain_line_buf(buf: &mut String, style: WriteLineStyle, out: &mut String) {
     while let Some(index) = buf.find('\n') {
         let line: String = buf.drain(..=index).collect();
         let line = line.trim_end_matches(['\n', '\r']);
-        push_rendered_line(line, dim_style, out);
+        push_rendered_line(line, style, out);
     }
 }
 
-fn flush_line_buf(buf: &mut String, dim_style: bool, out: &mut String) {
+fn flush_line_buf(buf: &mut String, style: WriteLineStyle, out: &mut String) {
     if buf.trim().is_empty() {
         buf.clear();
         return;
     }
     let line = std::mem::take(buf);
-    push_rendered_line(line.trim_end(), dim_style, out);
+    push_rendered_line(line.trim_end(), style, out);
 }
 
-fn push_rendered_line(line: &str, dim_style: bool, out: &mut String) {
-    if dim_style {
-        if !line.is_empty() {
-            out.push_str(&format!("\x1b[2m{line}\x1b[0m"));
+fn push_rendered_line(line: &str, style: WriteLineStyle, out: &mut String) {
+    match style {
+        WriteLineStyle::Content => out.push_str(&crate::render::render_markdown_line(line)),
+        WriteLineStyle::Reasoning => {
+            if !line.is_empty() {
+                out.push_str(&format!("\x1b[38;5;10m{line}\x1b[0m"));
+            }
         }
-    } else {
-        out.push_str(&crate::render::render_markdown_line(line));
+        WriteLineStyle::Note => {
+            if !line.is_empty() {
+                out.push_str(&format!("\x1b[2m{line}\x1b[0m"));
+            }
+        }
     }
     out.push_str("\r\n");
 }
@@ -12276,7 +12275,7 @@ sys.stdin.readline()  # 等 Rust 侧完成死后判定
                 ))
                 .unwrap();
             let mut body = String::new();
-            push_rendered_line("**粗体** 与 `代码` MIYU-E2E-END", false, &mut body);
+            push_rendered_line("**粗体** 与 `代码` MIYU-E2E-END", WriteLineStyle::Content, &mut body);
             ops_tx.send(TtyWriteOp::Write(body)).unwrap();
             ops_tx.send(TtyWriteOp::Finish).unwrap();
             writer.join().unwrap();
