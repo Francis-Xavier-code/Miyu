@@ -5129,6 +5129,24 @@ fn is_remote_turn_cancelled(error: &anyhow::Error) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 触发终端指纹。shellhook/单次 CLI 的 stdin 常被管道占用(--stdin 喂正文),
+/// 所以按 stderr→stdout→stdin 找第一个 tty;父进程就是触发它的 shell。后台任务
+/// 完成后 daemon 凭这份指纹校验「shell 还活着、仍在这个 tty、空闲在提示符」,
+/// 才把跟进回复写回终端。检测不到(纯管道/重定向/cron)就不带。
+fn detect_origin_tty() -> Option<crate::ipc::OriginTty> {
+    let fd = [2, 1, 0]
+        .into_iter()
+        .find(|&fd| unsafe { libc::isatty(fd) } == 1)?;
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    if !path.starts_with("/dev/") {
+        return None;
+    }
+    Some(crate::ipc::OriginTty {
+        path,
+        shell_pid: std::os::unix::process::parent_id(),
+    })
+}
+
 async fn try_run_remote_chat(
     paths: &MiyuPaths,
     mut live: Option<&mut LiveReplTail>,
@@ -5172,6 +5190,13 @@ async fn try_run_remote_chat(
             images: ipc_images(images),
             cwd: std::env::current_dir().ok(),
             session_id: session_override,
+            // REPL 常驻连接,后台任务有自己的 FollowWake 通道;只有阅后即焚的
+            // 单次/shellhook 触发才需要记下终端供 daemon 回写。
+            origin_tty: if live.is_none() {
+                detect_origin_tty()
+            } else {
+                None
+            },
         }),
     )
     .await?;

@@ -229,6 +229,13 @@ impl Request {
     }
 }
 
+/// 触发回合的终端身份:tty 设备路径 + 拉起 miyu 的 shell 进程。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginTty {
+    pub path: std::path::PathBuf,
+    pub shell_pid: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
@@ -276,6 +283,10 @@ pub enum Command {
         mode: String,
         #[serde(default)]
         images: Vec<Option<ImageAttachment>>,
+        /// 触发本回合的终端身份(shellhook/单次 CLI)。后台任务完成后的
+        /// 跟进回复据此写回原终端;缺省(REPL/WebUI/平台)不回写。
+        #[serde(default)]
+        origin_tty: Option<OriginTty>,
         /// Client working directory; used as the turn workspace when the
         /// target session has none bound.
         #[serde(default)]
@@ -1472,6 +1483,10 @@ mod tests {
             })],
             cwd: Some(std::path::PathBuf::from("/tmp/workdir")),
             session_id: Some("sess_test".to_string()),
+            origin_tty: Some(OriginTty {
+                path: std::path::PathBuf::from("/dev/pts/7"),
+                shell_pid: 4321,
+            }),
         });
         let writer = tokio::spawn(async move { send(&mut left, &request).await });
         let received = receive::<Request>(&mut right).await.unwrap().unwrap();
@@ -1485,12 +1500,16 @@ mod tests {
                 images,
                 cwd,
                 session_id,
+                origin_tty,
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(mode, "normal");
                 assert_eq!(images.len(), 1);
                 assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp/workdir")));
                 assert_eq!(session_id.as_deref(), Some("sess_test"));
+                let origin = origin_tty.expect("origin tty should round-trip");
+                assert_eq!(origin.path, std::path::PathBuf::from("/dev/pts/7"));
+                assert_eq!(origin.shell_pid, 4321);
             }
             _ => panic!("unexpected command"),
         }
@@ -1505,6 +1524,7 @@ mod tests {
             images: Vec::new(),
             cwd: None,
             session_id: None,
+            origin_tty: None,
         });
         assert!(send(&mut left, &request).await.is_err());
     }

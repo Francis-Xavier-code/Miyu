@@ -75,3 +75,20 @@ mod tests {
         assert_eq!(seen, workspace);
     }
 }
+
+tokio::task_local! {
+    /// 触发本回合的终端身份(shellhook/单次 CLI),供后台任务捕获,
+    /// 完成后把跟进回复写回原终端。
+    static ORIGIN_TTY: Option<crate::ipc::OriginTty>;
+}
+
+pub async fn with_origin_tty<F>(origin: Option<crate::ipc::OriginTty>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    ORIGIN_TTY.scope(origin, future).await
+}
+
+pub fn current_origin_tty() -> Option<crate::ipc::OriginTty> {
+    ORIGIN_TTY.try_with(|origin| origin.clone()).ok().flatten()
+}

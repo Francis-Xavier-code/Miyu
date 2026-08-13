@@ -2282,6 +2282,11 @@ pub struct NotificationsConfig {
     /// Notify when a reply finishes and Miyu is waiting on you again.
     #[serde(default = "default_true")]
     pub on_turn_complete: bool,
+    /// shellhook/单次 CLI 触发的后台任务完成后,把跟进回复写回触发它的那个
+    /// 终端。仅在该 shell 仍活着、停在同一 tty 的前台提示符时才写;写不了退化
+    /// 为桌面通知。
+    #[serde(default = "default_true")]
+    pub job_writeback_to_terminal: bool,
 }
 
 impl Default for NotificationsConfig {
@@ -2289,6 +2294,7 @@ impl Default for NotificationsConfig {
         Self {
             enabled: true,
             on_turn_complete: true,
+            job_writeback_to_terminal: true,
         }
     }
 }

@@ -98,6 +98,9 @@ struct JobEntry {
     command: String,
     workspace: PathBuf,
     session_id: Option<Arc<str>>,
+    /// 触发这轮回合的终端(shellhook/单次 CLI)。任务完成后 daemon 凭它把
+    /// 跟进回复写回那个终端。
+    origin_tty: Option<crate::ipc::OriginTty>,
     kind: JobKind,
     started_wall: SystemTime,
     started: Instant,
@@ -122,6 +125,8 @@ pub struct JobCompletion {
     pub command: String,
     pub workspace: PathBuf,
     pub session_id: Option<Arc<str>>,
+    /// 触发终端指纹,见 [`crate::ipc::OriginTty`]。
+    pub origin_tty: Option<crate::ipc::OriginTty>,
     pub state_label: String,
     pub exit_code: Option<i32>,
     pub runtime_seconds: u64,
@@ -458,6 +463,7 @@ pub async fn spawn_background(
         command: command.to_string(),
         workspace: workspace.clone(),
         session_id: super::workspace::try_session(),
+        origin_tty: super::workspace::current_origin_tty(),
         kind: JobKind::Command { pid },
         started_wall: SystemTime::now(),
         started: Instant::now(),
@@ -553,6 +559,7 @@ where
         command: description.to_string(),
         workspace: super::workspace::effective_workdir(),
         session_id: super::workspace::try_session(),
+        origin_tty: super::workspace::current_origin_tty(),
         kind: JobKind::Subagent {
             abort: handle.abort_handle(),
         },
@@ -605,6 +612,7 @@ fn finalize_job(job_id: &str, state: JobState, wake_requested: bool) {
             command: job.command.clone(),
             workspace: job.workspace.clone(),
             session_id: job.session_id.clone(),
+            origin_tty: job.origin_tty.clone(),
             state_label: state.label(),
             exit_code: match state {
                 JobState::Exited { code } => code,

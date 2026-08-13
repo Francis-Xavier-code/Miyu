@@ -526,6 +526,8 @@ pub(crate) enum ActorCommand {
         mode: AgentMode,
         images: Vec<Option<ImageAttachment>>,
         cwd: Option<std::path::PathBuf>,
+        /// 触发回合的终端(shellhook/单次 CLI);后台任务完成回写用。
+        origin_tty: Option<crate::ipc::OriginTty>,
         audience: PromptAudience,
         /// Platform-only per-turn overrides. CLI/WebUI turns leave this empty.
         profile: Option<platforms::TurnProfile>,
@@ -2493,8 +2495,10 @@ async fn handle_ipc_connection(
             images,
             cwd,
             session_id,
+            origin_tty,
         } => {
-            handle_ipc_turn(&state, &mut stream, content, mode, images, cwd, session_id).await?;
+            handle_ipc_turn(&state, &mut stream, content, mode, images, cwd, session_id, origin_tty)
+                .await?;
         }
         IpcCommand::QueueTurnUpdate {
             run_id,
@@ -3281,6 +3285,7 @@ async fn handle_ipc_turn(
     images: Vec<Option<ImageAttachment>>,
     cwd: Option<std::path::PathBuf>,
     session_id: Option<String>,
+    origin_tty: Option<crate::ipc::OriginTty>,
 ) -> Result<()> {
     let content = match validate_content(content) {
         Ok(content) => content,
@@ -3354,6 +3359,7 @@ async fn handle_ipc_turn(
             mode,
             images,
             cwd,
+            origin_tty,
             audience: PromptAudience::Owner,
             profile: None,
             cancel: cancel_rx,
@@ -5311,6 +5317,7 @@ async fn create_turn(
             mode,
             images: prepared.images,
             cwd: None,
+            origin_tty: None,
             audience: PromptAudience::External,
             profile: None,
             cancel: cancel_rx,
@@ -5893,6 +5900,7 @@ async fn actor_loop(
                 mode,
                 images,
                 cwd,
+                origin_tty,
                 audience,
                 profile,
                 cancel,
@@ -5939,7 +5947,10 @@ async fn actor_loop(
                 );
                 tokio::task::spawn_local(crate::tools::workspace::with_workspace(
                     workspace,
-                    crate::tools::workspace::with_session(session_id, task),
+                    crate::tools::workspace::with_session(
+                        session_id,
+                        crate::tools::workspace::with_origin_tty(origin_tty, task),
+                    ),
                 ));
             }
             ActorCommand::RedoTurn {
@@ -7532,6 +7543,13 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
             "runtime_seconds": completion.runtime_seconds,
         }),
     );
+    tracing::info!(
+        job_id = %completion.job_id,
+        wake_requested = completion.wake_requested,
+        has_session = completion.session_id.is_some(),
+        has_origin_tty = completion.origin_tty.is_some(),
+        "background job finished"
+    );
     if !completion.wake_requested {
         // The model stopped this command itself; clean the strips quietly.
         tools::jobs::acknowledge(&completion.job_id);
@@ -7565,6 +7583,7 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
     // right away.
     if let Some(run_id) = pending_wake_run {
         let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let mut wake_run_finished = false;
         while std::time::Instant::now() < deadline {
             let still_running = state
                 .manager
@@ -7573,15 +7592,161 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
                 .active_runs
                 .contains_key(&run_id);
             if !still_running {
+                wake_run_finished = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // 只有唤醒回合真跑完才回写终端;等到截止还没完就别写——那时匹配到的
+        // 只会是别的旧回合。同步阻塞 IO(sqlite 读 + 写别人的 tty,极端时 ^S
+        // 流控会卡住)扔进阻塞线程池,别拖累 acknowledge 和 async 线程。
+        if wake_run_finished {
+            let deliver_state = state.clone();
+            let deliver_completion = completion.clone();
+            tokio::task::spawn_blocking(move || {
+                deliver_job_wake_to_origin_tty(&deliver_state, &deliver_completion);
+            });
         }
     }
     tools::jobs::acknowledge(&completion.job_id);
     state
         .events
         .publish("job.acknowledged", json!({ "job_id": completion.job_id }));
+}
+
+/// 后台任务的唤醒回合跑完后,把最终回复写回当初触发 shellhook/单次 CLI 的那个
+/// 终端。触发端进程早已退出,由 daemon 直接写 tty 设备。三道闸全过才写:
+/// 1. `notifications.job_writeback_to_terminal` 开关(默认开);
+/// 2. 触发 shell 还活着且 stdin 仍指向记录的 tty——终端关闭、pid 复用都在此拦下;
+/// 3. shell 空闲在前台提示符(tpgid==pgrp)——正开着 vim/htop 时绝不能撕屏。
+/// 闸没过或写失败时退化为桌面通知,保证「完成了」这件事总能到人。
+fn deliver_job_wake_to_origin_tty(state: &DaemonState, completion: &tools::jobs::JobCompletion) {
+    let Some(origin) = completion.origin_tty.as_ref() else {
+        return;
+    };
+    let Some(session_id) = completion.session_id.as_deref() else {
+        return;
+    };
+    tracing::info!(
+        job_id = %completion.job_id,
+        tty = %origin.path.display(),
+        shell_pid = origin.shell_pid,
+        "delivering job wake reply to the originating terminal"
+    );
+    let notifications = crate::config::AppConfig::load_or_default(&state.paths)
+        .map(|config| config.notifications)
+        .unwrap_or_default();
+    if !notifications.job_writeback_to_terminal {
+        return;
+    }
+    let reply = state
+        .state_store
+        .pinned_for_turn(session_id)
+        .load_turns()
+        .ok()
+        .and_then(|turns| {
+            turns.into_iter().rev().find(|turn| {
+                // 同会话可能接连有多个任务各起唤醒回合;凭 display_content 里的
+                // job_id 认领自己的那一个,别把别人的回复写到我的终端。
+                turn.display_content.starts_with("[后台任务完成]")
+                    && turn.display_content.contains(&completion.job_id)
+            })
+        })
+        .map(|turn| turn.assistant_content)
+        .filter(|content| !content.trim().is_empty());
+    if reply.is_none() {
+        tracing::info!(job_id = %completion.job_id, "job wake reply not found in session store; skipping tty writeback");
+    }
+    let Some(reply) = reply else {
+        return;
+    };
+    let written = origin_shell_at_prompt(origin)
+        && write_reply_to_origin_tty(origin, &completion.title, &reply).is_ok();
+    if written {
+        tracing::info!(
+            job_id = %completion.job_id,
+            tty = %origin.path.display(),
+            "job wake reply written back to the originating terminal"
+        );
+    } else if notifications.enabled {
+        // 终端不在提示符(或已关)。别闷掉:桌面通知兜底,内容给个开头。
+        let mut preview = reply.trim().chars().take(120).collect::<String>();
+        if preview.len() < reply.trim().len() {
+            preview.push('…');
+        }
+        crate::notify::notify(&format!("Miyu 后台任务跟进 · {}", completion.title), &preview);
+    }
+}
+
+/// 三道闸的第 2、3 道:shell 活着、还挂在记录的 tty 上、且自己就是终端前台
+/// 进程组(即停在提示符,没在跑别的程序)。
+fn origin_shell_at_prompt(origin: &crate::ipc::OriginTty) -> bool {
+    let pid = origin.shell_pid;
+    let Ok(stdin_target) = std::fs::read_link(format!("/proc/{pid}/fd/0")) else {
+        return false;
+    };
+    if stdin_target != origin.path {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    matches!(parse_stat_pgrp_tpgid(&stat), Some((pgrp, tpgid)) if pgrp == tpgid)
+}
+
+/// /proc/pid/stat 的 comm 字段可含空格和括号,必须从最后一个 \')\' 之后再按空白
+/// 切:其后第 3 个字段是 pgrp,第 6 个是 tpgid。
+fn parse_stat_pgrp_tpgid(stat: &str) -> Option<(i64, i64)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let pgrp = fields.nth(2)?.parse().ok()?;
+    let tpgid = fields.nth(2)?.parse().ok()?;
+    Some((pgrp, tpgid))
+}
+
+/// 渲染回复并写入触发终端。逐行走 render_markdown_line(纯 SGR 文本,无 kitty
+/// 图像/光标控制,对别人的终端绝对安全);首尾加分隔线,写完给 shell 发一个
+/// SIGWINCH 促使它在我们的输出下方重绘提示符。
+fn write_reply_to_origin_tty(
+    origin: &crate::ipc::OriginTty,
+    title: &str,
+    reply: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let mut tty = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&origin.path)?;
+    let cols = unsafe {
+        let mut size: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0 {
+            size.ws_col as usize
+        } else {
+            80
+        }
+    };
+    let rule = "─".repeat(cols.clamp(20, 72));
+    let mut out = String::new();
+    out.push_str("\r\n");
+    out.push_str(&format!("\x1b[2m{rule}\x1b[0m\r\n"));
+    out.push_str(&format!(
+        "\x1b[1m✦ Miyu 后台任务跟进\x1b[0m \x1b[2m· {title}\x1b[0m\r\n\r\n"
+    ));
+    for line in reply.trim_end().lines() {
+        out.push_str(&crate::render::render_markdown_line(line));
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("\x1b[2m{rule}\x1b[0m\r\n"));
+    tty.write_all(out.as_bytes())?;
+    tty.flush()?;
+    // 提示符已被我们的文本推到半空,SIGWINCH 让 shell(fish/zsh/新 bash 的
+    // readline 都处理)原地重绘一行干净的提示符。
+    unsafe {
+        libc::kill(origin.shell_pid as i32, libc::SIGWINCH);
+    }
+    Ok(())
 }
 
 fn wake_local_session_for_job(
@@ -7642,6 +7807,12 @@ fn wake_local_session_for_job(
             })
     };
     if let Some((run_id, queue_target, audience)) = queued {
+        tracing::info!(
+            job_id = %completion.job_id,
+            run_id = %run_id,
+            has_queue_target = queue_target.is_some(),
+            "job wake joining the session's active run"
+        );
         let Some(target) = queue_target else {
             // Turn is still starting; report on the next completion poll
             // rather than racing its queue setup.
@@ -7710,6 +7881,7 @@ fn wake_local_session_for_job(
             mode: AgentMode::Normal,
             images: Vec::new(),
             cwd: Some(completion.workspace.clone()),
+            origin_tty: completion.origin_tty.clone(),
             audience: PromptAudience::Owner,
             profile: None,
             cancel: cancel_rx,
@@ -11810,5 +11982,103 @@ mod tests {
                 .persona,
             "a"
         );
+    }
+
+    /// comm 字段可以合法地包含空格和右括号(如进程改名成 "a) b"),解析必须
+    /// 锚定在最后一个 ')' 之后,否则字段错位会把别的数字当成 tpgid。
+    #[test]
+    fn stat_parse_survives_hostile_comm() {
+        // 正常 fish:pgrp==tpgid(停在提示符)
+        let stat = "1234 (fish) S 1000 1234 1234 34816 1234 4194304 1 0 0 0";
+        assert_eq!(parse_stat_pgrp_tpgid(stat), Some((1234, 1234)));
+        // comm 里嵌了 ") S 9 9 9 9":只有从最后一个 ')' 起切才对
+        let stat = "1234 (a) S 9 9 9 9 (b) R 1000 1234 1234 34816 5678 4194304";
+        assert_eq!(parse_stat_pgrp_tpgid(stat), Some((1234, 5678)));
+        // 前台在跑别的程序:pgrp != tpgid
+        let stat = "1234 (zsh) S 1000 1234 1234 34816 9999 4194304";
+        assert_eq!(parse_stat_pgrp_tpgid(stat), Some((1234, 9999)));
+        assert_eq!(parse_stat_pgrp_tpgid("no paren here"), None);
+    }
+
+    /// 真 PTY 全链路:python pty.fork 造出「会话首进程挂在 pts 上且是前台」的
+    /// 假 shell(exec sleep),验证 ① 在提示符判定为真 ② 写回的字节真从 master
+    /// 端读出来 ③ 进程死后判定翻假。覆盖 /proc 探测和 tty 写入两段真实内核路径。
+    #[test]
+    fn origin_tty_gates_and_writeback_against_real_pty() {
+        let script = r#"
+import os, pty, signal, sys
+pid, master = pty.fork()
+if pid == 0:
+    os.execvp("sleep", ["sleep", "60"])
+# 子进程是会话首进程,ctty=slave,前台进程组=自己 —— 正是 shell 停在提示符的形状。
+# slave 路径从 /proc/child/fd/0 反查,不依赖 ptsname。
+slave = os.readlink(f"/proc/{pid}/fd/0")
+print(pid, slave, flush=True)
+sys.stdin.readline()  # 等 Rust 侧写完
+data = b""
+try:
+    while b"MIYU-E2E-END" not in data:
+        data += os.read(master, 4096)
+except OSError:
+    pass
+print("DATA:" + data.hex(), flush=True)
+os.kill(pid, signal.SIGKILL)
+os.waitpid(pid, 0)
+print("GONE", flush=True)
+sys.stdin.readline()  # 等 Rust 侧完成死后判定
+"#;
+        use std::io::{BufRead, BufReader, Write};
+        let Ok(mut child) = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("python3 unavailable; skipping pty gate test");
+            return;
+        };
+        let mut stdin = child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let head = lines.next().unwrap().unwrap();
+        let (pid, slave) = head.split_once(' ').unwrap();
+        let origin = crate::ipc::OriginTty {
+            path: std::path::PathBuf::from(slave),
+            shell_pid: pid.parse().unwrap(),
+        };
+
+        assert!(
+            origin_shell_at_prompt(&origin),
+            "pty.fork 出的会话首进程应判定为「在提示符」"
+        );
+        write_reply_to_origin_tty(&origin, "e2e", "**粗体** 与 `代码` MIYU-E2E-END").unwrap();
+        stdin.write_all(b"written\n").unwrap();
+
+        let data_line = loop {
+            let line = lines.next().unwrap().unwrap();
+            if let Some(rest) = line.strip_prefix("DATA:") {
+                break rest.to_string();
+            }
+        };
+        let bytes = (0..data_line.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&data_line[i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("Miyu 后台任务跟进"),
+            "master 端应读到标题,实际: {text:?}"
+        );
+        assert!(text.contains("MIYU-E2E-END"), "正文应完整到达");
+        assert!(text.contains("\u{1b}["), "应带 SGR 样式");
+
+        let gone = lines.next().unwrap().unwrap();
+        assert_eq!(gone, "GONE");
+        assert!(
+            !origin_shell_at_prompt(&origin),
+            "进程死后必须判定为不可写"
+        );
+        stdin.write_all(b"done\n").unwrap();
+        let _ = child.wait();
     }
 }

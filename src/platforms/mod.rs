@@ -2092,6 +2092,7 @@ pub(crate) async fn run_platform_turn(
             mode: AgentMode::Normal,
             images,
             cwd: None,
+            origin_tty: None,
             audience: PromptAudience::External,
             profile: Some(profile),
             cancel: cancel_rx,
