@@ -210,6 +210,11 @@ fn short_model_name(model: &str, provider: &str) -> String {
 /// The answer is only ever used to re-anchor a redraw, so a stale one costs a
 /// single imperfect frame — losing the session costs the session.
 fn cursor_position_or(fallback: (u16, u16)) -> (u16, u16) {
+    // 终端已挂断时 ESC[6n 永远等不到应答,而 crossterm 的应答等待对
+    // HUP fd 会无限自旋(超时失效)——直接用回退值,让退出路径走完。
+    if terminal_hangup() {
+        return fallback;
+    }
     cursor::position().unwrap_or(fallback)
 }
 
@@ -4389,6 +4394,7 @@ struct InlineRawMode {
 impl InlineRawMode {
     fn start() -> Result<Self> {
         terminal::enable_raw_mode()?;
+    spawn_hangup_watchdog();
         Ok(Self {
             stdout: io::stdout(),
         })
@@ -10763,6 +10769,7 @@ impl LiveRawMode {
 
 fn enable_live_raw_mode() -> Result<()> {
     terminal::enable_raw_mode()?;
+    spawn_hangup_watchdog();
     if let Err(error) = restore_live_output_processing() {
         let _ = terminal::disable_raw_mode();
         return Err(error);
@@ -11026,6 +11033,25 @@ async fn fetch_jobs_overview(paths: &MiyuPaths) -> Result<JobsOverviewSnapshot> 
 /// 不发 SIGHUP 的断开路径(tmux kill-pane、终端崩溃、SSH 掉线)只能靠它
 /// 兜底——否则 crossterm 的 poll 对 EOF fd 永远立即就绪、read 又读不出
 /// 事件,REPL 主循环全速空转,留下一个 98% CPU 的残留进程。
+/// 挂断看门狗:独立线程每 500ms 裸 poll 探测 stdin 挂断,确认后给优雅
+/// 退出路径 5 秒宽限——主线程若卡死在 crossterm 对 HUP fd 的任何内部
+/// 自旋(事件 poll、CPR 应答等待,均为实测形态),由这里强制收尾,
+/// 保证关终端后绝不留下吃 CPU 的残留进程。
+fn spawn_hangup_watchdog() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if terminal_hangup() {
+                std::thread::sleep(Duration::from_secs(5));
+                if terminal_hangup() {
+                    std::process::exit(1);
+                }
+            }
+        });
+    });
+}
+
 fn terminal_hangup() -> bool {
     let mut pollfd = libc::pollfd { fd: libc::STDIN_FILENO, events: 0, revents: 0 };
     let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
@@ -11073,7 +11099,10 @@ fn read_live_repl_input(
         {
             return Ok(LiveReplOutcome::Exit);
         }
-        let has_input = ready == 1 && event::poll(Duration::ZERO)?;
+        // 就绪判定必须问 crossterm(它的内部缓冲对裸 poll 不可见):
+        // 一次 read 会把 fd 里的字节全部吞进内部缓冲,只看 fd 会让
+        // 积压按键滞留到下一次按键或超时才放行,打字手感直接变卡。
+        let has_input = event::poll(Duration::ZERO)?;
         if !has_input {
             // Idle tick: structural changes redraw the whole tail; otherwise
             // only the strip repaints. While the user is actively typing the
@@ -11102,43 +11131,51 @@ fn read_live_repl_input(
             }
             continue;
         }
-        last_key_at = Instant::now();
-        match live.editor.handle_event(event::read()?, paths, false)? {
-            LiveEditorAction::None => {}
-            LiveEditorAction::Redraw => {
-                synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?
-            }
-            LiveEditorAction::ClearScreen => {
-                synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.clear_screen())?
-            }
-            LiveEditorAction::EmptySubmit => {
-                synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
-                    live.commit_empty_submission()
-                })?
-            }
-            LiveEditorAction::Submit(submission) => {
-                let mode = live.mode();
-                synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-                    live.commit_submission(&submission)
-                })?;
-                raw.keep_cursor_hidden();
-                return Ok(LiveReplOutcome::Submit(
-                    mode,
-                    submission.content,
-                    submission.images,
-                ));
-            }
-            // Ctrl+C rung 3: the draft was empty and no reply is running, but
-            // this session still has background work — stop that before the
-            // press is allowed to mean "quit". `live.jobs` holds only running
-            // jobs of this session, refreshed on every idle tick. Ctrl+D
-            // (`Exit`) always quits outright.
-            LiveEditorAction::Interrupt if !live.jobs.is_empty() => {
-                return Ok(LiveReplOutcome::StopJobs);
-            }
-            LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
-                synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+        // 抽干本轮就绪的全部事件再回到等待,粘贴/快速输入不积压。
+        while event::poll(Duration::ZERO)? {
+            // read 前再验挂断:HUP 的 fd 会让 poll 报就绪却读不出事件,
+            // 直接 read 就掉进 crossterm 的自旋。
+            if terminal_hangup() {
                 return Ok(LiveReplOutcome::Exit);
+            }
+            last_key_at = Instant::now();
+            match live.editor.handle_event(event::read()?, paths, false)? {
+                LiveEditorAction::None => {}
+                LiveEditorAction::Redraw => {
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?
+                }
+                LiveEditorAction::ClearScreen => {
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.clear_screen())?
+                }
+                LiveEditorAction::EmptySubmit => {
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                        live.commit_empty_submission()
+                    })?
+                }
+                LiveEditorAction::Submit(submission) => {
+                    let mode = live.mode();
+                    synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
+                        live.commit_submission(&submission)
+                    })?;
+                    raw.keep_cursor_hidden();
+                    return Ok(LiveReplOutcome::Submit(
+                        mode,
+                        submission.content,
+                        submission.images,
+                    ));
+                }
+                // Ctrl+C rung 3: the draft was empty and no reply is running, but
+                // this session still has background work — stop that before the
+                // press is allowed to mean "quit". `live.jobs` holds only running
+                // jobs of this session, refreshed on every idle tick. Ctrl+D
+                // (`Exit`) always quits outright.
+                LiveEditorAction::Interrupt if !live.jobs.is_empty() => {
+                    return Ok(LiveReplOutcome::StopJobs);
+                }
+                LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                    synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+                    return Ok(LiveReplOutcome::Exit);
+                }
             }
         }
     }
@@ -11662,6 +11699,7 @@ fn read_repl_input(
         stdout.flush()?;
     }
     terminal::enable_raw_mode()?;
+    spawn_hangup_watchdog();
     execute!(stdout, EnableBracketedPaste)?;
     let mut keyboard_enhancement = KeyboardEnhancementState::enable(&mut stdout);
     let mut input_row = cursor_row_or(0);
