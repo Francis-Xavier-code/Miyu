@@ -7739,6 +7739,10 @@ fn write_reply_to_origin_tty(
         out.push_str("\r\n");
     }
     out.push_str(&format!("\x1b[2m{rule}\x1b[0m\r\n"));
+    // fish/zsh 收到 SIGWINCH 重绘提示符时,会从光标行向上清掉自家提示符
+    // 高度的行数再画(starship 双行提示符实测清 2 行)。垫两行空白当牺牲品,
+    // 免得它清到正文和底部分隔线。
+    out.push_str("\r\n\r\n");
     tty.write_all(out.as_bytes())?;
     tty.flush()?;
     // 提示符已被我们的文本推到半空,SIGWINCH 让 shell(fish/zsh/新 bash 的
