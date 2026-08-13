@@ -7559,7 +7559,7 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
         return;
     }
     let command_short = completion.command.chars().take(120).collect::<String>();
-    let mut pending_wake_run: Option<String> = None;
+    let mut pending_wake_run: Option<JobWakeRun> = None;
     if let Some(session_id) = completion.session_id.clone() {
         match state.state_store.is_platform_session(&session_id) {
             Ok(true) => {
@@ -7581,31 +7581,29 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
     // Keep the finished job visible in UI strips until its wake turn is done
     // (the report is what replaces the strip line); everything else clears
     // right away.
-    if let Some(run_id) = pending_wake_run {
+    if let Some(wake) = pending_wake_run {
+        // 流式回写与等待循环并行:回合一开跑就把思考/工具/正文追加进触发
+        // 终端,acknowledge 只关心回合何时结束。
+        if completion.origin_tty.is_some() {
+            let stream_state = state.clone();
+            let stream_completion = completion.clone();
+            let stream_wake = wake.clone();
+            tokio::spawn(async move {
+                stream_job_wake_to_origin_tty(stream_state, stream_completion, stream_wake).await;
+            });
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(600);
-        let mut wake_run_finished = false;
         while std::time::Instant::now() < deadline {
             let still_running = state
                 .manager
                 .lock()
                 .unwrap()
                 .active_runs
-                .contains_key(&run_id);
+                .contains_key(&wake.run_id);
             if !still_running {
-                wake_run_finished = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        // 只有唤醒回合真跑完才回写终端;等到截止还没完就别写——那时匹配到的
-        // 只会是别的旧回合。同步阻塞 IO(sqlite 读 + 写别人的 tty,极端时 ^S
-        // 流控会卡住)扔进阻塞线程池,别拖累 acknowledge 和 async 线程。
-        if wake_run_finished {
-            let deliver_state = state.clone();
-            let deliver_completion = completion.clone();
-            tokio::task::spawn_blocking(move || {
-                deliver_job_wake_to_origin_tty(&deliver_state, &deliver_completion);
-            });
         }
     }
     tools::jobs::acknowledge(&completion.job_id);
@@ -7614,68 +7612,289 @@ async fn handle_job_completion(state: DaemonState, completion: tools::jobs::JobC
         .publish("job.acknowledged", json!({ "job_id": completion.job_id }));
 }
 
-/// 后台任务的唤醒回合跑完后,把最终回复写回当初触发 shellhook/单次 CLI 的那个
-/// 终端。触发端进程早已退出,由 daemon 直接写 tty 设备。三道闸全过才写:
+/// 本地会话唤醒回合的标识:run id + 事件订阅起点(在回合入队前取,保证
+/// 从 turn.started 起一帧不漏)。
+#[derive(Clone)]
+struct JobWakeRun {
+    run_id: String,
+    events_after: u64,
+}
+
+enum TtyWriteOp {
+    Write(String),
+    /// 正常收尾:flush 后给 shell 发 SIGWINCH 促使重绘提示符。
+    Finish,
+    /// 中途收笔(前台被占/超时):已写的留在屏上,不再动那个终端。
+    Abort,
+}
+
+/// 把唤醒回合流式渲染进当初触发 shellhook/单次 CLI 的终端:思考(暗色,按
+/// display.reasoning 配置)、工具行、正文逐行 Markdown。触发端进程早已退出,
+/// 由 daemon 直接写 tty 设备。三道闸全过才动笔:
 /// 1. `notifications.job_writeback_to_terminal` 开关(默认开);
-/// 2. 触发 shell 还活着且 stdin 仍指向记录的 tty——终端关闭、pid 复用都在此拦下;
+/// 2. 触发 shell 还活着且 stdin 仍指向记录的 tty——终端关闭、pid 复用都拦下;
 /// 3. shell 空闲在前台提示符(tpgid==pgrp)——正开着 vim/htop 时绝不能撕屏。
-/// 闸没过或写失败时退化为桌面通知,保证「完成了」这件事总能到人。
-fn deliver_job_wake_to_origin_tty(state: &DaemonState, completion: &tools::jobs::JobCompletion) {
-    let Some(origin) = completion.origin_tty.as_ref() else {
+/// 追加式输出,无光标控制;每次落笔前重查第 3 道闸,中途被占立即收笔并补
+/// 桌面通知。物理写入走专职线程,^S 流控卡死也只占一根线程。
+async fn stream_job_wake_to_origin_tty(
+    state: DaemonState,
+    completion: tools::jobs::JobCompletion,
+    wake: JobWakeRun,
+) {
+    let Some(origin) = completion.origin_tty.clone() else {
         return;
     };
-    let Some(session_id) = completion.session_id.as_deref() else {
+    let config = crate::config::AppConfig::load_or_default(&state.paths).unwrap_or_default();
+    if !config.notifications.job_writeback_to_terminal {
         return;
+    }
+    let notify_fallback = |reason: &str| {
+        tracing::info!(job_id = %completion.job_id, reason, "job wake writeback fell back to a notification");
+        if config.notifications.enabled {
+            crate::notify::notify(
+                &format!("Miyu 后台任务跟进 · {}", completion.title),
+                "任务已完成,跟进回复在会话里(终端不在提示符,没有直接写入)。",
+            );
+        }
+    };
+    if !origin_shell_at_prompt(&origin) {
+        notify_fallback("shell not at prompt");
+        return;
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let tty = match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&origin.path)
+    {
+        Ok(tty) => tty,
+        Err(error) => {
+            tracing::debug!(job_id = %completion.job_id, %error, "origin tty open failed");
+            notify_fallback("tty open failed");
+            return;
+        }
+    };
+    let cols = unsafe {
+        let mut size: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0 {
+            size.ws_col as usize
+        } else {
+            80
+        }
     };
     tracing::info!(
         job_id = %completion.job_id,
+        run_id = %wake.run_id,
         tty = %origin.path.display(),
         shell_pid = origin.shell_pid,
-        "delivering job wake reply to the originating terminal"
+        "streaming job wake reply to the originating terminal"
     );
-    let notifications = crate::config::AppConfig::load_or_default(&state.paths)
-        .map(|config| config.notifications)
-        .unwrap_or_default();
-    if !notifications.job_writeback_to_terminal {
+
+    let (ops_tx, ops_rx) = std::sync::mpsc::channel::<TtyWriteOp>();
+    let shell_pid = origin.shell_pid;
+    let writer = std::thread::Builder::new()
+        .name("miyu-tty-writeback".to_string())
+        .spawn(move || origin_tty_writer(tty, shell_pid, ops_rx));
+    if writer.is_err() {
+        notify_fallback("writer thread spawn failed");
         return;
     }
-    let reply = state
-        .state_store
-        .pinned_for_turn(session_id)
-        .load_turns()
-        .ok()
-        .and_then(|turns| {
-            turns.into_iter().rev().find(|turn| {
-                // 同会话可能接连有多个任务各起唤醒回合;凭 display_content 里的
-                // job_id 认领自己的那一个,别把别人的回复写到我的终端。
-                turn.display_content.starts_with("[后台任务完成]")
-                    && turn.display_content.contains(&completion.job_id)
-            })
-        })
-        .map(|turn| turn.assistant_content)
-        .filter(|content| !content.trim().is_empty());
-    if reply.is_none() {
-        tracing::info!(job_id = %completion.job_id, "job wake reply not found in session store; skipping tty writeback");
-    }
-    let Some(reply) = reply else {
-        return;
-    };
-    let written = origin_shell_at_prompt(origin)
-        && write_reply_to_origin_tty(origin, &completion.title, &reply).is_ok();
-    if written {
-        tracing::info!(
-            job_id = %completion.job_id,
-            tty = %origin.path.display(),
-            "job wake reply written back to the originating terminal"
-        );
-    } else if notifications.enabled {
-        // 终端不在提示符(或已关)。别闷掉:桌面通知兜底,内容给个开头。
-        let mut preview = reply.trim().chars().take(120).collect::<String>();
-        if preview.len() < reply.trim().len() {
-            preview.push('…');
+
+    let reasoning_mode =
+        crate::render::ReasoningDisplayMode::from_config(&config.display.reasoning);
+    let rule = "─".repeat(cols.clamp(20, 72));
+    let dim = |text: &str| format!("\x1b[2m{text}\x1b[0m");
+    // 落笔即有反馈:头部先行,正文随事件到达逐行追加。
+    let _ = ops_tx.send(TtyWriteOp::Write(format!(
+        "\r\n{}\r\n\x1b[1m✦ Miyu 后台任务跟进\x1b[0m \x1b[2m· {}\x1b[0m\r\n\r\n",
+        dim(&rule),
+        completion.title
+    )));
+
+    let mut subscription = state.events.subscribe_after(wake.events_after);
+    let deadline = std::time::Instant::now() + Duration::from_secs(900);
+    let mut reasoning_buf = String::new();
+    let mut content_buf = String::new();
+    let mut wrote_reasoning = false;
+    let mut reasoning_open = false;
+    let mut last_id = wake.events_after;
+    let mut aborted = false;
+    loop {
+        if std::time::Instant::now() > deadline {
+            aborted = true;
+            break;
         }
-        crate::notify::notify(&format!("Miyu 后台任务跟进 · {}", completion.title), &preview);
+        let record = if let Some(record) = subscription.pending.pop_front() {
+            record
+        } else {
+            match tokio::time::timeout(Duration::from_secs(30), subscription.receiver.recv()).await
+            {
+                Ok(Ok(record)) => record,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    subscription.pending = state.events.replay_after(last_id);
+                    continue;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => {
+                    // 静默期顺手确认回合还活着,免得错过终态事件后干等。
+                    if !state
+                        .manager
+                        .lock()
+                        .unwrap()
+                        .active_runs
+                        .contains_key(&wake.run_id)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        };
+        last_id = record.id;
+        let Ok(data) = serde_json::from_str::<Value>(&record.data) else {
+            continue;
+        };
+        if data.get("run_id").and_then(Value::as_str) != Some(wake.run_id.as_str()) {
+            if !state
+                .manager
+                .lock()
+                .unwrap()
+                .active_runs
+                .contains_key(&wake.run_id)
+            {
+                break;
+            }
+            continue;
+        }
+
+        let mut chunk_out = String::new();
+        match record.kind.as_str() {
+            "reasoning.title" => {
+                if !matches!(reasoning_mode, crate::render::ReasoningDisplayMode::Hidden) {
+                    if let Some(title) = data.get("title").and_then(Value::as_str) {
+                        flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                        chunk_out.push_str(&dim(&format!("∴ {title}")));
+                        chunk_out.push_str("\r\n");
+                        wrote_reasoning = true;
+                        reasoning_open = true;
+                    }
+                }
+            }
+            "reasoning.delta" => {
+                if matches!(reasoning_mode, crate::render::ReasoningDisplayMode::Full) {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                        reasoning_buf.push_str(delta);
+                        drain_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                        wrote_reasoning = true;
+                        reasoning_open = true;
+                    }
+                }
+            }
+            "reasoning.part_end" | "reasoning.reset" => {
+                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+            }
+            "tool.started" => {
+                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                if reasoning_open {
+                    chunk_out.push_str("\r\n");
+                    reasoning_open = false;
+                }
+                let name = data
+                    .get("display_name")
+                    .or_else(|| data.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("工具");
+                chunk_out.push_str(&dim(&format!("⚙ {name} …")));
+                chunk_out.push_str("\r\n");
+            }
+            "tool.finished" => {
+                if data.get("ok").and_then(Value::as_bool) == Some(false) {
+                    let name = data
+                        .get("display_name")
+                        .or_else(|| data.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("工具");
+                    chunk_out.push_str(&dim(&format!("⚙ {name} 失败")));
+                    chunk_out.push_str("\r\n");
+                }
+            }
+            "assistant.delta" => {
+                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                if reasoning_open || (wrote_reasoning && content_buf.is_empty() && chunk_out.is_empty()) {
+                    chunk_out.push_str("\r\n");
+                    reasoning_open = false;
+                    wrote_reasoning = false;
+                }
+                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
+                    content_buf.push_str(delta);
+                    drain_line_buf(&mut content_buf, false, &mut chunk_out);
+                }
+            }
+            "run.completed" | "run.failed" | "run.cancelled" => {
+                flush_line_buf(&mut reasoning_buf, true, &mut chunk_out);
+                flush_line_buf(&mut content_buf, false, &mut chunk_out);
+                if record.kind != "run.completed" {
+                    chunk_out.push_str(&dim("(跟进中断)"));
+                    chunk_out.push_str("\r\n");
+                }
+                // fish/zsh 收到 SIGWINCH 重绘提示符时,会从光标行向上清掉
+                // 自家提示符高度的行数再画(starship 双行提示符实测清 2 行)。
+                // 垫两行空白当牺牲品,免得清到正文和底部分隔线。
+                chunk_out.push_str(&format!("\r\n{}\r\n\r\n\r\n", dim(&rule)));
+                let _ = ops_tx.send(TtyWriteOp::Write(chunk_out));
+                let _ = ops_tx.send(TtyWriteOp::Finish);
+                tracing::info!(
+                    job_id = %completion.job_id,
+                    outcome = %record.kind,
+                    "job wake reply streamed to the originating terminal"
+                );
+                return;
+            }
+            _ => {}
+        }
+        if !chunk_out.is_empty() {
+            // 落笔前重查前台闸:用户开了全屏程序就立即收笔,已写的留在屏上。
+            if !origin_shell_at_prompt(&origin) {
+                aborted = true;
+                break;
+            }
+            let _ = ops_tx.send(TtyWriteOp::Write(chunk_out));
+        }
     }
+    let _ = ops_tx.send(TtyWriteOp::Abort);
+    if aborted {
+        notify_fallback("interrupted mid-stream");
+    }
+}
+
+/// 行缓冲落盘:凑满整行才渲染(思考行统一暗色,正文行走 Markdown 渲染)。
+fn drain_line_buf(buf: &mut String, dim_style: bool, out: &mut String) {
+    while let Some(index) = buf.find('\n') {
+        let line: String = buf.drain(..=index).collect();
+        let line = line.trim_end_matches(['\n', '\r']);
+        push_rendered_line(line, dim_style, out);
+    }
+}
+
+fn flush_line_buf(buf: &mut String, dim_style: bool, out: &mut String) {
+    if buf.trim().is_empty() {
+        buf.clear();
+        return;
+    }
+    let line = std::mem::take(buf);
+    push_rendered_line(line.trim_end(), dim_style, out);
+}
+
+fn push_rendered_line(line: &str, dim_style: bool, out: &mut String) {
+    if dim_style {
+        if !line.is_empty() {
+            out.push_str(&format!("\x1b[2m{line}\x1b[0m"));
+        }
+    } else {
+        out.push_str(&crate::render::render_markdown_line(line));
+    }
+    out.push_str("\r\n");
 }
 
 /// 三道闸的第 2、3 道:shell 活着、还挂在记录的 tty 上、且自己就是终端前台
@@ -7704,53 +7923,33 @@ fn parse_stat_pgrp_tpgid(stat: &str) -> Option<(i64, i64)> {
     Some((pgrp, tpgid))
 }
 
-/// 渲染回复并写入触发终端。逐行走 render_markdown_line(纯 SGR 文本,无 kitty
-/// 图像/光标控制,对别人的终端绝对安全);首尾加分隔线,写完给 shell 发一个
-/// SIGWINCH 促使它在我们的输出下方重绘提示符。
-fn write_reply_to_origin_tty(
-    origin: &crate::ipc::OriginTty,
-    title: &str,
-    reply: &str,
-) -> std::io::Result<()> {
+/// 专职写线程:tty 是同步阻塞设备(^S 流控可以永久卡住 write),隔离在自己
+/// 的线程里,卡死也只占一根线程,不拖累 daemon 的 async runtime。
+fn origin_tty_writer(
+    mut tty: std::fs::File,
+    shell_pid: u32,
+    ops: std::sync::mpsc::Receiver<TtyWriteOp>,
+) {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let mut tty = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(&origin.path)?;
-    let cols = unsafe {
-        let mut size: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0 {
-            size.ws_col as usize
-        } else {
-            80
+    for op in ops {
+        match op {
+            TtyWriteOp::Write(text) => {
+                if tty.write_all(text.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            TtyWriteOp::Finish => {
+                let _ = tty.flush();
+                // 提示符被我们的输出推到半空,SIGWINCH 让 shell(fish/zsh/新
+                // bash 的 readline 都处理)原地重绘一行干净的提示符。
+                unsafe {
+                    libc::kill(shell_pid as i32, libc::SIGWINCH);
+                }
+                return;
+            }
+            TtyWriteOp::Abort => return,
         }
-    };
-    let rule = "─".repeat(cols.clamp(20, 72));
-    let mut out = String::new();
-    out.push_str("\r\n");
-    out.push_str(&format!("\x1b[2m{rule}\x1b[0m\r\n"));
-    out.push_str(&format!(
-        "\x1b[1m✦ Miyu 后台任务跟进\x1b[0m \x1b[2m· {title}\x1b[0m\r\n\r\n"
-    ));
-    for line in reply.trim_end().lines() {
-        out.push_str(&crate::render::render_markdown_line(line));
-        out.push_str("\r\n");
     }
-    out.push_str(&format!("\x1b[2m{rule}\x1b[0m\r\n"));
-    // fish/zsh 收到 SIGWINCH 重绘提示符时,会从光标行向上清掉自家提示符
-    // 高度的行数再画(starship 双行提示符实测清 2 行)。垫两行空白当牺牲品,
-    // 免得它清到正文和底部分隔线。
-    out.push_str("\r\n\r\n");
-    tty.write_all(out.as_bytes())?;
-    tty.flush()?;
-    // 提示符已被我们的文本推到半空,SIGWINCH 让 shell(fish/zsh/新 bash 的
-    // readline 都处理)原地重绘一行干净的提示符。
-    unsafe {
-        libc::kill(origin.shell_pid as i32, libc::SIGWINCH);
-    }
-    Ok(())
 }
 
 fn wake_local_session_for_job(
@@ -7758,7 +7957,7 @@ fn wake_local_session_for_job(
     session_id: Arc<str>,
     completion: &tools::jobs::JobCompletion,
     command_short: &str,
-) -> Option<String> {
+) -> Option<JobWakeRun> {
     let noun = if completion.is_subagent {
         "后台子代理"
     } else {
@@ -7874,6 +8073,8 @@ fn wake_local_session_for_job(
             },
         );
     }
+    // 订阅起点在入队前取:回合的 turn.started 起所有事件都不漏给流式回写。
+    let events_after = state.events.latest_id();
     if state
         .actor_tx
         .send(ActorCommand::StartTurn {
@@ -7895,7 +8096,10 @@ fn wake_local_session_for_job(
         finish_run(&state.manager, &run_id, None);
         return None;
     }
-    Some(run_id)
+    Some(JobWakeRun {
+        run_id,
+        events_after,
+    })
 }
 
 async fn wake_platform_session_for_job(
@@ -12055,7 +12259,28 @@ sys.stdin.readline()  # 等 Rust 侧完成死后判定
             origin_shell_at_prompt(&origin),
             "pty.fork 出的会话首进程应判定为「在提示符」"
         );
-        write_reply_to_origin_tty(&origin, "e2e", "**粗体** 与 `代码` MIYU-E2E-END").unwrap();
+        // 走生产写线程:Write 分片 + Finish(flush + SIGWINCH),与流式回写同路。
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let tty = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(&origin.path)
+                .unwrap();
+            let (ops_tx, ops_rx) = std::sync::mpsc::channel::<TtyWriteOp>();
+            let shell_pid = origin.shell_pid;
+            let writer = std::thread::spawn(move || origin_tty_writer(tty, shell_pid, ops_rx));
+            ops_tx
+                .send(TtyWriteOp::Write(
+                    "\x1b[1m✦ Miyu 后台任务跟进\x1b[0m\r\n".to_string(),
+                ))
+                .unwrap();
+            let mut body = String::new();
+            push_rendered_line("**粗体** 与 `代码` MIYU-E2E-END", false, &mut body);
+            ops_tx.send(TtyWriteOp::Write(body)).unwrap();
+            ops_tx.send(TtyWriteOp::Finish).unwrap();
+            writer.join().unwrap();
+        }
         stdin.write_all(b"written\n").unwrap();
 
         let data_line = loop {
