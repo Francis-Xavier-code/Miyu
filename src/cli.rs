@@ -13375,6 +13375,7 @@ mod repl_input_tests {
             assistant_timestamp: Some("2026-07-19 10:43".to_string()),
             status,
             tool_reports: vec!["hidden tool report".to_string()],
+            tool_flow: Vec::new(),
             question_exchanges: Vec::new(),
             followups: Vec::new(),
             attachments: Vec::new(),

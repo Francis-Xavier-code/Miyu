@@ -816,6 +816,7 @@ mod tests {
             assistant_timestamp: None,
             status: TurnStatus::Completed,
             tool_reports: Vec::new(),
+            tool_flow: Vec::new(),
             question_exchanges: Vec::new(),
             followups: Vec::new(),
             attachments: Vec::new(),

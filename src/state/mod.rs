@@ -31,6 +31,7 @@ pub use conversation_db::{
     TurnJournalEvent,
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
+    ToolFlowCall, ToolFlowRound,
 };
 pub use usage::{UsageMeta, UsageRange, UsageSnapshot, UsageStats};
 
@@ -900,6 +901,14 @@ impl StateStore {
     /// Archives the transient system tail that was sent after the user message
     /// of this turn (v7 append-only fossilization). Replayed verbatim by
     /// history rendering so the byte stream stays a pure extension.
+    pub fn set_turn_tool_flow(
+        &self,
+        turn_id: &str,
+        flow: &[conversation_db::ToolFlowRound],
+    ) -> Result<()> {
+        self.conv_db.set_turn_tool_flow(turn_id, flow)
+    }
+
     pub fn set_turn_context_messages(
         &self,
         turn_id: &str,

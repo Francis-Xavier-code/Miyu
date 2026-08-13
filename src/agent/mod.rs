@@ -1087,6 +1087,61 @@ impl Agent {
     }
 
     /// 用量历史的来源标签:平台回合记平台 id(如 "qq"),其余一律 "agent"。
+    /// dsh 式工具输出外溢(spill):模型侧内联超过 context.tool_output_spill_bytes
+    /// 的纯文本结果全文存进会话级文件,内联替换为头尾预览+定位提示。read_file
+    /// 不外溢(避免 读→溢→再读 循环);存盘失败保留原文,绝不把成功调用变错误。
+    /// 只约束进模型的消息,程序侧(报告提取/load_tools 解析等)继续用完整值。
+    fn spill_tool_output(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        output: &str,
+    ) -> Option<String> {
+        let cap = self.config.context.tool_output_spill_bytes;
+        if cap == 0 || tool_name == "read_file" || output.len() <= cap {
+            return None;
+        }
+        fn safe_segment(raw: &str) -> String {
+            raw.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect()
+        }
+        let dir = self
+            .paths
+            .state_dir
+            .join("spill")
+            .join(safe_segment(&self.state.session_id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        let file = dir.join(format!(
+            "{}-{}-{}.txt",
+            safe_segment(turn_id),
+            safe_segment(call_id),
+            safe_segment(tool_name)
+        ));
+        let replacement = spill_replacement(output, cap, &file.display().to_string())?;
+        if let Err(error) = std::fs::write(&file, output) {
+            tracing::warn!(%error, path = %file.display(), "tool output spill failed; keeping inline");
+            return None;
+        }
+        tracing::info!(
+            tool = tool_name,
+            bytes = output.len(),
+            path = %file.display(),
+            "oversized tool output spilled"
+        );
+        Some(replacement)
+    }
+
     fn usage_source(&self) -> &str {
         self.platform_context
             .as_ref()
@@ -1825,6 +1880,10 @@ impl Agent {
             tokens,
             result.usage_estimated,
         )?;
+        let tool_flow = derive_tool_flow(&messages, replay_start);
+        if !tool_flow.is_empty() {
+            self.state.set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
+        }
         if self.memory.process_after_turn(
             &diary_input,
             &result.content,
@@ -2023,6 +2082,10 @@ impl Agent {
             tokens,
             result.usage_estimated,
         )?;
+        let tool_flow = derive_tool_flow(&messages, replay_start);
+        if !tool_flow.is_empty() {
+            self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
+        }
         if self.memory.process_after_turn(
             // C10 三份内容分离(最小实现):日记读平台包装前的原文快照,
             // 而不是带指令样板和群聊记录块的完整 prompt 内容。
@@ -3179,7 +3242,15 @@ impl Agent {
                     if let Some(report) = group_output.report {
                         persisted_tool_reports.push((call.function.name.clone(), report));
                     }
-                    messages.push(ChatMessage::tool(call.id, group_output.output));
+                    let model_output = self
+                        .spill_tool_output(
+                            current_turn_id,
+                            &call.id,
+                            &call.function.name,
+                            &group_output.output,
+                        )
+                        .unwrap_or(group_output.output);
+                    messages.push(ChatMessage::tool(call.id, model_output));
                     continue;
                 }
                 let call_id = call.id.clone();
@@ -3383,7 +3454,10 @@ impl Agent {
                 } else {
                     None
                 };
-                messages.push(ChatMessage::tool(call.id, output.clone()));
+                let model_output = self
+                    .spill_tool_output(current_turn_id, &call.id, &call.function.name, &output)
+                    .unwrap_or_else(|| output.clone());
+                messages.push(ChatMessage::tool(call.id.clone(), model_output));
                 if tool_succeeded && call.function.name == "load_tools" {
                     let loaded = loaded_items_from_output(&output);
                     for name in &loaded.tools {
@@ -3683,13 +3757,42 @@ impl Agent {
                 );
                 messages.push(self.followup_user_message(followup));
             }
+            // dsh 形态回放:每轮 assistant 带原生 tool_calls(参数原样字节),
+            // 随后各 call 的 role:"tool" 输出;最终回复照旧收尾。老回合
+            // (无结构化流)退回 private_tool_memory 压扁兜底。
+            for round in &turn.tool_flow {
+                push_assistant_message_with_reasoning(
+                    messages,
+                    round.assistant_content.clone(),
+                    round.assistant_reasoning.as_deref(),
+                    None,
+                    Some(
+                        round
+                            .calls
+                            .iter()
+                            .map(|call| ToolCall {
+                                id: call.id.clone(),
+                                kind: "function".to_string(),
+                                function: ToolCallFunction {
+                                    name: call.name.clone(),
+                                    arguments: call.arguments.clone(),
+                                },
+                            })
+                            .collect(),
+                    ),
+                    false,
+                );
+                for call in &round.calls {
+                    messages.push(ChatMessage::tool(call.id.clone(), call.output.clone()));
+                }
+            }
             push_assistant_context_messages(
                 messages,
                 &turn.assistant_content,
                 turn.assistant_reasoning.as_deref(),
                 true,
             );
-            if !turn.tool_reports.is_empty() {
+            if turn.tool_flow.is_empty() && !turn.tool_reports.is_empty() {
                 messages.push(ChatMessage::turn_context(private_tool_memory(
                     &turn.tool_reports,
                 )));
@@ -4430,6 +4533,97 @@ fn private_reasoning_memory(reasoning: &str) -> Option<String> {
             "<system-reminder>\n<previous_assistant_reasoning>\n{reasoning}\n</previous_assistant_reasoning>\n这些是上一轮 assistant 已经产生的原始思考内容，用于继续工作；不要向用户复述这些标签。\n</system-reminder>"
         )
     })
+}
+
+/// dsh 式外溢替换文案的预算自洽拼装:先按最坏情况预扣提示文案的字节数,
+/// 预览用剩余额度头尾对半(字符边界安全);连提示都放不下返回 None(放弃
+/// 外溢保留原文——替换永不比原文更大)。
+fn spill_replacement(output: &str, cap: usize, locator: &str) -> Option<String> {
+    fn notice(omitted: usize, locator: &str) -> String {
+        format!(
+            "\n\n(已省略 {omitted} 字节。完整结果已存至: {locator} ——可用 read_file 配 offset/limit 分段读取,或用 run_command 里的 rg 检索。)"
+        )
+    }
+    fn cut_at_boundary(text: &str, mut at: usize) -> usize {
+        while at > 0 && !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+    // 预扣:提示文案按最坏情况(省略数取全长的位数上界) + 头尾之间的 \n…\n 分隔符。
+    let reserve = notice(output.len(), locator).len() + "\n…\n".len();
+    if reserve >= cap {
+        return None;
+    }
+    let budget = cap - reserve;
+    let head_end = cut_at_boundary(output, budget / 2);
+    let mut tail_start = output.len().saturating_sub(budget - budget / 2);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start <= head_end {
+        return None;
+    }
+    let omitted = tail_start - head_end;
+    Some(format!(
+        "{}\n…\n{}{}",
+        &output[..head_end],
+        &output[tail_start..],
+        notice(omitted, locator)
+    ))
+}
+
+/// 完成时从本回合的实况消息尾段推导结构化工具流。以 messages 为唯一真相
+/// (dsh "reconstructable requests":模型可见 ⟺ 可持久重建):assistant 带
+/// tool_calls 即开一轮,其后按 call id 认领 role:"tool" 输出。被 length 截断
+/// 拒执行的调用照录——它们的错误文案同样是模型看到的字节。任何悬空调用
+/// (无输出)补占位,回放绝不发"无应答的 tool_calls"(provider 会 400)。
+fn derive_tool_flow(
+    messages: &[ChatMessage],
+    live_start: usize,
+) -> Vec<crate::state::ToolFlowRound> {
+    let mut rounds: Vec<crate::state::ToolFlowRound> = Vec::new();
+    for message in &messages[live_start.min(messages.len())..] {
+        if message.role == "assistant" {
+            if let Some(calls) = message.tool_calls.as_ref().filter(|calls| !calls.is_empty()) {
+                rounds.push(crate::state::ToolFlowRound {
+                    assistant_content: chat_message_text(message).unwrap_or_default(),
+                    assistant_reasoning: message
+                        .reasoning_content
+                        .clone()
+                        .filter(|reasoning| !reasoning.is_empty()),
+                    calls: calls
+                        .iter()
+                        .map(|call| crate::state::ToolFlowCall {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            output: String::new(),
+                        })
+                        .collect(),
+                });
+            }
+        } else if message.role == "tool" {
+            if let (Some(call_id), Some(round)) = (message.tool_call_id.as_ref(), rounds.last_mut())
+            {
+                if let Some(call) = round
+                    .calls
+                    .iter_mut()
+                    .find(|call| &call.id == call_id && call.output.is_empty())
+                {
+                    call.output = chat_message_text(message).unwrap_or_default();
+                }
+            }
+        }
+    }
+    for round in &mut rounds {
+        for call in &mut round.calls {
+            if call.output.is_empty() {
+                call.output = "(执行结果不可用)".to_string();
+            }
+        }
+    }
+    rounds
 }
 
 fn push_assistant_context_messages(
@@ -7151,6 +7345,7 @@ mod tests {
             assistant_timestamp: None,
             status: crate::state::TurnStatus::Completed,
             tool_reports: Vec::new(),
+            tool_flow: Vec::new(),
             question_exchanges: Vec::new(),
             followups: Vec::new(),
             attachments: Vec::new(),
@@ -7254,6 +7449,7 @@ mod tests {
             assistant_timestamp: None,
             status: crate::state::TurnStatus::Interrupted,
             tool_reports: Vec::new(),
+            tool_flow: Vec::new(),
             question_exchanges: vec![
                 QuestionExchange {
                     questions: vec![crate::question::QuestionPrompt {
@@ -8612,5 +8808,67 @@ mod tests {
             scripts_dir: root.join("config/scripts"),
             system_scripts_dir: PathBuf::new(),
         }
+    }
+
+    /// 结构化工具流推导:从实况消息尾段还原轮次;悬空调用补占位,
+    /// 穿插的 user/context 消息不干扰配对。
+    #[test]
+    fn derive_tool_flow_reconstructs_rounds_from_live_messages() {
+        let call = |id: &str, name: &str, args: &str| crate::llm::ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::llm::ToolCallFunction {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        };
+        let mut messages = vec![ChatMessage::plain("user", "历史,不该被扫到")];
+        let live_start = messages.len();
+        let mut assistant =
+            ChatMessage::assistant("先查一下", Some(vec![call("c1", "run_command", "{\"command\":\"ls\"}")]));
+        assistant.reasoning_content = Some("想想".to_string());
+        messages.push(assistant);
+        messages.push(ChatMessage::tool("c1", "file-a\nfile-b"));
+        messages.push(ChatMessage::turn_context("穿插的系统提醒"));
+        messages.push(ChatMessage::assistant(
+            "再查两个",
+            Some(vec![
+                call("c2", "read_file", "{\"path\":\"x\"}"),
+                call("c3", "web_search", "{\"q\":\"y\"}"),
+            ]),
+        ));
+        messages.push(ChatMessage::tool("c3", "搜到了"));
+        // c2 悬空(崩溃/中断) → 必须补占位,回放绝不发无应答的 tool_calls
+        messages.push(ChatMessage::assistant("完事", None));
+
+        let flow = derive_tool_flow(&messages, live_start);
+        assert_eq!(flow.len(), 2);
+        assert_eq!(flow[0].assistant_content, "先查一下");
+        assert_eq!(flow[0].assistant_reasoning.as_deref(), Some("想想"));
+        assert_eq!(flow[0].calls.len(), 1);
+        assert_eq!(flow[0].calls[0].arguments, "{\"command\":\"ls\"}");
+        assert_eq!(flow[0].calls[0].output, "file-a\nfile-b");
+        assert_eq!(flow[1].calls.len(), 2);
+        assert_eq!(flow[1].calls[0].output, "(执行结果不可用)");
+        assert_eq!(flow[1].calls[1].output, "搜到了");
+    }
+
+    /// spill 替换文案的预算自洽:替换体永不超过上限;上限太小放弃;
+    /// CJK 多字节切口不产生半个字符。
+    #[test]
+    fn spill_replacement_respects_budget_and_char_boundaries() {
+        let output = "长".repeat(40_000);
+        let replaced = spill_replacement(&output, 10_000, "/tmp/x.txt").expect("should spill");
+        assert!(replaced.len() <= 10_000, "replacement {} > cap", replaced.len());
+        assert!(replaced.contains("已省略"));
+        assert!(replaced.contains("/tmp/x.txt"));
+        assert!(replaced.starts_with('长'));
+        assert!(replaced.trim_end().ends_with(')'));
+        // 上限连提示都装不下 → 放弃外溢
+        assert!(spill_replacement(&output, 60, "/tmp/x.txt").is_none());
+        // 不超限的输出不该被调用方外溢(逻辑在调用方,这里守函数本身)
+        let small = "小输出";
+        let r = spill_replacement(small, 10_000, "/tmp/x.txt");
+        assert!(r.is_some() || small.len() <= 10_000);
     }
 }

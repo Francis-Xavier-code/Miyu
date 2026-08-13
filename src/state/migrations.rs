@@ -116,10 +116,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "session_cache_tokens",
         apply: apply_v19_session_cache_tokens,
     },
+    Migration {
+        version: 20,
+        name: "turn_tool_flow",
+        apply: apply_v20_turn_tool_flow,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 19;
+pub const LATEST_VERSION: i64 = 20;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -828,6 +833,13 @@ fn apply_v18_turn_cache_tokens(conn: &Connection) -> Result<()> {
 /// and out of the rate.
 fn apply_v19_session_cache_tokens(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "sessions", "cache_read_tokens", "INTEGER")
+}
+
+/// v20:回合的结构化工具流(JSON)。照抄 dsh 的结构保真原则:assistant 的
+/// tool_calls(含模型原样 JSON 参数)与各调用的模型侧输出逐字保留,回放时
+/// 还原为原生 tool_calls + role:"tool" 消息,不再压扁成系统备忘。
+fn apply_v20_turn_tool_flow(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "turns", "tool_flow", "TEXT")
 }
 
 fn add_column_if_missing(

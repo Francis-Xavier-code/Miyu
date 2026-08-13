@@ -110,6 +110,26 @@ impl ToolFootprint {
     }
 }
 
+/// 一轮工具调用:assistant(可带思考)发起若干 call,随后各自的结果。
+/// `output` 与该轮模型实际看到的字节一致(超限时是 spill 预览),回放即重现。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ToolFlowRound {
+    #[serde(default)]
+    pub assistant_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_reasoning: Option<String>,
+    pub calls: Vec<ToolFlowCall>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolFlowCall {
+    pub id: String,
+    pub name: String,
+    /// 模型原样产出的 JSON 字符串,不解析不重排(dsh:字节保真)。
+    pub arguments: String,
+    pub output: String,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Turn {
@@ -125,6 +145,9 @@ pub struct Turn {
     pub assistant_timestamp: Option<String>,
     pub status: TurnStatus,
     pub tool_reports: Vec<String>,
+    /// 结构化工具流(v20+):非空时历史回放走原生 tool_calls/role:"tool" 形态,
+    /// tool_reports 只服务 UI 与旧回合兜底。
+    pub tool_flow: Vec<ToolFlowRound>,
     pub question_exchanges: Vec<QuestionExchange>,
     pub followups: Vec<TurnFollowup>,
     pub attachments: Vec<UserAttachment>,
@@ -2171,6 +2194,17 @@ impl ConversationDb {
         Ok(())
     }
 
+    /// 完成后落一次结构化工具流。独立 UPDATE 而非扩 complete 签名:调用点多,
+    /// 且流为空(无工具回合)时根本不写。
+    pub fn set_turn_tool_flow(&self, turn_id: &str, flow: &[ToolFlowRound]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE turns SET tool_flow = ?1 WHERE turn_id = ?2",
+            params![serde_json::to_string(flow)?, turn_id],
+        )?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn complete_turn(
         &self,
@@ -3775,7 +3809,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3795,7 +3829,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3815,7 +3849,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 AND hidden = 0 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3834,7 +3868,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 AND hidden = 0 AND turn_id != ?2 ORDER BY seq ASC",
         )?;
         let mut turns = stmt
@@ -3887,7 +3921,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 AND is_summary = 1 AND hidden = 0 ORDER BY seq DESC LIMIT 1",
         )?;
         let turn = stmt
@@ -3920,7 +3954,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns WHERE session_id = ?1 AND is_summary = 0 ORDER BY seq ASC LIMIT ?2",
         )?;
         let mut to_remove: Vec<Turn> = stmt
@@ -3946,7 +3980,7 @@ impl ConversationDb {
         let mut stmt = conn.prepare(
             "SELECT turn_id, seq, user_content, display_content, user_timestamp, assistant_content,
                     assistant_reasoning, assistant_provider_id, assistant_model, assistant_timestamp, status, tool_reports, hidden, is_summary, owner_pid,
-                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read
+                    token_total, token_usage_estimated, revision, context_messages, token_prompt, token_cache_read, tool_flow
              FROM turns
              WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0 AND status != 'running'
              ORDER BY seq ASC LIMIT ?2",
@@ -5311,6 +5345,8 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let context_messages_json: String = row.get::<_, Option<String>>(18)?.unwrap_or_default();
     let context_messages: Vec<ChatMessage> =
         serde_json::from_str(&context_messages_json).unwrap_or_default();
+    let tool_flow_json: String = row.get::<_, Option<String>>(21)?.unwrap_or_default();
+    let tool_flow: Vec<ToolFlowRound> = serde_json::from_str(&tool_flow_json).unwrap_or_default();
     Ok(Turn {
         turn_id: row.get(0)?,
         seq: row.get(1)?,
@@ -5324,6 +5360,7 @@ fn map_turn_row(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         assistant_timestamp: row.get(9)?,
         status: TurnStatus::from_str(row.get::<_, String>(10)?.as_str()),
         tool_reports,
+        tool_flow,
         question_exchanges: Vec::new(),
         followups: Vec::new(),
         attachments: Vec::new(),

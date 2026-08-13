@@ -2561,6 +2561,11 @@ impl EmbeddingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
+    /// 工具输出的模型侧内联上限(UTF-8 字节)。超限的纯文本输出全文外溢到
+    /// 会话级 spill 文件,模型只看头尾预览+取回提示(read_file/rg 按需读回)。
+    /// 0 = 关闭外溢。照抄 dsh 默认 50KB。
+    #[serde(default = "default_tool_output_spill_bytes")]
+    pub tool_output_spill_bytes: usize,
     #[serde(default = "default_trim_at_ratio")]
     pub trim_at_ratio: f32,
     #[serde(default = "default_trim_batch_ratio")]
@@ -3416,6 +3421,7 @@ impl Default for MemoryConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
+            tool_output_spill_bytes: default_tool_output_spill_bytes(),
             trim_at_ratio: default_trim_at_ratio(),
             trim_batch_ratio: default_trim_batch_ratio(),
             on_overflow: default_on_overflow(),
@@ -5799,6 +5805,10 @@ fn default_calculator_backend() -> String {
 
 /// Compact trigger watermark. 0.8 (was 0.9) leaves room between the trigger
 /// and the force watermark for the cheap mechanical layer to act first.
+fn default_tool_output_spill_bytes() -> usize {
+    50_000
+}
+
 fn default_trim_at_ratio() -> f32 {
     0.8
 }
