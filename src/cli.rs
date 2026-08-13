@@ -5240,6 +5240,10 @@ async fn try_run_remote_chat(
             tokio::select! {
                 biased;
                 _ = input_tick.tick(), if live.is_some() => {
+                    if terminal_hangup() {
+                        let _ = send_ipc_command(paths, IpcCommand::Cancel { run_id: run_id.clone() }).await;
+                        std::process::exit(0);
+                    }
                     if !event::poll(Duration::ZERO)? {
                         continue;
                     }
@@ -6979,7 +6983,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             }
             let session = { feed.repl_session.lock().unwrap().clone() };
             if let Some(session_id) = session {
-                let _ = send_ipc_admin(&paths, IpcCommand::StopSessionJobs { session_id }).await;
+                // 超时保底:daemon 正在重启/无响应时也必须退出,
+                // 否则挂在这里的同时主循环还在对死终端空转。
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    send_ipc_admin(&paths, IpcCommand::StopSessionJobs { session_id }),
+                )
+                .await;
             }
             std::process::exit(0);
         });
@@ -11012,6 +11022,16 @@ async fn fetch_jobs_overview(paths: &MiyuPaths) -> Result<JobsOverviewSnapshot> 
     }
 }
 
+/// 终端已死(PTY 对端关闭):POLLHUP/POLLERR/POLLNVAL 任一命中。
+/// 不发 SIGHUP 的断开路径(tmux kill-pane、终端崩溃、SSH 掉线)只能靠它
+/// 兜底——否则 crossterm 的 poll 对 EOF fd 永远立即就绪、read 又读不出
+/// 事件,REPL 主循环全速空转,留下一个 98% CPU 的残留进程。
+fn terminal_hangup() -> bool {
+    let mut pollfd = libc::pollfd { fd: libc::STDIN_FILENO, events: 0, revents: 0 };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready == 1 && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
 enum LiveReplOutcome {
     Exit,
     Submit(
@@ -11043,7 +11063,18 @@ fn read_live_repl_input(
     }
     let mut last_key_at = Instant::now();
     loop {
-        if !event::poll(std::time::Duration::from_millis(80))? {
+        // 等待权自持:PTY 死亡后 crossterm 的 poll 会在内部对 HUP fd
+        // 无限自旋、永不返回(实测),所以不能把"等 80ms"交给它——用裸
+        // poll 等待并率先识别挂断,有输入就绪时才让 crossterm 取事件。
+        let mut pollfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 80) };
+        if ready == 1
+            && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+        {
+            return Ok(LiveReplOutcome::Exit);
+        }
+        let has_input = ready == 1 && event::poll(Duration::ZERO)?;
+        if !has_input {
             // Idle tick: structural changes redraw the whole tail; otherwise
             // only the strip repaints. While the user is actively typing the
             // animation pauses so the two repaint sources never interleave.
@@ -11186,6 +11217,10 @@ async fn follow_wake_run(
             tokio::select! {
                 biased;
                 _ = input_tick.tick() => {
+                    if terminal_hangup() {
+                        let _ = send_ipc_command(paths, IpcCommand::Cancel { run_id: run_id.to_string() }).await;
+                        std::process::exit(0);
+                    }
                     if !event::poll(Duration::ZERO)? {
                         continue;
                     }
@@ -11520,6 +11555,9 @@ async fn run_live_agent_turn(
             tokio::select! {
                 biased;
                 _ = input_tick.tick() => {
+                    if terminal_hangup() {
+                        std::process::exit(0);
+                    }
                     if !event::poll(Duration::ZERO)? {
                         continue;
                     }
