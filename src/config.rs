@@ -851,8 +851,8 @@ pub struct RealContextPluginSettings {
 impl Default for RealContextPluginSettings {
     fn default() -> Self {
         Self {
-            reply_context_window: 50,
-            judge_context_window: 30,
+            reply_context_window: 25,
+            judge_context_window: 20,
             group_member_search_max_results: 200,
             active_reply_enable: true,
             judge_include_persona: true,
@@ -6982,8 +6982,8 @@ mod tests {
     fn real_context_defaults_match_the_deployed_contract() {
         let settings = RealContextPluginSettings::default();
 
-        assert_eq!(settings.reply_context_window, 50);
-        assert_eq!(settings.judge_context_window, 30);
+        assert_eq!(settings.reply_context_window, 25);
+        assert_eq!(settings.judge_context_window, 20);
         assert_eq!(settings.group_member_search_max_results, 200);
         assert!(settings.active_reply_enable);
         assert!(settings.judge_include_persona);
