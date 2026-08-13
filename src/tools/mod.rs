@@ -37,6 +37,7 @@ mod skills;
 mod subagent_runner;
 mod task;
 mod todowrite;
+pub(crate) mod usage_query;
 pub mod tool_descriptions;
 pub mod vision;
 mod weather;
@@ -296,6 +297,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     default_tools::register(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
+    usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"));
     apply_patch::register(&mut registry);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
@@ -444,6 +446,7 @@ pub fn uses_load_tools(mode: &str) -> bool {
 pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     web::register_fetch(&mut registry);
+    usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"));
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
     }
