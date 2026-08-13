@@ -32,7 +32,7 @@ pub use conversation_db::{
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
 };
-pub use usage::UsageSnapshot;
+pub use usage::{UsageMeta, UsageRange, UsageSnapshot, UsageStats};
 
 /// The only session kind users can list, name, switch to, or bind a platform
 /// to. Everything else is infrastructure and stays out of the session list.
@@ -1804,14 +1804,43 @@ impl StateStore {
         )
     }
 
-    pub fn add_usage(&self, usage: &Usage) -> Result<()> {
+    pub fn add_usage(&self, usage: &Usage, meta: UsageMeta<'_>) -> Result<()> {
         self.init_files()?;
-        usage::add_usage(&self.usage_file(), usage)
+        usage::add_usage(&self.usage_file(), usage)?;
+        self.record_usage_history(usage, meta, false);
+        Ok(())
     }
 
-    pub fn add_auxiliary_usage(&self, usage: &Usage) -> Result<()> {
+    pub fn add_auxiliary_usage(&self, usage: &Usage, meta: UsageMeta<'_>) -> Result<()> {
         self.init_files()?;
-        usage::add_auxiliary_usage(&self.usage_file(), usage)
+        usage::add_auxiliary_usage(&self.usage_file(), usage)?;
+        self.record_usage_history(usage, meta, true);
+        Ok(())
+    }
+
+    /// 历史明细落账失败只告警:usage.json 累计是正账,明细缺一行不该
+    /// 让整个回合报错。
+    fn record_usage_history(&self, usage: &Usage, meta: UsageMeta<'_>, aux: bool) {
+        if let Err(error) = usage::record_usage(&self.usage_history_file(), usage, meta, aux) {
+            tracing::warn!(error = %error, "recording usage history failed");
+        }
+    }
+
+    pub fn usage_history_file(&self) -> PathBuf {
+        self.state_dir.join("usage-history.jsonl")
+    }
+
+    pub fn usage_stats(&self, range: UsageRange) -> Result<usage::UsageStats> {
+        usage::usage_stats(&self.usage_history_file(), range)
+    }
+
+    pub fn usage_details(
+        &self,
+        limit: usize,
+        src: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Vec<usage::UsageRecord>> {
+        usage::usage_details(&self.usage_history_file(), limit, src, model)
     }
 
     #[allow(dead_code)]
@@ -3811,12 +3840,15 @@ mod tests {
             .unwrap();
 
         store
-            .add_usage(&Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-                ..Usage::default()
-            })
+            .add_usage(
+                &Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    ..Usage::default()
+                },
+                UsageMeta { source: "agent", provider: Some("prov"), model: Some("model") },
+            )
             .unwrap();
         let usage_before = store.usage_snapshot().unwrap();
 

@@ -181,6 +181,8 @@ pub(super) struct AffectionUpdateJob {
     config: AppConfig,
     paths: MiyuPaths,
     state_store: StateStore,
+    /// 用量历史来源标签(平台 id,如 "qq")。
+    platform: String,
     settings: Arc<RealContextPluginSettings>,
     history_store: HistoryStore,
     group: GroupKey,
@@ -224,6 +226,7 @@ pub(super) fn update_job(
         config: context.config.clone(),
         paths: context.paths.clone(),
         state_store: context.state_store.clone(),
+        platform: context.conversation.platform.clone(),
         settings,
         history_store,
         group,
@@ -622,7 +625,12 @@ async fn run_update(job: AffectionUpdateJob) -> Result<()> {
         })??
     };
     if let Some(usage) = result.usage.as_ref() {
-        if let Err(error) = job.state_store.add_auxiliary_usage(usage) {
+        let meta = crate::state::UsageMeta {
+            source: &job.platform,
+            provider: result.provider_id.as_deref(),
+            model: result.model.as_deref(),
+        };
+        if let Err(error) = job.state_store.add_auxiliary_usage(usage, meta) {
             tracing::warn!(target: "miyu::qq", error = %error, "{}", crate::i18n::text("recording affection update usage failed", "记录好感度更新用量失败"));
         }
     }

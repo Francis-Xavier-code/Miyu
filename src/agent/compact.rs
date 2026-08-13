@@ -48,6 +48,8 @@ pub struct CompactResult {
     pub usage_estimated: bool,
     pub folded_turns: usize,
     pub kept_turns: usize,
+    /// 压缩用的 provider,供用量历史记账(模型按请求轮换,不在此追溯)。
+    pub provider_id: Option<String>,
 }
 
 struct CompactTextResult {
@@ -398,6 +400,7 @@ impl Compactor {
             usage_estimated,
             folded_turns: fold.len(),
             kept_turns: head.len() - cut,
+            provider_id: Some(self.client.provider_id().to_string()),
         }))
     }
 }

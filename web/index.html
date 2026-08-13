@@ -7,8 +7,10 @@
   <meta name="theme-color" content="#171821">
   <title>Miyu</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <!-- matugen 生成的 MD3 token 覆盖;app.js 依据「配色方案」切换 link.disabled -->
   <link rel="stylesheet" href="/theme.css" id="matugenThemeLink">
+  <script defer src="/vendor/katex/katex.min.js"></script>
   <script defer src="/app.js"></script>
 </head>
 <body data-theme="graphite">
@@ -48,9 +50,9 @@
 
       <footer class="sidebar-footer">
         <div class="sidebar-actions">
-          <button class="sidebar-action" id="settingsButton" type="button">
-            <span class="icon-slot" data-icon="settings-2" aria-hidden="true"><span class="icon-fallback">⚙</span></span>
-            <span class="settings-label">设置</span>
+          <button class="sidebar-action" id="consoleButton" type="button">
+            <span class="icon-slot" data-icon="layout-grid" aria-hidden="true"><span class="icon-fallback">▦</span></span>
+            <span class="settings-label">控制台</span>
           </button>
           <button class="icon-button" id="sidebarThemeButton" type="button" title="切换主题" aria-label="切换主题">
             <span class="icon-slot" data-icon="sun-moon" aria-hidden="true"><span class="icon-fallback">◐</span></span>
@@ -279,6 +281,88 @@
     </section>
 
     <button class="page-scrim drawer-scrim" id="drawerScrim" type="button" aria-label="关闭设置" tabindex="-1"></button>
+    <section class="console-view" id="consoleView" aria-label="控制台" aria-hidden="true" hidden>
+      <aside class="con-rail" id="conRail">
+        <div class="con-rail-head">
+          <b>控制台</b>
+          <button class="icon-button" id="conRailToggle" type="button" title="收起/展开侧边栏" aria-label="收起/展开侧边栏">
+            <span class="icon-slot" data-icon="panel-left" aria-hidden="true"><span class="icon-fallback">▤</span></span>
+          </button>
+        </div>
+        <nav class="con-rail-nav">
+          <button class="con-rail-item active" type="button">
+            <span class="icon-slot" data-icon="chart-column" aria-hidden="true"><span class="icon-fallback">▮</span></span>
+            <span>数据统计</span>
+          </button>
+        </nav>
+        <footer class="con-rail-foot">
+          <button class="con-rail-item" id="consoleBack" type="button">
+            <span class="icon-slot" data-icon="chevron-left" aria-hidden="true"><span class="icon-fallback">‹</span></span>
+            <span>返回聊天</span>
+          </button>
+        </footer>
+      </aside>
+      <main class="con-main">
+        <div class="con-inner">
+          <div class="con-head">
+            <h2>数据统计</h2>
+            <button class="icon-button u-refresh" id="usageRefresh" type="button" title="刷新" aria-label="刷新">
+              <span class="icon-slot" data-icon="refresh-cw" aria-hidden="true"><span class="icon-fallback">⟳</span></span>
+            </button>
+            <small id="usageStamp">正在载入…</small>
+            <div class="con-segmented" id="usageRangeSeg">
+              <button class="on" data-range="1d" type="button">近一天</button>
+              <button data-range="7d" type="button">7 天</button>
+              <button data-range="30d" type="button">30 天</button>
+              <button data-range="all" type="button">至今</button>
+            </div>
+          </div>
+          <div class="u-tiles" id="usageTiles"></div>
+          <div class="u-card">
+            <div class="u-card-head"><h3>调用热力</h3><span class="u-hint">近一年 · 每格一天</span><div class="u-legend" id="usageHeatTotal"></div></div>
+            <div class="u-heat-body">
+              <div class="u-heat-days"><span>一</span><span>三</span><span>五</span></div>
+              <div class="u-heat-wrap">
+                <div class="u-heat-months" id="usageHeatMonths"></div>
+                <div class="u-heatmap" id="usageHeatmap"></div>
+              </div>
+            </div>
+            <div class="u-heat-scale">少 <i data-l="0"></i><i data-l="1"></i><i data-l="2"></i><i data-l="3"></i><i data-l="4"></i> 多</div>
+          </div>
+          <div class="u-card">
+            <div class="u-card-head">
+              <h3>每日 token</h3><span class="u-hint" id="usageBarsHint"></span>
+              <div class="u-legend">
+                <span><i class="u-lg1"></i>新输入</span>
+                <span><i class="u-lg2"></i>输出</span>
+                <span><i class="u-lg3"></i>缓存命中</span>
+              </div>
+            </div>
+            <div class="u-chart-wrap">
+              <div class="u-chart-y" id="usageBarsY"></div>
+              <div class="u-chart-plot">
+                <div class="u-bars" id="usageBars"></div>
+                <div class="u-bar-x" id="usageBarsX"></div>
+              </div>
+            </div>
+          </div>
+          <div id="usageSources"></div>
+          <div class="u-card">
+            <div class="u-card-head"><h3>最近调用</h3><span class="u-hint">usage-history.jsonl 尾部</span>
+              <div class="u-rec-filters">
+                <select id="usageSrcFilter" aria-label="按来源筛选"><option value="">全部来源</option></select>
+                <select id="usageModelFilter" aria-label="按模型筛选"><option value="">全部模型</option></select>
+              </div>
+            </div>
+            <div class="u-table-scroll"><table class="u-table u-records-table">
+              <thead><tr><th>时间</th><th>来源</th><th>模型</th><th class="num">输入</th><th class="num">输出</th><th>缓存命中</th><th>类型</th></tr></thead>
+              <tbody id="usageRecords"></tbody>
+            </table></div>
+          </div>
+        </div>
+      </main>
+    </section>
+
     <aside class="settings-drawer" id="settingsDrawer" aria-label="设置" aria-hidden="true" tabindex="-1">
       <header>
         <div><small>MIYU</small><strong>设置</strong></div>

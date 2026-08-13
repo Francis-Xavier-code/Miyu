@@ -110,7 +110,12 @@ pub(super) async fn run(
             call.await?
         };
         if let Some(usage) = result.usage.as_ref() {
-            if let Err(error) = context.state_store.add_auxiliary_usage(usage) {
+            let meta = crate::state::UsageMeta {
+                source: &context.conversation.platform,
+                provider: result.provider_id.as_deref(),
+                model: result.model.as_deref(),
+            };
+            if let Err(error) = context.state_store.add_auxiliary_usage(usage, meta) {
                 tracing::warn!(error = %error, "{}", crate::i18n::text("recording real-context judge usage failed", "记录真实上下文判断用量失败"));
             }
         }

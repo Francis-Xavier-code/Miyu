@@ -58,6 +58,9 @@
     brain: [["path", { d: "M9.5 4A2.5 2.5 0 0 1 12 6.5v11a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 5.5 13a3 3 0 0 1 .34-5.98A2.5 2.5 0 0 1 9.5 4Z" }], ["path", { d: "M14.5 4A2.5 2.5 0 0 0 12 6.5v11a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 18.5 13a3 3 0 0 0-.34-5.98A2.5 2.5 0 0 0 14.5 4Z" }]],
     check: [["path", { d: "M20 6 9 17l-5-5" }]],
     "chevron-down": [["path", { d: "m6 9 6 6 6-6" }]],
+    "chevron-left": [["path", { d: "m15 18-6-6 6-6" }]],
+    "layout-grid": [["rect", { x: "3", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "14", width: "7", height: "7", rx: "1" }], ["rect", { x: "3", y: "14", width: "7", height: "7", rx: "1" }]],
+    "chart-column": [["path", { d: "M3 3v16a2 2 0 0 0 2 2h16" }], ["path", { d: "M7 15v-4m5 4V8m5 7v-6" }]],
     "chevron-right": [["path", { d: "m9 18 6-6-6-6" }]],
     "circle-alert": [["circle", { cx: "12", cy: "12", r: "10" }], ["line", { x1: "12", x2: "12", y1: "8", y2: "12" }], ["line", { x1: "12", x2: "12.01", y1: "16", y2: "16" }]],
     "circle-help": [["circle", { cx: "12", cy: "12", r: "10" }], ["path", { d: "M9.09 9a3 3 0 1 1 5.83 1c0 2-3 3-3 3" }], ["path", { d: "M12 17h.01" }]],
@@ -185,7 +188,25 @@
     contextNumbers: document.getElementById("contextNumbers"),
     contextTrack: document.getElementById("contextTrack"),
     contextBar: document.getElementById("contextBar"),
-    settingsButton: document.getElementById("settingsButton"),
+    consoleButton: document.getElementById("consoleButton"),
+    consoleView: document.getElementById("consoleView"),
+    consoleBack: document.getElementById("consoleBack"),
+    conRailToggle: document.getElementById("conRailToggle"),
+    usageStamp: document.getElementById("usageStamp"),
+    usageRangeSeg: document.getElementById("usageRangeSeg"),
+    usageTiles: document.getElementById("usageTiles"),
+    usageHeatmap: document.getElementById("usageHeatmap"),
+    usageHeatMonths: document.getElementById("usageHeatMonths"),
+    usageHeatTotal: document.getElementById("usageHeatTotal"),
+    usageBars: document.getElementById("usageBars"),
+    usageBarsX: document.getElementById("usageBarsX"),
+    usageBarsY: document.getElementById("usageBarsY"),
+    usageBarsHint: document.getElementById("usageBarsHint"),
+    usageSources: document.getElementById("usageSources"),
+    usageRecords: document.getElementById("usageRecords"),
+    usageRefresh: document.getElementById("usageRefresh"),
+    usageSrcFilter: document.getElementById("usageSrcFilter"),
+    usageModelFilter: document.getElementById("usageModelFilter"),
     sidebarThemeButton: document.getElementById("sidebarThemeButton"),
     brandAvatar: document.getElementById("brandAvatar"),
     brandName: document.getElementById("brandName"),
@@ -4399,12 +4420,52 @@
       if (end > plainStart) parent.appendChild(document.createTextNode(text.slice(plainStart, end)));
     };
     while (index < text.length) {
-      if (text[index] === "\\" && index + 1 < text.length && "\\`*_[]|~".includes(text[index + 1])) {
+      if (text[index] === "\\" && text[index + 1] === "(") {
+        const end = text.indexOf("\\)", index + 2);
+        if (end > index + 1) {
+          flushPlain(index);
+          renderMathInto(parent, text.slice(index + 2, end), false);
+          index = end + 2;
+          plainStart = index;
+          continue;
+        }
+      }
+      if (text[index] === "\\" && index + 1 < text.length && "\\`*_[]|~$".includes(text[index + 1])) {
         flushPlain(index);
         parent.appendChild(document.createTextNode(text[index + 1]));
         index += 2;
         plainStart = index;
         continue;
+      }
+      if (text[index] === "$") {
+        if (text[index + 1] === "$") {
+          const end = text.indexOf("$$", index + 2);
+          if (end > index + 1) {
+            flushPlain(index);
+            renderMathInto(parent, text.slice(index + 2, end), false);
+            index = end + 2;
+            plainStart = index;
+            continue;
+          }
+        } else {
+          // 行内 $…$:内容非空、不跨行、两端非空格,右 $ 后不紧跟数字(避开价格写法)。
+          const end = text.indexOf("$", index + 1);
+          const inner = end > index ? text.slice(index + 1, end) : "";
+          if (
+            end > index + 1
+            && inner.length
+            && !inner.includes("\n")
+            && !/^\s/.test(inner)
+            && !/\s$/.test(inner)
+            && !/^\d/.test(text.slice(end + 1))
+          ) {
+            flushPlain(index);
+            renderMathInto(parent, inner, false);
+            index = end + 1;
+            plainStart = index;
+            continue;
+          }
+        }
       }
       if (text[index] === "\n") {
         flushPlain(index);
@@ -4613,7 +4674,95 @@
 
   function isMarkdownBlockStart(lines, index) {
     const line = lines[index];
-    return /^\s*```/.test(line) || /^#{1,6}\s+/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line) || /^\s*>/.test(line) || isHorizontalRule(line) || isTableStart(lines, index);
+    return /^\s*```/.test(line) || /^#{1,6}\s+/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line) || /^\s*>/.test(line) || isHorizontalRule(line) || isTableStart(lines, index) || /^\s*\$\$/.test(line) || /^\s*\\\[\s*$/.test(line) || Boolean(videoSourceFor(line));
+  }
+
+  /* ── 视频消息:整行只有一个视频 URL / 本地路径(或指向它的 markdown 链接)
+     时升级为播放器。本地文件经 /api/media 流式端点(带 HTTP Range)。 ── */
+  const VIDEO_SOURCE_PATTERN = /\.(mp4|m4v|webm|mov|mkv|ogv)(\?[^\s)]*)?$/i;
+  function videoSourceFor(rawLine) {
+    const trimmed = String(rawLine || "").trim();
+    if (!trimmed || trimmed.length > 2048) return null;
+    const link = trimmed.match(/^\[([^\]]*)\]\(([^)\s]+)\)$/);
+    const target = link ? link[2] : trimmed;
+    if (/\s/.test(target) || !VIDEO_SOURCE_PATTERN.test(target)) return null;
+    if (/^https?:\/\//i.test(target)) {
+      return { src: target, label: link?.[1] || target };
+    }
+    if (target.startsWith("/") || target.startsWith("~/")) {
+      return {
+        src: `/api/media?path=${encodeURIComponent(target)}`,
+        label: link?.[1] || target.split("/").pop() || target,
+      };
+    }
+    return null;
+  }
+
+  function videoNode(source) {
+    const card = document.createElement("div");
+    card.className = "video-card";
+    const shell = document.createElement("div");
+    shell.className = "video-shell";
+    const video = document.createElement("video");
+    video.controls = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    video.src = source.src;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "vfs-btn";
+    button.title = "网页全屏";
+    button.setAttribute("aria-label", "网页全屏");
+    button.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+    button.addEventListener("click", () => shell.classList.toggle("webfs"));
+    shell.append(video, button);
+    const caption = document.createElement("div");
+    caption.className = "video-caption";
+    caption.textContent = source.label;
+    card.append(shell, caption);
+    return card;
+  }
+
+  /* ── LaTeX 公式(KaTeX):块级 $$…$$ / \[…\],行内 $…$ / \(…\)。
+     katex 未就绪或语法错误时原样降级;流式期间未闭合的定界符保持原文,
+     闭合后的下一次重渲染自动升级成公式。 */
+  function renderMathInto(parent, tex, displayMode) {
+    const trimmed = tex.trim();
+    if (trimmed && window.katex && typeof window.katex.render === "function") {
+      const node = document.createElement(displayMode ? "div" : "span");
+      node.className = displayMode ? "math-display" : "math-inline";
+      try {
+        window.katex.render(trimmed, node, { displayMode, throwOnError: false, strict: "ignore" });
+        parent.appendChild(node);
+        return;
+      } catch (_) { /* 落到原样文本 */ }
+    }
+    parent.appendChild(document.createTextNode(displayMode ? `$$${tex}$$` : `$${tex}$`));
+  }
+
+  function matchMathBlock(lines, index) {
+    const trimmed = lines[index].trim();
+    for (const [open, close] of [["$$", "$$"], ["\\[", "\\]"]]) {
+      if (!trimmed.startsWith(open)) continue;
+      const rest = trimmed.slice(open.length);
+      if (rest.length > close.length && rest.endsWith(close)) {
+        return { tex: rest.slice(0, rest.length - close.length), nextIndex: index + 1 };
+      }
+      const body = rest && rest !== close ? [rest] : [];
+      let cursor = index + 1;
+      while (cursor < lines.length) {
+        const candidate = lines[cursor].trim();
+        if (candidate === close || candidate.endsWith(close)) {
+          if (candidate !== close) body.push(candidate.slice(0, candidate.length - close.length));
+          return { tex: body.join("\n"), nextIndex: cursor + 1 };
+        }
+        body.push(lines[cursor]);
+        cursor += 1;
+      }
+      return null; // 未闭合:保持原文(流式中)
+    }
+    return null;
   }
 
   function renderMarkdown(container, source) {
@@ -4638,6 +4787,23 @@
         const language = /^[\w.+-]{1,40}$/.test(fence[1] || "") ? fence[1] : "";
         fragment.appendChild(codeBlock(language, codeLines.join("\n")));
         continue;
+      }
+      const video = videoSourceFor(line);
+      if (video) {
+        fragment.appendChild(videoNode(video));
+        index += 1;
+        continue;
+      }
+      if (/^\s*(\$\$|\\\[)/.test(line)) {
+        const math = matchMathBlock(lines, index);
+        if (math) {
+          const wrapper = document.createElement("div");
+          wrapper.className = "math-block";
+          renderMathInto(wrapper, math.tex, true);
+          fragment.appendChild(wrapper);
+          index = math.nextIndex;
+          continue;
+        }
       }
       if (isTableStart(lines, index)) {
         const rendered = markdownTable(lines, index);
@@ -4983,6 +5149,11 @@
     elements.artifactToggleButton.hidden = artifacts.length === 0;
     if (!artifacts.length) setArtifactWorkspaceOpen(false);
     else if (state.artifactOpen) renderArtifactWorkspace();
+    else if (window.location.hash.includes("artifact")) {
+      // 深链 #artifact:载入后自动展开预览工作区(与 #console 同一约定)。
+      window.location.hash = "";
+      setArtifactWorkspaceOpen(true);
+    }
   }
 
   function artifactIconName(artifact) {
@@ -8474,14 +8645,651 @@
     }
   }
 
+  /* ───────────────────────── 控制台 · 数据统计 ─────────────────────────
+     数据源:GET /api/usage/stats?range= 与 /api/usage/details。
+     图表全部手写 DOM/SVG,与整站同一套 token,离线自包含。 */
+  const usageState = {
+    range: "1d",
+    stats: null,
+    loadSeq: 0,
+    platformTab: null,
+    modelColors: new Map(),
+  };
+  const USAGE_COLOR_VARS = ["var(--chart-1)", "var(--chart-2)", "var(--chart-4)", "var(--chart-3)"];
+  const usageTip = document.createElement("div");
+  usageTip.className = "u-chart-tip";
+  document.body.appendChild(usageTip);
+
+  function usageTipShow(html, event) {
+    usageTip.innerHTML = html;
+    usageTip.style.display = "block";
+    usageTipMove(event);
+  }
+  function usageTipMove(event) {
+    const width = usageTip.offsetWidth;
+    usageTip.style.left = `${Math.min(window.innerWidth - width - 12, event.clientX + 14)}px`;
+    usageTip.style.top = `${Math.max(8, event.clientY - usageTip.offsetHeight - 12)}px`;
+  }
+  function usageTipHide() {
+    usageTip.style.display = "none";
+  }
+
+  function usageFmt(value) {
+    if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+    if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
+    return String(value);
+  }
+  function usageSourceName(src) {
+    if (src === "agent") return "智能体";
+    if (src === "qq" || src === "onebot") return "QQ";
+    return src;
+  }
+
+  /* ── 图表色派生:跟随当前主题(含 matugen /theme.css 覆盖)──
+     取 MD3 三色的"色相",明度错位+色度夹取整形成图表专用色;
+     环邻 ΔE<15 时沿明度推开。内置双主题的派生结果已过校验脚本。 */
+  const usageSrgbToLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  const usageLinearToSrgb = (c) => (c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055);
+  function usageHexToOklch(hex) {
+    const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+    if (!match) return null;
+    const n = parseInt(match[1], 16);
+    const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => usageSrgbToLinear(v / 255));
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    const L = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
+    const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
+    const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+    return { L, C: Math.hypot(a, bb), H: (Math.atan2(bb, a) * 180) / Math.PI };
+  }
+  function usageOklchToHex({ L, C, H }) {
+    for (let c = C; c >= 0; c -= 0.004) {
+      const h = (H * Math.PI) / 180;
+      const a = c * Math.cos(h), bb = c * Math.sin(h);
+      const l3 = L + 0.3963377774 * a + 0.2158037573 * bb;
+      const m3 = L - 0.1055613458 * a - 0.0638541728 * bb;
+      const s3 = L - 0.0894841775 * a - 1.291485548 * bb;
+      const [l, m, s] = [l3 ** 3, m3 ** 3, s3 ** 3];
+      const r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+      const g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+      const b = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
+      if ([r, g, b].every((v) => v >= -1e-4 && v <= 1 + 1e-4)) {
+        const to255 = (v) => Math.round(Math.min(1, Math.max(0, usageLinearToSrgb(v))) * 255);
+        return `#${[r, g, b].map((v) => to255(v).toString(16).padStart(2, "0")).join("")}`;
+      }
+    }
+    return "#808080";
+  }
+  function usageOklabDelta(a, b) {
+    const rad = (H) => (H * Math.PI) / 180;
+    const [aa, ab] = [a.C * Math.cos(rad(a.H)), a.C * Math.sin(rad(a.H))];
+    const [ba, bb] = [b.C * Math.cos(rad(b.H)), b.C * Math.sin(rad(b.H))];
+    return Math.hypot(a.L - b.L, aa - ba, ab - bb) * 100;
+  }
+  function updateChartColors() {
+    const styles = getComputedStyle(document.body);
+    const read = (name) => usageHexToOklch(styles.getPropertyValue(name));
+    const primary = read("--md-sys-color-primary");
+    const secondary = read("--md-sys-color-secondary");
+    const tertiary = read("--md-sys-color-tertiary");
+    const surface = read("--md-sys-color-surface");
+    if (!primary || !secondary || !tertiary || !surface) return; // 保底用 CSS 静态色
+    const dark = surface.L < 0.5;
+    const targetL = dark
+      ? { c1: 0.60, c2: 0.66, c3: 0.55, c4: 0.64 }
+      : { c1: 0.52, c2: 0.56, c3: 0.47, c4: 0.44 };
+    const band = dark ? [0.49, 0.67] : [0.43, 0.62];
+    const clampC = (c) => Math.min(0.17, Math.max(0.11, c));
+    const colors = {
+      c1: { L: targetL.c1, C: clampC(primary.C), H: primary.H },
+      c2: { L: targetL.c2, C: clampC(secondary.C), H: secondary.H },
+      c3: { L: targetL.c3, C: clampC(tertiary.C), H: tertiary.H },
+      c4: { L: targetL.c4, C: clampC(primary.C), H: primary.H - 50 },
+    };
+    const ring = [["c1", "c2"], ["c2", "c4"], ["c4", "c3"], ["c3", "c1"]];
+    for (let pass = 0; pass < 8; pass += 1) {
+      let adjusted = false;
+      for (const [xa, xb] of ring) {
+        if (usageOklabDelta(colors[xa], colors[xb]) < 15) {
+          const [lo, hi] = colors[xa].L <= colors[xb].L ? [xa, xb] : [xb, xa];
+          colors[lo].L = Math.max(band[0], colors[lo].L - 0.025);
+          colors[hi].L = Math.min(band[1], colors[hi].L + 0.025);
+          adjusted = true;
+        }
+      }
+      if (!adjusted) break;
+    }
+    ["c1", "c2", "c3", "c4"].forEach((key, index) =>
+      document.body.style.setProperty(`--chart-${index + 1}`, usageOklchToHex(colors[key])));
+    const top = dark
+      ? { L: 0.72, C: Math.min(0.15, clampC(primary.C)) }
+      : { L: 0.42, C: Math.min(0.16, clampC(primary.C)) };
+    const base = dark
+      ? { L: Math.min(0.34, surface.L + 0.06), C: 0.03 }
+      : { L: Math.max(0.88, surface.L - 0.06), C: 0.025 };
+    for (let i = 0; i < 5; i += 1) {
+      const k = i / 4;
+      document.body.style.setProperty(`--heat-${i}`, usageOklchToHex({
+        L: base.L + (top.L - base.L) * k,
+        C: base.C + (top.C - base.C) * k,
+        H: primary.H,
+      }));
+    }
+  }
+  /* 色键含 provider:同名模型经不同网关(或模型名缺失)也能分色;
+     同一 (provider, model) 跨栏目保持同色。 */
+  function usageModelColor(provider, model) {
+    const key = `${provider || ""}/${model || ""}`;
+    if (!usageState.modelColors.has(key)) {
+      usageState.modelColors.set(key, USAGE_COLOR_VARS[usageState.modelColors.size % USAGE_COLOR_VARS.length]);
+    }
+    return usageState.modelColors.get(key);
+  }
+  function usageCacheRate(cacheRead, prompt) {
+    if (!prompt) return null;
+    return Math.min(100, Math.round((cacheRead / prompt) * 100));
+  }
+
+  function consoleOpen() {
+    elements.consoleView.hidden = false;
+    elements.consoleView.setAttribute("aria-hidden", "false");
+    updateChartColors();
+    loadUsageStats();
+    loadUsageRecords();
+  }
+  function consoleClose() {
+    elements.consoleView.hidden = true;
+    elements.consoleView.setAttribute("aria-hidden", "true");
+    usageTipHide();
+  }
+  function consoleIsOpen() {
+    return !elements.consoleView.hidden;
+  }
+
+  async function loadUsageStats() {
+    const seq = ++usageState.loadSeq;
+    elements.usageStamp.textContent = "正在载入…";
+    try {
+      const response = await apiRequest(`/api/usage/stats?range=${usageState.range}`);
+      const data = await response.json();
+      if (seq !== usageState.loadSeq) return;
+      usageState.stats = data.stats;
+      renderUsage();
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      elements.usageStamp.textContent =
+        `更新于 ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    } catch (error) {
+      if (seq !== usageState.loadSeq) return;
+      elements.usageStamp.textContent = `载入失败:${error.message || error}`;
+    }
+  }
+
+  async function loadUsageRecords() {
+    try {
+      const params = new URLSearchParams({ limit: "50" });
+      if (elements.usageSrcFilter.value) params.set("src", elements.usageSrcFilter.value);
+      if (elements.usageModelFilter.value) params.set("model", elements.usageModelFilter.value);
+      const response = await apiRequest(`/api/usage/details?${params}`);
+      const data = await response.json();
+      renderUsageRecords(data.records || []);
+    } catch (_) {
+      elements.usageRecords.innerHTML =
+        `<tr class="u-day-row"><td colspan="7">明细载入失败</td></tr>`;
+    }
+  }
+
+  /* 筛选选项来自"至今"聚合里出现过的来源与模型;保留当前选中值。 */
+  function refreshUsageFilters(stats) {
+    const sources = stats.sources || [];
+    const fill = (select, entries) => {
+      const current = select.value;
+      const keepFirst = select.options[0];
+      select.replaceChildren(keepFirst);
+      for (const [value, label] of entries) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        select.appendChild(option);
+      }
+      select.value = entries.some(([value]) => value === current) ? current : "";
+    };
+    fill(elements.usageSrcFilter, sources.map((source) => [source.src, usageSourceName(source.src)]));
+    const models = new Map();
+    for (const source of sources) {
+      for (const model of source.models || []) {
+        if (model.model) models.set(model.model, true);
+      }
+    }
+    fill(elements.usageModelFilter, [...models.keys()].sort().map((model) => [model, model]));
+  }
+
+  function renderUsage() {
+    const stats = usageState.stats;
+    if (!stats) return;
+    renderUsageTiles(stats);
+    renderUsageHeat(stats.daily || []);
+    renderUsageBars(stats);
+    renderUsageSources(stats);
+    refreshUsageFilters(stats);
+  }
+
+  function renderUsageTiles(stats) {
+    const totals = stats.totals || {};
+    const prev = stats.prev_totals || null;
+    const delta = (current, previous) => {
+      if (!prev) return "";
+      const base = previous || 0;
+      if (!base) return "";
+      const value = ((current || 0) / base - 1) * 100;
+      const dir = value >= 0 ? "up" : "down";
+      const sign = value >= 0 ? "+" : "";
+      return `<span class="u-tl-right u-delta ${dir}" title="对比上一周期">${sign}${value.toFixed(0)}%</span>`;
+    };
+    const hit = usageCacheRate(totals.cache_read || 0, totals.prompt || 0);
+    const RING_R = 15;
+    const RING_C = 2 * Math.PI * RING_R;
+    const icon = (path) => `<svg viewBox="0 0 24 24" aria-hidden="true">${path}</svg>`;
+    const dailyAvg = usageState.range === "1d"
+      ? ""
+      : ` · 日均 ${(Number(totals.requests || 0) / rangeDayCount(stats)).toFixed(1)} 次`;
+    elements.usageTiles.innerHTML = `
+      <div class="u-tile"><div class="u-tile-label">${icon('<path d="M18 5H7l6 7-6 7h11"/>')}总消耗${delta(totals.total, prev && prev.total)}</div>
+        <div class="u-tile-value">${usageFmt(totals.total || 0)}<small>tokens</small></div>
+        <div class="u-tile-sub">输入 ${usageFmt(totals.prompt || 0)} · 输出 ${usageFmt(totals.completion || 0)}</div></div>
+      <div class="u-tile"><div class="u-tile-label">${icon('<path d="M22 12h-4l-3 8L9 4l-3 8H2"/>')}请求数${delta(totals.requests, prev && prev.requests)}</div>
+        <div class="u-tile-value">${Number(totals.requests || 0).toLocaleString()}</div>
+        <div class="u-tile-sub">全部请求:对话 + 辅助${dailyAvg}</div></div>
+      <div class="u-tile u-tile-flex"><div class="u-tf-main">
+        <div class="u-tile-label">${icon('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/>')}缓存命中率</div>
+        <div class="u-tile-value">${hit == null ? "—" : `${hit}<small>%</small>`}</div>
+        <div class="u-tile-sub">命中 ${usageFmt(totals.cache_read || 0)} / 输入侧 ${usageFmt(totals.prompt || 0)}</div></div>
+        <svg class="u-ring" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="20" cy="20" r="${RING_R}" fill="none" stroke="var(--chart-1)" stroke-opacity=".22" stroke-width="5"/>
+          <circle cx="20" cy="20" r="${RING_R}" fill="none" stroke="var(--chart-3)" stroke-width="5" stroke-linecap="round"
+            stroke-dasharray="${(((hit || 0) / 100) * RING_C).toFixed(1)} ${RING_C.toFixed(1)}" transform="rotate(-90 20 20)"/></svg></div>`;
+  }
+
+  function rangeDayCount(stats) {
+    if (usageState.range === "7d") return 7;
+    if (usageState.range === "30d") return 30;
+    if (usageState.range === "1d") return 1;
+    const daily = stats.daily || [];
+    const firstActive = daily.findIndex((day) => day.requests > 0);
+    return firstActive === -1 ? 1 : Math.max(1, daily.length - firstActive);
+  }
+
+  function usageParseDate(key) {
+    const [year, month, day] = key.split("-").map(Number);
+    return new Date(year, month - 1, day);
+  }
+
+  function renderUsageHeat(daily) {
+    const wrap = elements.usageHeatmap;
+    const monthsEl = elements.usageHeatMonths;
+    wrap.innerHTML = "";
+    monthsEl.innerHTML = "";
+    if (!daily.length) return;
+    const max = Math.max(1, ...daily.map((day) => day.total));
+    const firstDate = usageParseDate(daily[0].date);
+    const lead = (firstDate.getDay() + 6) % 7;
+    for (let index = 0; index < lead; index += 1) {
+      const cell = document.createElement("i");
+      cell.style.visibility = "hidden";
+      wrap.appendChild(cell);
+    }
+    for (const day of daily) {
+      const cell = document.createElement("i");
+      cell.dataset.l = day.total === 0 ? 0 : Math.min(4, 1 + Math.floor((day.total / max) * 3.99));
+      cell.addEventListener("mousemove", (event) => usageTipShow(
+        `<b>${day.date}</b>
+         <div class="row"><span>tokens</span><em>${usageFmt(day.total)}</em></div>
+         <div class="row"><span>请求</span><em>${day.requests}</em></div>`, event));
+      cell.addEventListener("mouseleave", usageTipHide);
+      wrap.appendChild(cell);
+    }
+    const columns = Math.ceil((lead + daily.length) / 7);
+    let previousMonth = -1;
+    for (let column = 0; column < columns; column += 1) {
+      const index = Math.min(Math.max(0, column * 7 - lead), daily.length - 1);
+      const month = usageParseDate(daily[index].date).getMonth();
+      if (month !== previousMonth) {
+        const label = document.createElement("span");
+        label.textContent = `${month + 1}月`;
+        label.style.left = `${(column / columns) * 100}%`;
+        monthsEl.appendChild(label);
+        previousMonth = month;
+      }
+    }
+    const requests = daily.reduce((sum, day) => sum + day.requests, 0);
+    const tokens = daily.reduce((sum, day) => sum + day.total, 0);
+    elements.usageHeatTotal.textContent =
+      `共 ${requests.toLocaleString()} 次调用 · ${usageFmt(tokens)} tokens`;
+  }
+
+  function renderUsageBars(stats) {
+    const daily = stats.daily || [];
+    let slice;
+    let weekly = false;
+    if (usageState.range === "1d") slice = daily.slice(-2); // 滚动 24h 跨两个日历日
+    else if (usageState.range === "7d") slice = daily.slice(-7);
+    else if (usageState.range === "30d") slice = daily.slice(-30);
+    else {
+      weekly = true;
+      slice = [];
+      for (let week = 0; week < Math.floor(daily.length / 7); week += 1) {
+        const chunk = daily.slice(daily.length - (Math.floor(daily.length / 7) - week) * 7,
+          daily.length - (Math.floor(daily.length / 7) - week - 1) * 7);
+        if (!chunk.length) continue;
+        const merged = { date: chunk[0].date, requests: 0, prompt: 0, completion: 0, cache_read: 0, total: 0 };
+        for (const day of chunk) {
+          merged.requests += day.requests; merged.prompt += day.prompt;
+          merged.completion += day.completion; merged.cache_read += day.cache_read;
+          merged.total += day.total;
+        }
+        slice.push(merged);
+      }
+    }
+    elements.usageBarsHint.textContent = weekly ? "按周聚合 · 悬停看明细" : "悬停看明细";
+    const bars = elements.usageBars;
+    const xs = elements.usageBarsX;
+    const ys = elements.usageBarsY;
+    bars.innerHTML = ""; xs.innerHTML = ""; ys.innerHTML = "";
+    const max = Math.max(...slice.map((day) => day.total), 0);
+    if (!max) {
+      bars.innerHTML = `<div class="u-empty" style="width:100%">该范围内没有调用记录</div>`;
+      return;
+    }
+    const HEIGHT = 200;
+    const step = max > 4e6 ? 2e6 : max > 1e6 ? 5e5 : max > 2e5 ? 2e5 : max > 4e4 ? 2e4 : 5e3;
+    const yLabel = (value, text) => {
+      const label = document.createElement("span");
+      label.textContent = text;
+      label.style.bottom = `${(value / max) * HEIGHT}px`;
+      ys.appendChild(label);
+    };
+    yLabel(0, "0");
+    for (let value = step; value <= max; value += step) {
+      const grid = document.createElement("div");
+      grid.className = "u-gridline";
+      grid.style.bottom = `${(value / max) * HEIGHT}px`;
+      bars.appendChild(grid);
+      yLabel(value, usageFmt(value));
+    }
+    slice.forEach((day, index) => {
+      const slot = document.createElement("div");
+      slot.className = "u-bar-slot";
+      const column = document.createElement("div");
+      column.className = "u-bar-col";
+      const fresh = Math.max(0, day.prompt - day.cache_read);
+      for (const [value, cls] of [[fresh, "s1"], [day.completion, "s2"], [day.cache_read, "s3"]]) {
+        const segment = document.createElement("i");
+        segment.className = cls;
+        segment.style.height = `${Math.max(value > 0 ? 1 : 0, (value / max) * HEIGHT)}px`;
+        column.appendChild(segment);
+      }
+      slot.appendChild(column);
+      slot.addEventListener("mousemove", (event) => usageTipShow(
+        `<b>${day.date.slice(5)}${weekly ? " 起当周" : ""}</b>
+         <div class="row"><span><i style="background:var(--chart-1)"></i>新输入</span><em>${usageFmt(fresh)}</em></div>
+         <div class="row"><span><i style="background:var(--chart-2)"></i>输出</span><em>${usageFmt(day.completion)}</em></div>
+         <div class="row"><span><i style="background:var(--chart-3)"></i>缓存命中</span><em>${usageFmt(day.cache_read)}</em></div>
+         <div class="row"><span>请求</span><em>${day.requests}</em></div>
+         <div class="row"><span>合计</span><em>${usageFmt(day.total)}</em></div>`, event));
+      slot.addEventListener("mouseleave", usageTipHide);
+      bars.appendChild(slot);
+      const label = document.createElement("span");
+      label.textContent = weekly
+        ? (index % 4 ? "" : day.date.slice(5))
+        : slice.length > 16
+          ? (index % 5 ? "" : day.date.slice(5))
+          : slice.length === 1 ? day.date.slice(5) : day.date.slice(8);
+      xs.appendChild(label);
+    });
+  }
+
+  function renderUsageSources(stats) {
+    const container = elements.usageSources;
+    container.innerHTML = "";
+    const sources = stats.sources || [];
+    if (!sources.length) {
+      container.innerHTML = `<div class="u-card"><div class="u-empty">该范围内没有调用记录</div></div>`;
+      return;
+    }
+    const agent = sources.find((source) => source.src === "agent");
+    const platforms = sources.filter((source) => source.src !== "agent");
+    if (agent) {
+      container.appendChild(buildUsageSourceCard(
+        "模型消耗明细 · 智能体",
+        "终端 / WebUI / 定时任务 / 子代理 · 悬停环形图或表行看联动",
+        agent,
+        stats,
+        null,
+      ));
+    }
+    if (platforms.length) {
+      if (!usageState.platformTab || !platforms.some((source) => source.src === usageState.platformTab)) {
+        usageState.platformTab = platforms[0].src;
+      }
+      const active = platforms.find((source) => source.src === usageState.platformTab) || platforms[0];
+      container.appendChild(buildUsageSourceCard(
+        "模型消耗明细 · 通讯平台",
+        "按平台分页 · 同一模型全页同色",
+        active,
+        stats,
+        platforms,
+      ));
+    }
+  }
+
+  function buildUsageSourceCard(title, hint, source, stats, platformTabs) {
+    const card = document.createElement("div");
+    card.className = "u-card";
+    const head = document.createElement("div");
+    head.className = "u-card-head";
+    head.innerHTML = `<h3>${title}</h3><span class="u-hint">${hint}</span>`;
+    if (platformTabs && platformTabs.length) {
+      const seg = document.createElement("div");
+      seg.className = "con-segmented";
+      seg.style.marginLeft = "auto";
+      for (const platform of platformTabs) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = usageSourceName(platform.src);
+        button.classList.toggle("on", platform.src === source.src);
+        button.addEventListener("click", () => {
+          usageState.platformTab = platform.src;
+          renderUsageSources(usageState.stats);
+        });
+        seg.appendChild(button);
+      }
+      head.appendChild(seg);
+    }
+    card.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "u-model-body";
+    const donutWrap = document.createElement("div");
+    donutWrap.className = "u-donut-wrap";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 120 120");
+    const center = document.createElement("div");
+    center.className = "u-donut-center";
+    donutWrap.appendChild(svg);
+    donutWrap.appendChild(center);
+    body.appendChild(donutWrap);
+
+    const scroll = document.createElement("div");
+    scroll.className = "u-table-scroll";
+    const table = document.createElement("table");
+    table.className = "u-table";
+    table.innerHTML = `<thead><tr><th>模型</th><th class="num">占比</th><th class="num">请求</th>
+      <th class="num">输入</th><th class="num">输出</th><th>缓存命中</th></tr></thead>`;
+    const tbody = document.createElement("tbody");
+    const tfoot = document.createElement("tfoot");
+    table.appendChild(tbody);
+    table.appendChild(tfoot);
+    scroll.appendChild(table);
+    body.appendChild(scroll);
+    card.appendChild(body);
+
+    const aggregate = source;
+    const models = source.models || [];
+    const requests = Number(aggregate.requests || 0);
+    const defCenter = `<div><b>${requests.toLocaleString()}</b><small>次请求</small></div>`;
+    center.innerHTML = defCenter;
+    if (!models.length || !aggregate.total) {
+      tbody.innerHTML = `<tr><td colspan="6"><div class="u-empty">暂无记录</div></td></tr>`;
+      return card;
+    }
+
+    const globalShare = stats.totals && stats.totals.total
+      ? Math.round((aggregate.total / stats.totals.total) * 100)
+      : null;
+    const sourceHit = usageCacheRate(aggregate.cache_read || 0, aggregate.prompt || 0);
+    tfoot.innerHTML = `<tr><td>合计${globalShare == null ? "" :
+      ` <small style="color:var(--text-faint);font-weight:400">占全局 ${globalShare}%</small>`}</td>
+      <td></td><td class="num">${requests}</td>
+      <td class="num">${usageFmt(aggregate.prompt || 0)}</td>
+      <td class="num">${usageFmt(aggregate.completion || 0)}</td>
+      <td>${sourceHit == null ? "" : `<span class="u-cache-pill">${sourceHit}%</span>`}</td></tr>`;
+
+    const RADIUS = 44;
+    const CIRCUM = 2 * Math.PI * RADIUS;
+    const GAP = 3;
+    let accumulated = 0;
+    models.forEach((model, index) => {
+      const share = model.total / aggregate.total;
+      const modelName = model.model || "(未标模型)";
+      const color = usageModelColor(model.provider, model.model);
+      const hit = usageCacheRate(model.cache_read || 0, model.prompt || 0);
+      const row = document.createElement("tr");
+      row.innerHTML = `<td class="u-model-name"><b><i class="u-dot" style="background:${color}"></i>${modelName}</b>
+          <small>${model.provider || "—"}</small></td>
+        <td class="num">${Math.round(share * 100)}%</td>
+        <td class="num">${model.requests}</td>
+        <td class="num">${usageFmt(model.prompt || 0)}</td>
+        <td class="num">${usageFmt(model.completion || 0)}</td>
+        <td>${hit == null ? "—" : `<span class="u-cache-pill">${hit}%</span>`}</td>`;
+      tbody.appendChild(row);
+
+      const length = Math.max(0.5, share * CIRCUM - GAP);
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("cx", "60");
+      circle.setAttribute("cy", "60");
+      circle.setAttribute("r", String(RADIUS));
+      circle.setAttribute("fill", "none");
+      circle.setAttribute("stroke", color);
+      circle.setAttribute("stroke-width", "18");
+      circle.setAttribute("stroke-dasharray", `${length.toFixed(2)} ${(CIRCUM - length).toFixed(2)}`);
+      circle.setAttribute("stroke-dashoffset", `${(-(accumulated * CIRCUM + GAP / 2)).toFixed(2)}`);
+      circle.setAttribute("transform", "rotate(-90 60 60)");
+      circle.addEventListener("mousemove", (event) => {
+        circle.setAttribute("stroke-width", "21");
+        row.classList.add("hl");
+        center.innerHTML = `<div><b>${Math.round(share * 100)}%</b><small>${modelName}</small></div>`;
+        usageTipShow(
+          `<b>${modelName}</b>
+           <div class="row"><span>占比</span><em>${Math.round(share * 100)}%</em></div>
+           <div class="row"><span>请求</span><em>${model.requests}</em></div>
+           <div class="row"><span>输入</span><em>${usageFmt(model.prompt || 0)}</em></div>
+           <div class="row"><span>输出</span><em>${usageFmt(model.completion || 0)}</em></div>
+           <div class="row"><span>缓存命中</span><em>${hit == null ? "—" : `${hit}%`}</em></div>`, event);
+      });
+      circle.addEventListener("mouseleave", () => {
+        circle.setAttribute("stroke-width", "18");
+        row.classList.remove("hl");
+        center.innerHTML = defCenter;
+        usageTipHide();
+      });
+      row.addEventListener("mouseenter", () => circle.setAttribute("stroke-width", "21"));
+      row.addEventListener("mouseleave", () => circle.setAttribute("stroke-width", "18"));
+      svg.appendChild(circle);
+      accumulated += share;
+    });
+    return card;
+  }
+
+  function renderUsageRecords(records) {
+    const tbody = elements.usageRecords;
+    tbody.innerHTML = "";
+    if (!records.length) {
+      tbody.innerHTML = `<tr class="u-day-row"><td colspan="7">还没有任何调用记录</td></tr>`;
+      return;
+    }
+    const today = new Date();
+    const dayKey = (date) =>
+      `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    const todayKey = dayKey(today);
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+    const yesterdayKey = dayKey(yesterday);
+    let currentDay = null;
+    for (const record of records) {
+      const date = new Date(record.ts * 1000);
+      const key = dayKey(date);
+      if (key !== currentDay) {
+        currentDay = key;
+        const label = key === todayKey ? "今天" : key === yesterdayKey ? "昨天" : "";
+        const row = document.createElement("tr");
+        row.className = "u-day-row";
+        row.innerHTML = `<td colspan="7">${label ? `${label} · ` : ""}${key.slice(5)}</td>`;
+        tbody.appendChild(row);
+      }
+      const pad = (n) => String(n).padStart(2, "0");
+      const hit = usageCacheRate(record.cache_read || 0, record.prompt || 0);
+      const row = document.createElement("tr");
+      row.innerHTML = `<td class="time">${pad(date.getHours())}:${pad(date.getMinutes())}</td>
+        <td><span class="u-src-pill">${usageSourceName(record.src || "agent")}</span></td>
+        <td class="u-model-name"><b>${record.model || "(未标模型)"}</b><small>${record.provider || "—"}</small></td>
+        <td class="num">${usageFmt(record.prompt || 0)}</td>
+        <td class="num">${usageFmt(record.completion || 0)}</td>
+        <td>${hit == null ? "—" : `<span class="u-cache-pill">${hit}%</span>`}</td>
+        <td><span class="u-type-pill ${record.aux ? "t-aux" : "t-chat"}">${record.aux ? "辅助" : "对话"}</span></td>`;
+      tbody.appendChild(row);
+    }
+  }
+
+  function bindConsoleEvents() {
+    elements.consoleButton.addEventListener("click", () => consoleOpen());
+    elements.consoleBack.addEventListener("click", () => consoleClose());
+    elements.conRailToggle.addEventListener("click", () =>
+      elements.consoleView.classList.toggle("rail-collapsed"));
+    elements.usageRangeSeg.addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button) return;
+      elements.usageRangeSeg.querySelectorAll("button").forEach((other) =>
+        other.classList.toggle("on", other === button));
+      usageState.range = button.dataset.range;
+      loadUsageStats();
+    });
+    elements.usageRefresh.addEventListener("click", () => {
+      updateChartColors();
+      loadUsageStats();
+      loadUsageRecords();
+    });
+    elements.usageSrcFilter.addEventListener("change", () => loadUsageRecords());
+    elements.usageModelFilter.addEventListener("change", () => loadUsageRecords());
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const fullscreenVideo = document.querySelector(".video-shell.webfs");
+      if (fullscreenVideo) {
+        fullscreenVideo.classList.remove("webfs");
+        return;
+      }
+      if (consoleIsOpen()) consoleClose();
+    });
+  }
+
   function bindEvents() {
+    bindConsoleEvents();
     elements.mobileMenuButton.addEventListener("click", (event) => openSidebar(event.currentTarget));
     elements.sidebarClose.addEventListener("click", closeSidebar);
     elements.sidebarScrim.addEventListener("click", closeSidebar);
     elements.sidebarCollapseButton?.addEventListener("click", () => setSidebarCollapsed(true));
     elements.sidebarExpandButton?.addEventListener("click", () => setSidebarCollapsed(false));
     elements.archivedToggle.addEventListener("click", toggleArchivedSection);
-    elements.settingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.artifactToggleButton.addEventListener("click", () => setArtifactWorkspaceOpen(!state.artifactOpen));
     elements.artifactCloseButton.addEventListener("click", () => setArtifactWorkspaceOpen(false));
@@ -8713,6 +9521,7 @@
 
   function initialize() {
     renderIconSlots();
+    if (window.location.hash.includes("console")) consoleOpen();
     setTheme(safeStorageGet("miyu.web.theme") || "graphite", false);
     const storedScheme = safeStorageGet("miyu.web.colorScheme");
     if (storedScheme) setColorScheme(storedScheme, false);

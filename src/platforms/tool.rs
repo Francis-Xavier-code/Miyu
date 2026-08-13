@@ -16,6 +16,7 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
     if context.conversation.kind == ConversationKind::Group {
         register_mention(registry, context.clone());
     }
+    register_usage_query(registry, context.clone());
     let host_tools_allowed = context.host_tools_allowed();
     let parameters = if host_tools_allowed {
         json!({
@@ -273,4 +274,120 @@ fn required_path(value: &Value, key: &str) -> Result<PathBuf> {
         bail!("attachment is not a regular file: {}", path.display());
     }
     Ok(Path::new(&path).to_path_buf())
+}
+
+/// 平台侧的 token 消耗查询:读 usage-history 聚合出适合聊天气泡的摘要。
+/// 口径与 WebUI 控制台一致——智能体与各平台的全部 LLM 请求都在账上。
+fn register_usage_query(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
+    registry.register(
+        ToolSpec::new(
+            "query_token_usage",
+            t(
+                "Query Miyu's token usage statistics: totals, request count, cache hit rate, and the per-source (agent / messaging platforms) model breakdown. range: 1d (rolling 24h, default) / 7d / 30d / all.",
+                "查询 Miyu 的 token 消耗统计:总量、请求数、缓存命中率,以及按来源(智能体/通讯平台)的模型构成。range 可选 1d(近 24 小时,默认)/ 7d / 30d / all。",
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "range": {
+                        "type": "string",
+                        "enum": ["1d", "7d", "30d", "all"],
+                        "description": t("Time range, defaults to 1d (rolling 24h).", "统计范围,默认 1d(近 24 小时)。")
+                    }
+                },
+                "additionalProperties": false
+            }),
+            move |arguments| {
+                let context = context.clone();
+                async move { query_token_usage(arguments, context).await }
+            },
+        )
+        .with_display_name(t("Token usage", "用量统计")),
+    );
+}
+
+async fn query_token_usage(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<String> {
+    let range_key = arguments
+        .get("range")
+        .and_then(Value::as_str)
+        .unwrap_or("1d")
+        .to_string();
+    let range = crate::state::UsageRange::parse(&range_key);
+    let store = context.state_store.clone();
+    let stats = tokio::task::spawn_blocking(move || store.usage_stats(range))
+        .await
+        .context("usage stats task panicked")??;
+    Ok(format_usage_summary(&stats, &range_key))
+}
+
+fn format_usage_summary(stats: &crate::state::UsageStats, range_key: &str) -> String {
+    let label = match range_key {
+        "1d" | "24h" | "today" => "近一天",
+        "7d" => "近 7 天",
+        "30d" => "近 30 天",
+        _ => "至今",
+    };
+    if stats.totals.requests == 0 {
+        return format!("{label}没有任何 LLM 调用记录。");
+    }
+    let fmt = format_tokens;
+    let hit = if stats.totals.prompt > 0 {
+        (stats.totals.cache_read as f64 / stats.totals.prompt as f64 * 100.0).round()
+    } else {
+        0.0
+    };
+    let mut lines = vec![
+        format!("📊 Token 消耗 · {label}"),
+        format!(
+            "总消耗 {}(输入 {} · 输出 {})",
+            fmt(stats.totals.total),
+            fmt(stats.totals.prompt),
+            fmt(stats.totals.completion)
+        ),
+        format!("请求 {} 次 · 缓存命中率 {hit:.0}%", stats.totals.requests),
+    ];
+    for source in &stats.sources {
+        let name = match source.src.as_str() {
+            "agent" => "智能体".to_string(),
+            "qq" | "onebot" => "QQ".to_string(),
+            other => other.to_string(),
+        };
+        let source_hit = if source.aggregate.prompt > 0 {
+            format!(
+                " · 命中 {:.0}%",
+                source.aggregate.cache_read as f64 / source.aggregate.prompt as f64 * 100.0
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "▸ {name} · {} 次 · {}{source_hit}",
+            source.aggregate.requests,
+            fmt(source.aggregate.total)
+        ));
+        let mut parts = Vec::new();
+        for model in source.models.iter().take(3) {
+            let share = if source.aggregate.total > 0 {
+                (model.aggregate.total as f64 / source.aggregate.total as f64 * 100.0).round()
+            } else {
+                0.0
+            };
+            let display = if model.model.is_empty() { "(未标模型)" } else { model.model.as_str() };
+            parts.push(format!("{display} {share:.0}%"));
+        }
+        if !parts.is_empty() {
+            lines.push(format!("   {}", parts.join(" · ")));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }

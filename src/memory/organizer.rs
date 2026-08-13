@@ -290,7 +290,12 @@ truth_status 使用 accepted、reported、uncertain、fictional 或 rejected。i
     .await
     .context("memory organizer timed out")??;
     if let Some(usage) = result.usage.as_ref() {
-        if let Err(error) = job.state_store.add_auxiliary_usage(usage) {
+        let meta = crate::state::UsageMeta {
+            source: "agent",
+            provider: result.provider_id.as_deref(),
+            model: result.model.as_deref(),
+        };
+        if let Err(error) = job.state_store.add_auxiliary_usage(usage, meta) {
             tracing::warn!(error = %error, "{}", crate::i18n::text("recording memory organizer usage failed", "记录记忆整理器用量失败"));
         }
     }

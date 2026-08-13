@@ -1,9 +1,19 @@
 use crate::llm::Usage;
 use anyhow::Result;
+use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 fn usage_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -145,6 +155,316 @@ pub fn reset_conversation(path: &Path) -> Result<()> {
     write_state(path, &state)
 }
 
+// ─────────────── 用量历史(usage-history.jsonl):控制台统计数据源 ───────────────
+// 每次 LLM 调用追加一行 JSON(O_APPEND 单行原子),全部请求都入账:
+// 主对话、子代理、压缩、记忆整理、平台插件……由 StateStore 的
+// add_usage/add_auxiliary_usage 包装统一落账,想漏都难。
+
+/// 一次 LLM 调用的历史记录。`src` 标来源:"agent"(终端/WebUI/定时/子代理)
+/// 或平台 id(如 "qq");旧记录缺省归 "agent"。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageRecord {
+    #[serde(default)]
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub src: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default)]
+    pub prompt: u64,
+    #[serde(default)]
+    pub completion: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub cache_read: u64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub cache_write: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aux: bool,
+}
+
+/// 调用元数据,由各埋点交代。provider/model 拿不到就 None(如缓存保活)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageMeta<'a> {
+    pub source: &'a str,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+pub fn record_usage(path: &Path, usage: &Usage, meta: UsageMeta<'_>, aux: bool) -> Result<()> {
+    record_usage_at(path, usage, meta, aux, chrono::Utc::now().timestamp())
+}
+
+fn record_usage_at(
+    path: &Path,
+    usage: &Usage,
+    meta: UsageMeta<'_>,
+    aux: bool,
+    ts: i64,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let record = UsageRecord {
+        ts,
+        src: if meta.source.is_empty() { "agent".to_string() } else { meta.source.to_string() },
+        provider: meta.provider.unwrap_or_default().to_string(),
+        model: meta.model.unwrap_or_default().to_string(),
+        prompt: usage.prompt_tokens,
+        completion: usage.completion_tokens,
+        total: usage.effective_total_tokens(),
+        cache_read: usage.cache_read_tokens,
+        cache_write: usage.cache_write_tokens,
+        aux,
+    };
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    Ok(())
+}
+
+fn load_records(path: &Path) -> Result<Vec<UsageRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    // 容错逐行解析:坏行跳过,不让一条脏数据废掉整个统计。
+    Ok(raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<UsageRecord>(line).ok())
+        .collect())
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UsageAggregate {
+    pub requests: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cache_read: u64,
+    pub total: u64,
+}
+
+impl UsageAggregate {
+    fn absorb(&mut self, record: &UsageRecord) {
+        self.requests += 1;
+        self.prompt += record.prompt;
+        self.completion += record.completion;
+        self.cache_read += record.cache_read;
+        self.total += record.total;
+    }
+}
+
+/// 一个本地自然日的汇总(热力图与柱状图共用)。
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyUsage {
+    pub date: String,
+    pub requests: u64,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cache_read: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelUsage {
+    pub provider: String,
+    pub model: String,
+    #[serde(flatten)]
+    pub aggregate: UsageAggregate,
+}
+
+/// 一个来源(智能体/某平台)在选定范围内的汇总与模型构成。
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceUsage {
+    pub src: String,
+    #[serde(flatten)]
+    pub aggregate: UsageAggregate,
+    pub models: Vec<ModelUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageStats {
+    pub range: String,
+    pub totals: UsageAggregate,
+    /// 上一个等长窗口(环比基线);"至今" 无基线为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_totals: Option<UsageAggregate>,
+    /// 最近 364 个本地自然日(含今天),供热力图与柱状图切片。
+    pub daily: Vec<DailyUsage>,
+    pub sources: Vec<SourceUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageRange {
+    /// 滚动近 24 小时(非日历日)。
+    LastDay,
+    Days(u32),
+    All,
+}
+
+impl UsageRange {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "1d" | "24h" | "today" => Self::LastDay,
+            "7d" => Self::Days(7),
+            "30d" => Self::Days(30),
+            _ => Self::All,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::LastDay => "1d".to_string(),
+            Self::Days(n) => format!("{n}d"),
+            Self::All => "all".to_string(),
+        }
+    }
+}
+
+fn local_day_start(ts: i64) -> Option<chrono::DateTime<Local>> {
+    let time = Local.timestamp_opt(ts, 0).single()?;
+    time.date_naive().and_hms_opt(0, 0, 0)?.and_local_timezone(Local).single()
+}
+
+pub fn usage_stats(path: &Path, range: UsageRange) -> Result<UsageStats> {
+    let records = load_records(path)?;
+    let now = chrono::Utc::now().timestamp();
+    // 范围窗口按本地自然日对齐:今天=本地零点起;7d/30d=含今天往前 n 天。
+    let today_start = local_day_start(now).map(|t| t.timestamp()).unwrap_or(now);
+    let (start, prev_start) = match range {
+        UsageRange::LastDay => (Some(now - 86_400), Some(now - 2 * 86_400)),
+        UsageRange::Days(n) => {
+            let start = today_start - i64::from(n - 1) * 86_400;
+            (Some(start), Some(start - i64::from(n) * 86_400))
+        }
+        UsageRange::All => (None, None),
+    };
+
+    let mut totals = UsageAggregate::default();
+    let mut prev_totals = UsageAggregate::default();
+    let mut daily = BTreeMap::<String, DailyUsage>::new();
+    let mut sources = BTreeMap::<String, (UsageAggregate, BTreeMap<(String, String), UsageAggregate>)>::new();
+    let daily_floor = today_start - 363 * 86_400;
+    let mut first_ts: Option<i64> = None;
+
+    for record in &records {
+        first_ts = Some(first_ts.map_or(record.ts, |t| t.min(record.ts)));
+        let in_range = start.map_or(true, |s| record.ts >= s);
+        if in_range {
+            totals.absorb(record);
+            let src = if record.src.is_empty() { "agent" } else { record.src.as_str() };
+            let (agg, models) = sources.entry(src.to_string()).or_default();
+            agg.absorb(record);
+            models
+                .entry((record.provider.clone(), record.model.clone()))
+                .or_default()
+                .absorb(record);
+        } else if let (Some(s), Some(p)) = (start, prev_start) {
+            if record.ts >= p && record.ts < s {
+                prev_totals.absorb(record);
+            }
+        }
+        if record.ts >= daily_floor {
+            if let Some(day) = local_day_start(record.ts) {
+                let key = day.format("%Y-%m-%d").to_string();
+                let entry = daily.entry(key.clone()).or_insert_with(|| DailyUsage {
+                    date: key,
+                    requests: 0,
+                    prompt: 0,
+                    completion: 0,
+                    cache_read: 0,
+                    total: 0,
+                });
+                entry.requests += 1;
+                entry.prompt += record.prompt;
+                entry.completion += record.completion;
+                entry.cache_read += record.cache_read;
+                entry.total += record.total;
+            }
+        }
+    }
+
+    // 补齐 364 天里没有记录的日子(前端网格要连续)。
+    if let Some(today) = local_day_start(now) {
+        for offset in 0i64..364 {
+            let day = today - ChronoDuration::days(363 - offset);
+            let key = day.format("%Y-%m-%d").to_string();
+            daily.entry(key.clone()).or_insert(DailyUsage {
+                date: key,
+                requests: 0,
+                prompt: 0,
+                completion: 0,
+                cache_read: 0,
+                total: 0,
+            });
+        }
+    }
+    let daily: Vec<DailyUsage> = daily.into_values().collect();
+    let daily = daily
+        .into_iter()
+        .rev()
+        .take(364)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let sources = sources
+        .into_iter()
+        .map(|(src, (aggregate, models))| {
+            let mut models: Vec<ModelUsage> = models
+                .into_iter()
+                .map(|((provider, model), aggregate)| ModelUsage { provider, model, aggregate })
+                .collect();
+            models.sort_by(|a, b| b.aggregate.total.cmp(&a.aggregate.total));
+            SourceUsage { src, aggregate, models }
+        })
+        .collect::<Vec<_>>();
+    // 智能体排最前,平台按名称序。
+    let mut sources = sources;
+    sources.sort_by(|a, b| {
+        let rank = |s: &SourceUsage| if s.src == "agent" { 0 } else { 1 };
+        rank(a).cmp(&rank(b)).then_with(|| a.src.cmp(&b.src))
+    });
+
+    Ok(UsageStats {
+        range: range.label(),
+        totals,
+        prev_totals: (range != UsageRange::All).then_some(prev_totals),
+        daily,
+        sources,
+        first_ts,
+    })
+}
+
+/// 最近 `limit` 条调用记录,新的在前;可按来源/模型过滤。按 ts 排序而非
+/// 文件顺序:追加序通常就是时间序,但时钟回拨或手工并档后也要给出正确的"最近"。
+pub fn usage_details(
+    path: &Path,
+    limit: usize,
+    src: Option<&str>,
+    model: Option<&str>,
+) -> Result<Vec<UsageRecord>> {
+    let mut records = load_records(path)?;
+    if let Some(src) = src.filter(|value| !value.is_empty()) {
+        records.retain(|record| {
+            let record_src = if record.src.is_empty() { "agent" } else { record.src.as_str() };
+            record_src == src
+        });
+    }
+    if let Some(model) = model.filter(|value| !value.is_empty()) {
+        records.retain(|record| record.model == model);
+    }
+    records.sort_by_key(|record| std::cmp::Reverse(record.ts));
+    records.truncate(limit);
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +549,70 @@ mod tests {
         let snapshot = snapshot(&path).unwrap();
         assert_eq!(snapshot.total_tokens, 10);
         assert_eq!(snapshot.conversation_tokens, 10);
+    }
+
+    #[test]
+    fn usage_history_records_and_aggregates_by_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage-history.jsonl");
+        let now = chrono::Utc::now().timestamp();
+        let usage = |prompt: u64, completion: u64, cache: u64| Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cache_read_tokens: cache,
+            ..Usage::default()
+        };
+        let meta = |source, model| UsageMeta { source, provider: Some("prov"), model: Some(model) };
+
+        record_usage_at(&path, &usage(100, 20, 60), meta("agent", "m-a"), false, now).unwrap();
+        record_usage_at(&path, &usage(50, 10, 0), meta("qq", "m-b"), false, now - 3_600).unwrap();
+        record_usage_at(&path, &usage(30, 5, 10), meta("qq", "m-b"), true, now - 40 * 86_400)
+            .unwrap();
+
+        let all = usage_stats(&path, UsageRange::All).unwrap();
+        assert_eq!(all.totals.requests, 3);
+        assert_eq!(all.totals.prompt, 180);
+        assert_eq!(all.totals.cache_read, 70);
+        assert!(all.prev_totals.is_none());
+        assert_eq!(all.daily.len(), 364);
+        assert_eq!(all.sources.len(), 2);
+        assert_eq!(all.sources[0].src, "agent"); // 智能体排最前
+        assert_eq!(all.sources[1].src, "qq");
+        assert_eq!(all.sources[1].aggregate.requests, 2);
+        assert_eq!(all.sources[1].models[0].model, "m-b");
+
+        let week = usage_stats(&path, UsageRange::Days(7)).unwrap();
+        assert_eq!(week.totals.requests, 2); // 40 天前的那条不在窗口
+        assert!(week.prev_totals.is_some());
+
+        let details = usage_details(&path, 2, None, None).unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].model, "m-a"); // 新的在前
+        assert!(!details[0].aux);
+
+        let only_qq = usage_details(&path, 10, Some("qq"), None).unwrap();
+        assert_eq!(only_qq.len(), 2);
+        assert!(only_qq.iter().all(|record| record.src == "qq"));
+        let only_model = usage_details(&path, 10, None, Some("m-b")).unwrap();
+        assert_eq!(only_model.len(), 2);
+    }
+
+    #[test]
+    fn usage_history_tolerates_corrupt_lines_and_defaults_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage-history.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"ts\":{ts},\"prompt\":10,\"completion\":2,\"total\":12}}\nnot-json\n",
+                ts = chrono::Utc::now().timestamp()
+            ),
+        )
+        .unwrap();
+        let stats = usage_stats(&path, UsageRange::All).unwrap();
+        assert_eq!(stats.totals.requests, 1);
+        assert_eq!(stats.sources[0].src, "agent"); // 旧记录缺 src 归智能体
     }
 
     #[test]

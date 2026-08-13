@@ -3764,6 +3764,38 @@ mod tests {
         assert!(parameters["properties"].get("files").is_none());
     }
 
+    #[tokio::test]
+    async fn usage_query_tool_reports_platform_history() {
+        let (_temp, context, _adapter) = test_turn_context(false);
+        context
+            .state_store
+            .add_usage(
+                &crate::llm::Usage {
+                    prompt_tokens: 1000,
+                    completion_tokens: 200,
+                    total_tokens: 1200,
+                    cache_read_tokens: 400,
+                    ..crate::llm::Usage::default()
+                },
+                crate::state::UsageMeta {
+                    source: "onebot",
+                    provider: Some("prov"),
+                    model: Some("test-model"),
+                },
+            )
+            .unwrap();
+        let mut registry = crate::tools::ToolRegistry::new();
+        register_platform_tools(&mut registry, Arc::new(context));
+        let output = registry
+            .call("query_token_usage", r#"{"range":"7d"}"#)
+            .await
+            .unwrap();
+        assert!(output.contains("Token 消耗"), "{output}");
+        assert!(output.contains("QQ"), "{output}");
+        assert!(output.contains("test-model"), "{output}");
+        assert!(output.contains("缓存命中率 40%"), "{output}");
+    }
+
     #[test]
     fn multi_mention_tool_is_only_registered_for_group_turns() {
         let (_private_temp, private, _adapter) = test_turn_context(false);

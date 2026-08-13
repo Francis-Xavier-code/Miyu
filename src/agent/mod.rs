@@ -1054,6 +1054,7 @@ impl Agent {
         self.keepalive_cancel = Some(cancel.clone());
         let client = self.client.clone();
         let state = self.state.clone();
+        let usage_source = self.usage_source().to_string();
         tokio::spawn(async move {
             for ping in 0..max_pings {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
@@ -1068,7 +1069,12 @@ impl Agent {
                             cache_read = usage.cache_read_tokens,
                             "cache keepalive ping"
                         );
-                        let _ = state.add_auxiliary_usage(&usage);
+                        let meta = crate::state::UsageMeta {
+                            source: &usage_source,
+                            provider: Some(client.provider_id()),
+                            model: None,
+                        };
+                        let _ = state.add_auxiliary_usage(&usage, meta);
                     }
                     Ok(None) => return, // protocol without keepalive support
                     Err(error) => {
@@ -1078,6 +1084,14 @@ impl Agent {
                 }
             }
         });
+    }
+
+    /// 用量历史的来源标签:平台回合记平台 id(如 "qq"),其余一律 "agent"。
+    fn usage_source(&self) -> &str {
+        self.platform_context
+            .as_ref()
+            .map(|context| context.conversation.platform.as_str())
+            .unwrap_or("agent")
     }
 
     pub fn prepare_for_turn(&mut self) -> Result<()> {
@@ -1821,7 +1835,12 @@ impl Agent {
             self.wake_memory_organizer();
         }
         if let Some(usage) = result.usage.clone() {
-            self.state.add_usage(&usage)?;
+            let meta = crate::state::UsageMeta {
+                source: self.usage_source(),
+                provider: result.provider_id.as_deref(),
+                model: result.model.as_deref(),
+            };
+            self.state.add_usage(&usage, meta)?;
         }
         self.start_cache_keepalive();
         Ok(result)
@@ -2016,7 +2035,12 @@ impl Agent {
             self.wake_memory_organizer();
         }
         if let Some(usage) = result.usage.clone() {
-            self.state.add_usage(&usage)?;
+            let meta = crate::state::UsageMeta {
+                source: self.usage_source(),
+                provider: result.provider_id.as_deref(),
+                model: result.model.as_deref(),
+            };
+            self.state.add_usage(&usage, meta)?;
         }
         self.start_cache_keepalive();
         Ok(result)
@@ -2194,7 +2218,14 @@ impl Agent {
         let Some(compact) = self.handle_overflow(context_tokens, &mut on_event).await? else {
             return Ok(None);
         };
-        self.state.add_auxiliary_usage(&compact.usage)?;
+        self.state.add_auxiliary_usage(
+            &compact.usage,
+            crate::state::UsageMeta {
+                source: self.usage_source(),
+                provider: compact.provider_id.as_deref(),
+                model: None,
+            },
+        )?;
         Ok(Some(ChatResult {
             content: String::new(),
             reasoning: None,
@@ -2286,7 +2317,14 @@ impl Agent {
         let Some(compact) = compact else {
             return Ok(None);
         };
-        self.state.add_auxiliary_usage(&compact.usage)?;
+        self.state.add_auxiliary_usage(
+            &compact.usage,
+            crate::state::UsageMeta {
+                source: self.usage_source(),
+                provider: compact.provider_id.as_deref(),
+                model: None,
+            },
+        )?;
         Ok(Some(ChatResult {
             content: String::new(),
             reasoning: None,
@@ -2862,7 +2900,14 @@ impl Agent {
                             .await;
                         on_event(AgentEvent::CompactEnd)?;
                         if let Ok(Some(compact_result)) = compacted {
-                            self.state.add_auxiliary_usage(&compact_result.usage)?;
+                            self.state.add_auxiliary_usage(
+                                &compact_result.usage,
+                                crate::state::UsageMeta {
+                                    source: self.usage_source(),
+                                    provider: compact_result.provider_id.as_deref(),
+                                    model: None,
+                                },
+                            )?;
                             // Splice the rebuilt (compacted) history prefix in
                             // front of the current turn's user message; the
                             // live tail (user input, runtime stamp, hints)
@@ -5298,6 +5343,11 @@ fn with_host_environment(
     }
     system_prompt.push_str("\n\n");
     system_prompt.push_str(&crate::host_info::host_environment_block(&paths.root_dir));
+    // 渲染能力说明(仅 owner 会话):终端与 WebUI 都支持 LaTeX。
+    // 不放人格提示词里——QQ 等平台的排版能力不同,不该看到这段。
+    system_prompt.push_str(
+        "\n\n输出数学公式时使用 LaTeX:重要公式用块级定界符(`$$…$$` 或 `\\[…\\]`,独立成段)会渲染成排版图;行内用 `$…$` 或 `\\(…\\)`,会转写为 Unicode 数学文本;表格单元格内的公式同样支持,分式会排成上下结构。不要用裸 Unicode 或 ASCII 手拼公式。",
+    );
     system_prompt
 }
 
@@ -6236,7 +6286,8 @@ mod tests {
 
         let owner = with_host_environment("base".to_string(), PromptAudience::Owner, &paths);
         assert!(owner.starts_with("base\n\n<host-environment os=\""));
-        assert!(owner.ends_with("/>"));
+        assert!(owner.contains("/>"));
+        assert!(owner.contains("LaTeX"), "渲染能力说明应跟随 owner 提示词");
         assert!(owner.contains(&format!(" miyu_home=\"{}\"", paths.root_dir.display())));
         // The static block must not be mistaken for the per-turn stamp, and
         // `mode_reminder_does_not_inject_a_reasoning_title_protocol` asserts the

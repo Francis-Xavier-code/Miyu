@@ -86,6 +86,32 @@ const LOGIN_ATTEMPT_LIMIT: u8 = 5;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
 const APP_JS: &str = include_str!("../web/app.js");
+// KaTeX 0.18.4(vendored):公式渲染;字体只带 woff2(css 里 woff2 列首,
+// 现代浏览器不会去请求 woff/ttf 回退项)。
+const KATEX_JS: &str = include_str!("../web/vendor/katex/katex.min.js");
+const KATEX_CSS: &str = include_str!("../web/vendor/katex/katex.min.css");
+static KATEX_FONTS: &[(&str, &[u8])] = &[
+    ("KaTeX_AMS-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_AMS-Regular.woff2")),
+    ("KaTeX_Caligraphic-Bold.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Caligraphic-Bold.woff2")),
+    ("KaTeX_Caligraphic-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Caligraphic-Regular.woff2")),
+    ("KaTeX_Fraktur-Bold.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Fraktur-Bold.woff2")),
+    ("KaTeX_Fraktur-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Fraktur-Regular.woff2")),
+    ("KaTeX_Main-Bold.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Main-Bold.woff2")),
+    ("KaTeX_Main-BoldItalic.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Main-BoldItalic.woff2")),
+    ("KaTeX_Main-Italic.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Main-Italic.woff2")),
+    ("KaTeX_Main-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Main-Regular.woff2")),
+    ("KaTeX_Math-BoldItalic.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Math-BoldItalic.woff2")),
+    ("KaTeX_Math-Italic.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Math-Italic.woff2")),
+    ("KaTeX_SansSerif-Bold.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_SansSerif-Bold.woff2")),
+    ("KaTeX_SansSerif-Italic.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_SansSerif-Italic.woff2")),
+    ("KaTeX_SansSerif-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_SansSerif-Regular.woff2")),
+    ("KaTeX_Script-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Script-Regular.woff2")),
+    ("KaTeX_Size1-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Size1-Regular.woff2")),
+    ("KaTeX_Size2-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Size2-Regular.woff2")),
+    ("KaTeX_Size3-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Size3-Regular.woff2")),
+    ("KaTeX_Size4-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Size4-Regular.woff2")),
+    ("KaTeX_Typewriter-Regular.woff2", include_bytes!("../web/vendor/katex/fonts/KaTeX_Typewriter-Regular.woff2")),
+];
 const MIYU_LOGO: &[u8] = include_bytes!("../pics/miyu-logo.png");
 const MIYU_WALLPAPER: &[u8] = include_bytes!("../pics/miyuwallpaper.png");
 
@@ -3490,6 +3516,10 @@ fn router(state: DaemonState) -> Router {
         .route("/styles.css", get(styles_asset))
         .route("/theme.css", get(theme_css))
         .route("/app.js", get(app_asset))
+        .route("/vendor/katex/katex.min.js", get(katex_js_asset))
+        .route("/vendor/katex/katex.min.css", get(katex_css_asset))
+        .route("/vendor/katex/fonts/{font}", get(katex_font_asset))
+        .route("/api/media", get(media_stream))
         .route("/assets/miyu-logo.png", get(logo_asset))
         .route("/assets/miyuwallpaper.png", get(wallpaper_asset))
         .route("/api/health", get(health))
@@ -3565,6 +3595,8 @@ fn router(state: DaemonState) -> Router {
         )
         .route("/api/conversation/reset", post(reset_conversation))
         .route("/api/jobs", get(list_jobs_http))
+        .route("/api/usage/stats", get(usage_stats_web))
+        .route("/api/usage/details", get(usage_details_web))
         .route("/api/jobs/{job_id}", delete(stop_job_http))
         // OneBot v11 reverse-WS endpoint: NapCat connects here as a WS
         // client. Gated by platforms.qq config, not web auth.
@@ -3618,6 +3650,14 @@ async fn index_asset(headers: HeaderMap) -> Response {
         INDEX_HTML
             .replace("href=\"/styles.css\"", concat!("href=\"/styles.css?v=", env!("MIYU_BUILD_ID"), "\""))
             .replace("src=\"/app.js\"", concat!("src=\"/app.js?v=", env!("MIYU_BUILD_ID"), "\""))
+            .replace(
+                "href=\"/vendor/katex/katex.min.css\"",
+                concat!("href=\"/vendor/katex/katex.min.css?v=", env!("MIYU_BUILD_ID"), "\""),
+            )
+            .replace(
+                "src=\"/vendor/katex/katex.min.js\"",
+                concat!("src=\"/vendor/katex/katex.min.js?v=", env!("MIYU_BUILD_ID"), "\""),
+            )
     });
     embedded_asset(&headers, VERSIONED_INDEX.as_bytes(), "text/html; charset=utf-8")
 }
@@ -3643,6 +3683,137 @@ async fn app_asset(headers: HeaderMap) -> Response {
 
 async fn logo_asset(headers: HeaderMap) -> Response {
     embedded_asset(&headers, MIYU_LOGO, "image/png")
+}
+
+#[derive(Deserialize)]
+struct MediaQuery {
+    path: String,
+}
+
+/// 视频扩展名 → MIME。清单外一律拒绝:这个端点只做媒体流,
+/// 不做通用文件下载器(尽管登录态本就有 read_file 同级能力)。
+fn media_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "mkv" => Some("video/x-matroska"),
+        "ogv" | "ogg" => Some("video/ogg"),
+        "mp3" => Some("audio/mpeg"),
+        "flac" => Some("audio/flac"),
+        "wav" => Some("audio/wav"),
+        "m4a" => Some("audio/mp4"),
+        "opus" => Some("audio/ogg"),
+        _ => None,
+    }
+}
+
+/// 解析 `Range: bytes=start-end`(单段)。返回 (start, inclusive_end)。
+fn parse_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = value.trim().strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        // 后缀形式 bytes=-N:最后 N 字节
+        let suffix: u64 = end.parse().ok()?;
+        if suffix == 0 || total == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(suffix), total - 1));
+    }
+    let start: u64 = start.parse().ok()?;
+    let end: u64 = if end.is_empty() { total.saturating_sub(1) } else { end.parse().ok()? };
+    (start <= end && start < total).then(|| (start, end.min(total.saturating_sub(1))))
+}
+
+/// 本地媒体流:登录态可播放本机音视频文件,带 HTTP Range(拖进度条)。
+async fn media_stream(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<MediaQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let raw = if let Some(rest) = query.path.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media not found"))?;
+        std::path::Path::new(&home).join(rest)
+    } else {
+        std::path::PathBuf::from(&query.path)
+    };
+    let path = tokio::fs::canonicalize(&raw)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "media not found"))?;
+    let mime = media_mime(&path)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unsupported media type"))?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "media not found"))?;
+    if !metadata.is_file() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "media not found"));
+    }
+    let total = metadata.len();
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_byte_range(value, total));
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "media not found"))?;
+
+    let (status, start, end) = match range {
+        None => (StatusCode::OK, 0, total.saturating_sub(1)),
+        Some(Some((start, end))) => (StatusCode::PARTIAL_CONTENT, start, end),
+        Some(None) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total}")).unwrap(),
+            );
+            return Ok(response);
+        }
+    };
+    let length = if total == 0 { 0 } else { end - start + 1 };
+    use tokio::io::AsyncSeekExt;
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(ApiError::internal)?;
+    let stream = tokio_util::io::ReaderStream::new(tokio::io::AsyncReadExt::take(file, length));
+    let mut response = Response::new(axum::body::Body::from_stream(stream));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+    response_headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    response_headers.insert(
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
+    if status == StatusCode::PARTIAL_CONTENT {
+        response_headers.insert(
+            axum::http::header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")).unwrap(),
+        );
+    }
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn katex_js_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, KATEX_JS.as_bytes(), "text/javascript; charset=utf-8")
+}
+
+async fn katex_css_asset(headers: HeaderMap) -> Response {
+    embedded_asset(&headers, KATEX_CSS.as_bytes(), "text/css; charset=utf-8")
+}
+
+async fn katex_font_asset(headers: HeaderMap, Path(font): Path<String>) -> Response {
+    match KATEX_FONTS.iter().find(|(name, _)| *name == font) {
+        Some((_, bytes)) => embedded_asset(&headers, bytes, "font/woff2"),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn wallpaper_asset(headers: HeaderMap) -> Response {
@@ -3882,7 +4053,7 @@ fn finish_asset_response(mut response: Response, content_type: &'static str) -> 
     response.headers_mut().insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            "default-src 'self'; img-src 'self'; media-src 'self' https: http:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         ),
     );
     response
@@ -5249,6 +5420,52 @@ async fn list_jobs_http(
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
     Ok(Json(json!({ "jobs": tools::jobs::overview() })).into_response())
+}
+
+#[derive(Deserialize)]
+struct UsageStatsQuery {
+    #[serde(default)]
+    range: Option<String>,
+}
+
+/// 控制台「数据统计」数据源:选定范围的汇总/环比基线 + 364 天日序列 +
+/// 按来源(agent/各平台)分组的模型明细。
+async fn usage_stats_web(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageStatsQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let range = crate::state::UsageRange::parse(query.range.as_deref().unwrap_or("1d"));
+    let stats = state
+        .state_store
+        .usage_stats(range)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "stats": stats })).into_response())
+}
+
+#[derive(Deserialize)]
+struct UsageDetailsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    src: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn usage_details_web(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageDetailsQuery>,
+) -> std::result::Result<Response, ApiError> {
+    require_auth(&headers, &state)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let records = state
+        .state_store
+        .usage_details(limit, query.src.as_deref(), query.model.as_deref())
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "records": records })).into_response())
 }
 
 async fn stop_job_http(
@@ -6675,7 +6892,12 @@ fn spawn_session_title_refinement(
             );
         }
         if let Some(usage) = result.usage.as_ref() {
-            let _ = store.add_auxiliary_usage(usage);
+            let meta = crate::state::UsageMeta {
+                source: "agent",
+                provider: result.provider_id.as_deref(),
+                model: result.model.as_deref(),
+            };
+            let _ = store.add_auxiliary_usage(usage, meta);
         }
     });
 }

@@ -919,6 +919,11 @@ fn llm_endpoints(config: &AppConfig, paths: &MiyuPaths) -> Result<Vec<LlmEndpoin
 }
 
 impl OpenAiCompatibleClient {
+    /// 当前主 provider id,用量历史记账用(具体模型以 ChatResult 为准)。
+    pub fn provider_id(&self) -> &str {
+        &self.provider.id
+    }
+
     pub fn from_config(config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
         super::cache_log::configure(paths, &config.cache);
         let endpoints = llm_endpoints(config, paths)?;
