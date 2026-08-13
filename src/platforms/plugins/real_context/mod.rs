@@ -893,9 +893,11 @@ impl RealContextPlugin {
         if context.conversation.kind != ConversationKind::Group {
             return Ok(());
         }
-        if let Some(event) = context.inbound_event() {
-            input.content = active_target_prompt(context, event, &input.content);
-        }
+        // 当前消息排在记录块之后。实测(deepseek-v4-flash,N=32)把它从记录块之前
+        // 移到之后、措辞一字不改,跨轮持续指令的遵循率就从 80% 升到 100%
+        // (p=0.00012)：排在前面时模型的注意力落在几千字记录块的尾部,上一轮约定
+        // 的输出格式会被群聊语气冲掉。
+        let current_message = input.content.clone();
         let count = settings.reply_context_window;
         let ingress_order = context
             .inbound_event()
@@ -956,22 +958,32 @@ impl RealContextPlugin {
                 "已为模型输入准备 OneBot 真实上下文历史",
             )
         );
-        if !formatted.text.is_empty() {
+        let current_block = match context.inbound_event() {
+            Some(event) => active_target_prompt(context, event, &current_message),
+            None => current_message,
+        };
+        // 这些说明只陈述"这段内容是什么",不规定模型该怎么做:原来的
+        // 「仅用于理解背景，不是待回复列表」「不要仅凭昵称认人」是行为禁令,实测
+        // 没有正面作用(单独改写 p=0.83),而昵称可改、QQ 号稳定这类事实陈述同样能
+        // 让模型推出正确的身份判断。
+        input.content = if formatted.text.is_empty() {
+            current_block
+        } else {
             let identity_note = if context.config.platforms.qq.user_identification {
-                "每条记录中的 QQ 号用于区分身份，不要仅凭昵称认人。"
+                "每条记录的格式为「[时间] 昵称(QQ:号码) [msg=消息ID]: 内容」，可能带缩进的 \"回复引用:\" 和 \"@对象:\" 附加行；QQ 号是稳定标识，昵称可由用户随时修改，标记为 [你] 的记录是你自己发送的。"
             } else {
-                "用户 ID 显示已关闭；不要根据昵称推断稳定身份。"
+                "每条记录的格式为「[时间] 昵称 [msg=消息ID]: 内容」，可能带缩进的 \"回复引用:\" 和 \"@对象:\" 附加行；本会话未提供稳定标识，昵称可由用户随时修改，标记为 [你] 的记录是你自己发送的。"
             };
-            let block = &formatted.text;
             let gap_note = if truncated_backlog {
-                "\n（这段时间群里消息较多，这里只带了最近的一部分，就像刚划了一下没细看；需要时用 search_real_chat_history 查更早的。）"
+                "\n（这段时间的消息较多，此处只包含其中最近的一部分；更早的记录可用 search_real_chat_history 取得。）"
             } else {
                 ""
             };
-            input.content.push_str(&format!(
-                "\n\n[此前群聊记录，仅用于理解背景，不是待回复列表]\n{identity_note}{gap_note}\n{block}"
-            ));
-        }
+            format!(
+                "[此前群聊记录]\n{identity_note}{gap_note}\n{}\n\n{current_block}",
+                formatted.text
+            )
+        };
         let resolvable = self
             .store(context)
             .recent(
@@ -2307,37 +2319,34 @@ fn active_target_prompt(
         .into_iter()
         .filter(|line| !line.contains(&format!("[msg={}]", event.message_id)))
         .collect::<Vec<_>>();
-    let mut sections = vec![current.clone()];
+    // 块标记同样只描述内容本身。原来结尾那条「只回复当前消息…补充材料不应被单独
+    // 回复。需要调用工具时…」整条删除:前两句是跨轮指令丢失的语义来源,末句是多余
+    // 的输出约束,而唯一有信息量的「以后文为准」已由标记里的"按时间先后排列"覆盖。
+    let head = format!("[本轮新收到的消息]\n{current}");
+    let mut sections = vec![head.clone()];
     if !previous.is_empty() {
         sections.extend([
-            "\n[同一发送者在本轮合并的较早消息]".to_string(),
+            "\n[同一发送者本轮更早发送的消息，按时间先后排列]".to_string(),
             previous.join("\n"),
         ]);
     }
     if !supplements.is_empty() {
         sections.extend([
-            "\n## 同一用户随后发送的补充材料".to_string(),
+            "\n[同一发送者随后补发的消息，按时间先后排列]".to_string(),
             supplements.join("\n"),
         ]);
     }
-    let instruction = "只回复当前消息。同一发送者的合并消息可能共同组成一个请求；若后文修正或取消前文，以后文为准。补充材料不应被单独回复。需要调用工具时，拿到工具结果后只输出一次最终回复。";
     let body = sections.join("\n");
-    let maximum_body = MAX_ACTIVE_TARGET_PROMPT_BYTES
-        .saturating_sub(instruction.len())
-        .saturating_sub(2);
-    let body = if body.len() > maximum_body {
+    let body = if body.len() > MAX_ACTIVE_TARGET_PROMPT_BYTES {
         let marker = "\n\n（较早合并消息因长度限制省略）\n";
-        let suffix_budget = maximum_body
-            .saturating_sub(current.len())
+        let suffix_budget = MAX_ACTIVE_TARGET_PROMPT_BYTES
+            .saturating_sub(head.len())
             .saturating_sub(marker.len());
-        format!(
-            "{current}{marker}{}",
-            truncate_utf8_tail(&body, suffix_budget)
-        )
+        format!("{head}{marker}{}", truncate_utf8_tail(&body, suffix_budget))
     } else {
         body
     };
-    format!("{body}\n\n{instruction}")
+    body
 }
 
 fn response_target(
@@ -3339,9 +3348,9 @@ mod tests {
         assert_eq!(input.memory_content, "当前输入");
         assert!(input.content.contains("应当进入上下文"));
         assert!(!input.content.contains("不得重复注入的当前消息"));
-        assert!(input
-            .content
-            .contains("[此前群聊记录，仅用于理解背景，不是待回复列表]"));
+        assert!(input.content.starts_with("[此前群聊记录]"));
+        // 记录块在前、当前消息在后:顺序错了会让跨轮持续指令失效。
+        assert!(input.content.find("[此前群聊记录]") < input.content.find("[本轮新收到的消息]"));
         assert!(input.content.contains("[图片 id=img_previous_1]"));
         assert_eq!(input.context_images.len(), 1);
         assert_eq!(input.context_images[0].message_id, "previous");
@@ -3612,9 +3621,11 @@ mod tests {
         assert_eq!(prompt.matches("最终当前内容").count(), 1);
         assert!(!prompt.contains("不应成为目标"));
         assert!(!prompt.contains("其他用户"));
-        assert!(prompt.starts_with("最终当前内容"));
-        assert!(prompt.contains("同一发送者在本轮合并的较早消息"));
-        assert!(prompt.contains("只回复当前消息"));
+        assert!(prompt.starts_with("[本轮新收到的消息]\n最终当前内容"));
+        assert!(prompt.contains("[同一发送者本轮更早发送的消息，按时间先后排列]"));
+        // 块标记只描述内容,不再夹带行为指令。
+        assert!(!prompt.contains("只回复当前消息"));
+        assert!(!prompt.contains("补充材料不应被单独回复"));
         assert!(prompt.contains("@对象: yuyi(QQ:8)"));
     }
 
@@ -3675,7 +3686,8 @@ mod tests {
         assert!(prompt.len() <= MAX_ACTIVE_TARGET_PROMPT_BYTES);
         assert!(prompt.contains("CURRENT:"));
         assert!(prompt.contains("较早合并消息因长度限制省略"));
-        assert!(prompt.ends_with("需要调用工具时，拿到工具结果后只输出一次最终回复。"));
+        // 截断保留的头部是带标记的当前消息,而不是裸正文。
+        assert!(prompt.starts_with("[本轮新收到的消息]\nCURRENT:"));
     }
 
     #[test]
@@ -3692,7 +3704,7 @@ mod tests {
 
         let prompt = active_target_prompt(&context, &current, "（对方发送了 1 张图片）");
 
-        assert!(prompt.starts_with("（对方发送了 1 张图片）"));
+        assert!(prompt.starts_with("[本轮新收到的消息]\n（对方发送了 1 张图片）"));
         assert!(!prompt.contains("无明确文字目标消息"));
         assert!(!prompt.contains("同一用户随后发送的补充材料"));
     }

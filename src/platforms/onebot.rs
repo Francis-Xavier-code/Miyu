@@ -1821,7 +1821,7 @@ fn qq_turn_system_context(
         request["message"] = message;
     }
     let reply_rule = if conversation.kind == ConversationKind::Group {
-        "只回答当前发送者的当前消息；此前群聊记录仅用于理解背景。"
+        "此前群聊记录是本群真实发生过的对话。"
     } else {
         "当前私聊 Session 的历史只属于这个传输主体。"
     };
