@@ -36,7 +36,42 @@ pub fn print(path: &Path, requested_size: Option<&str>) -> Result<()> {
         .with_context(|| format!("failed to decode image {}", path.display()))?;
     let (terminal_cols, terminal_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let (max_cols, max_rows) = parse_size(requested_size, terminal_cols, terminal_rows)?;
-    let (cell_width, cell_height) = terminal_cell_pixels(terminal_cols, terminal_rows);
+    let sequence = kitty_sequence(&image, max_cols, max_rows)?;
+    io::stdout().write_all(sequence.as_bytes())?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+/// 当前终端单元格像素尺寸(供公式渲染等调用方做尺寸账)。
+pub(crate) fn cell_pixel_size() -> (u16, u16) {
+    let (terminal_cols, terminal_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    terminal_cell_pixels(terminal_cols, terminal_rows)
+}
+
+/// 按调用方指定的 c×r 网格渲染成 Kitty Unicode-placeholder 序列
+/// (占位行自带换行)。print_image 的"撑满可用区"与公式的"自然大小"
+/// 都经由这里,只是网格怎么算不同。
+pub(crate) fn kitty_sequence_with_grid(
+    image: &DynamicImage,
+    cols: u16,
+    rows: u16,
+) -> Result<String> {
+    let (cell_width, cell_height) = cell_pixel_size();
+    let resized = resize_for_transfer(image.clone(), cols, rows, cell_width, cell_height);
+    let image_id = rand::random::<u32>() & 0x00ff_ffff;
+    let image_id = image_id.max(1);
+    let mut buffer = Vec::new();
+    write_image(&mut buffer, &resized, image_id, cols, rows)?;
+    Ok(String::from_utf8(buffer).context("kitty sequence is not utf-8")?)
+}
+
+/// 渲染成 Kitty 序列,撑满 max 框(看图语义,print_image 用)。
+pub(crate) fn kitty_sequence(
+    image: &DynamicImage,
+    max_cols: u16,
+    max_rows: u16,
+) -> Result<String> {
+    let (cell_width, cell_height) = cell_pixel_size();
     let (cols, rows) = fit_cells(
         image.width(),
         image.height(),
@@ -45,12 +80,7 @@ pub fn print(path: &Path, requested_size: Option<&str>) -> Result<()> {
         cell_width,
         cell_height,
     );
-    let image = resize_for_transfer(image, cols, rows, cell_width, cell_height);
-    let image_id = rand::random::<u32>() & 0x00ff_ffff;
-    let image_id = image_id.max(1);
-    write_image(&mut io::stdout(), &image, image_id, cols, rows)?;
-    io::stdout().flush()?;
-    Ok(())
+    kitty_sequence_with_grid(image, cols, rows)
 }
 
 fn parse_size(

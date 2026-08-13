@@ -20,7 +20,7 @@ mod html_conversion;
 mod http_response;
 mod image_generation;
 pub mod jobs;
-mod kitty_image;
+pub(crate) mod kitty_image;
 pub mod knowledge_base;
 mod load_tools;
 mod man;

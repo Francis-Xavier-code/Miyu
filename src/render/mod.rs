@@ -1,3 +1,4 @@
+pub(crate) mod math;
 pub(crate) mod wait_spinner;
 
 use crate::i18n::text as t;
@@ -2781,6 +2782,9 @@ struct MarkdownLineRenderer {
     code_buffer: Vec<String>,
     table_buffer: Vec<String>,
     active_table: Option<ActiveTable>,
+    math_buffer: Vec<String>,
+    /// 当前块级公式的闭合定界符("$$" 或 "\\]")。
+    math_closer: &'static str,
 }
 
 struct ActiveTable {
@@ -2797,6 +2801,8 @@ impl MarkdownLineRenderer {
             code_buffer: Vec::new(),
             table_buffer: Vec::new(),
             active_table: None,
+            math_buffer: Vec::new(),
+            math_closer: "$$",
         }
     }
 
@@ -2825,13 +2831,46 @@ impl MarkdownLineRenderer {
             self.code_buffer.push(line.to_string());
             return String::new();
         }
-        if line.trim() == "$$" {
-            let pending = self.flush();
-            self.in_math_block = !self.in_math_block;
-            return format!("{pending}\x1b[36m$$\x1b[0m\n");
-        }
         if self.in_math_block {
-            return format!("\x1b[36m{}\x1b[0m\n", line.trim_end());
+            let trimmed = line.trim();
+            if trimmed == self.math_closer || trimmed.ends_with(self.math_closer) {
+                if trimmed != self.math_closer {
+                    self.math_buffer
+                        .push(trimmed[..trimmed.len() - self.math_closer.len()].to_string());
+                }
+                self.in_math_block = false;
+                let tex = std::mem::take(&mut self.math_buffer).join("\n");
+                return render_display_math(&tex, self.math_closer);
+            }
+            self.math_buffer.push(line.to_string());
+            return String::new();
+        }
+        {
+            let trimmed = line.trim();
+            let opener = if trimmed.starts_with("$$") {
+                Some(("$$", "$$"))
+            } else if trimmed.starts_with("\\[") {
+                Some(("\\[", "\\]"))
+            } else {
+                None
+            };
+            if let Some((open, close)) = opener {
+                let pending = self.flush();
+                let inner = &trimmed[open.len()..];
+                // 单行闭合:$$E=mc^2$$ / \[x\]
+                if let Some(tex) = inner.strip_suffix(close) {
+                    if !tex.trim().is_empty() {
+                        return format!("{pending}{}", render_display_math(tex, close));
+                    }
+                }
+                self.in_math_block = true;
+                self.math_closer = close;
+                self.math_buffer.clear();
+                if !inner.trim().is_empty() {
+                    self.math_buffer.push(inner.to_string());
+                }
+                return pending;
+            }
         }
         if let Some(table) = &self.active_table {
             if looks_like_table_row(line) {
@@ -2883,6 +2922,16 @@ impl MarkdownLineRenderer {
     }
 
     fn flush(&mut self) -> String {
+        if self.in_math_block {
+            // 流结束仍未闭合:按原样回放,不吞内容。
+            self.in_math_block = false;
+            let opener = if self.math_closer == "$$" { "$$" } else { "\\[" };
+            let mut output = format!("\x1b[36m{opener}\x1b[0m\n");
+            for line in std::mem::take(&mut self.math_buffer) {
+                output.push_str(&format!("\x1b[36m{line}\x1b[0m\n"));
+            }
+            return output;
+        }
         if self.in_code_block {
             self.in_code_block = false;
             let output = render_code_block(&self.code_lang, &self.code_buffer);
@@ -2908,6 +2957,47 @@ impl MarkdownLineRenderer {
             output
         }
     }
+}
+
+/// 块级公式:kitty 家族终端走图形协议(高清,复用 print_image 管线),
+/// 其余终端半块画;渲染失败原样回放(青色+定界符)。
+fn render_display_math(tex: &str, closer: &str) -> String {
+    let max_cols = terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(100)
+        .saturating_sub(6)
+        .clamp(24, 110);
+    if math::kitty_graphics_supported() {
+        if let Some(kitty) = math::render_math_kitty(tex, max_cols) {
+            // 占位行自带换行,逐行加两格缩进(图形转义段无换行,不受影响);
+            // 首尾补空行,与正文拉开呼吸感。
+            let mut output = String::from("\n");
+            for line in kitty.sequence.split_inclusive('\n') {
+                output.push_str("  ");
+                output.push_str(line);
+            }
+            output.push('\n');
+            return output;
+        }
+    }
+    if let Some(art) = math::render_math(tex, math::MathMode::Block, 9, max_cols) {
+        let mut output = String::from("\n");
+        for line in art.lines {
+            output.push_str("  ");
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output.push('\n');
+        return output;
+    }
+    let opener = if closer == "$$" { "$$" } else { "\\[" };
+    let closing = if closer == "$$" { "$$" } else { "\\]" };
+    let mut output = format!("\x1b[36m{opener}\x1b[0m\n");
+    for line in tex.lines() {
+        output.push_str(&format!("\x1b[36m{line}\x1b[0m\n"));
+    }
+    output.push_str(&format!("\x1b[36m{closing}\x1b[0m\n"));
+    output
 }
 
 pub(crate) fn render_markdown_line(line: &str) -> String {
@@ -2972,6 +3062,53 @@ fn render_inline(text: &str) -> String {
     let chars = text.chars().collect::<Vec<_>>();
     let mut index = 0;
     while index < chars.len() {
+        // 行内公式 $…$ / $$…$$:Unicode 转写(xₙ₊₁、√π、α∈(0,1))。
+        // 单 $ 启发式同 WebUI:内容非空、两端非空格、右侧不接数字(放过价格)。
+        if chars[index] == '$' {
+            let double = chars.get(index + 1) == Some(&'$');
+            let open = if double { index + 2 } else { index + 1 };
+            let close = if double {
+                find_double_dollar(&chars, open)
+            } else {
+                find_marker(&chars, open, '$')
+            };
+            if let Some(end) = close {
+                let tex: String = chars[open..end].iter().collect();
+                let accept = !tex.trim().is_empty()
+                    && (double
+                        || (!tex.starts_with(' ')
+                            && !tex.ends_with(' ')
+                            && !chars
+                                .get(end + 1)
+                                .is_some_and(|next| next.is_ascii_digit())));
+                if accept {
+                    output.push_str(PRIMARY_STYLE);
+                    output.push_str(&math::unicode_math(&tex));
+                    output.push_str(RESET);
+                    index = end + if double { 2 } else { 1 };
+                    continue;
+                }
+            }
+        }
+        if chars[index] == '\\' && chars.get(index + 1) == Some(&'(') {
+            let mut probe = index + 2;
+            let mut closing = None;
+            while probe + 1 < chars.len() {
+                if chars[probe] == '\\' && chars[probe + 1] == ')' {
+                    closing = Some(probe);
+                    break;
+                }
+                probe += 1;
+            }
+            if let Some(end) = closing {
+                let tex: String = chars[index + 2..end].iter().collect();
+                output.push_str(PRIMARY_STYLE);
+                output.push_str(&math::unicode_math(&tex));
+                output.push_str(RESET);
+                index = end + 2;
+                continue;
+            }
+        }
         if index + 1 < chars.len() && chars[index] == '!' && chars[index + 1] == '[' {
             if let Some(label_end) = find_marker(&chars, index + 2, ']') {
                 if chars.get(label_end + 1) == Some(&'(') {
@@ -3000,28 +3137,6 @@ fn render_inline(text: &str) -> String {
             if let Some(end) = find_marker(&chars, index + 1, '`') {
                 output.push_str(INLINE_CODE_STYLE);
                 output.extend(chars[index + 1..end].iter());
-                output.push_str(RESET);
-                index = end + 1;
-                continue;
-            }
-        }
-        if index + 1 < chars.len() && chars[index] == '$' && chars[index + 1] == '$' {
-            if let Some(end) = find_double_marker(&chars, index + 2, '$') {
-                output.push_str(MATH_STYLE);
-                output.push_str("$$ ");
-                output.extend(chars[index + 2..end].iter());
-                output.push_str(" $$");
-                output.push_str(RESET);
-                index = end + 2;
-                continue;
-            }
-        }
-        if chars[index] == '$' {
-            if let Some(end) = find_marker(&chars, index + 1, '$') {
-                output.push_str(MATH_STYLE);
-                output.push('$');
-                output.extend(chars[index + 1..end].iter());
-                output.push('$');
                 output.push_str(RESET);
                 index = end + 1;
                 continue;
@@ -3114,7 +3229,7 @@ const INLINE_CODE_STYLE: &str = SECONDARY_STYLE;
 const LINK_LABEL_STYLE: &str = "\x1b[38;5;117m";
 const URL_STYLE: &str = "\x1b[2m\x1b[38;5;75m";
 const IMAGE_STYLE: &str = "\x1b[38;5;183m";
-const MATH_STYLE: &str = "\x1b[38;5;117m";
+
 const BOLD_STYLE: &str = "\x1b[1m\x1b[34m";
 const ITALIC_STYLE: &str = "\x1b[3m\x1b[38;5;250m";
 const STRIKE_STYLE: &str = "\x1b[9m";
@@ -3201,8 +3316,32 @@ fn parse_table_row(line: &str) -> Vec<String> {
     line.trim()
         .trim_matches('|')
         .split('|')
-        .map(|cell| render_inline(cell.trim()))
+        .map(|cell| render_table_cell(cell.trim()))
         .collect()
+}
+
+/// 表格单元格:整格为一条公式($…$ / \(…\) 完整包裹)时走二维转写,
+/// 分式排成真正的上下结构(多行格);其余走常规行内渲染。
+fn render_table_cell(cell: &str) -> String {
+    let tex = cell
+        .strip_prefix('$')
+        .and_then(|rest| rest.strip_suffix('$'))
+        .filter(|inner| !inner.is_empty() && !inner.contains('$'))
+        .or_else(|| {
+            cell.strip_prefix("\\(")
+                .and_then(|rest| rest.strip_suffix("\\)"))
+        });
+    if let Some(tex) = tex {
+        if !tex.trim().is_empty() {
+            let lines = math::unicode_math_lines(tex);
+            let styled = lines
+                .iter()
+                .map(|line| format!("{PRIMARY_STYLE}{line}{RESET}"))
+                .collect::<Vec<_>>();
+            return styled.join("\n");
+        }
+    }
+    render_inline(cell)
 }
 
 fn table_widths_for_rows(rows: &[Vec<String>]) -> Vec<usize> {
@@ -3210,7 +3349,9 @@ fn table_widths_for_rows(rows: &[Vec<String>]) -> Vec<usize> {
     let mut widths = vec![0usize; cols];
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(visible_width(cell));
+            // 多行格(二维公式)取最宽一行。
+            let cell_width = cell.split('\n').map(visible_width).max().unwrap_or(0);
+            widths[index] = widths[index].max(cell_width);
         }
     }
     let readable_min = readable_table_min_width(cols);
@@ -3241,7 +3382,9 @@ fn render_table_row(
         .enumerate()
         .map(|(index, width)| {
             let cell = row.get(index).map(String::as_str).unwrap_or("");
-            wrap_ansi_text(cell, *width)
+            cell.split('\n')
+                .flat_map(|part| wrap_ansi_text(part, *width))
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
@@ -3628,6 +3771,11 @@ fn is_horizontal_rule(line: &str) -> bool {
 
 fn find_marker(chars: &[char], start: usize, marker: char) -> Option<usize> {
     (start..chars.len()).find(|index| chars[*index] == marker)
+}
+
+fn find_double_dollar(chars: &[char], start: usize) -> Option<usize> {
+    (start..chars.len().saturating_sub(1))
+        .find(|index| chars[*index] == '$' && chars[*index + 1] == '$')
 }
 
 fn find_emphasis_end(chars: &[char], start: usize, marker: char) -> Option<usize> {
@@ -6060,16 +6208,20 @@ mod tests {
     #[test]
     fn renders_math_formulas_visibly() {
         let output = render_inline("inline $E=mc^2$ and display $$a^2+b^2=c^2$$");
-        assert!(output.contains(&format!("{MATH_STYLE}$E=mc^2${RESET}")));
-        assert!(output.contains(&format!("{MATH_STYLE}$$ a^2+b^2=c^2 $${RESET}")));
+        assert!(output.contains("E=mc²"), "{output}");
+        assert!(output.contains("a²+b²=c²"), "{output}");
+        assert!(!output.contains("$E"), "raw tex must be replaced: {output}");
     }
 
     #[test]
     fn renders_multiline_math_blocks_visibly() {
         let mut renderer = MarkdownStreamRenderer::new();
         let output = renderer.push("$$\na^2 + b^2 = c^2\n$$\n");
-        assert!(output.contains("\x1b[36m$$\x1b[0m"));
-        assert!(output.contains("\x1b[36ma^2 + b^2 = c^2\x1b[0m"));
+        assert!(
+            output.contains('▀') || output.contains('▄'),
+            "block math should render halfblocks: {output}"
+        );
+        assert!(!output.contains("a^2"), "{output}");
     }
 
     #[test]
@@ -6119,5 +6271,62 @@ mod tests {
         assert_eq!(result.exit_code, Some(1));
         assert_eq!(result.stdout, "unused");
         assert_eq!(result.stderr, "not found");
+    }
+}
+
+#[cfg(test)]
+mod math_stream_tests {
+    use super::*;
+
+    fn render_document(document: &str) -> String {
+        let mut renderer = MarkdownLineRenderer::new();
+        let mut output = String::new();
+        for line in document.lines() {
+            output.push_str(&renderer.render_line(line));
+        }
+        output.push_str(&renderer.flush());
+        output
+    }
+
+    #[test]
+    fn block_math_renders_to_halfblocks_and_inline_transliterates() {
+        let document = "推导如下:\n$$\nE = mc^2\n$$\n其中 $\\alpha\\in(0,1)$,价格 $5 和 $10 不动。\n";
+        let output = render_document(document);
+        assert!(output.contains('▀') || output.contains('▄'), "block math should render halfblocks");
+        assert!(output.contains("α∈(0,1)"), "inline math should transliterate: {output}");
+        assert!(output.contains("$5"), "prices must stay literal");
+        assert!(!output.contains("mc^2"), "raw tex should be replaced");
+    }
+
+    #[test]
+    fn table_cells_render_stacked_fractions() {
+        let document = "| 方法 | 收敛阶 |\n| --- | --- |\n| 牛顿法 | $q=2$ |\n| 割线法 | $q=\\frac{1+\\sqrt5}{2}$ |\n\n";
+        let output = render_document(document);
+        assert!(output.contains("q=2"), "{output}");
+        assert!(output.contains("1+√5"), "分子应独立成行: {output}");
+        assert!(output.contains("───"), "分数线应存在: {output}");
+        assert!(!output.contains("\\frac"), "{output}");
+    }
+
+    #[test]
+    fn unclosed_math_block_replays_verbatim_on_flush() {
+        let output = render_document("$$\nE=mc^2\n");
+        assert!(output.contains("$$"));
+        assert!(output.contains("E=mc^2"));
+    }
+
+    #[test]
+    fn single_line_display_math_renders() {
+        let output = render_document("$$E=mc^2$$\n");
+        assert!(output.contains('▀') || output.contains('▄'), "{output}");
+    }
+
+    /// 检视产物:整段 markdown 渲染输出落盘,供 ANSI→PNG 回显人工核看。
+    #[test]
+    #[ignore]
+    fn dump_stream_preview() {
+        let document = "偏导与分式:\n\n| 名称 | 表达式 |\n| --- | --- |\n| 偏导数 | $\\frac{\\partial f}{\\partial x}=\\lim_{h\\to 0}\\frac{f(x+h,y)-f(x,y)}{h}$ |\n| 二次方程 | $x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}$ |\n| 组合数 | $\\binom{n}{k}=\\frac{n!}{k!(n-k)!}$ |\n| 波函数 | $i\\hbar\\frac{\\partial}{\\partial t}\\Psi=\\hat{H}\\Psi$ |\n| 极限 | $\\lim_{x\\to\\infty}(1+1/x)^x=e$ |\n\n完事～\n";
+        let output = render_document(document);
+        std::fs::write("/tmp/claude-1000/math-stream.ansi", output).unwrap();
     }
 }
