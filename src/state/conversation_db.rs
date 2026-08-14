@@ -2259,6 +2259,7 @@ impl ConversationDb {
         if affected != 1 {
             bail!("turn changed before it could be completed");
         }
+        bump_completion_seq_locked(&tx, turn_id)?;
         // Snapshot the display transcript before the journal goes: the tables
         // below are load-bearing for in-flight turn recovery, so they keep
         // being wiped on completion exactly as before.
@@ -2345,6 +2346,7 @@ impl ConversationDb {
              WHERE turn_id = ?4 AND revision = ?5 AND status = 'running'",
             params![content, reasoning, now, turn_id, revision],
         )?;
+        bump_completion_seq_locked(&tx, turn_id)?;
         tx.execute(
             "UPDATE turn_journal_segments
              SET status = 'interrupted', finished_at = ?1
@@ -4683,6 +4685,7 @@ impl ConversationDb {
                 params![content, reasoning, now, turn_id, revision],
             )?;
             if turn_affected == 1 {
+                bump_completion_seq_locked(&tx, turn_id)?;
                 tx.execute(
                     "UPDATE turn_journal_segments
                      SET status = 'interrupted', finished_at = ?1
@@ -5062,6 +5065,30 @@ fn touch_session_last_request(tx: &Transaction<'_>, turn_id: &str) -> Result<()>
         "UPDATE sessions SET last_request_at = MAX(COALESCE(last_request_at, 0), ?1)
          WHERE session_id = (SELECT session_id FROM turns WHERE turn_id = ?2)",
         params![Utc::now().timestamp(), turn_id],
+    )?;
+    Ok(())
+}
+
+/// 并发回合完成序追加(消除插入型缓存断点):回合从 running 首次转为
+/// 可回放(completed/interrupted)时,若同会话已有 seq 更靠后的可回放
+/// 回合,按原 seq 插回会落在后续请求已缓存前缀的中间,之后每个请求都
+/// 从那里断链(群聊约 1/5 回合重叠)。把 seq 提升到会话全局 max+1,让
+/// "已完成历史"跨请求保持 append-only——这也更忠实:并发回合的实况
+/// 请求本来就没见过彼此,群聊时间线由各回合的群聊转储自己承载。
+/// 只动首次完成的回合(revision=0):redo 修订的位置已被历史请求看过,
+/// 原位改写才是正确语义。
+fn bump_completion_seq_locked(tx: &Transaction<'_>, turn_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE turns AS t
+            SET seq = (SELECT MAX(o.seq) + 1 FROM turns AS o
+                        WHERE o.session_id = t.session_id)
+          WHERE t.turn_id = ?1
+            AND t.revision = 0
+            AND EXISTS (SELECT 1 FROM turns AS later
+                         WHERE later.session_id = t.session_id
+                           AND later.seq > t.seq
+                           AND later.status != 'running')",
+        params![turn_id],
     )?;
     Ok(())
 }

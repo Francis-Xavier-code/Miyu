@@ -2174,6 +2174,77 @@ mod tests {
         assert_eq!(turns[0].assistant_content, interrupted_text());
     }
 
+    /// 并发回合完成序追加:与已完成回合重叠的回合在完成/中断时移到
+    /// 会话末尾,已完成历史跨请求 append-only,不再出现插入型缓存
+    /// 断点;无重叠回合与 redo 修订保持原位。
+    #[test]
+    fn overlapping_turns_reorder_to_completion_order() {
+        let (_temp, store) = test_store();
+        // A 先开跑,B 后开但先答完(群聊并发形态)——回放顺序按完成序。
+        store.start_turn("turn_a", "先来的", 999999).unwrap();
+        store.start_turn("turn_b", "后来的", 999999).unwrap();
+        store.complete_turn("turn_b", "B 先答完", None).unwrap();
+        store.complete_turn("turn_a", "A 后答完", None).unwrap();
+        let turns = store.load_turns().unwrap();
+        let order = turns
+            .iter()
+            .map(|turn| turn.turn_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["turn_b", "turn_a"]);
+
+        // 无重叠的后续回合不发生无谓跳位。
+        store.start_turn("turn_c", "单独回合", 999999).unwrap();
+        store.complete_turn("turn_c", "顺序完成", None).unwrap();
+        let turns = store.load_turns().unwrap();
+        assert_eq!(turns[2].turn_id, "turn_c");
+        assert_eq!(turns[2].seq, turns[1].seq + 1);
+
+        // 中断同样是"首次变为可回放",一样追加到末尾。
+        store.start_turn("turn_d", "被打断的", 999999).unwrap();
+        store.start_turn("turn_e", "插队的", 999999).unwrap();
+        store.complete_turn("turn_e", "插队先完", None).unwrap();
+        store.interrupt_turn("turn_d").unwrap();
+        let turns = store.load_turns().unwrap();
+        let order = turns
+            .iter()
+            .map(|turn| turn.turn_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["turn_b", "turn_a", "turn_c", "turn_e", "turn_d"]);
+
+        // redo 修订原位改写:turn_d 重跑完成后位置不动。
+        let candidate = store.redo_candidate().unwrap().unwrap();
+        assert_eq!(candidate.turn_id, "turn_d");
+        let redo = store
+            .begin_redo(
+                "turn_d",
+                "turn_d",
+                RedoInputKind::Initial,
+                candidate.revision,
+                "重打的输入",
+                "重打的输入",
+                std::process::id(),
+            )
+            .unwrap();
+        store
+            .complete_turn_revision_with_usage_and_model(
+                "turn_d",
+                redo.revision,
+                "重答",
+                None,
+                None,
+                None,
+                TurnTokens::default(),
+                false,
+            )
+            .unwrap();
+        let turns = store.load_turns().unwrap();
+        let order = turns
+            .iter()
+            .map(|turn| turn.turn_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["turn_b", "turn_a", "turn_c", "turn_e", "turn_d"]);
+    }
+
     #[test]
     fn interrupted_turn_materializes_persisted_journal_output() {
         let temp = tempfile::tempdir().unwrap();
