@@ -2427,6 +2427,9 @@ pub struct PromptConfig {
     pub active_persona: String,
     #[serde(default)]
     pub active_identity: String,
+    /// 平台会话尾部的人格提醒(自动蒸馏,见 persona_hint 模块)。
+    #[serde(default = "default_true")]
+    pub persona_reminder: bool,
 }
 
 /// Identifies who a model prompt is acting for. Only trusted local operator
@@ -2905,6 +2908,10 @@ pub struct MemesPluginConfig {
     pub allow_gif_animation: bool,
     #[serde(default)]
     pub auto_send_enabled: bool,
+    /// 通讯平台会话的自动提示发送表情:与终端/WebUI 的 auto_send_enabled
+    /// 独立,默认开——表情包本来就是平台聊天的语言。
+    #[serde(default = "default_true")]
+    pub auto_send_platform_enabled: bool,
     #[serde(default = "default_memes_auto_send_probability")]
     pub auto_send_probability: f32,
 }
@@ -3106,6 +3113,7 @@ impl Default for PromptConfig {
             user_identity_file: default_user_identity_file(),
             active_persona: String::new(),
             active_identity: String::new(),
+            persona_reminder: true,
         }
     }
 }
@@ -3300,6 +3308,7 @@ impl Default for MemesPluginConfig {
             search_max_results: default_memes_search_max_results(),
             allow_gif_animation: false,
             auto_send_enabled: false,
+            auto_send_platform_enabled: true,
             auto_send_probability: default_memes_auto_send_probability(),
         }
     }
@@ -5580,7 +5589,7 @@ fn default_memes_search_max_results() -> usize {
 }
 
 fn default_memes_auto_send_probability() -> f32 {
-    0.2
+    0.05
 }
 
 fn default_web_search_max_results() -> usize {
@@ -7856,8 +7865,9 @@ mod tests {
             "custom-persona"
         );
         assert!(!memes.auto_send_enabled);
+        assert!(memes.auto_send_platform_enabled);
         assert_eq!(memes.search_max_results, 1);
-        assert_eq!(memes.auto_send_probability, 0.2);
+        assert_eq!(memes.auto_send_probability, 0.05);
     }
 
     #[test]

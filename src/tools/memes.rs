@@ -186,10 +186,19 @@ enum MemeSource {
     User,
 }
 
-pub(crate) fn auto_meme_reminder(config: &AppConfig, user_message: &str) -> Option<String> {
+pub(crate) fn auto_meme_reminder(
+    config: &AppConfig,
+    user_message: &str,
+    platform: bool,
+) -> Option<String> {
     let meme_config = &config.plugins.memes;
+    let auto_enabled = if platform {
+        meme_config.auto_send_platform_enabled
+    } else {
+        meme_config.auto_send_enabled
+    };
     if !meme_config.enabled
-        || !meme_config.auto_send_enabled
+        || !auto_enabled
         || user_message.trim().is_empty()
         || meme_config.auto_send_probability <= 0.0
     {
@@ -1549,6 +1558,19 @@ mod tests {
     fn sanitize_library_keeps_simple_names() {
         assert_eq!(sanitize_library("Miyu"), "miyu");
         assert_eq!(sanitize_library("默认 表情"), "default");
+    }
+
+    /// 自动提示发送表情的平台/本地开关相互独立:默认平台开、本地关。
+    #[test]
+    fn platform_and_local_auto_send_gates_are_independent() {
+        let mut config = AppConfig::default();
+        config.plugins.memes.auto_send_probability = 1.0;
+        assert!(auto_meme_reminder(&config, "你好", true).is_some());
+        assert!(auto_meme_reminder(&config, "你好", false).is_none());
+        config.plugins.memes.auto_send_enabled = true;
+        config.plugins.memes.auto_send_platform_enabled = false;
+        assert!(auto_meme_reminder(&config, "你好", false).is_some());
+        assert!(auto_meme_reminder(&config, "你好", true).is_none());
     }
 
     #[test]

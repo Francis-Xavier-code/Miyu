@@ -18,6 +18,7 @@ mod memory;
 mod models_cache;
 mod notify;
 mod paths;
+mod persona_hint;
 mod platforms;
 mod prompts;
 mod question;

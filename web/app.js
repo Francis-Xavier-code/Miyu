@@ -145,6 +145,7 @@
     "queue.removed",
     "queue.consumed",
     "generation.superseded",
+    "chat.round_usage",
     "run.completed",
     "run.cancelled",
     "run.failed",
@@ -7767,6 +7768,28 @@
     }
   }
 
+  // 回合内一次模型请求结束(chat.round_usage):立即刷新气泡计量与上下文
+  // 条,不等 run 完结。usage 是刚结束请求的用量,其 prompt+completion 即
+  // 当前上下文占用;turn_* 是回合累计。回合结束后 finishLiveRun 会用权威
+  // 数字覆盖这里的中间值。
+  function handleRoundUsage(live, data) {
+    if (live.meta) {
+      const usage = formatUsageMeta({
+        turnTotal: asFiniteNumber(data?.turn_total),
+        turnPrompt: data?.turn_prompt,
+        turnCached: data?.turn_cache_read,
+        estimated: data?.estimated
+      });
+      if (usage) live.meta.textContent = usage;
+    }
+    const round = data?.usage;
+    const contextTokens = asFiniteNumber(round?.prompt_tokens, 0) + asFiniteNumber(round?.completion_tokens, 0);
+    if (contextTokens > 0) {
+      state.context.tokens = contextTokens;
+      updateContext();
+    }
+  }
+
   function finishLiveRun(kind, data, live) {
     if (!live || live.ended) return;
     const runId = live.runId;
@@ -8012,6 +8035,7 @@
       if (live.operation === "redo") commitRedoLive(live);
       else ensureActiveTurnUser(live, live.turnId);
     } else if (name === "assistant.delta") appendAssistantDelta(live, data?.delta);
+    else if (name === "chat.round_usage") handleRoundUsage(live, data);
     else if (name === "generation.superseded") resetSupersededGeneration(live);
     else if (name.startsWith("reasoning.")) handleReasoningEvent(name, live, data);
     else if (name === "queue.consumed") consumeLiveQueue(live, data);

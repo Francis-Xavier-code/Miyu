@@ -884,6 +884,13 @@ fn plugin_fields(config: &AppConfig, index: usize) -> Vec<Field> {
                 t("Suggest memes automatically", "自动提示发送表情"),
                 config.plugins.memes.auto_send_enabled,
             ),
+            Field::boolean(
+                t(
+                    "Suggest memes automatically on platforms",
+                    "通讯平台自动提示发送表情",
+                ),
+                config.plugins.memes.auto_send_platform_enabled,
+            ),
             Field::new(
                 t(
                     "Automatic meme suggestion probability",
@@ -1165,8 +1172,9 @@ fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -
                 fields[4].value.trim().parse::<usize>()?.clamp(1, 3);
             config.plugins.memes.allow_gif_animation = parse_bool_field(&fields[5].value)?;
             config.plugins.memes.auto_send_enabled = parse_bool_field(&fields[6].value)?;
+            config.plugins.memes.auto_send_platform_enabled = parse_bool_field(&fields[7].value)?;
             config.plugins.memes.auto_send_probability =
-                fields[7].value.trim().parse::<f32>()?.clamp(0.0, 1.0);
+                fields[8].value.trim().parse::<f32>()?.clamp(0.0, 1.0);
         }
         7 => {
             config.plugins.knowledge_base.enabled = parse_bool_field(&fields[0].value)?;
@@ -1427,11 +1435,23 @@ fn manage_personas(
             }
             KeyCode::Enter if selected >= custom_offset => {
                 if let Some(name) = personas.get(selected - custom_offset) {
-                    if let Some((new_name, content)) = edit_persona(stdout, paths, config, name)? {
-                        apply_persona_edit(paths, config, name, &new_name, &content)?;
-                        target.rename_custom(name, &new_name);
+                    if let Some(values) = edit_persona(stdout, paths, config, name)? {
+                        apply_persona_edit(paths, config, name, &values.name, &values.content)?;
+                        write_persona_aux(
+                            paths,
+                            config,
+                            &crate::config::persona_scope_name(&values.name),
+                            &values.hint,
+                            &values.dialogs,
+                        )?;
+                        target.rename_custom(name, &values.name);
                     }
                 }
+            }
+            // 默认 Miyu 人格本体只读,但防失忆提示与预设对话是独立文件
+            // (hints/default.md、dialogs/default.md),回车打开精简表单。
+            KeyCode::Enter if selected + 1 == custom_offset => {
+                edit_miyu_persona_extras(stdout, paths, config)?;
             }
             KeyCode::Char('d') if selected >= custom_offset => {
                 if let Some(name) = personas.get(selected - custom_offset) {
@@ -1548,21 +1568,113 @@ fn apply_persona_delete(
     Ok(())
 }
 
+struct PersonaFormValues {
+    name: String,
+    content: String,
+    hint: String,
+    dialogs: String,
+}
+
+/// 人格附属文件现值:防失忆提示(hints/<scope>.md)与预设对话
+/// (dialogs/<scope>.md)。
+fn persona_aux_values(paths: &MiyuPaths, config: &AppConfig, scope: &str) -> (String, String) {
+    let hint =
+        std::fs::read_to_string(crate::persona_hint::manual_hint_path(config, paths, scope))
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+    let dialogs = crate::persona_hint::dialogs_raw(config, paths, scope);
+    (hint, dialogs)
+}
+
+/// 附属文件落盘:非空写入,空则删除(清空提示=回到自动蒸馏,清空
+/// 对话=不注入)。
+fn write_persona_aux(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    scope: &str,
+    hint: &str,
+    dialogs: &str,
+) -> Result<()> {
+    let targets = [
+        (
+            crate::persona_hint::manual_hint_path(config, paths, scope),
+            hint,
+        ),
+        (
+            crate::persona_hint::dialogs_path(config, paths, scope),
+            dialogs,
+        ),
+    ];
+    for (path, value) in targets {
+        let value = value.trim();
+        if value.is_empty() {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, format!("{value}\n"))?;
+        }
+    }
+    Ok(())
+}
+
+fn persona_aux_fields(hint: String, dialogs: String, miyu: bool) -> Vec<Field> {
+    let (hint_label, dialogs_label) = if miyu {
+        (
+            t(
+                "Anti-amnesia reminder (empty = built-in default)",
+                "防失忆提示(清空=恢复内置默认)",
+            ),
+            t(
+                "Preset dialogs (user:/assistant: lines; empty = built-in default)",
+                "预设对话(user:/assistant: 开头的行,清空=恢复内置默认)",
+            ),
+        )
+    } else {
+        (
+            t(
+                "Anti-amnesia reminder (empty = auto distill)",
+                "防失忆提示(留空=自动蒸馏)",
+            ),
+            t(
+                "Preset dialogs (lines starting with user:/assistant:)",
+                "预设对话(user:/assistant: 开头的行)",
+            ),
+        )
+    };
+    vec![
+        Field::textarea(hint_label, hint),
+        Field::textarea(dialogs_label, dialogs),
+    ]
+}
+
 fn new_persona(
     stdout: &mut io::Stdout,
     paths: &MiyuPaths,
     config: &AppConfig,
 ) -> Result<Option<String>> {
-    edit_prompt_file_form(
-        stdout,
-        t(" NEW PERSONA ", " 新建人格 "),
-        None,
-        String::new(),
-        |name, content| {
-            ensure_persona_name_available(paths, config, name, None)?;
-            write_persona(paths, config, name, content)
-        },
-    )
+    let mut fields = vec![
+        Field::new(t("Name", "名称"), String::new()),
+        Field::textarea(t("Content", "内容"), String::new()),
+    ];
+    fields.extend(persona_aux_fields(String::new(), String::new(), false));
+    if !run_form(stdout, t(" NEW PERSONA ", " 新建人格 "), &mut fields)? {
+        return Ok(None);
+    }
+    let name = sanitize_persona_name(&fields[0].value)?;
+    ensure_persona_name_available(paths, config, &name, None)?;
+    write_persona(paths, config, &name, &fields[1].value)?;
+    write_persona_aux(
+        paths,
+        config,
+        &crate::config::persona_scope_name(&name),
+        &fields[2].value,
+        &fields[3].value,
+    )?;
+    Ok(Some(name))
 }
 
 fn edit_persona(
@@ -1570,14 +1682,46 @@ fn edit_persona(
     paths: &MiyuPaths,
     config: &AppConfig,
     current_name: &str,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<PersonaFormValues>> {
     let content = read_persona(paths, config, current_name)?;
-    edit_prompt_file_values(
-        stdout,
-        t(" EDIT PERSONA ", " 编辑人格 "),
-        Some(current_name),
-        content,
-    )
+    let (hint, dialogs) = persona_aux_values(
+        paths,
+        config,
+        &crate::config::persona_scope_name(current_name),
+    );
+    let mut fields = vec![
+        Field::new(
+            t("Name", "名称"),
+            persona_display_name(current_name).to_string(),
+        ),
+        Field::textarea(t("Content", "内容"), content),
+    ];
+    fields.extend(persona_aux_fields(hint, dialogs, false));
+    if !run_form(stdout, t(" EDIT PERSONA ", " 编辑人格 "), &mut fields)? {
+        return Ok(None);
+    }
+    let name = sanitize_persona_name(&fields[0].value)?;
+    Ok(Some(PersonaFormValues {
+        name,
+        content: fields[1].value.clone(),
+        hint: fields[2].value.clone(),
+        dialogs: fields[3].value.clone(),
+    }))
+}
+
+/// 默认 Miyu 人格:本体只读,回车只编辑附属的防失忆提示与预设对话
+/// (scope 固定为 default)。
+fn edit_miyu_persona_extras(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &AppConfig,
+) -> Result<()> {
+    let (hint, dialogs) = crate::persona_hint::miyu_aux_prefill(config, paths);
+    let mut fields = persona_aux_fields(hint, dialogs, true);
+    if !run_form(stdout, t(" MIYU EXTRAS ", " Miyu 人格附加 "), &mut fields)? {
+        return Ok(());
+    }
+    write_persona_aux(paths, config, "default", &fields[0].value, &fields[1].value)
 }
 
 fn ensure_persona_name_available(
@@ -1660,6 +1804,23 @@ fn move_persona_scope(
             completed.push((source, target));
         }
     }
+    let old_scope = crate::config::persona_scope_name(old_name);
+    let new_scope = crate::config::persona_scope_name(new_name);
+    let file_moves = [
+        (
+            crate::persona_hint::manual_hint_path(config, paths, &old_scope),
+            crate::persona_hint::manual_hint_path(config, paths, &new_scope),
+        ),
+        (
+            crate::persona_hint::dialogs_path(config, paths, &old_scope),
+            crate::persona_hint::dialogs_path(config, paths, &new_scope),
+        ),
+    ];
+    for (source, target) in file_moves {
+        if source.exists() && !target.exists() {
+            std::fs::rename(&source, &target)?;
+        }
+    }
     Ok(())
 }
 
@@ -1667,6 +1828,15 @@ fn remove_persona_scope(paths: &MiyuPaths, config: &AppConfig, name: &str) -> Re
     remove_dir_if_exists(config.persona_memory_data_dir(paths, name))?;
     remove_dir_if_exists(config.persona_memory_state_dir(paths, name))?;
     remove_dir_if_exists(config.persona_skills_dir(paths, name))?;
+    let scope = crate::config::persona_scope_name(name);
+    for path in [
+        crate::persona_hint::manual_hint_path(config, paths, &scope),
+        crate::persona_hint::dialogs_path(config, paths, &scope),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
     Ok(())
 }
 

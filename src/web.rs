@@ -1210,6 +1210,25 @@ impl RunEventMapper {
                 }),
             ),
             AgentEvent::SpinnerTick => {}
+            // 逐请求计量快照:round 为刚结束请求的用量(prompt+completion
+            // ≈ 当前上下文占用),turn 为回合累计。前端据此在回合中途刷新
+            // 计量条,不必等 chat.done。
+            AgentEvent::RoundUsage {
+                round,
+                turn,
+                estimated,
+            } => self.publish(
+                "chat.round_usage",
+                json!({
+                    "run_id": self.run_id,
+                    "turn_id": self.turn_id,
+                    "usage": *round,
+                    "turn_total": turn.total,
+                    "turn_prompt": turn.prompt,
+                    "turn_cache_read": turn.cache_read,
+                    "estimated": estimated,
+                }),
+            ),
             AgentEvent::CompactStart => {
                 self.publish("context.compact_start", json!({ "run_id": self.run_id }))
             }

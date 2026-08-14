@@ -11,6 +11,7 @@ use crate::llm::{
 };
 use crate::memory::{EvictedTurn, MemoryAccess, MemoryOrganizerHandle, MemoryOrigin, MemoryStore};
 use crate::paths::MiyuPaths;
+use crate::persona_hint;
 use crate::platforms::{PlatformContextImageRef, PlatformTurnContext};
 use crate::question::{
     answered_tool_output, closed_tool_output, unavailable_tool_output, QuestionCancelled,
@@ -427,6 +428,15 @@ pub enum AgentEvent {
     GenerationSuperseded {
         prompt_ids: Vec<String>,
     },
+    /// 回合内每次模型请求结束时的用量快照:`round` 是刚结束这次请求的
+    /// 用量(其 prompt+completion ≈ 当前上下文占用),`turn` 是回合开始
+    /// 至今的累计。终端 footer 和 WebUI 用它逐请求刷新计量,不必等整个
+    /// 回合(可能含多轮工具调用)结束。
+    RoundUsage {
+        round: Box<Usage>,
+        turn: TurnTokens,
+        estimated: bool,
+    },
     SpinnerTick,
     CompactStart,
     CompactChunk(ChatStreamChunk),
@@ -503,6 +513,8 @@ impl TurnJournalSink {
                 self.flush(on_event)?;
                 on_event(AgentEvent::SpinnerTick)
             }
+            // 瞬态计量快照,只给 UI,不入回放日志。
+            event @ AgentEvent::RoundUsage { .. } => on_event(event),
             AgentEvent::ReasoningStart { received_at } => {
                 self.flush(on_event)?;
                 self.append("reasoning_start", None, None, None, None, None)?;
@@ -910,6 +922,14 @@ pub struct Agent {
     image_platform_label: Option<String>,
     platform_context: Option<Arc<PlatformTurnContext>>,
     context_images: Vec<PlatformContextImageRef>,
+    /// 本回合的浮动尾部人格提醒全文。只追加进发送副本
+    /// `request_messages`,永不进 `messages`,因此不化石化、不落库——
+    /// 见 persona_hint 模块头注释。
+    persona_reminder: Option<String>,
+    /// 预设对话(begin_dialogs):system 之后、真实历史之前的 user/assistant
+    /// 示例对,每请求注入、永不落库。构造时从当前人格 scope 的
+    /// dialogs/<scope>.md 加载。
+    preset_dialogs: Vec<(String, String)>,
     /// Exact (messages, tools) of the most recent live request; feeds the
     /// idle cache-keepalive pings (v7 DeepSeek 高命中策略). Only populated
     /// while `cache.keepalive_seconds > 0`.
@@ -986,6 +1006,8 @@ impl Agent {
         );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
+        let preset_dialogs =
+            persona_hint::load_dialogs(&config, paths, &config.active_persona_scope());
         let memory = MemoryStore::new(&config, paths);
         memory.init()?;
         let (memory_database_id, memory_generation) = memory.identity()?;
@@ -1020,6 +1042,8 @@ impl Agent {
             image_platform_label: None,
             platform_context: None,
             context_images: Vec::new(),
+            persona_reminder: None,
+            preset_dialogs,
             last_request_snapshot: None,
             keepalive_cancel: None,
             consecutive_compacts: std::sync::atomic::AtomicU32::new(0),
@@ -1929,6 +1953,22 @@ impl Agent {
         .await
     }
 
+    /// 浮动尾部人格提醒,所有会话形态(终端/WebUI/平台)一致生效:命中
+    /// 缓存时只是一次小文件读,缓存未建时对同一 client 蒸馏一次(每份
+    /// 人格内容一生只发生一次)。蒸馏失败降级为无提醒,绝不阻断回合。
+    async fn resolve_persona_reminder(&self) -> Option<String> {
+        if !self.config.prompt.persona_reminder {
+            return None;
+        }
+        match persona_hint::resolve(&self.config, &self.paths, &self.client).await {
+            Ok(reminder) => reminder,
+            Err(error) => {
+                tracing::warn!(error = %error, "persona reminder distillation failed");
+                None
+            }
+        }
+    }
+
     async fn chat_stream_turn<F>(
         &mut self,
         input: &str,
@@ -1944,6 +1984,7 @@ impl Agent {
         self.cancel_cache_keepalive();
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
+        self.persona_reminder = self.resolve_persona_reminder().await;
         let prepared = self.prepare_user_input(input, images).await?;
         let input = prepared.content.clone();
         let turn_id = format!(
@@ -2034,7 +2075,9 @@ impl Agent {
             }
         }
         {
-            if let Some(reminder) = memes::auto_meme_reminder(&self.config, &input) {
+            if let Some(reminder) =
+                memes::auto_meme_reminder(&self.config, &input, self.platform_context.is_some())
+            {
                 messages.push(ChatMessage::turn_context(reminder));
             }
         }
@@ -2349,6 +2392,7 @@ impl Agent {
             check.reserved_tokens,
             self.compact_tail_budget(context_window),
             matches!(self.mode, AgentMode::Chat),
+            self.preset_dialogs.len(),
         );
         let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
         let fork_builder = |fold_ids: &[String]| -> Result<compact::CompactForkParts> {
@@ -2574,6 +2618,7 @@ impl Agent {
                     check.reserved_tokens,
                     self.compact_tail_budget(window),
                     matches!(self.mode, AgentMode::Chat),
+                    self.preset_dialogs.len(),
                 );
                 let mut on_chunk =
                     |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
@@ -2856,6 +2901,14 @@ impl Agent {
                 }
                 request_messages.splice(offset..offset, context_messages.clone());
             }
+            // 浮动尾部人格提醒:只追加进本次发送副本,`messages` 与化石
+            // 从不包含它,所以跨回合前缀缓存只在提醒自身处分叉(~80 tok)。
+            // Responses continuation 的服务端会话会累积输入,这条不发。
+            if responses_continuation.is_none() {
+                if let Some(reminder) = self.persona_reminder.as_deref() {
+                    request_messages.push(persona_hint::reminder_message(reminder));
+                }
+            }
             let mut reasoning_filter = ReasoningTitleFilter::default();
             if self.config.cache.write_grace_ms > 0 {
                 if let Some(previous) = last_round_completed_at {
@@ -2952,6 +3005,7 @@ impl Agent {
                             check.reserved_tokens,
                             self.compact_tail_budget(window),
                             matches!(self.mode, AgentMode::Chat),
+                            self.preset_dialogs.len(),
                         );
                         let mut on_compact_chunk =
                             |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
@@ -3073,6 +3127,23 @@ impl Agent {
                 }))?;
             }
             usage_accumulator.add_result(&result, messages);
+            if let Some(turn_usage) = usage_accumulator.usage() {
+                let round = result.usage.clone().unwrap_or_else(|| {
+                    let prompt = overflow::estimate_messages_tokens(&request_messages) as u64;
+                    let completion = estimate_result_tokens(&result) as u64;
+                    Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: prompt.saturating_add(completion),
+                        ..Usage::default()
+                    }
+                });
+                on_event(AgentEvent::RoundUsage {
+                    round: Box::new(round),
+                    turn: TurnTokens::from_usage(Some(&turn_usage)),
+                    estimated: usage_accumulator.estimated,
+                })?;
+            }
             last_round_completed_at = Some(Instant::now());
             if result.tool_calls.is_empty() || !self.tools_enabled {
                 responses_continuation = None;
@@ -3687,6 +3758,14 @@ impl Agent {
         current_input: &str,
     ) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
+        // 预设对话(begin_dialogs):system 之后、历史之前,每请求注入、
+        // 永不落库。模型把它当普通聊天记录,学的是轮次里的语气;作为
+        // 常量前缀只在编辑时断一次缓存。compact_fork_prefix 同步注入,
+        // 保持折叠请求与实况字节一致。
+        for (user, assistant) in &self.preset_dialogs {
+            messages.push(ChatMessage::plain("user", user.clone()));
+            messages.push(ChatMessage::assistant(assistant.clone(), None));
+        }
         if !self.suppress_session_history {
             if let Some(summary) = self.state.load_last_summary()? {
                 messages.push(summary_checkpoint_message(&summary.assistant_content));
@@ -3809,6 +3888,11 @@ impl Agent {
         let fold: std::collections::HashSet<&str> =
             fold_turn_ids.iter().map(|id| id.as_str()).collect();
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
+        // 与 chat_messages 的实况前缀字节一致:预设对话也在折叠前缀里。
+        for (user, assistant) in &self.preset_dialogs {
+            messages.push(ChatMessage::plain("user", user.clone()));
+            messages.push(ChatMessage::assistant(assistant.clone(), None));
+        }
         if let Some(summary) = self.state.load_last_summary()? {
             messages.push(summary_checkpoint_message(&summary.assistant_content));
         }
@@ -8565,6 +8649,304 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// 浮动尾部人格提醒:首回合先蒸馏一次并落缓存,对话请求的绝对末尾
+    /// 是 user 角色的 `<persona-reminder>`;化石与回放历史永不包含它,
+    /// 第二回合命中缓存直接对话(历史里 0 份、请求尾部 1 份)。
+    #[tokio::test]
+    async fn persona_reminder_rides_request_tail_and_stays_out_of_fossils() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = false;
+        config.system_prompt = Some("测试人格：说话简短。".to_string());
+        config.prompt.persona_reminder = true;
+
+        let (first_chat_tx, first_chat_rx) = oneshot::channel();
+        let (second_chat_tx, second_chat_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let reply = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"哦\"}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            // 回合1请求①:蒸馏调用(产物首行名字,次行正文)。
+            let (mut distill, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut distill).await;
+            let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
+            assert!(body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("人格设定文件"));
+            write_test_sse(
+                &mut distill,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"短\\n回复很短，从不用Emoji。\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+            // 回合1请求②:正式对话。
+            let (mut chat, _) = listener.accept().await.unwrap();
+            let _ = first_chat_tx.send(read_test_http_request(&mut chat).await);
+            write_test_sse(&mut chat, reply).await;
+            // 回合2请求①:缓存命中,直接就是对话请求(若再蒸馏一次,
+            // 这里读到的请求不含新消息,下方断言会失败)。
+            let (mut chat2, _) = listener.accept().await.unwrap();
+            let _ = second_chat_tx.send(read_test_http_request(&mut chat2).await);
+            write_test_sse(&mut chat2, reply).await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config.clone(),
+            &paths,
+            state.clone(),
+            client,
+            ToolRegistry::new(),
+            AgentMode::Chat,
+        )
+        .unwrap();
+        let context = Arc::new(PlatformTurnContext::new(
+            PlatformConversation {
+                platform: "onebot".to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Group,
+                conversation_id: "20000".to_string(),
+            },
+            "30000".to_string(),
+            "tester".to_string(),
+            false,
+            config,
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            Arc::new(NoopPlatformAdapter),
+            Arc::new(crate::platforms::plugins::PlatformPluginRegistry::default()),
+        ));
+        agent.set_platform_context_images(context.clone(), Vec::new());
+        agent.chat_stream("第一条消息", |_| Ok(())).await.unwrap();
+
+        let expected_reminder =
+            "<persona-reminder>回复很短，从不用Emoji。\
+             就算是讲解答疑，也只说最关键的两三步，整条不超过一百字，\
+             一次说不完就等对方追问。</persona-reminder>";
+        let request: serde_json::Value =
+            serde_json::from_slice(&first_chat_rx.await.unwrap()).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"], expected_reminder);
+        let turns = state.load_turns().unwrap();
+        assert!(!format!("{:?}", turns[0].context_messages).contains("persona-reminder"));
+        assert!(paths
+            .state_dir
+            .join("persona-hints")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+
+        agent.set_platform_context_images(context, Vec::new());
+        agent.chat_stream("第二条消息", |_| Ok(())).await.unwrap();
+        let request: serde_json::Value =
+            serde_json::from_slice(&second_chat_rx.await.unwrap()).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("第二条消息"))
+        }));
+        let reminder_count = messages
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("persona-reminder"))
+            })
+            .count();
+        assert_eq!(reminder_count, 1);
+        assert_eq!(messages.last().unwrap()["content"], expected_reminder);
+        server.await.unwrap();
+    }
+
+    /// 手写防失忆提示(hints/<scope>.md)优先于自动蒸馏:存在时整回合
+    /// 不发蒸馏请求(服务端只应答一次对话),尾部原样携带手写内容,
+    /// 不拼场景句。
+    #[tokio::test]
+    async fn manual_persona_reminder_overrides_distillation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = false;
+        config.system_prompt = Some("测试人格：说话简短。".to_string());
+        config.prompt.persona_reminder = true;
+        let hint_path = crate::persona_hint::manual_hint_path(&config, &paths, "default");
+        std::fs::create_dir_all(hint_path.parent().unwrap()).unwrap();
+        std::fs::write(&hint_path, "未有在群里潜水。手写版提醒。\n").unwrap();
+
+        let (chat_tx, chat_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut chat, _) = listener.accept().await.unwrap();
+            let _ = chat_tx.send(read_test_http_request(&mut chat).await);
+            write_test_sse(
+                &mut chat,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"哦\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config.clone(),
+            &paths,
+            state.clone(),
+            client,
+            ToolRegistry::new(),
+            AgentMode::Chat,
+        )
+        .unwrap();
+        let context = Arc::new(PlatformTurnContext::new(
+            PlatformConversation {
+                platform: "onebot".to_string(),
+                account_id: "10000".to_string(),
+                kind: ConversationKind::Group,
+                conversation_id: "20000".to_string(),
+            },
+            "30000".to_string(),
+            "tester".to_string(),
+            false,
+            config,
+            paths.clone(),
+            StateStore::new(&paths).unwrap(),
+            Arc::new(NoopPlatformAdapter),
+            Arc::new(crate::platforms::plugins::PlatformPluginRegistry::default()),
+        ));
+        agent.set_platform_context_images(context, Vec::new());
+        agent.chat_stream("第一条消息", |_| Ok(())).await.unwrap();
+
+        let request: serde_json::Value = serde_json::from_slice(&chat_rx.await.unwrap()).unwrap();
+        let last = request["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"],
+            "<persona-reminder>未有在群里潜水。手写版提醒。</persona-reminder>"
+        );
+        server.await.unwrap();
+    }
+
+    /// 预设对话(begin_dialogs):system 之后、真实历史之前注入 Q/A 对,
+    /// 每请求从 dialogs/<scope>.md 重建、永不落库。
+    #[test]
+    fn preset_dialogs_ride_after_system_before_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        let dialogs = crate::persona_hint::dialogs_path(&config, &paths, "default");
+        std::fs::create_dir_all(dialogs.parent().unwrap()).unwrap();
+        std::fs::write(&dialogs, "user: 你好\nassistant: 哼，又来一个。\n").unwrap();
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        state.start_turn("turn_h", "历史问题", 999999).unwrap();
+        state.complete_turn("turn_h", "历史回答", None).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Chat,
+        )
+        .unwrap();
+        let messages = agent.chat_messages("current", "新消息").unwrap();
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(chat_message_text(&messages[1]).unwrap(), "你好");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(chat_message_text(&messages[2]).unwrap(), "哼，又来一个。");
+        assert_eq!(chat_message_text(&messages[3]).unwrap(), "历史问题");
+        // 预设对话只活在请求里:历史存储不含它。
+        let turns = agent.state.load_turns().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_content, "历史问题");
+    }
+
+    /// 回合内每次模型请求结束都发射 RoundUsage(provider 未报 usage 时走
+    /// 估算路径),这是 footer/WebUI 逐请求刷新计量的事件源。
+    #[tokio::test]
+    async fn round_usage_event_fires_per_model_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = false;
+        let server = tokio::spawn(async move {
+            let (mut chat, _) = listener.accept().await.unwrap();
+            let _ = read_test_http_request(&mut chat).await;
+            write_test_sse(
+                &mut chat,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"回答\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":8,\"total_tokens\":128}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Chat,
+        )
+        .unwrap();
+        let rounds = std::cell::RefCell::new(Vec::new());
+        agent
+            .chat_stream("你好", |event| {
+                if let AgentEvent::RoundUsage {
+                    round,
+                    turn,
+                    estimated,
+                } = &event
+                {
+                    rounds
+                        .borrow_mut()
+                        .push((round.prompt_tokens, turn.total, *estimated));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let rounds = rounds.into_inner();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].0, 120);
+        assert_eq!(rounds[0].1, 128);
+        assert!(!rounds[0].2);
+        server.await.unwrap();
+    }
+
     async fn read_test_http_request(stream: &mut TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut buffer = [0u8; 4096];
@@ -8768,6 +9150,9 @@ mod tests {
         };
         config.skills.enabled = false;
         config.memory.enabled = false;
+        // 人格提醒会触发一次蒸馏 LLM 调用,与各测试的 mock 应答序列冲突;
+        // 测提醒本身的用例再显式打开。
+        config.prompt.persona_reminder = false;
         config
     }
 

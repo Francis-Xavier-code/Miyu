@@ -41,6 +41,10 @@ pub struct Compactor {
     /// Chat mode uses the persona/social summary template instead of the
     /// coding one.
     chat_mode: bool,
+    /// 折叠前缀开头的预设对话对数(begin_dialogs)。它们为对齐实况请求的
+    /// 缓存字节而留在前缀里,但不是真实会话——摘要指令按这个数量明确
+    /// 排除,防止样板对话被总结成伪造的会话事实。
+    preset_dialog_pairs: usize,
 }
 
 pub struct CompactResult {
@@ -66,6 +70,7 @@ impl Compactor {
         reserved_tokens: usize,
         tail_budget_tokens: usize,
         chat_mode: bool,
+        preset_dialog_pairs: usize,
     ) -> Self {
         // Safety cap: on a small window the tail itself must stay well under
         // the trigger watermark or compaction can never win.
@@ -83,6 +88,7 @@ impl Compactor {
             reserved_tokens,
             tail_budget_tokens,
             chat_mode,
+            preset_dialog_pairs,
         }
     }
 
@@ -118,11 +124,20 @@ impl Compactor {
         } else {
             ""
         };
+        let preset_note = if self.preset_dialog_pairs > 0 {
+            format!(
+                "The first {} user/assistant exchange(s) at the very top of the conversation are scripted persona example dialogs, NOT part of the real session — exclude them entirely from the summary. ",
+                self.preset_dialog_pairs,
+            )
+        } else {
+            String::new()
+        };
         messages.push(ChatMessage::plain(
             "user",
             format!(
-                "IMPORTANT: The conversation stops here. Do NOT reply to the messages above and do NOT call any tools — a tool call fails this task. You are now acting under the summarization instructions below.\n\n{}\n\n{}Summarize the entire conversation above now, following the output structure exactly.",
+                "IMPORTANT: The conversation stops here. Do NOT reply to the messages above and do NOT call any tools — a tool call fails this task. You are now acting under the summarization instructions below.\n\n{}\n\n{}{}Summarize the entire conversation above now, following the output structure exactly.",
                 self.system_prompt(),
+                preset_note,
                 anchor_note,
             ),
         ));

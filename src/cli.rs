@@ -159,6 +159,22 @@ impl ReplFooterStatus {
         self.token_usage.session_tokens = session_tokens;
     }
 
+    /// 回合中途的逐请求刷新:在(回合前的)基线上叠加回合累计。必须作用
+    /// 在基线快照的克隆上,同一回合内可重复调用而不重复相加。
+    fn apply_round_usage(&mut self, context_tokens: u64, turn: TurnTokens) {
+        let meter = &mut self.token_usage;
+        meter.turn_tokens = turn.total;
+        meter.turn_prompt_tokens = turn.prompt;
+        meter.turn_cached_tokens = turn.cache_read;
+        if context_tokens > 0 {
+            meter.session_tokens = context_tokens;
+        }
+        let cumulative = meter.cumulative_tokens.unwrap_or(0) + turn.total;
+        meter.cumulative_tokens = (cumulative > 0).then_some(cumulative);
+        meter.cumulative_prompt_tokens += turn.prompt;
+        meter.cumulative_cached_tokens += turn.cache_read;
+    }
+
     fn update_context_window(&mut self, context_window: Option<usize>) {
         self.token_usage.context_window = context_window;
     }
@@ -9581,6 +9597,10 @@ struct LiveReplTail {
     queued: Vec<QueuedPrompt>,
     pending_chunks: Vec<ChatStreamChunk>,
     footer: ReplFooterStatus,
+    /// 回合中途逐请求刷新计量时的基线(回合开始前的 footer 快照)。
+    /// 每次 RoundUsage 事件都从基线重新叠加,避免累计值重复相加;
+    /// 任何权威更新(set_footer)都会清掉它。
+    round_base_footer: Option<Box<ReplFooterStatus>>,
     jobs: Vec<crate::tools::jobs::JobOverview>,
     job_spinner: usize,
     output_cursor: (u16, u16),
@@ -9968,6 +9988,7 @@ impl LiveReplTail {
             queued,
             pending_chunks: Vec::new(),
             footer,
+            round_base_footer: None,
             jobs: Vec::new(),
             job_spinner: 0,
             output_cursor: cursor_position_or((0, 0)),
@@ -9986,6 +10007,23 @@ impl LiveReplTail {
 
     fn set_footer(&mut self, footer: ReplFooterStatus) {
         self.footer = footer;
+        self.round_base_footer = None;
+    }
+
+    /// 回合内一次模型请求结束:用基线+回合累计刷新计量并立即重绘。
+    /// `context_tokens` 取该请求 prompt+completion,即当前上下文占用的
+    /// 最新实测;回合结束后外层会用权威数字覆盖(set_footer 清基线)。
+    fn refresh_round_usage(&mut self, context_tokens: u64, turn: TurnTokens) -> Result<()> {
+        let base = self
+            .round_base_footer
+            .get_or_insert_with(|| Box::new(self.footer.clone()));
+        let mut display = (**base).clone();
+        display.apply_round_usage(context_tokens, turn);
+        self.footer = display;
+        if self.rendered && !self.external_output_active {
+            synchronized_terminal_update(CursorAfterUpdate::Shown, || self.redraw())?;
+        }
+        Ok(())
     }
 
     /// Replaces the footer and redraws the live editor immediately when it is
@@ -11509,6 +11547,12 @@ fn handle_live_agent_event(
         AgentEvent::Chunk(chunk) => {
             live.queue_stream_chunk(chunk);
             return Ok(());
+        }
+        AgentEvent::RoundUsage { round, turn, .. } => {
+            // 一次模型请求刚结束:立即刷新 footer 计量,不等整个回合。
+            // prompt+completion 即该请求结束时的上下文实际占用。
+            let context_tokens = round.prompt_tokens.saturating_add(round.completion_tokens);
+            return live.refresh_round_usage(context_tokens, turn);
         }
         event => event,
     };
@@ -14895,6 +14939,7 @@ mod repl_input_tests {
             queued: Vec::new(),
             pending_chunks: Vec::new(),
             footer: ReplFooterStatus::from_config(&config, 0, TurnTokens::default()),
+            round_base_footer: None,
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,
@@ -14927,6 +14972,7 @@ mod repl_input_tests {
             queued: Vec::new(),
             pending_chunks: Vec::new(),
             footer: ReplFooterStatus::from_config(&config, 0, TurnTokens::default()),
+            round_base_footer: None,
             output_cursor: (0, 0),
             tail_start: 0,
             tail_rows: 0,
@@ -15931,6 +15977,8 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
         AgentEvent::TurnStarted { .. } => Ok(()),
         AgentEvent::RawReasoning(_) => Ok(()),
         AgentEvent::FlushJournal => Ok(()),
+        // 单次输出模式没有常驻 footer,逐请求计量快照无处可画。
+        AgentEvent::RoundUsage { .. } => Ok(()),
         AgentEvent::Chunk(chunk) => {
             renderer.write_chunk(chunk)?;
             renderer.tick_spinner()
