@@ -1460,6 +1460,7 @@
       api_key: null,
       models: [],
       model_context_window: {},
+      model_costs: {},
       model_modalities: {},
       default_model: "",
       timeout_seconds: 60,
@@ -1770,7 +1771,7 @@
       }
       const structured = [
         ["可用模型", "models", "lines", "每行一个模型"],
-        ["模型上下文窗口", "model_context_window", "json", "JSON 对象：模型名到 Token 数"],
+        ["模型上下文窗口", "model_context_window", "json", "JSON 对象：模型名到 Token 数"], ["模型价格", "model_costs", "json", "JSON 对象：模型名到 {currency, input, output, cache_read}，currency 可为 USD/CNY(默认 USD)，价格单位为 每 1M tokens；留空用 models.dev 目录价"],
         ["模型输入模态", "model_modalities", "json", "JSON 对象：模型名到 text/image/audio/video/pdf 数组"],
         ["额外请求体", "extra_body", "json", "JSON 对象，留空表示不设置"]
       ];
@@ -8698,6 +8699,15 @@
     usageTip.style.display = "none";
   }
 
+  // 计费估算显示:None/0 → null(不渲染);极小值给足小数位。
+  function usageFmtCost(usd) {
+    if (!Number.isFinite(usd) || usd <= 0) return null;
+    if (usd < 0.01) return `$${usd.toFixed(4)}`;
+    if (usd < 1) return `$${usd.toFixed(3)}`;
+    if (usd < 100) return `$${usd.toFixed(2)}`;
+    return `$${usd.toFixed(1)}`;
+  }
+
   function usageFmt(value) {
     if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
     if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
@@ -8918,10 +8928,17 @@
     const dailyAvg = usageState.range === "1d"
       ? ""
       : ` · 日均 ${(Number(totals.requests || 0) / rangeDayCount(stats)).toFixed(1)} 次`;
+    const costValue = usageFmtCost(totals.cost);
+    const costCoverage = Number(totals.costed_requests || 0) < Number(totals.requests || 0)
+      ? `估算覆盖 ${Number(totals.costed_requests || 0).toLocaleString()}/${Number(totals.requests || 0).toLocaleString()} 次`
+      : "按 models.dev 价格估算";
     elements.usageTiles.innerHTML = `
       <div class="u-tile"><div class="u-tile-label">${icon('<path d="M18 5H7l6 7-6 7h11"/>')}总消耗${delta(totals.total, prev && prev.total)}</div>
         <div class="u-tile-value">${usageFmt(totals.total || 0)}<small>tokens</small></div>
         <div class="u-tile-sub">输入 ${usageFmt(totals.prompt || 0)} · 输出 ${usageFmt(totals.completion || 0)}</div></div>
+      <div class="u-tile"><div class="u-tile-label">${icon('<path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>')}总消费${delta(totals.cost, prev && prev.cost)}</div>
+        <div class="u-tile-value">${costValue ? `≈${costValue}` : "—"}</div>
+        <div class="u-tile-sub">${costValue ? costCoverage : "暂无价格数据"}</div></div>
       <div class="u-tile"><div class="u-tile-label">${icon('<path d="M22 12h-4l-3 8L9 4l-3 8H2"/>')}请求数${delta(totals.requests, prev && prev.requests)}</div>
         <div class="u-tile-value">${Number(totals.requests || 0).toLocaleString()}</div>
         <div class="u-tile-sub">全部请求:对话 + 辅助${dailyAvg}</div></div>
@@ -8969,7 +8986,8 @@
       cell.addEventListener("mousemove", (event) => usageTipShow(
         `<b>${day.date}</b>
          <div class="row"><span>tokens</span><em>${usageFmt(day.total)}</em></div>
-         <div class="row"><span>请求</span><em>${day.requests}</em></div>`, event));
+         <div class="row"><span>请求</span><em>${day.requests}</em></div>${usageFmtCost(day.cost) ? `
+         <div class="row"><span>消费</span><em>≈${usageFmtCost(day.cost)}</em></div>` : ""}`, event));
       cell.addEventListener("mouseleave", usageTipHide);
       wrap.appendChild(cell);
     }
@@ -9006,11 +9024,11 @@
         const chunk = daily.slice(daily.length - (Math.floor(daily.length / 7) - week) * 7,
           daily.length - (Math.floor(daily.length / 7) - week - 1) * 7);
         if (!chunk.length) continue;
-        const merged = { date: chunk[0].date, requests: 0, prompt: 0, completion: 0, cache_read: 0, total: 0 };
+        const merged = { date: chunk[0].date, requests: 0, prompt: 0, completion: 0, cache_read: 0, total: 0, cost: 0 };
         for (const day of chunk) {
           merged.requests += day.requests; merged.prompt += day.prompt;
           merged.completion += day.completion; merged.cache_read += day.cache_read;
-          merged.total += day.total;
+          merged.total += day.total; merged.cost += day.cost || 0;
         }
         slice.push(merged);
       }
@@ -9026,7 +9044,12 @@
       return;
     }
     const HEIGHT = 200;
-    const step = max > 4e6 ? 2e6 : max > 1e6 ? 5e5 : max > 2e5 ? 2e5 : max > 4e4 ? 2e4 : 5e3;
+    // 自适应刻度:目标 3-5 条网格线。老的固定档位在单日过亿 token 时
+    // 会摆出上百条虚线和重叠标签(条纹背景 bug)。
+    const rawStep = max / 4;
+    const stepPow = 10 ** Math.floor(Math.log10(Math.max(1, rawStep)));
+    const stepUnit = rawStep / stepPow;
+    const step = (stepUnit <= 1 ? 1 : stepUnit <= 2 ? 2 : stepUnit <= 5 ? 5 : 10) * stepPow;
     const yLabel = (value, text) => {
       const label = document.createElement("span");
       label.textContent = text;
@@ -9054,14 +9077,15 @@
         column.appendChild(segment);
       }
       slot.appendChild(column);
-      slot.addEventListener("mousemove", (event) => usageTipShow(
+      column.addEventListener("mousemove", (event) => usageTipShow(
         `<b>${day.date.slice(5)}${weekly ? " 起当周" : ""}</b>
          <div class="row"><span><i style="background:var(--chart-1)"></i>新输入</span><em>${usageFmt(fresh)}</em></div>
          <div class="row"><span><i style="background:var(--chart-2)"></i>输出</span><em>${usageFmt(day.completion)}</em></div>
          <div class="row"><span><i style="background:var(--chart-3)"></i>缓存命中</span><em>${usageFmt(day.cache_read)}</em></div>
          <div class="row"><span>请求</span><em>${day.requests}</em></div>
-         <div class="row"><span>合计</span><em>${usageFmt(day.total)}</em></div>`, event));
-      slot.addEventListener("mouseleave", usageTipHide);
+         <div class="row"><span>合计</span><em>${usageFmt(day.total)}</em></div>${usageFmtCost(day.cost) ? `
+         <div class="row"><span>消费</span><em>≈${usageFmtCost(day.cost)}</em></div>` : ""}`, event));
+      column.addEventListener("mouseleave", usageTipHide);
       bars.appendChild(slot);
       const label = document.createElement("span");
       label.textContent = weekly
@@ -9147,9 +9171,9 @@
     const scroll = document.createElement("div");
     scroll.className = "u-table-scroll";
     const table = document.createElement("table");
-    table.className = "u-table";
+    table.className = "u-table u-models-table";
     table.innerHTML = `<thead><tr><th>模型</th><th class="num">占比</th><th class="num">请求</th>
-      <th class="num">输入</th><th class="num">输出</th><th>缓存命中</th></tr></thead>`;
+      <th class="num">输入</th><th class="num">输出</th><th class="num">消费</th><th>缓存命中</th></tr></thead>`;
     const tbody = document.createElement("tbody");
     const tfoot = document.createElement("tfoot");
     table.appendChild(tbody);
@@ -9164,7 +9188,7 @@
     const defCenter = `<div><b>${requests.toLocaleString()}</b><small>次请求</small></div>`;
     center.innerHTML = defCenter;
     if (!models.length || !aggregate.total) {
-      tbody.innerHTML = `<tr><td colspan="6"><div class="u-empty">暂无记录</div></td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7"><div class="u-empty">暂无记录</div></td></tr>`;
       return card;
     }
 
@@ -9177,11 +9201,15 @@
       <td></td><td class="num">${requests}</td>
       <td class="num">${usageFmt(aggregate.prompt || 0)}</td>
       <td class="num">${usageFmt(aggregate.completion || 0)}</td>
+      <td class="num">${usageFmtCost(aggregate.cost) ? `≈${usageFmtCost(aggregate.cost)}` : "—"}</td>
       <td>${sourceHit == null ? "" : `<span class="u-cache-pill">${sourceHit}%</span>`}</td></tr>`;
 
     const RADIUS = 44;
     const CIRCUM = 2 * Math.PI * RADIUS;
-    const GAP = 3;
+    // 单段就是完整圆环;分段间隙只在真的有多段时存在,且不超过最小段
+    // 的一半,防止小切片被间隙吃掉。
+    const minShare = Math.min(...models.map((model) => model.total / aggregate.total));
+    const GAP = models.length > 1 ? Math.min(3, Math.max(0.5, (minShare * CIRCUM) / 2)) : 0;
     let accumulated = 0;
     models.forEach((model, index) => {
       const share = model.total / aggregate.total;
@@ -9190,11 +9218,12 @@
       const hit = usageCacheRate(model.cache_read || 0, model.prompt || 0);
       const row = document.createElement("tr");
       row.innerHTML = `<td class="u-model-name"><b><i class="u-dot" style="background:${color}"></i>${modelName}</b>
-          <small>${model.provider || "—"}</small></td>
+          <small><i class="u-dot" style="visibility:hidden"></i>${model.provider || "—"}</small></td>
         <td class="num">${Math.round(share * 100)}%</td>
         <td class="num">${model.requests}</td>
         <td class="num">${usageFmt(model.prompt || 0)}</td>
         <td class="num">${usageFmt(model.completion || 0)}</td>
+        <td class="num">${usageFmtCost(model.cost) ? `≈${usageFmtCost(model.cost)}` : "—"}</td>
         <td>${hit == null ? "—" : `<span class="u-cache-pill">${hit}%</span>`}</td>`;
       tbody.appendChild(row);
 
@@ -9218,7 +9247,8 @@
            <div class="row"><span>占比</span><em>${Math.round(share * 100)}%</em></div>
            <div class="row"><span>请求</span><em>${model.requests}</em></div>
            <div class="row"><span>输入</span><em>${usageFmt(model.prompt || 0)}</em></div>
-           <div class="row"><span>输出</span><em>${usageFmt(model.completion || 0)}</em></div>
+           <div class="row"><span>输出</span><em>${usageFmt(model.completion || 0)}</em></div>${usageFmtCost(model.cost) ? `
+           <div class="row"><span>消费</span><em>≈${usageFmtCost(model.cost)}</em></div>` : ""}
            <div class="row"><span>缓存命中</span><em>${hit == null ? "—" : `${hit}%`}</em></div>`, event);
       });
       circle.addEventListener("mouseleave", () => {
@@ -9239,7 +9269,7 @@
     const tbody = elements.usageRecords;
     tbody.innerHTML = "";
     if (!records.length) {
-      tbody.innerHTML = `<tr class="u-day-row"><td colspan="7">还没有任何调用记录</td></tr>`;
+      tbody.innerHTML = `<tr class="u-day-row"><td colspan="8">还没有任何调用记录</td></tr>`;
       return;
     }
     const today = new Date();
@@ -9258,7 +9288,7 @@
         const label = key === todayKey ? "今天" : key === yesterdayKey ? "昨天" : "";
         const row = document.createElement("tr");
         row.className = "u-day-row";
-        row.innerHTML = `<td colspan="7">${label ? `${label} · ` : ""}${key.slice(5)}</td>`;
+        row.innerHTML = `<td colspan="8">${label ? `${label} · ` : ""}${key.slice(5)}</td>`;
         tbody.appendChild(row);
       }
       const pad = (n) => String(n).padStart(2, "0");
@@ -9269,6 +9299,7 @@
         <td class="u-model-name"><b>${record.model || "(未标模型)"}</b><small>${record.provider || "—"}</small></td>
         <td class="num">${usageFmt(record.prompt || 0)}</td>
         <td class="num">${usageFmt(record.completion || 0)}</td>
+        <td class="num">${usageFmtCost(record.cost) ? `≈${usageFmtCost(record.cost)}` : "—"}</td>
         <td>${hit == null ? "—" : `<span class="u-cache-pill">${hit}%</span>`}</td>
         <td><span class="u-type-pill ${record.aux ? "t-aux" : "t-chat"}">${record.aux ? "辅助" : "对话"}</span></td>`;
       tbody.appendChild(row);

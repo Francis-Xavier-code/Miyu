@@ -5463,9 +5463,11 @@ async fn usage_stats_web(
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
     let range = crate::state::UsageRange::parse(query.range.as_deref().unwrap_or("1d"));
+    let config = state.manager.lock().unwrap().config.clone();
+    crate::models_cache::ensure_active_metadata(&state.paths, &config);
     let stats = state
         .state_store
-        .usage_stats(range)
+        .usage_stats(range, Some(&config))
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true, "stats": stats })).into_response())
 }
@@ -5487,9 +5489,11 @@ async fn usage_details_web(
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let config = state.manager.lock().unwrap().config.clone();
+    crate::models_cache::ensure_active_metadata(&state.paths, &config);
     let records = state
         .state_store
-        .usage_details(limit, query.src.as_deref(), query.model.as_deref())
+        .usage_details(limit, query.src.as_deref(), query.model.as_deref(), Some(&config))
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true, "records": records })).into_response())
 }

@@ -2388,6 +2388,9 @@ pub struct ProviderConfig {
     pub model_context_window: HashMap<String, usize>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_modalities: HashMap<String, Vec<String>>,
+    /// 手动模型价格,键为模型名;设了就覆盖 models.dev 目录价。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_costs: HashMap<String, ModelCostConfig>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_model: String,
     #[serde(
@@ -2914,6 +2917,30 @@ pub struct MemesPluginConfig {
     pub auto_send_platform_enabled: bool,
     #[serde(default = "default_memes_auto_send_probability")]
     pub auto_send_probability: f32,
+}
+
+/// 手动模型价格(每 1M tokens):目录查不到价的中转/赠送端点用它,
+/// 设了就覆盖 models.dev 的价目。缓存价缺省时按输入价计。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelCostConfig {
+    #[serde(default)]
+    pub currency: CostCurrency,
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default, alias = "cache", skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+}
+
+/// 手动价格的币种。统计聚合统一折算成 USD 展示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CostCurrency {
+    #[default]
+    #[serde(rename = "USD", alias = "usd")]
+    Usd,
+    #[serde(rename = "CNY", alias = "cny", alias = "rmb", alias = "¥")]
+    Cny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3457,6 +3484,7 @@ impl ProviderConfig {
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
             model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
+            model_costs: HashMap::new(),
             default_model: OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
@@ -3475,6 +3503,7 @@ impl ProviderConfig {
             models: Vec::new(),
             model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
+            model_costs: HashMap::new(),
             default_model: String::new(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
@@ -3486,6 +3515,7 @@ impl ProviderConfig {
     pub fn default_templates() -> Vec<Self> {
         let mut providers = vec![Self::default_opencodezen()];
         providers.extend([
+            Self::template("opencodego", "OpenCode Go", "https://opencode.ai/zen/go/v1"),
             Self::template("openai", "OpenAI", "https://api.openai.com/v1"),
             Self::default_anthropic(),
             Self::template("deepseek", "DeepSeek", "https://api.deepseek.com"),
@@ -3517,6 +3547,7 @@ impl ProviderConfig {
             models: Vec::new(),
             model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
+            model_costs: HashMap::new(),
             default_model: String::new(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
@@ -3535,6 +3566,7 @@ impl ProviderConfig {
             models: Vec::new(),
             model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
+            model_costs: HashMap::new(),
             default_model: String::new(),
             timeout_seconds: default_timeout(),
             temperature: default_temperature(),
@@ -4076,6 +4108,19 @@ impl AppConfig {
                     "provider {} anthropic_max_tokens must be greater than 0",
                     provider.id
                 );
+            }
+        }
+        for provider in &self.providers {
+            for (model, cost) in &provider.model_costs {
+                if cost.input < 0.0
+                    || cost.output < 0.0
+                    || cost.cache_read.is_some_and(|price| price < 0.0)
+                {
+                    bail!(
+                        "provider {} model {model} price must be non-negative",
+                        provider.id
+                    );
+                }
             }
         }
         if !(0.0..=1.0).contains(&self.plugins.memes.auto_send_probability) {
@@ -7881,6 +7926,7 @@ mod tests {
             models: vec![],
             model_context_window: HashMap::new(),
             model_modalities: HashMap::new(),
+            model_costs: HashMap::new(),
             default_model: String::new(),
             timeout_seconds: 60,
             temperature: 1.0,

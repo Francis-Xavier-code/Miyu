@@ -6641,6 +6641,7 @@ fn edit_provider_form(
             models,
             model_context_window,
             model_modalities: provider.model_modalities.clone(),
+            model_costs: provider.model_costs.clone(),
             default_model,
             timeout_seconds: timeout,
             temperature,
@@ -6690,6 +6691,15 @@ fn edit_model_form(
     let variant_options =
         thinking_variant_options_for_model(provider, model, stored_variant.as_deref());
     let initial_variant = stored_variant.clone();
+    let cost = provider.model_costs.get(model).copied();
+    let currency_value = cost
+        .map(|cost| match cost.currency {
+            crate::config::CostCurrency::Usd => "USD",
+            crate::config::CostCurrency::Cny => "CNY",
+        })
+        .unwrap_or("")
+        .to_string();
+    let price_text = |value: Option<f64>| value.map(|v| v.to_string()).unwrap_or_default();
     let mut fields = vec![
         Field::modalities(
             t("Supported input", "支持输入"),
@@ -6708,35 +6718,117 @@ fn edit_model_form(
         ),
         thinking_variant_field(&variant_options, stored_variant.as_deref()),
         Field::new("Temperature", provider.temperature.to_string()),
+        Field::new(
+            t(
+                "Price currency (empty = models.dev)",
+                "价格货币 (留空=用 models.dev 目录价)",
+            ),
+            currency_value,
+        )
+        .choices(&["", "USD", "CNY"])
+        .empty_choice_label(t("catalogue", "目录价")),
+        Field::new(
+            t("Input price / 1M tokens", "输入价 / 1M tokens"),
+            price_text(cost.map(|c| c.input)),
+        ),
+        Field::new(
+            t("Output price / 1M tokens", "输出价 / 1M tokens"),
+            price_text(cost.map(|c| c.output)),
+        ),
+        Field::new(
+            t(
+                "Cache-hit price / 1M (empty = input price)",
+                "缓存命中价 / 1M (留空=按输入价)",
+            ),
+            price_text(cost.and_then(|c| c.cache_read)),
+        ),
     ];
-    if !run_form(stdout, t(" EDIT MODEL ", " 编辑模型 "), &mut fields)? {
-        return Ok(false);
-    }
-    let mut modalities = parse_modalities(&fields[0].value);
-    modalities.retain(|item| item != EMBEDDING_MODALITY);
-    if parse_bool_field(&fields[1].value)? {
-        modalities.push(EMBEDDING_MODALITY.to_string());
-    }
-    provider
-        .model_modalities
-        .insert(model.to_string(), modalities);
-    match fields[2].value.trim().parse::<usize>().unwrap_or_default() {
-        0 => {
-            provider.model_context_window.remove(model);
+    loop {
+        if !run_form(stdout, t(" EDIT MODEL ", " 编辑模型 "), &mut fields)? {
+            return Ok(false);
         }
-        value => {
-            provider
-                .model_context_window
-                .insert(model.to_string(), value);
+        // 价格:选了货币才生效;三个价按所选货币记,估算时统一折 USD。
+        match fields[5].value.trim() {
+            "" => {
+                provider.model_costs.remove(model);
+            }
+            currency => {
+                let parse = |value: &str| -> Option<f64> {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    value.parse::<f64>().ok().filter(|price| *price >= 0.0)
+                };
+                let (input, output) = match (parse(&fields[6].value), parse(&fields[7].value)) {
+                    (Some(input), Some(output)) => (input, output),
+                    _ => {
+                        message(
+                            stdout,
+                            t(
+                                "Input and output prices are required non-negative numbers",
+                                "输入价与输出价必须是非负数字",
+                            ),
+                        )?;
+                        continue;
+                    }
+                };
+                let cache_read = match (fields[8].value.trim().is_empty(), parse(&fields[8].value))
+                {
+                    (true, _) => None,
+                    (false, Some(price)) => Some(price),
+                    (false, None) => {
+                        message(
+                            stdout,
+                            t(
+                                "Cache-hit price must be a non-negative number",
+                                "缓存命中价必须是非负数字",
+                            ),
+                        )?;
+                        continue;
+                    }
+                };
+                provider.model_costs.insert(
+                    model.to_string(),
+                    crate::config::ModelCostConfig {
+                        currency: if currency == "CNY" {
+                            crate::config::CostCurrency::Cny
+                        } else {
+                            crate::config::CostCurrency::Usd
+                        },
+                        input,
+                        output,
+                        cache_read,
+                    },
+                );
+            }
         }
+        let mut modalities = parse_modalities(&fields[0].value);
+        modalities.retain(|item| item != EMBEDDING_MODALITY);
+        if parse_bool_field(&fields[1].value)? {
+            modalities.push(EMBEDDING_MODALITY.to_string());
+        }
+        provider
+            .model_modalities
+            .insert(model.to_string(), modalities);
+        match fields[2].value.trim().parse::<usize>().unwrap_or_default() {
+            0 => {
+                provider.model_context_window.remove(model);
+            }
+            value => {
+                provider
+                    .model_context_window
+                    .insert(model.to_string(), value);
+            }
+        }
+        let selected_variant =
+            (!fields[3].value.trim().is_empty()).then(|| fields[3].value.trim().to_string());
+        if selected_variant != initial_variant {
+            thinking_variants.set(&provider.id, model, selected_variant);
+        }
+        provider.temperature = fields[4].value.trim().parse().unwrap_or(1.0);
+        return Ok(true);
     }
-    let selected_variant =
-        (!fields[3].value.trim().is_empty()).then(|| fields[3].value.trim().to_string());
-    if selected_variant != initial_variant {
-        thinking_variants.set(&provider.id, model, selected_variant);
-    }
-    provider.temperature = fields[4].value.trim().parse().unwrap_or(1.0);
-    Ok(true)
 }
 
 fn thinking_variant_field(options: &ThinkingVariantOptions, stored: Option<&str>) -> Field {

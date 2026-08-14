@@ -7053,6 +7053,7 @@ mod tests {
                 vec!["text".to_string(), "image".to_string()],
             )]
             .into(),
+            model_costs: Default::default(),
             default_model: "vision-model".to_string(),
             timeout_seconds: 30,
             temperature: 0.0,
@@ -9140,6 +9141,7 @@ mod tests {
                 models: vec!["test-model".to_string()],
                 model_context_window: Default::default(),
                 model_modalities: Default::default(),
+                model_costs: Default::default(),
                 default_model: "test-model".to_string(),
                 timeout_seconds: 30,
                 temperature: 0.0,

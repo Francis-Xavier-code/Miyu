@@ -7878,6 +7878,7 @@ mod tests {
             models: Vec::new(),
             model_context_window: std::collections::HashMap::new(),
             model_modalities: std::collections::HashMap::new(),
+            model_costs: std::collections::HashMap::new(),
             default_model: String::new(),
             timeout_seconds: 60,
             temperature: 1.0,

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-pub fn register(registry: &mut ToolRegistry, history_file: PathBuf) {
+pub fn register(registry: &mut ToolRegistry, history_file: PathBuf, config: crate::config::AppConfig) {
     registry.register(
         ToolSpec::new(
             "query_token_usage",
@@ -30,23 +30,27 @@ pub fn register(registry: &mut ToolRegistry, history_file: PathBuf) {
             }),
             move |arguments| {
                 let history_file = history_file.clone();
-                async move { query(arguments, history_file).await }
+                let config = config.clone();
+                async move { query(arguments, history_file, config).await }
             },
         )
         .with_display_name(t("Token usage", "用量统计")),
     );
 }
 
-async fn query(arguments: Value, history_file: PathBuf) -> Result<String> {
+async fn query(arguments: Value, history_file: PathBuf, config: crate::config::AppConfig) -> Result<String> {
     let range_key = arguments
         .get("range")
         .and_then(Value::as_str)
         .unwrap_or("1d")
         .to_string();
     let range = crate::state::UsageRange::parse(&range_key);
-    let stats = tokio::task::spawn_blocking(move || usage::usage_stats(&history_file, range))
-        .await
-        .context("usage stats task panicked")??;
+    let stats = tokio::task::spawn_blocking(move || {
+        let price = crate::models_cache::pricing_resolver(&config);
+        usage::usage_stats(&history_file, range, &price)
+    })
+    .await
+    .context("usage stats task panicked")??;
     Ok(format_usage_summary(&stats, &range_key))
 }
 
@@ -76,6 +80,20 @@ pub(crate) fn format_usage_summary(stats: &crate::state::UsageStats, range_key: 
         ),
         format!("请求 {} 次 · 缓存命中率 {hit:.0}%", stats.totals.requests),
     ];
+    if stats.totals.costed_requests > 0 {
+        let coverage = if stats.totals.costed_requests < stats.totals.requests {
+            format!(
+                "(估算覆盖 {}/{} 次请求)",
+                stats.totals.costed_requests, stats.totals.requests
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "估算消费 ≈${:.4}{coverage}",
+            stats.totals.cost
+        ));
+    }
     for source in &stats.sources {
         let name = match source.src.as_str() {
             "agent" => "智能体".to_string(),
@@ -145,7 +163,7 @@ mod tests {
         )
         .unwrap();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, history);
+        register(&mut registry, history, crate::config::AppConfig::default());
         let output = registry
             .call("query_token_usage", r#"{"range":"1d"}"#)
             .await

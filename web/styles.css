@@ -6520,8 +6520,8 @@ body[data-theme="linen"] {
 .u-gridline { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--line); pointer-events: none; }
 .u-bar-slot { flex: 1; min-width: 0; display: flex; justify-content: center; align-items: flex-end;
   position: relative; z-index: 1; height: 100%; }
-.u-bar-slot:hover .u-bar-col { filter: brightness(1.12); }
-.u-bar-col { width: 62%; max-width: 38px; min-width: 5px; display: flex; flex-direction: column-reverse; gap: 2px;
+.u-bar-col:hover { filter: brightness(1.12); }
+.u-bar-col { width: 62%; max-width: 38px; min-width: 5px; min-height: 8px; display: flex; flex-direction: column-reverse; gap: 2px;
   transform-origin: bottom; animation: u-rise .35s ease; }
 @keyframes u-rise { from { transform: scaleY(.35); opacity: .4; } }
 .u-bar-col i:last-of-type { border-radius: 3px 3px 0 0; }
@@ -6585,6 +6585,19 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
 @media (max-width: 720px) {
   .con-inner { padding: 16px 14px 32px; }
   .u-model-body { gap: 16px; }
+  /* 手机端表格:滚动容器不再撑最小宽,列间距收紧,并裁掉次要列——
+     整行塞不进屏幕时宁可少列也不让页面横向溢出。 */
+  .u-table-scroll { min-width: 0; width: 100%; }
+  .u-table th, .u-table td { padding-left: 6px; padding-right: 6px; }
+  /* 模型消耗明细:留 模型/占比/消费/缓存命中,裁 请求/输入/输出。 */
+  .u-models-table th:nth-child(3), .u-models-table td:nth-child(3),
+  .u-models-table th:nth-child(4), .u-models-table td:nth-child(4),
+  .u-models-table th:nth-child(5), .u-models-table td:nth-child(5) { display: none; }
+  /* 最近调用:留 时间/模型/消费/缓存命中/类型,裁 来源/输入/输出。 */
+  .u-records-table th:nth-child(2), .u-records-table td:nth-child(2),
+  .u-records-table th:nth-child(4), .u-records-table td:nth-child(4),
+  .u-records-table th:nth-child(5), .u-records-table td:nth-child(5) { display: none; }
+  .u-donut-wrap { margin-inline: auto; }
 }
 
 /* ═ LaTeX 公式(KaTeX) ═ 块级横向滚动防溢出;颜色随 currentColor 跟主题。 */

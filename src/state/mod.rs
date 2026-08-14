@@ -1839,8 +1839,19 @@ impl StateStore {
         self.state_dir.join("usage-history.jsonl")
     }
 
-    pub fn usage_stats(&self, range: UsageRange) -> Result<usage::UsageStats> {
-        usage::usage_stats(&self.usage_history_file(), range)
+    /// `config` 提供时按 models.dev 单价做计费估算;None 则费用字段全零。
+    pub fn usage_stats(
+        &self,
+        range: UsageRange,
+        config: Option<&crate::config::AppConfig>,
+    ) -> Result<usage::UsageStats> {
+        match config {
+            Some(config) => {
+                let price = crate::models_cache::pricing_resolver(config);
+                usage::usage_stats(&self.usage_history_file(), range, &price)
+            }
+            None => usage::usage_stats(&self.usage_history_file(), range, &|_, _| None),
+        }
     }
 
     pub fn usage_details(
@@ -1848,8 +1859,15 @@ impl StateStore {
         limit: usize,
         src: Option<&str>,
         model: Option<&str>,
+        config: Option<&crate::config::AppConfig>,
     ) -> Result<Vec<usage::UsageRecord>> {
-        usage::usage_details(&self.usage_history_file(), limit, src, model)
+        match config {
+            Some(config) => {
+                let price = crate::models_cache::pricing_resolver(config);
+                usage::usage_details(&self.usage_history_file(), limit, src, model, &price)
+            }
+            None => usage::usage_details(&self.usage_history_file(), limit, src, model, &|_, _| None),
+        }
     }
 
     #[allow(dead_code)]
