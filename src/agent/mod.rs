@@ -1006,6 +1006,13 @@ impl Agent {
         // init) so concurrent turns can each build their own Agent; startup
         // maintenance (prompt-change reset, stale-turn recovery) lives in
         // `prepare_for_turn`.
+        // dev 有自己的记忆/技能(=切人格语义):把 config 的人格指针换成
+        // 保留人格 "dev",此后 MemoryStore/skills 派生目录全部随之隔离。
+        let config = if mode == AgentMode::Dev {
+            config.dev_scoped()
+        } else {
+            config
+        };
         let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
         let system_prompt = with_host_environment(
             with_mode_reminder(base_system_prompt, mode),
@@ -1925,7 +1932,7 @@ impl Agent {
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         }
-        if self.mode != AgentMode::Dev && self.memory.process_after_turn(
+        if self.memory.process_after_turn(
             &diary_input,
             &result.content,
             &self.memory_origin,
@@ -2076,35 +2083,36 @@ impl Agent {
             }
         }
         messages.extend(prepared.hints);
-        if self.mode == AgentMode::Normal {
-            if let Some(mut association) = self.memory.association(&input)? {
-                if association.organization_due {
-                    self.wake_memory_organizer();
-                }
-                if self.memory.association_dedup_enabled() {
-                    // Cross-turn dedup: fossils replay earlier associative
-                    // blocks byte-for-byte, so a line already visible in this
-                    // request adds nothing but tokens. Filtering only shrinks
-                    // the block being built this turn; once a carrying turn is
-                    // hidden by compact or trim, its lines leave the request
-                    // and the memory becomes eligible for injection again.
-                    let seen = visible_association_lines(&messages);
-                    self.memory
-                        .retain_unseen_association(&mut association, &seen);
-                }
-                if !association.facts.is_empty() || !association.episodes.is_empty() {
-                    // v7 Phase 1.1: the associative-memory block rides the turn
-                    // tail instead of `insert(1)`, so the stable history prefix
-                    // in front stays byte-identical for provider prefix caches.
-                    // It lands after `replay_start`, so redo checkpoints freeze
-                    // the recalled snapshot (decision 6).
-                    messages.push(ChatMessage::turn_context(
-                        self.memory.format_association(&association),
-                    ));
-                }
+        // 记忆联想不再按模式关断:dev 的 MemoryStore 指向保留人格 "dev"
+        // 的独立库(构造时作用域化),联想/落库都发生在自己的命名空间里。
+        if let Some(mut association) = self.memory.association(&input)? {
+            if association.organization_due {
+                self.wake_memory_organizer();
+            }
+            if self.memory.association_dedup_enabled() {
+                // Cross-turn dedup: fossils replay earlier associative
+                // blocks byte-for-byte, so a line already visible in this
+                // request adds nothing but tokens. Filtering only shrinks
+                // the block being built this turn; once a carrying turn is
+                // hidden by compact or trim, its lines leave the request
+                // and the memory becomes eligible for injection again.
+                let seen = visible_association_lines(&messages);
+                self.memory
+                    .retain_unseen_association(&mut association, &seen);
+            }
+            if !association.facts.is_empty() || !association.episodes.is_empty() {
+                // v7 Phase 1.1: the associative-memory block rides the turn
+                // tail instead of `insert(1)`, so the stable history prefix
+                // in front stays byte-identical for provider prefix caches.
+                // It lands after `replay_start`, so redo checkpoints freeze
+                // the recalled snapshot (decision 6).
+                messages.push(ChatMessage::turn_context(
+                    self.memory.format_association(&association),
+                ));
             }
         }
-        {
+        // dev 目录里没有表情包工具,提醒只会指向不存在的工具——不发。
+        if self.mode != AgentMode::Dev {
             if let Some(reminder) =
                 memes::auto_meme_reminder(&self.config, &input, self.platform_context.is_some())
             {
@@ -2159,7 +2167,7 @@ impl Agent {
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
         }
-        if self.mode != AgentMode::Dev && self.memory.process_after_turn(
+        if self.memory.process_after_turn(
             // C10 三份内容分离(最小实现):日记读平台包装前的原文快照,
             // 而不是带指令样板和群聊记录块的完整 prompt 内容。
             self.memory_content.as_deref().unwrap_or(&input),

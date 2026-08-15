@@ -202,7 +202,13 @@ fn acquire_lock(lock_path: PathBuf) -> Result<File> {
         .open(lock_path)?;
     let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
-        bail!("Miyu Web core is starting or temporarily unavailable");
+        bail!(
+            "{}",
+            crate::i18n::text(
+                "another Miyu core (the daemon or another direct REPL) holds this home; stop it (miyu daemon stop) or drop MIYU_DIRECT to attach to the daemon",
+                "另一个 Miyu 核心(daemon 或另一个直连 REPL)正占用本机身份;直连模式与它互斥——先 miyu daemon stop,或去掉 MIYU_DIRECT 改为连接 daemon"
+            )
+        );
     }
     Ok(lock_file)
 }
@@ -322,6 +328,9 @@ pub enum Command {
     ListSessions {
         #[serde(default)]
         include_archived: bool,
+        /// `dev` 列开发模式会话(保留人格 "dev" 名下);缺省=当前人格。
+        #[serde(default)]
+        mode: Option<String>,
     },
     CreateSession {
         #[serde(default)]

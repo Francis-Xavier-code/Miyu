@@ -2696,10 +2696,30 @@ async fn handle_session_command(
     let store = &state.state_store;
     let persona = active_persona_scope(state);
     match command {
-        IpcCommand::ListSessions { include_archived } => {
-            let current = store.session_id();
+        IpcCommand::ListSessions {
+            include_archived,
+            mode,
+        } => {
+            // dev 列表以 dev REPL 指针为"当前":全局指针指向普通会话,
+            // 用它高亮永远落空。
+            let dev = mode.as_deref() == Some("dev");
+            let scope = if dev {
+                crate::state::DEV_PERSONA.to_string()
+            } else {
+                persona.clone()
+            };
+            let current = if dev {
+                store
+                    .repl_session(crate::state::DEV_PERSONA)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into()
+            } else {
+                store.session_id()
+            };
             let sessions = store
-                .list_local_sessions(&persona, include_archived)
+                .list_local_sessions(&scope, include_archived)
                 .map_err(|error| safe_error_message(&error))?;
             let sessions: Vec<Value> = sessions
                 .iter()
@@ -3281,7 +3301,13 @@ fn resolve_local_session_ref_with_kinds(
     let is_platform = store
         .is_platform_session(&record.session_id)
         .map_err(|error| safe_error_message(&error))?;
-    if record.persona != persona || !kinds.contains(&record.kind.as_str()) || is_platform {
+    // 人格过滤只约束按名寻址与当前指针:显式 id 是不可猜测的能力凭据,
+    // 且 dev 会话(保留人格 "dev")必须能被 dev REPL 按 id 操作——否则
+    // 起回合/切换/指针全部 404(验收问题二:dev 首启即被踢回默认会话)。
+    let persona_ok = record.persona == persona
+        || record.persona == crate::state::DEV_PERSONA
+        || matches!(target, ipc::SessionRef::Id { .. });
+    if !persona_ok || !kinds.contains(&record.kind.as_str()) || is_platform {
         return Err(t("session not found", "找不到该会话").to_string());
     }
     Ok(record)
@@ -10950,6 +10976,7 @@ mod tests {
             &state,
             IpcCommand::ListSessions {
                 include_archived: true,
+                mode: None,
             },
         )
         .await
@@ -11101,6 +11128,7 @@ mod tests {
             &state,
             IpcCommand::ListSessions {
                 include_archived: false,
+                mode: None,
             },
         )
         .await
@@ -11379,6 +11407,72 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn dev_sessions_resolve_by_id_and_list_under_dev_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        state
+            .state_store
+            .adopt_sessions_for_persona(&persona)
+            .unwrap();
+        let dev = state
+            .state_store
+            .create_session(crate::state::DEV_PERSONA, "编译修复", "user", None)
+            .unwrap();
+
+        // 验收问题二:显式 id 寻址必须穿过人格过滤,否则 dev REPL 的
+        // 起回合/切换全部 404 并落回默认会话。
+        let resolved = resolve_local_session_ref(
+            &state,
+            &ipc::SessionRef::Id {
+                id: dev.session_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.session_id, dev.session_id);
+        assert_eq!(resolved.persona, crate::state::DEV_PERSONA);
+
+        // dev 会话不进普通人格的名字空间;dev 模式列表只见 dev 会话。
+        assert!(resolve_local_session_ref(
+            &state,
+            &ipc::SessionRef::Name {
+                name: "编译修复".to_string(),
+            },
+        )
+        .is_err());
+        let listed = handle_session_command(
+            &state,
+            IpcCommand::ListSessions {
+                include_archived: false,
+                mode: Some("dev".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![dev.session_id.as_str()]);
+        let normal = handle_session_command(
+            &state,
+            IpcCommand::ListSessions {
+                include_archived: false,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(normal["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session_id"].as_str() != Some(dev.session_id.as_str())));
     }
 
     #[test]

@@ -6260,17 +6260,27 @@ fn select_session_target(
 
 /// Resolves a user-typed `/session` / `/delete` argument into a session ref:
 /// a number picks from the visible session list, anything else is a name.
+/// REPL 会话列表的作用域:dev REPL 只看/只解析 dev 人格名下的会话。
+fn repl_list_mode(mode: AgentMode) -> Option<String> {
+    (mode == AgentMode::Dev).then(|| "dev".to_string())
+}
+
 async fn resolve_repl_session_target(
     paths: &MiyuPaths,
     live: &mut LiveReplTail,
+    mode: AgentMode,
     arg: &str,
 ) -> Result<Option<crate::ipc::SessionRef>> {
-    if let Ok(index) = arg.parse::<usize>() {
+    let index = arg.parse::<usize>().ok();
+    // 名字寻址在 daemon 侧按"当前人格"检索,够不着 dev 会话;dev REPL
+    // 统一走列表在客户端配对,再降成不可猜的 id 显式寻址。
+    if index.is_some() || mode == AgentMode::Dev {
         let Some((_, data)) = repl_ipc_admin(
             paths,
             live,
             IpcCommand::ListSessions {
                 include_archived: false,
+                mode: repl_list_mode(mode),
             },
         )
         .await?
@@ -6278,12 +6288,21 @@ async fn resolve_repl_session_target(
             return Ok(None);
         };
         let entries = session_list_entries(&data);
-        let Some(target) = session_ref_from_index(&entries, index) else {
+        let target = match index {
+            Some(index) => session_ref_from_index(&entries, index),
+            None => entries
+                .iter()
+                .find(|entry| entry.name == arg)
+                .map(|entry| crate::ipc::SessionRef::Id {
+                    id: entry.id.clone(),
+                }),
+        };
+        let Some(target) = target else {
             repl_note(
                 live,
                 &format!(
-                    "\x1b[2m{}: {index}\x1b[0m\n",
-                    t("no session with this number", "没有这个编号的会话")
+                    "\x1b[2m{}: {arg}\x1b[0m\n",
+                    t("no such session", "没有这个会话")
                 ),
             )?;
             return Ok(None);
@@ -6391,12 +6410,27 @@ async fn repl_get_session_state(
 async fn repl_fallback_session_state(
     paths: &MiyuPaths,
     live: &mut LiveReplTail,
+    mode: AgentMode,
 ) -> Result<Option<ipc::SessionState>> {
+    // dev 无普通人格的"终端会话"可退:GetReplSession 会治愈指针并在
+    // 没有 dev 会话时就地自举一个,绝不落回普通人格的会话。
+    if mode == AgentMode::Dev {
+        return Ok(repl_ipc_admin(
+            paths,
+            live,
+            IpcCommand::GetReplSession {
+                mode: Some("dev".to_string()),
+            },
+        )
+        .await?
+        .map(|(state, _)| state));
+    }
     let Some((_, data)) = repl_ipc_admin(
         paths,
         live,
         IpcCommand::ListSessions {
             include_archived: false,
+            mode: None,
         },
     )
     .await?
@@ -6428,6 +6462,7 @@ async fn repl_fallback_session_state(
 async fn repl_pick_session(
     paths: &MiyuPaths,
     live: &mut LiveReplTail,
+    mode: AgentMode,
     active_session_id: &str,
 ) -> Result<Option<ipc::SessionState>> {
     let mut cursor = None;
@@ -6438,6 +6473,7 @@ async fn repl_pick_session(
             live,
             IpcCommand::ListSessions {
                 include_archived: false,
+                mode: repl_list_mode(mode),
             },
         )
         .await?
@@ -6452,7 +6488,7 @@ async fn repl_pick_session(
             )?;
             // Deleting the last session leaves the daemon to mint a fresh one.
             return if lost_active {
-                repl_fallback_session_state(paths, live).await
+                repl_fallback_session_state(paths, live, mode).await
             } else {
                 Ok(None)
             };
@@ -6460,7 +6496,7 @@ async fn repl_pick_session(
         match select_session_target(&entries, Some(active_session_id), cursor)? {
             SessionPick::Cancelled => {
                 return if lost_active {
-                    repl_fallback_session_state(paths, live).await
+                    repl_fallback_session_state(paths, live, mode).await
                 } else {
                     Ok(None)
                 };
@@ -6480,7 +6516,7 @@ async fn repl_pick_session(
                 .await?;
                 if deleted.is_none() {
                     return if lost_active {
-                        repl_fallback_session_state(paths, live).await
+                        repl_fallback_session_state(paths, live, mode).await
                     } else {
                         Ok(None)
                     };
@@ -6537,6 +6573,7 @@ async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: &str) -> Result<Str
         paths,
         IpcCommand::ListSessions {
             include_archived: true,
+            mode: None,
         },
     )
     .await?;
@@ -6566,6 +6603,7 @@ async fn resolve_cli_session_target(
             paths,
             IpcCommand::ListSessions {
                 include_archived: false,
+                mode: None,
             },
         )
         .await?;
@@ -6630,6 +6668,7 @@ async fn cli_pick_session(
                     paths,
                     IpcCommand::ListSessions {
                         include_archived: false,
+                        mode: None,
                     },
                 )
                 .await?;
@@ -6659,6 +6698,7 @@ async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Resu
             paths,
             IpcCommand::ListSessions {
                 include_archived: false,
+                mode: None,
             },
         )
         .await?;
@@ -7135,17 +7175,15 @@ fn print_variant_updated() {
 
 fn print_mode_help() {
     if crate::i18n::is_zh() {
-        println!("Miyu 现在按模式进入会话(创建时定死,中途不可切换):\n");
-        println!("  miyu normal   普通模式——人格、记忆、全量工具,日常主力");
-        println!("  miyu dev      开发模式——一行提示词、极简编码工具、无人格");
-        println!("\n一次性提问不变:miyu \"问题\"(普通模式)。");
-        println!("想让裸 miyu 直接进某个模式:config.jsonc 设 default_mode = \"normal\" 或 \"dev\"。");
+        println!("请选择模式。想让裸 miyu 命令直接进某个模式,可以在设置中修改(config.jsonc 的 default_mode)。\n");
+        println!("  miyu normal   普通模式。可使用全部工具,适合日常使用。支持角色扮演、娱乐聊天、记忆、技能等全部能力。");
+        println!("  miyu dev      开发模式。与普通模式明确区分,用于开发工作;移除与开发无关的角色扮演与娱乐工具,提示词极简可编辑,记忆独立。");
+        println!("  miyu '<your_prompts>'   使用普通模式进行一次性对话");
     } else {
-        println!("Miyu enters a session by mode (fixed at creation, no mid-session switch):\n");
-        println!("  miyu normal   full-capability persona mode");
-        println!("  miyu dev      minimal coding mode (one-line prompt, no persona)");
-        println!("\nOne-shot asks are unchanged: miyu \"question\" (normal mode).");
-        println!("Set default_mode = \"normal\" | \"dev\" in config.jsonc to skip this screen.");
+        println!("Pick a mode. To make bare `miyu` enter one directly, set default_mode in config.jsonc.\n");
+        println!("  miyu normal   full-capability mode: persona, memory, every tool.");
+        println!("  miyu dev      development mode: minimal editable prompt, coding tools only, separate memory.");
+        println!("  miyu '<your_prompts>'   one-shot ask in normal mode");
     }
 }
 
@@ -7412,13 +7450,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 ReplSlashCommand::Session => {
                     let arg = command_args.trim();
                     let state = if arg.is_empty() {
-                        match repl_pick_session(paths, &mut live_repl, &active_session_id).await? {
+                        match repl_pick_session(paths, &mut live_repl, mode, &active_session_id).await? {
                             Some(state) => state,
                             None => continue,
                         }
                     } else {
                         let target =
-                            match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
+                            match resolve_repl_session_target(paths, &mut live_repl, mode, arg).await? {
                                 Some(target) => target,
                                 None => continue,
                             };
@@ -7492,7 +7530,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         &mut live_repl,
                         &format!("\x1b[2m{}\x1b[0m", t("session archived", "当前会话已归档")),
                     )?;
-                    let Some(state) = repl_fallback_session_state(paths, &mut live_repl).await?
+                    let Some(state) = repl_fallback_session_state(paths, &mut live_repl, mode).await?
                     else {
                         continue;
                     };
@@ -7515,7 +7553,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             id: active_session_id.clone(),
                         }
                     } else {
-                        match resolve_repl_session_target(paths, &mut live_repl, arg).await? {
+                        match resolve_repl_session_target(paths, &mut live_repl, mode, arg).await? {
                             Some(target) => target,
                             None => continue,
                         }
@@ -7558,7 +7596,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     )?;
                     if deleted_active {
                         let Some(state) =
-                            repl_fallback_session_state(paths, &mut live_repl).await?
+                            repl_fallback_session_state(paths, &mut live_repl, mode).await?
                         else {
                             continue;
                         };
@@ -8065,6 +8103,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     // reloaded rather than left showing them.
                     cumulative_tokens = TurnTokens::default();
                     footer.reset_token_usage(state.context_tokens, state.context_window);
+                    // 存下新数字还不够:footer 不重绘,屏幕上的 Σ 就一直
+                    // 挂着重置前的累计(验收问题四)。
+                    live_repl.refresh_footer(footer.clone())?;
                     reload_repl_queue(&mut live_repl, paths, &active_session_id)?;
                     repl_note(
                         &mut live_repl,
@@ -8096,6 +8137,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     live_repl.editor.cursor = 0;
                     cumulative_tokens = TurnTokens::default();
                     footer.reset_token_usage(state.context_tokens, state.context_window);
+                    live_repl.refresh_footer(footer.clone())?;
                     reload_repl_queue(&mut live_repl, paths, &active_session_id)?;
                     repl_note(
                         &mut live_repl,
@@ -8569,11 +8611,13 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
             run_reset(paths).await?;
-            if let Some(live) = live_repl.as_mut() {
-                live.queued.clear();
-            }
             cumulative_tokens = TurnTokens::default();
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
+            // 直连道同病同修(验收问题四):不重绘,Σ 旧数一直挂在屏上。
+            if let Some(live) = live_repl.as_mut() {
+                live.queued.clear();
+                live.refresh_footer(footer.clone())?;
+            }
             continue;
         }
         if command.eq_ignore_ascii_case("/wipe") {
@@ -8583,12 +8627,13 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                 continue;
             }
             run_wipe(paths, true).await?;
-            if let Some(live) = live_repl.as_mut() {
-                live.queued.clear();
-            }
             agent.reset_memory()?;
             cumulative_tokens = TurnTokens::default();
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
+            if let Some(live) = live_repl.as_mut() {
+                live.queued.clear();
+                live.refresh_footer(footer.clone())?;
+            }
             continue;
         }
         if command.eq_ignore_ascii_case("/goal") {

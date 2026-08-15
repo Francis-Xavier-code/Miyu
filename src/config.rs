@@ -5274,6 +5274,15 @@ impl AppConfig {
         persona_scope_name(self.prompt.active_persona.trim())
     }
 
+    /// Dev 模式的作用域配置:人格指针换成保留人格 "dev",记忆/技能目录
+    /// 随之落入独立命名空间。键是常量人格名而非提示词内容——编辑
+    /// dev-prompt.md 只改提示词,永远不会切库丢记忆。
+    pub fn dev_scoped(&self) -> AppConfig {
+        let mut config = self.clone();
+        config.prompt.active_persona = crate::state::DEV_PERSONA.to_string();
+        config
+    }
+
     pub fn active_persona_memory_data_dir(&self, paths: &MiyuPaths) -> PathBuf {
         self.persona_memory_data_dir(paths, self.prompt.active_persona.trim())
     }

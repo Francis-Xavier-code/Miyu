@@ -493,10 +493,10 @@ pub fn uses_load_tools(mode: &str) -> bool {
 /// 删除)。只注册编码核心:run_command+后台任务管理、读写/补丁/字符串
 /// 编辑、grep/glob,外加 task 子代理、todo、web 检索、知识库与 MCP
 /// (常驻还是 stub 由各工具 descriptions 的 always_loaded 决定,stub
-/// 加载模式下数组字节恒定)。人格/娱乐/平台/记忆类一概**不注册**——
-/// 不是 stub 化,是不存在;记忆工具待独立 dev 命名空间落地后再进
-/// (直接注册会写脏默认 Miyu 人格的记忆库)。ask_question 等界面
-/// 胶水与 normal 同路,由 daemon/CLI 按 surface 追加。
+/// 加载模式下数组字节恒定)。人格/娱乐/平台类一概**不注册**——不是
+/// stub 化,是不存在。记忆工具**注册**,但作用域切到保留人格 "dev"
+/// 的独立命名空间(`dev_scoped`),不会写脏默认 Miyu 人格的记忆库。
+/// ask_question 等界面胶水与 normal 同路,由 daemon/CLI 按 surface 追加。
 pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
@@ -514,6 +514,11 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     }
     if config.plugins.knowledge_base.enabled {
         knowledge_base::register(&mut registry, config.clone(), paths.clone());
+    }
+    if config.memory_config().enabled {
+        // dev 独立记忆:同一套工具,库切到保留人格 "dev" 的命名空间,
+        // 与默认人格的记忆互不可见(验收问题一:开发模式也要有记忆)。
+        memory::register(&mut registry, config.dev_scoped(), paths.clone());
     }
     let task_tools = registry.clone();
     task::register(&mut registry, config.clone(), paths.clone(), task_tools);
