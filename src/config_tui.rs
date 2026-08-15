@@ -1259,22 +1259,13 @@ fn edit_custom_prompts(
 ) -> Result<()> {
     let mut selected = 0usize;
     loop {
-        let persona = if config.prompt.active_persona.trim().is_empty() {
-            "Miyu".to_string()
-        } else {
-            persona_display_name(&config.prompt.active_persona).to_string()
-        };
         let options = [
-            format!(
-                "{} ({}: {persona})",
-                t("AI persona", "AI 人格"),
-                t("Current", "当前")
-            ),
-            t("User identity", "用户身份").to_string(),
+            t("Normal mode", "普通模式").to_string(),
+            t("Dev mode", "开发模式").to_string(),
             // 08-15 A/B 二轮:干净体制下预设对话单独已满分,提醒降为可关
             // 开关;重噪声 QQ 长群聊体制未复测,默认保持启用。
             format!(
-                "{} ({})",
+                "{}: {}",
                 t("Anti-amnesia reminder", "防失忆提醒"),
                 if config.prompt.persona_reminder {
                     t("Enabled", "启用")
@@ -1297,14 +1288,88 @@ fn edit_custom_prompts(
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter if selected == 0 => edit_personas(stdout, paths, config)?,
-            KeyCode::Enter if selected == 1 => edit_identities(stdout, paths, config)?,
+            KeyCode::Enter if selected == 0 => edit_normal_mode_prompts(stdout, paths, config)?,
+            KeyCode::Enter if selected == 1 => edit_dev_prompt(stdout, paths)?,
             KeyCode::Enter if selected == 2 => {
                 config.prompt.persona_reminder = !config.prompt.persona_reminder;
             }
             _ => {}
         }
     }
+}
+
+/// 普通模式的提示词面:AI 人格与用户身份(原顶层两项下沉至此)。
+fn edit_normal_mode_prompts(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &mut AppConfig,
+) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let persona = if config.prompt.active_persona.trim().is_empty() {
+            "Miyu".to_string()
+        } else {
+            persona_display_name(&config.prompt.active_persona).to_string()
+        };
+        let options = [
+            format!(
+                "{} ({}: {persona})",
+                t("AI persona", "AI 人格"),
+                t("Current", "当前")
+            ),
+            t("User identity", "用户身份").to_string(),
+        ];
+        draw_menu(
+            stdout,
+            t(" NORMAL MODE ", " 普通模式 "),
+            &options,
+            selected,
+            t("[Enter]select [q]back", "[Enter]选择 [q]返回"),
+        )?;
+        match read_key()? {
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter if selected == 0 => edit_personas(stdout, paths, config)?,
+            KeyCode::Enter if selected == 1 => edit_identities(stdout, paths, config)?,
+            _ => {}
+        }
+    }
+}
+
+/// 开发模式的「AI 提示词」:编辑 config/dev-prompt.md 一个文件。清空
+/// 保存=删文件,运行时回退内置默认一行;记忆按保留人格 "dev" 落库,
+/// 与这份提示词的内容完全解耦——怎么改都不会切库。
+fn edit_dev_prompt(stdout: &mut io::Stdout, paths: &MiyuPaths) -> Result<()> {
+    let path = paths.config_dir.join(crate::config::DEV_PROMPT_FILE);
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let prefill = if current.trim().is_empty() {
+        crate::config::DEFAULT_DEV_SYSTEM_PROMPT.to_string()
+    } else {
+        current.trim_end().to_string()
+    };
+    let mut fields = vec![Field::textarea(
+        t(
+            "AI prompt (empty = built-in default)",
+            "AI 提示词(清空=恢复内置默认)",
+        ),
+        prefill,
+    )];
+    if !run_form(stdout, t(" DEV MODE ", " 开发模式 "), &mut fields)? {
+        return Ok(());
+    }
+    let value = fields[0].value.trim();
+    if value.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, format!("{value}\n"))?;
+    }
+    Ok(())
 }
 
 fn edit_personas(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -> Result<()> {
@@ -1646,8 +1711,8 @@ fn persona_aux_fields(hint: String, dialogs: String, miyu: bool) -> Vec<Field> {
                 "防失忆提示(清空=恢复内置默认)",
             ),
             t(
-                "Preset dialogs (user:/assistant: lines; empty = built-in default)",
-                "预设对话(user:/assistant: 开头的行,清空=恢复内置默认)",
+                "Preset dialogs (Enter = list editor; empty = built-in default)",
+                "预设对话(回车进列表编辑,清空=恢复内置默认)",
             ),
         )
     } else {
@@ -1657,14 +1722,14 @@ fn persona_aux_fields(hint: String, dialogs: String, miyu: bool) -> Vec<Field> {
                 "防失忆提示(留空=自动蒸馏)",
             ),
             t(
-                "Preset dialogs (lines starting with user:/assistant:)",
-                "预设对话(user:/assistant: 开头的行)",
+                "Preset dialogs (Enter = list editor)",
+                "预设对话(回车进列表编辑)",
             ),
         )
     };
     vec![
         Field::textarea(hint_label, hint),
-        Field::textarea(dialogs_label, dialogs),
+        Field::dialog_list(dialogs_label, dialogs),
     ]
 }
 
@@ -2113,6 +2178,17 @@ fn sanitize_persona_name(value: &str) -> Result<String> {
             t(
                 "system-prompt.md is reserved",
                 "system-prompt.md 是保留文件名"
+            )
+        );
+    }
+    // "dev" 是开发模式的保留人格(记忆/技能命名空间挂其名下);同名
+    // 用户人格会与 dev 模式共享记忆库,必须挡在创建入口。
+    if persona_display_name(&name).eq_ignore_ascii_case(crate::state::DEV_PERSONA) {
+        bail!(
+            "{}",
+            t(
+                "\"dev\" is reserved for dev mode",
+                "\"dev\" 是开发模式的保留名"
             )
         );
     }
@@ -7216,6 +7292,10 @@ fn run_form_from(
                 )?;
                 cursors[selected] = fields[selected].value.chars().count();
             }
+            KeyCode::Enter if !editing && fields[selected].dialog_list => {
+                edit_dialog_list(stdout, &mut fields[selected].value)?;
+                cursors[selected] = fields[selected].value.chars().count();
+            }
             KeyCode::Enter if !editing && fields[selected].textarea => {
                 edit_textarea(stdout, &mut fields[selected].value)?;
                 cursors[selected] = fields[selected].value.chars().count();
@@ -7699,6 +7779,95 @@ fn parse_provider_model_choice(value: &str) -> (String, String) {
         return (provider.trim().to_string(), model.trim().to_string());
     }
     (value.to_string(), String::new())
+}
+
+/// 预设对话列表式编辑器(验收 #19):每行一对 user/assistant,回车编辑、
+/// [a] 新增、[d] 删除;退出时把列表写回 `user:`/`assistant:` 行格式,
+/// 与手写 dialogs 文件同构,存量文件无需迁移。
+fn edit_dialog_list(stdout: &mut io::Stdout, value: &mut String) -> Result<()> {
+    let mut pairs = crate::persona_hint::parse_dialogs(value);
+    let mut selected = 0usize;
+    loop {
+        let mut options: Vec<String> = pairs
+            .iter()
+            .map(|(question, answer)| {
+                format!(
+                    "user: {}  assistant: {}",
+                    truncate(question.lines().next().unwrap_or(""), 20),
+                    truncate(answer.lines().next().unwrap_or(""), 20),
+                )
+            })
+            .collect();
+        if options.is_empty() {
+            options.push(t("(no preset dialogs)", "(暂无预设对话)").to_string());
+        }
+        selected = selected.min(options.len() - 1);
+        draw_menu(
+            stdout,
+            t(" PRESET DIALOGS ", " 预设对话 "),
+            &options,
+            selected,
+            t(
+                "[Enter]edit [a]add [d]delete [j/k]move [q]done",
+                "[Enter]编辑 [a]新增 [d]删除 [j/k]移动 [q]完成",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                *value = crate::persona_hint::format_dialogs(&pairs);
+                return Ok(());
+            }
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Char('a') => {
+                if let Some(pair) =
+                    edit_dialog_pair(stdout, t(" NEW DIALOG ", " 新增对话 "), "", "")?
+                {
+                    pairs.push(pair);
+                    selected = pairs.len() - 1;
+                }
+            }
+            KeyCode::Enter if !pairs.is_empty() => {
+                let (question, answer) = pairs[selected].clone();
+                if let Some(pair) = edit_dialog_pair(
+                    stdout,
+                    t(" EDIT DIALOG ", " 编辑对话 "),
+                    &question,
+                    &answer,
+                )? {
+                    pairs[selected] = pair;
+                }
+            }
+            KeyCode::Char('d') if !pairs.is_empty() => {
+                pairs.remove(selected);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// user/assistant 双框表单:打开即落在 user 框内直接输入,回车确认后
+/// j 移到 assistant 框。空的一侧视为放弃(与 `parse_dialogs` 丢弃
+/// 空对的语义一致)。
+fn edit_dialog_pair(
+    stdout: &mut io::Stdout,
+    title: &str,
+    question: &str,
+    answer: &str,
+) -> Result<Option<(String, String)>> {
+    let mut fields = vec![
+        Field::new("user", question.to_string()),
+        Field::new("assistant", answer.to_string()),
+    ];
+    if !run_form_editing(stdout, title, &mut fields)? {
+        return Ok(None);
+    }
+    let question = fields[0].value.trim().to_string();
+    let answer = fields[1].value.trim().to_string();
+    if question.is_empty() || answer.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((question, answer)))
 }
 
 fn edit_textarea(stdout: &mut io::Stdout, value: &mut String) -> Result<()> {
@@ -8221,6 +8390,9 @@ struct Field {
     label: &'static str,
     value: String,
     textarea: bool,
+    /// 预设对话列表:Enter 进入列表式子编辑器而不是 $EDITOR(验收 #19),
+    /// value 仍是 `user:`/`assistant:` 行格式的序列化文本。
+    dialog_list: bool,
     sensitive: bool,
     boolean: bool,
     modalities: bool,
@@ -8235,6 +8407,7 @@ impl Field {
             label,
             value,
             textarea: false,
+            dialog_list: false,
             sensitive: false,
             boolean: false,
             modalities: false,
@@ -8249,6 +8422,7 @@ impl Field {
             label,
             value: value.to_string(),
             textarea: false,
+            dialog_list: false,
             sensitive: false,
             boolean: true,
             modalities: false,
@@ -8263,12 +8437,20 @@ impl Field {
             label,
             value,
             textarea: true,
+            dialog_list: false,
             sensitive: false,
             boolean: false,
             modalities: false,
             choices: Vec::new(),
             empty_choice_label: t("Use current provider", "使用当前 Provider"),
             raw_choice_labels: false,
+        }
+    }
+
+    fn dialog_list(label: &'static str, value: String) -> Self {
+        Self {
+            dialog_list: true,
+            ..Self::textarea(label, value)
         }
     }
 
@@ -8287,6 +8469,7 @@ impl Field {
             label,
             value,
             textarea: false,
+            dialog_list: false,
             sensitive: false,
             boolean: false,
             modalities: true,

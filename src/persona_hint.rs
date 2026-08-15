@@ -126,7 +126,7 @@ pub fn load_dialogs(config: &AppConfig, paths: &MiyuPaths, scope: &str) -> Vec<(
 /// `user:` 行开新的用户消息,`assistant:` 行开对应回复(标记大小写不
 /// 敏感,冒号全半角均可),后续无标记行并入当前段(保留换行);没有配到
 /// 回复的尾部 user 丢弃,防止注入无应答的 user 消息。
-fn parse_dialogs(raw: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_dialogs(raw: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut question: Option<String> = None;
     let mut answer: Option<String> = None;
@@ -156,6 +156,24 @@ fn parse_dialogs(raw: &str) -> Vec<(String, String)> {
     }
     flush(&mut question, &mut answer);
     pairs
+}
+
+/// `parse_dialogs` 的逆:对列表写回 `user:`/`assistant:` 行格式,对与
+/// 对之间空一行(纯可读性,解析忽略)。多行内容靠续行进位,往返无损。
+pub(crate) fn format_dialogs(pairs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (index, (question, answer)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str("user: ");
+        out.push_str(question);
+        out.push('\n');
+        out.push_str("assistant: ");
+        out.push_str(answer);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// 行首角色标记 `<role>:`(ASCII 大小写不敏感,冒号全半角均可)。
@@ -328,6 +346,18 @@ async fn distill(client: &OpenAiCompatibleClient, persona: &str) -> Result<Disti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_pairs_round_trip_through_line_format() {
+        // TUI 列表编辑器(验收 #19)靠这一对函数存取:多行内容走续行,
+        // 序列化→解析必须无损,否则每次进出编辑器都会磨损内容。
+        let pairs = vec![
+            ("你好".to_string(), "嗯,在。".to_string()),
+            ("多行\n第二行".to_string(), "回答\n也两行".to_string()),
+        ];
+        assert_eq!(parse_dialogs(&format_dialogs(&pairs)), pairs);
+        assert_eq!(format_dialogs(&[]), "");
+    }
 
     #[test]
     fn distill_output_terse_appends_fixed_clause() {
