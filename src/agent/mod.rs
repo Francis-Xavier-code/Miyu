@@ -1728,6 +1728,13 @@ impl Agent {
         self.prepare_for_turn()
     }
 
+    /// /reset-memory:清空本模式人格的长期记忆(会话历史/技能不动),
+    /// 然后重建句柄。dev 作用域由构造期的 dev_scoped 配置自动继承。
+    pub fn wipe_memory(&mut self) -> Result<()> {
+        self.memory.reset_all(false)?;
+        self.reset_memory()
+    }
+
     pub fn reset_memory(&mut self) -> Result<()> {
         let (access, writer_principal, writer_display_name) = self.memory.request_context();
         self.memory = MemoryStore::new(&self.config, &self.paths).with_request_context(

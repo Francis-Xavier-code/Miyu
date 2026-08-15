@@ -7839,6 +7839,42 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     footer.update_context_window(state.context_window);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
+                ReplSlashCommand::ResetMemory => {
+                    if !confirm_inline(
+                        &mut live_repl,
+                        t(
+                            "erase this mode's long-term memory (facts, diary, episodes)? conversations stay",
+                            "确认清空当前模式的长期记忆（事实/日记/经历）？会话历史保留",
+                        ),
+                    )? {
+                        repl_note(
+                            &mut live_repl,
+                            &format!("\x1b[2m{}\x1b[0m\n", t("cancelled", "已取消")),
+                        )?;
+                        continue;
+                    }
+                    let Some((_, _)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::ResetMemory {
+                            mode: (mode == AgentMode::Dev).then(|| "dev".to_string()),
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    repl_note(
+                        &mut live_repl,
+                        &format!(
+                            "\x1b[2m{}\x1b[0m\n",
+                            t(
+                                "long-term memory erased; conversations untouched",
+                                "长期记忆已清空；会话历史未动"
+                            )
+                        ),
+                    )?;
+                }
                 ReplSlashCommand::Reset => {
                     let Some((state, _)) = repl_ipc_admin(
                         paths,
@@ -8366,6 +8402,24 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
                     eprintln!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
                 }
             }
+            continue;
+        }
+        if command.eq_ignore_ascii_case("/reset-memory") {
+            if !confirm_stdin(t(
+                "erase this mode's long-term memory (facts, diary, episodes)? conversations stay",
+                "确认清空当前模式的长期记忆（事实/日记/经历）？会话历史保留",
+            ))? {
+                println!("{}", t("cancelled", "已取消"));
+                continue;
+            }
+            agent.wipe_memory()?;
+            println!(
+                "{}",
+                t(
+                    "long-term memory erased; conversations untouched",
+                    "长期记忆已清空；会话历史未动"
+                )
+            );
             continue;
         }
         if command.eq_ignore_ascii_case("/reset") && command_args.trim().is_empty() {
@@ -13191,6 +13245,7 @@ enum ReplSlashCommand {
     Pop,
     Compact,
     Reset,
+    ResetMemory,
     Wipe,
     History,
     Clear,
@@ -13315,6 +13370,13 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "",
         help_en: "start this conversation over",
         help_zh: "重新开始当前会话",
+    },
+    ReplCommandSpec {
+        name: "/reset-memory",
+        command: ReplSlashCommand::ResetMemory,
+        arg_hint: "",
+        help_en: "erase this mode's long-term memory (conversations stay)",
+        help_zh: "清空当前模式的长期记忆（会话历史保留）",
     },
     ReplCommandSpec {
         name: "/wipe",

@@ -270,6 +270,13 @@ pub enum Command {
     ResetConversation {
         target: SessionRef,
     },
+    /// 只清长期记忆(事实/日记/经历/待处理事件与外溢上下文存档),会话
+    /// 历史与技能不动。`mode: "dev"` 清开发模式的独立记忆命名空间,
+    /// 缺省清当前人格。不可逆,前端须先确认。
+    ResetMemory {
+        #[serde(default)]
+        mode: Option<String>,
+    },
     /// Erases everything the persona accumulated: memory, every session's
     /// contents, group-chat contexts and auto-generated skills. Configuration
     /// is untouched. Irreversible; every frontend confirms before sending it.

@@ -2701,6 +2701,21 @@ async fn handle_session_command(
     let store = &state.state_store;
     let persona = active_persona_scope(state);
     match command {
+        IpcCommand::ResetMemory { mode } => {
+            // dev 记忆挂保留人格名下,与 Agent 构造同一把 dev_scoped 钥匙;
+            // 生成号在 reset_all 里自增,进行中的回合据此识别陈旧句柄。
+            let config = state.manager.lock().unwrap().config.clone();
+            let config = if mode.as_deref() == Some("dev") {
+                config.dev_scoped()
+            } else {
+                config
+            };
+            let memory = crate::memory::MemoryStore::new(&config, &state.paths);
+            memory
+                .reset_all(false)
+                .map_err(|error| safe_error_message(&error))?;
+            Ok(json!({}))
+        }
         IpcCommand::ListSessions { mode } => {
             // dev 列表以 dev REPL 指针为"当前":全局指针指向普通会话,
             // 用它高亮永远落空。"all" 是管理面(miyu session):普通+dev
@@ -11350,6 +11365,34 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_memory_bumps_generation_in_the_requested_scope_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let config = state.manager.lock().unwrap().config.clone();
+        let dev_store = crate::memory::MemoryStore::new(&config.dev_scoped(), &state.paths);
+        dev_store.init().unwrap();
+        let normal_store = crate::memory::MemoryStore::new(&config, &state.paths);
+        normal_store.init().unwrap();
+        let (_, dev_gen_before) = dev_store.identity().unwrap();
+        let (_, normal_gen_before) = normal_store.identity().unwrap();
+
+        handle_session_command(
+            &state,
+            IpcCommand::ResetMemory {
+                mode: Some("dev".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 只有 dev 命名空间的代数被抬升,普通人格纹丝不动。
+        let (_, dev_gen_after) = dev_store.identity().unwrap();
+        let (_, normal_gen_after) = normal_store.identity().unwrap();
+        assert_eq!(dev_gen_after, dev_gen_before + 1);
+        assert_eq!(normal_gen_after, normal_gen_before);
     }
 
     #[tokio::test]
