@@ -15,7 +15,6 @@ mod diagnostics;
 mod edit_replace;
 mod exchange_rate;
 mod fcitx_wiki;
-pub(crate) mod goal;
 mod hash_codec;
 mod html_conversion;
 mod http_response;
@@ -347,7 +346,6 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     // edit_file/edit_string 与 dev 同步退场(验收四轮:normal 也去冗余)。
     apply_patch::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
-    goal::register(&mut registry, paths.clone());
     alarm::register(&mut registry, paths.clone());
     clipboard::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
@@ -509,7 +507,6 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     jobs::register_management(&mut registry);
     apply_patch::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
-    goal::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());

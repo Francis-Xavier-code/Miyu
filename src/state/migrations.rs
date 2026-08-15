@@ -136,10 +136,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_session_archiving",
         apply: apply_v23_retire_session_archiving,
     },
+    Migration {
+        version: 24,
+        name: "retire_session_goals",
+        apply: apply_v24_retire_session_goals,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 23;
+pub const LATEST_VERSION: i64 = 24;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -871,30 +876,9 @@ fn apply_v21_rename_default_session(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 同会话长任务目标(dsh goal 域的 SQLite 快照形态,任务#9)。每会话至多
-/// 一个当前目标(session_id 主键):dsh 用事件日志回放,Miyu 的真源是
-/// SQLite,一行快照即全部状态,clear/替换=删行/换行,历史留在对话本身。
-/// revision 是变更 CAS(乐观并发:REPL/WebUI/QQ 多前端可能并发改),
-/// rounds_started 由续轮驱动器单独 CAS 递增,不抬 revision。armed/
-/// disarmed 激活态**有意不落库**——daemon 重启后必须人工 resume 才能
-/// 恢复自动续跑(dsh 的关键安全阀)。
-fn apply_v22_session_goals(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS goals (
-            session_id      TEXT PRIMARY KEY
-                            REFERENCES sessions(session_id) ON DELETE CASCADE,
-            goal_id         TEXT NOT NULL,
-            revision        INTEGER NOT NULL,
-            objective       TEXT NOT NULL,
-            phase           TEXT NOT NULL,
-            blocked_code    TEXT,
-            blocked_message TEXT,
-            max_rounds      INTEGER NOT NULL,
-            rounds_started  INTEGER NOT NULL DEFAULT 0,
-            created_at      TEXT NOT NULL,
-            updated_at      TEXT NOT NULL
-        );",
-    )?;
+/// v22 曾建 goals 表;goal 功能于 08-16 整体移除,此迁移改为空操作
+/// (老库的表由 v24 落掉,新库从未建过)。
+fn apply_v22_session_goals(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
@@ -902,6 +886,12 @@ fn apply_v22_session_goals(conn: &Connection) -> Result<()> {
 /// 新版里永远不可见。列本身保留(0 值),避免无谓的表重建。
 fn apply_v23_retire_session_archiving(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE sessions SET archived = 0 WHERE archived != 0", [])?;
+    Ok(())
+}
+
+/// goal 功能整体移除:老库落掉 goals 表。
+fn apply_v24_retire_session_goals(conn: &Connection) -> Result<()> {
+    conn.execute("DROP TABLE IF EXISTS goals", [])?;
     Ok(())
 }
 

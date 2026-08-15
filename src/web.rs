@@ -1909,7 +1909,6 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     install_background_job_hook(&state);
-    spawn_goal_round_driver(state.clone());
     let app = router(state.clone());
     let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
@@ -2610,28 +2609,8 @@ async fn handle_ipc_connection(
                 let manager = state.manager.lock().unwrap();
                 manager.active_runs.get(&run_id).map(|run| {
                     run.request_cancel();
-                    (run.session_id.clone(), run.turn_origin.clone())
                 })
             };
-            if let Some((session_id, origin)) = cancelled.as_ref() {
-                // 取消语义(dsh 驱动器同款):取消的是 goal 自动轮 → 目标转
-                // paused,防止空闲检查点又把它拉起来;无关取消 → 仅撤销
-                // 本进程自动续跑权限(disarm),目标状态不动。
-                if let crate::tools::workspace::TurnOrigin::GoalRound { goal_id, .. } = origin {
-                    if let Ok(Some(goal)) = state.state_store.goal(session_id) {
-                        if goal.goal_id == *goal_id
-                            && goal.phase == crate::state::GoalPhase::Active
-                        {
-                            let _ = state.state_store.pause_goal(
-                                session_id,
-                                &goal.goal_id,
-                                goal.revision,
-                            );
-                        }
-                    }
-                }
-                tools::goal::set_armed(session_id, false);
-            }
             if cancelled.is_some() {
                 ipc::send(&mut stream, &IpcFrame::Ack).await?;
             } else {
@@ -2850,27 +2829,6 @@ async fn handle_session_command(
             .await
             .map_err(|error| format!("tool error: {error:#}"))?;
             Ok(json!({ "output": output }))
-        }
-        IpcCommand::Goal { session, input } => {
-            let session_id = match session {
-                Some(session) => {
-                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
-                        .session_id
-                }
-                None => store.session_id().to_string(),
-            };
-            let text =
-                tools::goal::execute_goal_command(&state.paths, &session_id, &input);
-            // resume/create 经命令面武装后,没有 run 完成事件可触发驱动器,
-            // 这里直接踢一脚(栅栏在 maybe_continue_goal 里,重复踢无害)。
-            if tools::goal::is_armed(&session_id) {
-                let state = state.clone();
-                let session = session_id.clone();
-                tokio::spawn(async move {
-                    maybe_continue_goal(state, session).await;
-                });
-            }
-            Ok(json!({ "text": text }))
         }
         IpcCommand::SetReplSession { target } => {
             let record = resolve_available_local_session_ref(state, &target)?;
@@ -7719,186 +7677,6 @@ fn clear_actor_session_content(
 /// - run.completed → 尝试认领下一轮(四道栅栏见 maybe_continue_goal)
 /// - run.failed → disarm(异常不自动重试,dsh 同款;等人 resume)
 /// 取消→pause 的语义在 ipc Cancel 处理器里(那里能拿到被取消 run 的来源)。
-fn spawn_goal_round_driver(state: DaemonState) {
-    let mut receiver = state.events.sender.subscribe();
-    tokio::spawn(async move {
-        loop {
-            let record = match receiver.recv().await {
-                Ok(record) => record,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
-            let session_id = || {
-                serde_json::from_str::<serde_json::Value>(&record.data)
-                    .ok()
-                    .and_then(|data| {
-                        data.get("session_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-            };
-            match record.kind.as_str() {
-                "run.completed" => {
-                    if let Some(session) = session_id() {
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            maybe_continue_goal(state, session).await;
-                        });
-                    }
-                }
-                "run.failed" => {
-                    if let Some(session) = session_id() {
-                        if tools::goal::is_armed(&session) {
-                            tracing::info!(%session, "goal disarmed after a failed run; resume to continue");
-                            tools::goal::set_armed(&session, false);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-}
-
-/// 空闲检查点:四道栅栏后认领下一 goal round 并起自动轮。
-/// 栅栏(dsh 驱动器语义的 Miyu 化):
-/// 1. 会话无在飞 run(空闲才驱动);
-/// 2. 无排队的人类输入(人类让行,自动轮不消耗轮号);
-/// 3. 目标 active + 本进程 armed + 有余量(耗尽→block round-limit);
-/// 4. begin_goal_round 双 CAS 认领(并发 nudge 只有一个赢)。
-/// 平台绑定会话 v1 不驱动(回复送达需要合成平台轮,与 wake 同构,后续做)。
-async fn maybe_continue_goal(state: DaemonState, session_id: String) {
-    {
-        let manager = state.manager.lock().unwrap();
-        if manager.admin_busy
-            || manager
-                .active_runs
-                .values()
-                .any(|run| &*run.session_id == session_id.as_str())
-        {
-            return;
-        }
-    }
-    let store = state.state_store.pinned(&session_id);
-    match store.load_queued_prompts() {
-        Ok(queued) if queued.is_empty() => {}
-        _ => return,
-    }
-    let Ok(Some(record)) = state.state_store.session_record(&session_id) else {
-        return;
-    };
-    if let Ok(bindings) = state
-        .state_store
-        .platform_session_bindings(&record.persona, "onebot")
-    {
-        if bindings
-            .iter()
-            .any(|binding| binding.session_id == session_id)
-        {
-            tracing::debug!(%session_id, "goal driver skips platform-bound session (v1)");
-            return;
-        }
-    }
-    let Ok(Some(goal)) = state.state_store.goal(&session_id) else {
-        return;
-    };
-    if goal.phase != crate::state::GoalPhase::Active || !tools::goal::is_armed(&session_id) {
-        return;
-    }
-    if goal.rounds_started >= goal.max_rounds {
-        let _ = state.state_store.block_goal(
-            &session_id,
-            &goal.goal_id,
-            goal.revision,
-            "round-limit",
-            &format!("goal reached its configured limit of {} rounds", goal.max_rounds),
-        );
-        tools::goal::set_armed(&session_id, false);
-        return;
-    }
-    let claimed = match state.state_store.begin_goal_round(
-        &session_id,
-        &goal.goal_id,
-        goal.revision,
-        goal.rounds_started,
-    ) {
-        Ok(claimed) => claimed,
-        Err(error) => {
-            tracing::debug!(%session_id, error = %error, "goal round claim lost; not continuing");
-            return;
-        }
-    };
-    let content = tools::goal::goal_round_prompt(
-        &claimed.objective,
-        claimed.rounds_started,
-        claimed.max_rounds,
-    );
-    let display_content = format!(
-        "⟳ goal round {}/{} · {}",
-        claimed.rounds_started, claimed.max_rounds, claimed.objective
-    );
-    let run_id = random_id("run", 18);
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let origin = crate::tools::workspace::TurnOrigin::GoalRound {
-        goal_id: claimed.goal_id.clone(),
-        revision: claimed.revision,
-        round: claimed.rounds_started,
-    };
-    {
-        let mut manager = state.manager.lock().unwrap();
-        if manager.admin_busy {
-            return;
-        }
-        manager.active_runs.insert(
-            run_id.clone(),
-            RunInfo {
-                session_id: session_id.clone().into(),
-                mode: AgentMode::Normal,
-                audience: PromptAudience::Owner,
-                cancel: cancel_tx,
-                turn_id: None,
-                queue_target: None,
-                supersede: Arc::new(crate::agent::TurnSupersedeSignal::default()),
-                platform_followup: None,
-                operation: RunOperation::Create,
-                job_wake: false,
-                job_wake_label: Some(format!(
-                    "goal round {}/{}",
-                    claimed.rounds_started, claimed.max_rounds
-                )),
-                turn_origin: origin.clone(),
-            },
-        );
-    }
-    tracing::info!(
-        %session_id,
-        round = claimed.rounds_started,
-        max = claimed.max_rounds,
-        "goal driver starting an autonomous round"
-    );
-    if state
-        .actor_tx
-        .send(ActorCommand::StartTurn {
-            run_id: run_id.clone(),
-            session_id: session_id.clone().into(),
-            content,
-            display_content,
-            attachment_run_id: None,
-            mode: AgentMode::Normal,
-            images: Vec::new(),
-            cwd: None,
-            origin_tty: None,
-            audience: PromptAudience::Owner,
-            profile: None,
-            cancel: cancel_rx,
-            turn_origin: Box::new(origin),
-        })
-        .is_err()
-    {
-        finish_run(&state.manager, &run_id, None);
-    }
-}
-
 fn install_background_job_hook(state: &DaemonState) {
     let started_state = state.clone();
     tools::jobs::set_started_hook(Arc::new(move |overview| {
@@ -11149,7 +10927,7 @@ mod tests {
             &state,
             IpcCommand::ToolCall {
                 session: Some(session.clone()),
-                name: "get_goal".to_string(),
+                name: "job_status".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: 0,
@@ -11158,13 +10936,13 @@ mod tests {
         .await
         .unwrap();
         let output = data["output"].as_str().unwrap();
-        assert!(output.contains("\"goal\":null"), "unexpected: {output}");
+        assert!(!output.is_empty(), "unexpected: {output}");
         // 深度护栏。
         let denied = handle_session_command(
             &state,
             IpcCommand::ToolCall {
                 session: Some(session),
-                name: "get_goal".to_string(),
+                name: "job_status".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: crate::tools::workspace::MAX_BRIDGE_DEPTH,
@@ -11173,49 +10951,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(denied.contains("recursion limit"));
-    }
-
-    #[tokio::test]
-    async fn goal_driver_gates_on_armed_queued_and_claims_rounds() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
-        let record = state
-            .state_store
-            .create_session("miyu", "goal drive", crate::state::USER_SESSION_KIND, None)
-            .unwrap();
-        let session = record.session_id.clone();
-        let goal = state
-            .state_store
-            .create_goal(&session, "把测试跑绿", Some(3))
-            .unwrap();
-
-        // 未武装:不认领。
-        tools::goal::set_armed(&session, false);
-        maybe_continue_goal(state.clone(), session.clone()).await;
-        assert_eq!(
-            state.state_store.goal(&session).unwrap().unwrap().rounds_started,
-            0
-        );
-
-        // 有排队的人类输入:让行,不消耗轮号。
-        tools::goal::set_armed(&session, true);
-        state
-            .state_store
-            .pinned(&session)
-            .enqueue_prompt("q1", "人类插话", "人类插话", &[])
-            .unwrap();
-        maybe_continue_goal(state.clone(), session.clone()).await;
-        assert_eq!(
-            state.state_store.goal(&session).unwrap().unwrap().rounds_started,
-            0
-        );
-
-        // 栅栏全开:认领第 1 轮,run 表挂上 GoalRound 来源。
-        state.state_store.pinned(&session).delete_queued_prompts().unwrap();
-        maybe_continue_goal(state.clone(), session.clone()).await;
-        let claimed = state.state_store.goal(&session).unwrap().unwrap();
-        assert_eq!(claimed.rounds_started, 1);
-        assert_eq!(claimed.goal_id, goal.goal_id);
     }
 
     #[tokio::test]

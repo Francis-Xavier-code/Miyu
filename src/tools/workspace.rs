@@ -112,19 +112,12 @@ pub fn current_platform_sender() -> Option<String> {
 }
 
 /// 本回合的发起来源(dsh goal 权限模型的 Miyu 化:不扫会话事件,发起方
-/// 在起回合时如实声明)。goal 工具凭它做权限二元分立:create/edit/pause/
-/// resume 只认人类发起轮;complete/blocked 额外接受"恰好当前 goal round"。
+/// 在起回合时如实声明)。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnOrigin {
     /// 人类输入(REPL/WebUI/平台真实消息)。
     Human,
-    /// goal 续轮驱动器注入的自动轮(任务#10)。
-    GoalRound {
-        goal_id: String,
-        revision: i64,
-        round: i64,
-    },
     /// 后台任务完成唤醒的合成轮。
     JobWake,
 }
