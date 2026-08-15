@@ -17,6 +17,9 @@ const OPEN_METEO_CLIMATE_URL: &str = "https://climate-api.open-meteo.com/v1/clim
 const OPEN_METEO_ELEVATION_URL: &str = "https://api.open-meteo.com/v1/elevation";
 const GEOCODING_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FORECAST_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Retained entries older than this are swept on every write so the caches
+/// never grow without bound on long-running daemons.
+const WEATHER_CACHE_TTL_MAX: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 
 pub fn register(registry: &mut ToolRegistry) {
     registry.register(ToolSpec::new(
@@ -671,6 +674,7 @@ fn read_cache<T: Clone>(
 
 fn write_cache<T>(cache: &Mutex<HashMap<String, CacheEntry<T>>>, key: String, value: T) {
     if let Ok(mut cache) = cache.lock() {
+        cache.retain(|_, entry| entry.inserted_at.elapsed() <= WEATHER_CACHE_TTL_MAX);
         cache.insert(
             key,
             CacheEntry {

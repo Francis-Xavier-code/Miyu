@@ -9271,6 +9271,11 @@ impl LiveReplEditor {
 
     fn record_history(&mut self, content: &str) {
         self.history.push(content.to_string());
+        const REPL_HISTORY_LIMIT: usize = 500;
+        if self.history.len() > REPL_HISTORY_LIMIT {
+            let excess = self.history.len() - REPL_HISTORY_LIMIT;
+            self.history.drain(..excess);
+        }
         self.history_index = self.history.len();
     }
 
@@ -10902,6 +10907,19 @@ struct SharedJobsFeed {
     rendered_turns: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// Cap for the dedup bookkeeping sets in [`SharedJobsFeed`]. They only
+/// suppress double-follow / double-render; dropping old ids is harmless and
+/// keeps long-lived REPLs from accumulating an unbounded set.
+const JOBS_FEED_MARK_LIMIT: usize = 4096;
+
+fn mark_with_cap(set: &std::sync::Mutex<std::collections::HashSet<String>>, id: &str) {
+    let mut set = set.lock().unwrap();
+    if set.len() >= JOBS_FEED_MARK_LIMIT {
+        set.clear();
+    }
+    set.insert(id.to_string());
+}
+
 #[derive(Clone)]
 struct BackgroundReport {
     turn_id: String,
@@ -10969,6 +10987,9 @@ impl JobsFeed {
         let mut followed = shared.followed_runs.lock().unwrap();
         for (run_id, run_session, label) in wake_runs.iter() {
             if run_session == session && !followed.contains(run_id) {
+                if followed.len() >= JOBS_FEED_MARK_LIMIT {
+                    followed.clear();
+                }
                 followed.insert(run_id.clone());
                 return Some((run_id.clone(), label.clone()));
             }
@@ -11529,11 +11550,7 @@ async fn follow_wake_run(
     live.raw_mode_handoff = true;
     // Suppress the duplicate DB report for a turn that was rendered live.
     if let Some(turn_id) = turn_id {
-        jobs_shared
-            .rendered_turns
-            .lock()
-            .unwrap()
-            .insert(turn_id);
+        mark_with_cap(&jobs_shared.rendered_turns, &turn_id);
     }
     Ok(())
 }

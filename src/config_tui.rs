@@ -8126,6 +8126,18 @@ fn read_key() -> Result<KeyCode> {
 
 fn read_key_with_timeout(timeout: Option<Duration>) -> Result<Option<KeyCode>> {
     loop {
+        // PTY 对端关闭后 crossterm 的 poll/read 会空转,用裸 poll 探测 HUP 兜底。
+        let mut pollfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: 0,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready == 1
+            && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+        {
+            std::process::exit(1);
+        }
         if let Some(timeout) = timeout {
             if !event::poll(timeout)? {
                 return Ok(None);

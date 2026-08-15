@@ -233,11 +233,14 @@ pub fn overview() -> Vec<JobOverview> {
     rows.into_iter().map(overview_of).collect()
 }
 
-/// Mark a finished job as reported; it disappears from the overview.
+/// Mark a finished job as reported; it disappears from the overview and its
+/// registry entry is freed so long-running daemons do not accumulate an
+/// unbounded number of terminal jobs in memory.
 pub fn acknowledge(job_id: &str) {
-    if let Some(job) = jobs().lock().unwrap().get_mut(job_id) {
+    let mut jobs = jobs().lock().unwrap();
+    if let Some(job) = jobs.get(job_id) {
         if job.state.is_terminal() {
-            job.acknowledged = true;
+            jobs.remove(job_id);
         }
     }
 }

@@ -190,6 +190,9 @@ impl MessageActivityHandle {
         state.total_messages = state.total_messages.saturating_add(1);
         let total_messages = state.total_messages;
         let sender_messages = {
+            if state.sender_messages.len() >= MESSAGE_ACTIVITY_SEEN_LIMIT {
+                state.sender_messages.clear();
+            }
             let count = state
                 .sender_messages
                 .entry(sender_id.to_string())

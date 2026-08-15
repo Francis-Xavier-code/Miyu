@@ -53,6 +53,19 @@ pub fn ask(request: &QuestionRequest) -> Result<QuestionResponse> {
     let mut state = QuestionState::new(request);
 
     loop {
+        // PTY 对端关闭时 crossterm 的 poll 会永远立即就绪但读不出事件,
+        // 导致主循环全速空转。用裸 poll 探测 HUP,挂了直接退出。
+        let mut pollfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: 0,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready == 1
+            && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+        {
+            std::process::exit(1);
+        }
         if state
             .cancel_armed_until
             .is_some_and(|deadline| Instant::now() >= deadline)
