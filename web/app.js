@@ -55,6 +55,18 @@
     check: [["path", { d: "M20 6 9 17l-5-5" }]],
     "chevron-down": [["path", { d: "m6 9 6 6 6-6" }]],
     terminal: [["polyline", { points: "4 17 10 11 4 5" }], ["line", { x1: "12", x2: "20", y1: "19", y2: "19" }]],
+    target: [["circle", { cx: "12", cy: "12", r: "10" }], ["circle", { cx: "12", cy: "12", r: "6" }], ["circle", { cx: "12", cy: "12", r: "2" }]],
+    bot: [["path", { d: "M12 8V4H8" }], ["rect", { x: "4", y: "8", width: "16", height: "12", rx: "2" }], ["path", { d: "M2 14h2" }], ["path", { d: "M20 14h2" }], ["path", { d: "M15 13v2" }], ["path", { d: "M9 13v2" }]],
+    "book-open": [["path", { d: "M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" }], ["path", { d: "M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" }]],
+    image: [["rect", { x: "3", y: "3", width: "18", height: "18", rx: "2", ry: "2" }], ["circle", { cx: "9", cy: "9", r: "2" }], ["path", { d: "m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" }]],
+    smile: [["circle", { cx: "12", cy: "12", r: "10" }], ["path", { d: "M8 14s1.5 2 4 2 4-2 4-2" }], ["line", { x1: "9", x2: "9.01", y1: "9", y2: "9" }], ["line", { x1: "15", x2: "15.01", y1: "9", y2: "9" }]],
+    "alarm-clock": [["circle", { cx: "12", cy: "13", r: "8" }], ["path", { d: "M12 9v4l2 2" }], ["path", { d: "M5 3 2 6" }], ["path", { d: "m22 6-3-3" }], ["path", { d: "M6.38 18.7 4 21" }], ["path", { d: "M17.64 18.67 20 21" }]],
+    clipboard: [["rect", { x: "8", y: "2", width: "8", height: "4", rx: "1", ry: "1" }], ["path", { d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" }]],
+    calculator: [["rect", { x: "4", y: "2", width: "16", height: "20", rx: "2" }], ["line", { x1: "8", x2: "16", y1: "6", y2: "6" }], ["line", { x1: "16", x2: "16", y1: "14", y2: "18" }], ["path", { d: "M16 10h.01" }], ["path", { d: "M12 10h.01" }], ["path", { d: "M8 10h.01" }], ["path", { d: "M12 14h.01" }], ["path", { d: "M8 14h.01" }], ["path", { d: "M12 18h.01" }], ["path", { d: "M8 18h.01" }]],
+    search: [["circle", { cx: "11", cy: "11", r: "8" }], ["path", { d: "m21 21-4.3-4.3" }]],
+    puzzle: [["path", { d: "M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z" }]],
+    package: [["path", { d: "m7.5 4.27 9 5.15" }], ["path", { d: "M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" }], ["path", { d: "m3.3 7 8.7 5 8.7-5" }], ["path", { d: "M12 22V12" }]],
+    sparkles: [["path", { d: "M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" }], ["path", { d: "M20 3v4" }], ["path", { d: "M22 5h-4" }]],
     code: [["polyline", { points: "16 18 22 12 16 6" }], ["polyline", { points: "8 6 2 12 8 18" }]],
     "chevron-left": [["path", { d: "m15 18-6-6 6-6" }]],
     "layout-grid": [["rect", { x: "3", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "14", width: "7", height: "7", rx: "1" }], ["rect", { x: "3", y: "14", width: "7", height: "7", rx: "1" }]],
@@ -6485,6 +6497,39 @@
     });
   }
 
+  // 工具家族图标(验收清单):终端=$、网络=地球仪、编辑=笔、记忆=大脑……
+  // 未列家族回落扳手。全部 lucide 线稿,无 emoji。
+  function toolIconName(name) {
+    const n = String(name || "");
+    if (["run_command", "job_status", "job_stop"].includes(n)) return "dollar-sign";
+    if (["web_search", "web_fetch", "search_web", "webfetch"].includes(n)) return "globe";
+    if (n === "search_web_images") return "image-search";
+    if (n === "apply_patch" || n === "apply_artifact_patch") return "square-pen";
+    if (["recall_memories", "recall_past_events", "remember_fact", "search_evicted_context"].includes(n)) return "brain";
+    if (["create_goal", "get_goal", "update_goal"].includes(n)) return "target";
+    if (n === "todowrite" || n === "todoupdate") return "list-todo";
+    if (n === "task" || n === "deep_research") return "bot";
+    if (n.includes("knowledge_base")) return "book-open";
+    if (n === "ask_question") return "circle-help";
+    if (n === "generate_image") return "paintbrush";
+    if (["analyze_image", "vision_analyze", "print_image"].includes(n)) return "image";
+    if (n.includes("meme")) return "smile";
+    if (n.includes("alarm")) return "alarm-clock";
+    if (n === "read_clipboard") return "clipboard";
+    if (n === "get_weather") return "cloud-sun";
+    if (["calculator", "calculate_hash", "get_exchange_rate", "decode_encoded_text"].includes(n)) return "calculator";
+    if (n === "read_file") return "file-text";
+    if (n === "glob" || n === "grep") return "search";
+    if (n === "trash_path") return "trash-2";
+    if (n === "load_tools") return "package";
+    if (n.includes("skill")) return "puzzle";
+    if (n.startsWith("aur_") || n.startsWith("archlinux") || n.startsWith("archwiki") || n.startsWith("online_man") || n === "install_aur_package") return "package";
+    if (n === "usage_query") return "chart-column";
+    if (["draw_tarot_card", "draw_zhouyi_hexagram", "draw_fortune_lot"].includes(n)) return "sparkles";
+    if (["create_artifact", "read_artifact", "present_artifact"].includes(n)) return "file-text";
+    return "wrench";
+  }
+
   function createTool(live, data) {
     ensureLiveArticle(live);
     clearTypingIndicator(live, { waitingOnly: true });
@@ -6510,8 +6555,7 @@
     const icon = document.createElement("span");
     icon.className = "tool-icon";
     const toolName = String(data?.name || "");
-    const isWebTool = ["web_search", "web_fetch", "search_web_images", "search_web", "webfetch"].includes(toolName);
-    icon.appendChild(makeIconSlot(isCommand ? "dollar-sign" : isWebTool ? "globe" : toolName === "generate_image" ? "paintbrush" : toolName === "present_artifact" ? "file-text" : "wrench"));
+    icon.appendChild(makeIconSlot(toolIconName(toolName)));
     const title = document.createElement("span");
     title.className = "tool-title";
     const displayName = document.createElement("strong");

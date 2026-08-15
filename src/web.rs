@@ -1996,12 +1996,12 @@ impl IpcRunGuard {
 
 impl Drop for IpcRunGuard {
     fn drop(&mut self) {
-        if !self.finished {
-            // Client disconnected mid-turn: cancel its run.
-            if let Some(info) = self.manager.lock().unwrap().active_runs.get(&self.run_id) {
-                info.request_cancel();
-            }
-        }
+        // dsh 语义(验收):回合归 daemon 所有,前端断线只是观众离席——
+        // 不取消。曾经这里在客户端断开时砍掉 run,REPL 一关回合就死;
+        // 现在 run 由 actor 跑到终态,finish_run 在完成路径里自行清理,
+        // 断线客户端留下的只是一个没人看的事件流。guard 保留为挂点
+        // (显式取消仍走 IpcCommand::Cancel)。
+        let _ = self.finished;
     }
 }
 
@@ -12150,26 +12150,14 @@ mod tests {
     }
 
     #[test]
-    fn dropped_ipc_turn_cancels_its_core_run() {
+    fn dropped_ipc_turn_detaches_without_cancelling_the_run() {
+        // dsh 语义:前端断线,回合继续——guard 掉落绝不发取消。
         let (manager, cancel_rx) = manager_with_run("run_test");
         drop(IpcRunGuard {
             manager,
             run_id: "run_test".to_string(),
             finished: false,
         });
-        assert!(*cancel_rx.borrow());
-    }
-
-    #[test]
-    fn completed_ipc_turn_does_not_send_a_late_cancel() {
-        let (manager, cancel_rx) = manager_with_run("run_test");
-        let mut guard = IpcRunGuard {
-            manager,
-            run_id: "run_test".to_string(),
-            finished: false,
-        };
-        guard.finish();
-        drop(guard);
         assert!(!*cancel_rx.borrow());
     }
 

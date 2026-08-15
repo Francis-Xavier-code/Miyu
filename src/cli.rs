@@ -5381,6 +5381,23 @@ impl std::fmt::Display for RemoteTurnCancelled {
 
 impl std::error::Error for RemoteTurnCancelled {}
 
+/// 前端退出但回合继续:daemon 拥有回合,REPL 只是观众离席(验收:
+/// dsh 语义,前端退出任务照跑)。
+#[derive(Debug)]
+struct RemoteTurnDetached;
+
+impl std::fmt::Display for RemoteTurnDetached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(t("detached", "已脱离"))
+    }
+}
+
+impl std::error::Error for RemoteTurnDetached {}
+
+fn is_remote_turn_detached(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RemoteTurnDetached>().is_some()
+}
+
 fn is_remote_turn_cancelled(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RemoteTurnCancelled>().is_some()
 }
@@ -5529,7 +5546,7 @@ async fn try_run_remote_chat(
                 biased;
                 _ = input_tick.tick(), if live.is_some() => {
                     if terminal_hangup() {
-                        let _ = send_ipc_command(paths, IpcCommand::Cancel { run_id: run_id.clone() }).await;
+                        // 终端没了但回合是 daemon 的:观众离席,戏照演。
                         std::process::exit(0);
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -5616,12 +5633,19 @@ async fn try_run_remote_chat(
                                 }
                             }
                         }
-                        LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                        LiveEditorAction::Interrupt => {
                             let _ = send_ipc_command(
                                 paths,
                                 IpcCommand::Cancel { run_id: run_id.clone() },
                             )
                             .await;
+                        }
+                        LiveEditorAction::Exit => {
+                            renderer.finish()?;
+                            if let Some(live) = live.as_deref_mut() {
+                                live.apply_renderer_frame(&mut renderer)?;
+                            }
+                            return Err(anyhow::Error::new(RemoteTurnDetached));
                         }
                     }
                 },
@@ -7051,16 +7075,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                 _ = hangup.recv() => {}
                 _ = terminate.recv() => {}
             }
-            let session = { feed.repl_session.lock().unwrap().clone() };
-            if let Some(session_id) = session {
-                // 超时保底:daemon 正在重启/无响应时也必须退出,
-                // 否则挂在这里的同时主循环还在对死终端空转。
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    send_ipc_admin(&paths, IpcCommand::StopSessionJobs { session_id }),
-                )
-                .await;
-            }
+            // 后台任务归 daemon 管:前端死了任务照跑,完成后有唤醒
+            // (验收:dsh 语义,前端退出不拖死会话任务)。
+            let _ = (&paths, &feed);
             std::process::exit(0);
         });
     }
@@ -8000,6 +8017,17 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     "Miyu Web 核心已停止；请重新启动 REPL 以使用直连模式"
                 )
             ),
+            Err(err) if is_remote_turn_detached(&err) => {
+                let frame = format!(
+                    "\x1b[2m{}\x1b[0m\n",
+                    t(
+                        "exited; the reply keeps running in the daemon",
+                        "已退出；回复在 daemon 里继续运行"
+                    )
+                );
+                live_repl.apply_output_frame(frame.as_bytes())?;
+                break;
+            }
             Err(err)
                 if is_remote_turn_cancelled(&err)
                     || crate::question::is_question_cancelled(&err) =>
@@ -8036,31 +8064,6 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     .await?;
                 }
             }
-        }
-    }
-    // Background commands follow their conversation's lifecycle: leaving the
-    // REPL (exit/quit or Ctrl+C) terminates this session's running jobs.
-    if let Ok((_, data)) = send_ipc_admin(
-        paths,
-        IpcCommand::StopSessionJobs {
-            session_id: active_session_id.clone(),
-        },
-    )
-    .await
-    {
-        let stopped = data
-            .get("stopped")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if stopped > 0 {
-            println!(
-                "\x1b[2m{}\x1b[0m",
-                if is_zh() {
-                    format!("已停止 {stopped} 个后台命令")
-                } else {
-                    format!("stopped {stopped} background command(s)")
-                }
-            );
         }
     }
     Ok(())
