@@ -700,6 +700,44 @@ pub(crate) fn thinking_variant_options_for_model(
     }
 }
 
+/// Responses 续传健康位(任务#16 自愈)。跨 clone 共享:压缩器等辅助克隆
+/// 与主客户端看到同一份;置位即进程内立即生效,并持久化到
+/// provider-capabilities.json 供后续会话读取。多供应商混池时按主
+/// provider 记录(续传本就钉在单端点上,混池仅有过度抑制的轻微风险)。
+#[derive(Clone)]
+struct ResponsesContinuationHealth {
+    unsupported: Arc<std::sync::atomic::AtomicBool>,
+    store: std::path::PathBuf,
+    base_url: String,
+    provider_id: String,
+}
+
+impl ResponsesContinuationHealth {
+    fn for_provider(paths: &MiyuPaths, provider: &ProviderConfig) -> Self {
+        let store = crate::llm::provider_capabilities::store_path(&paths.cache_dir);
+        let unsupported = crate::llm::provider_capabilities::continuation_unsupported(
+            &store,
+            &provider.base_url,
+        );
+        Self {
+            unsupported: Arc::new(std::sync::atomic::AtomicBool::new(unsupported)),
+            store,
+            base_url: provider.base_url.clone(),
+            provider_id: provider.id.clone(),
+        }
+    }
+
+    /// 测试用:无持久化、乐观放行。
+    fn detached() -> Self {
+        Self {
+            unsupported: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: std::path::PathBuf::new(),
+            base_url: String::new(),
+            provider_id: String::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenAiCompatibleClient {
     client: Client,
@@ -718,6 +756,7 @@ pub struct OpenAiCompatibleClient {
     /// clone the client and set this so a runaway summary cannot eat the
     /// window; None leaves the provider default untouched.
     max_tokens_override: Option<u32>,
+    continuation_health: ResponsesContinuationHealth,
     /// Scope tag for the per-request cache accounting log ("chat", "qq-judge",
     /// "compact", …). Auxiliary callers override it via `with_request_scope`
     /// so cache stats separate the main conversation from side channels.
@@ -960,12 +999,41 @@ impl OpenAiCompatibleClient {
         &self.provider.id
     }
 
+    /// 该端点的 Responses 续传是否已被记为不可用(记录或本进程自愈置位)。
+    fn responses_continuation_suppressed(&self) -> bool {
+        self.continuation_health
+            .unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 自愈标记:上游拒了 previous_response_id(任务#16 签名 400)。进程内
+    /// 立即生效并持久化;首个标记者负责落盘,后续幂等。
+    pub fn mark_responses_continuation_unsupported(&self) {
+        let health = &self.continuation_health;
+        if !health
+            .unsupported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            if !health.base_url.is_empty() {
+                crate::llm::provider_capabilities::record_continuation_unsupported(
+                    &health.store,
+                    &health.base_url,
+                );
+            }
+            tracing::warn!(
+                provider = %health.provider_id,
+                "responses continuation rejected upstream; falling back to stateless full replay for this provider"
+            );
+        }
+    }
+
     pub fn from_config(config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
         super::cache_log::configure(paths, &config.cache);
         let endpoints = llm_endpoints(config, paths)?;
         let first = endpoints
             .first()
             .with_context(|| "no active provider/model endpoint is configured")?;
+        let continuation_health = ResponsesContinuationHealth::for_provider(paths, &first.provider);
         let mut client = Self {
             client: first.client.clone(),
             provider: first.provider.clone(),
@@ -978,6 +1046,7 @@ impl OpenAiCompatibleClient {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1028,6 +1097,7 @@ impl OpenAiCompatibleClient {
                 errors.join("\n- ")
             ),
         };
+        let continuation_health = ResponsesContinuationHealth::for_provider(paths, &first.provider);
         let mut client = Self {
             client: first.client.clone(),
             provider: first.provider.clone(),
@@ -1040,6 +1110,7 @@ impl OpenAiCompatibleClient {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1068,6 +1139,7 @@ impl OpenAiCompatibleClient {
             api_key: key.value.clone(),
             key_index: key.index,
         };
+        let continuation_health = ResponsesContinuationHealth::for_provider(paths, provider);
         let mut client = Self {
             client,
             provider: provider.clone(),
@@ -1080,6 +1152,7 @@ impl OpenAiCompatibleClient {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -1167,6 +1240,8 @@ impl OpenAiCompatibleClient {
             request_timeouts: self.request_timeouts,
             max_tokens_override: self.max_tokens_override,
             request_scope: self.request_scope,
+            // failover 换端点共享同一健康位(续传本就钉在原端点)。
+            continuation_health: self.continuation_health.clone(),
         }
     }
 
@@ -2699,6 +2774,7 @@ impl OpenAiCompatibleClient {
                         dsml,
                         response_id,
                         store_disabled,
+                        self.responses_continuation_suppressed(),
                     )
                     .map(Some);
                 }
@@ -2736,6 +2812,7 @@ impl OpenAiCompatibleClient {
             dsml,
             response_id,
             store_disabled,
+            self.responses_continuation_suppressed(),
         )
         .map(Some)
     }
@@ -4966,9 +5043,16 @@ fn finalize_responses_stream_result(
     dsml_enabled: bool,
     response_id: Option<String>,
     store_disabled: bool,
+    continuation_unsupported: bool,
 ) -> Result<ChatResult> {
     let mut result = finalize_stream_result(content, reasoning, usage, tool_calls, dsml_enabled)?;
     if result.tool_calls.is_empty() {
+        return Ok(result);
+    }
+    // 该端点续传已被记为不可用(能力记录/自愈置位):不设 continuation,
+    // 工具轮走无状态全量回放(lower_responses_messages 重放
+    // function_call/function_call_output 是完整配对的)。
+    if continuation_unsupported {
         return Ok(result);
     }
     if store_disabled {
@@ -6143,6 +6227,7 @@ mod tests {
             false,
             Some("resp_1".to_string()),
             true,
+            false,
         )
         .unwrap_err();
         assert!(store_error.to_string().contains("store=false"));
@@ -6151,13 +6236,29 @@ mod tests {
             String::new(),
             String::new(),
             None,
-            vec![tool_call],
+            vec![tool_call.clone()],
             false,
             None,
+            false,
             false,
         )
         .unwrap_err();
         assert!(id_error.to_string().contains("without a response ID"));
+
+        // 续传被记为不可用:带工具调用也不设 continuation(无状态全量回放),
+        // 且不再要求 response_id。
+        let suppressed = finalize_responses_stream_result(
+            String::new(),
+            String::new(),
+            None,
+            vec![tool_call],
+            false,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(suppressed.responses_continuation.is_none());
     }
 
     #[tokio::test]
@@ -6627,6 +6728,7 @@ mod tests {
             }),
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
 
         let result = client
@@ -7056,6 +7158,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
         let initial_result = initial_client
             .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
@@ -7091,6 +7194,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
 
         let result = client
@@ -7227,6 +7331,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
         let mut chunks = Vec::new();
 
@@ -7312,6 +7417,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
 
         let result = client
@@ -7539,6 +7645,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
 
         let error = client
@@ -7755,6 +7862,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         }
     }
 
@@ -7847,6 +7955,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         }
     }
 
@@ -8238,6 +8347,7 @@ mod tests {
             request_timeouts: None,
             max_tokens_override: None,
             request_scope: "chat",
+            continuation_health: ResponsesContinuationHealth::detached(),
         };
 
         let first_endpoint = client.with_endpoint(&client.endpoints[0]);

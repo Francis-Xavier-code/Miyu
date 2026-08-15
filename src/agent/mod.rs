@@ -2985,6 +2985,23 @@ impl Agent {
             };
             let round = match round {
                 Some(Err(error)) => {
+                    // Responses 续传自愈(任务#16):上游不支持
+                    // previous_response_id 时,工具轮第二步只发增量会撞
+                    // "No tool call found for tool output" 类 400。此时清
+                    // 续传重发全量(messages 里工具结果已齐,无状态回放
+                    // 完整),并让客户端持久记该供应商不可续传——本会话
+                    // 与后续会话都不再发增量。
+                    if responses_continuation.is_some()
+                        && crate::llm::is_responses_continuation_unsupported_error(&error)
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "responses continuation rejected; retrying this round with full stateless input"
+                        );
+                        self.client.mark_responses_continuation_unsupported();
+                        responses_continuation = None;
+                        continue;
+                    }
                     // Passive overflow trigger (compact-and-retry). Only at
                     // the turn's initial request, before any assistant output
                     // was streamed: mid-loop the live tool exchange is not
