@@ -346,6 +346,22 @@ pub enum Command {
     SetReplSession {
         target: SessionRef,
     },
+    /// 工具桥(任务#12):`miyu tool-call` 打回 daemon,以指定会话的身份与
+    /// 回合来源执行结构化工具——内层调用照走 guard/超时管线。bash 就是
+    /// 编排层:中间数据在脚本里流动,不经模型上下文往返。
+    ToolCall {
+        #[serde(default)]
+        session: Option<String>,
+        name: String,
+        #[serde(default)]
+        arguments: String,
+        /// 序列化的 TurnOrigin(来自 run_command 注入的 MIYU_TURN_ORIGIN)。
+        #[serde(default)]
+        origin: Option<String>,
+        /// 递归深度(护栏,daemon 侧校验)。
+        #[serde(default)]
+        depth: u32,
+    },
     /// `/goal` 人类命令:daemon 侧解析五分支语法并执行,返回直接打印的
     /// 文本;命令输出永不进模型历史(dsh 命令平面同款边界)。
     Goal {

@@ -1029,6 +1029,9 @@ pub enum Command {
     Normal,
     /// 进入开发模式 REPL(极简编码形态,无人格)
     Dev,
+    /// 工具桥:以当前会话身份调用一个结构化工具(供 run_command 脚本编排)
+    #[command(name = "tool-call")]
+    ToolCallCmd(ToolCallArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1139,6 +1142,26 @@ pub struct AlarmWorkerArgs {
 pub struct ToolArgs {
     pub name: String,
     pub arguments: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ToolCallArgs {
+    /// 工具名(--list 时可省略)
+    pub name: Option<String>,
+    /// 参数 JSON(便捷位置参数;脚本里推荐 --stdin 免引号地狱)
+    pub arguments: Option<String>,
+    /// 从标准输入读参数 JSON(跨 shell 安全,PowerShell 也能用)
+    #[arg(long = "stdin")]
+    pub args_stdin: bool,
+    /// 从文件读参数 JSON
+    #[arg(long)]
+    pub args_file: Option<std::path::PathBuf>,
+    /// 列出当前可用工具(名称+显示名)
+    #[arg(long)]
+    pub list: bool,
+    /// 打印指定工具的完整合同(描述+参数 schema)
+    #[arg(long)]
+    pub describe: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1506,6 +1529,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
         Some(Command::Archive) => run_session_archive(&paths).await,
         Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
+        Some(Command::ToolCallCmd(args)) => run_tool_call(&paths, args).await,
         Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
         Some(Command::Dev) => run_repl(&paths, AgentMode::Dev).await,
         Some(Command::Workspace(args)) => run_workspace_command(&paths, args).await,
@@ -2511,6 +2535,116 @@ async fn run_tool(paths: &MiyuPaths, mode: AgentMode, args: ToolArgs) -> Result<
     let output = registry
         .call(&args.name, args.arguments.as_deref().unwrap_or("{}"))
         .await?;
+    println!("{output}");
+    Ok(())
+}
+
+/// 工具桥客户端(任务#12)。bash 就是编排层:脚本里循环/管道串结构化
+/// 工具,中间数据本地流动、不经模型上下文往返;每次内层调用都以本回合的
+/// 会话身份与来源在 daemon 侧过 guard/超时管线。daemon 不在(直连调试
+/// 形态)则本地执行,语义一致但 jobs 等 daemon 态不可见。
+async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs) -> Result<()> {
+    let config = AppConfig::load_or_default(paths)?;
+    let env_mode = std::env::var("MIYU_TURN_MODE").unwrap_or_default();
+    let mode = if env_mode == "dev" {
+        AgentMode::Dev
+    } else {
+        AgentMode::Normal
+    };
+    if args.list || args.describe {
+        let registry = build_tool_registry(&config, paths, mode, false)?;
+        if args.list {
+            let mut names = registry.tool_names();
+            names.sort();
+            for name in names {
+                let display = registry.display_name(&name).unwrap_or_default();
+                if display.is_empty() {
+                    println!("{name}");
+                } else {
+                    println!("{name}\t{display}");
+                }
+            }
+            return Ok(());
+        }
+        let Some(name) = args.name.as_deref() else {
+            bail!("--describe 需要工具名");
+        };
+        let Some(spec) = registry.get(name) else {
+            bail!("unknown tool: {name}");
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }))?
+        );
+        return Ok(());
+    }
+    let Some(name) = args.name.clone() else {
+        bail!("用法: miyu tool-call <name> [json] [--stdin|--args-file <f>|--list|--describe]");
+    };
+    let arguments = if args.args_stdin {
+        let mut raw = String::new();
+        use std::io::Read as _;
+        io::stdin().read_to_string(&mut raw)?;
+        raw
+    } else if let Some(file) = &args.args_file {
+        std::fs::read_to_string(file)?
+    } else {
+        args.arguments.clone().unwrap_or_else(|| "{}".to_string())
+    };
+    let session = std::env::var("MIYU_SESSION").ok().filter(|s| !s.is_empty());
+    let origin = std::env::var("MIYU_TURN_ORIGIN").ok().filter(|s| !s.is_empty());
+    let depth: u32 = std::env::var("MIYU_BRIDGE_DEPTH")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+
+    if ipc::daemon_info(paths).await.is_some() {
+        let (_, data) = send_ipc_admin(
+            paths,
+            IpcCommand::ToolCall {
+                session,
+                name,
+                arguments,
+                origin,
+                depth,
+            },
+        )
+        .await?;
+        let output = data
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        println!("{output}");
+        return Ok(());
+    }
+
+    // 直连回退:本地建 registry(guard/超时同源),会话与来源按环境作用域化。
+    // jobs 等 daemon 内存态在本地进程不可见,直连调试形态可接受。
+    if depth >= crate::tools::workspace::MAX_BRIDGE_DEPTH {
+        bail!("tool bridge recursion limit reached (depth {depth})");
+    }
+    let registry = build_tool_registry(&config, paths, mode, false)?;
+    let turn_origin: crate::tools::workspace::TurnOrigin = origin
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(crate::tools::workspace::TurnOrigin::Human);
+    let invoke = crate::tools::workspace::with_turn_origin(
+        turn_origin,
+        crate::tools::workspace::with_bridge_depth(depth + 1, async {
+            registry.call(&name, &arguments).await
+        }),
+    );
+    let output = match session {
+        Some(session) => {
+            let session: std::sync::Arc<str> = session.into();
+            crate::tools::workspace::with_session(session, invoke).await?
+        }
+        None => invoke.await?,
+    };
     println!("{output}");
     Ok(())
 }

@@ -534,7 +534,20 @@ async fn execute_command(command: &str, timeout: u64, progress: ToolProgress) ->
         .arg(command)
         // Explicit cwd: shell commands must run in the turn workspace, not
         // whatever the daemon process cwd happens to be.
-        .current_dir(super::workspace::effective_workdir())
+        .current_dir(super::workspace::effective_workdir());
+    // 工具桥环境(任务#12):脚本里 `miyu tool-call` 凭这些以本回合的
+    // 会话身份/来源打回 daemon 执行结构化工具,内层调用照走 guard 管线。
+    if let Some(session) = super::workspace::try_session() {
+        command_process.env("MIYU_SESSION", &*session);
+    }
+    if let Ok(origin) = serde_json::to_string(&super::workspace::current_turn_origin()) {
+        command_process.env("MIYU_TURN_ORIGIN", origin);
+    }
+    command_process.env(
+        "MIYU_BRIDGE_DEPTH",
+        super::workspace::current_bridge_depth().to_string(),
+    );
+    command_process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

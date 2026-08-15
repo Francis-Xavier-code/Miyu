@@ -114,7 +114,8 @@ pub fn current_platform_sender() -> Option<String> {
 /// 本回合的发起来源(dsh goal 权限模型的 Miyu 化:不扫会话事件,发起方
 /// 在起回合时如实声明)。goal 工具凭它做权限二元分立:create/edit/pause/
 /// resume 只认人类发起轮;complete/blocked 额外接受"恰好当前 goal round"。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnOrigin {
     /// 人类输入(REPL/WebUI/平台真实消息)。
     Human,
@@ -144,4 +145,23 @@ pub fn current_turn_origin() -> TurnOrigin {
     TURN_ORIGIN
         .try_with(|origin| origin.clone())
         .unwrap_or(TurnOrigin::Human)
+}
+
+tokio::task_local! {
+    /// 工具桥递归深度:回合内 run_command 起的脚本经 `miyu tool-call` 打回
+    /// daemon 再执行工具,若那个工具又是 run_command……深度护栏防无限套娃。
+    static BRIDGE_DEPTH: u32;
+}
+
+pub const MAX_BRIDGE_DEPTH: u32 = 2;
+
+pub async fn with_bridge_depth<F>(depth: u32, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    BRIDGE_DEPTH.scope(depth, future).await
+}
+
+pub fn current_bridge_depth() -> u32 {
+    BRIDGE_DEPTH.try_with(|depth| *depth).unwrap_or(0)
 }

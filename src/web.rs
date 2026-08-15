@@ -2741,6 +2741,62 @@ async fn handle_session_command(
             }
             Ok(json!({ "session": session_record_json(&record) }))
         }
+        IpcCommand::ToolCall {
+            session,
+            name,
+            arguments,
+            origin,
+            depth,
+        } => {
+            if depth >= crate::tools::workspace::MAX_BRIDGE_DEPTH {
+                return Err(format!(
+                    "tool bridge recursion limit reached (depth {depth})"
+                ));
+            }
+            let session_id = match session {
+                Some(session) => {
+                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
+                        .session_id
+                }
+                None => store.session_id().to_string(),
+            };
+            let record = store
+                .session_record(&session_id)
+                .map_err(|error| safe_error_message(&error))?
+                .ok_or_else(|| "session not found".to_string())?;
+            let mode = turn_mode_for_session(store, &session_id, AgentMode::Normal);
+            // 与回合同源的 registry(guard/超时齐备);会话工作区与来源
+            // 一并作用域化,内层工具看到的世界和回合内一致。
+            let config = { state.manager.lock().unwrap().config.clone() };
+            let registry = crate::cli::build_tool_registry(&config, &state.paths, mode, false)
+                .map_err(|error| safe_error_message(&error))?;
+            let turn_origin: crate::tools::workspace::TurnOrigin = origin
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or(crate::tools::workspace::TurnOrigin::Human);
+            let workspace = record
+                .workspace
+                .clone()
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            let session_arc: Arc<str> = session_id.clone().into();
+            let output = crate::tools::workspace::with_workspace(
+                workspace,
+                crate::tools::workspace::with_session(
+                    session_arc,
+                    crate::tools::workspace::with_turn_origin(
+                        turn_origin,
+                        crate::tools::workspace::with_bridge_depth(depth + 1, async {
+                            registry.call(&name, &arguments).await
+                        }),
+                    ),
+                ),
+            )
+            .await
+            .map_err(|error| format!("tool error: {error:#}"))?;
+            Ok(json!({ "output": output }))
+        }
         IpcCommand::Goal { session, input } => {
             let session_id = match session {
                 Some(session) => {
@@ -11079,6 +11135,47 @@ mod tests {
 
         assert_eq!(snapshot.session_id, local.session_id);
         assert_eq!(&*state.state_store.session_id(), &*default_session_id);
+    }
+
+    #[tokio::test]
+    async fn tool_bridge_executes_with_session_scope_and_depth_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let persona = active_persona_scope(&state);
+        let session = state
+            .state_store
+            .create_session(&persona, "bridge", crate::state::USER_SESSION_KIND, None)
+            .unwrap()
+            .session_id;
+        // 会话作用域生效:get_goal 在指定会话身份下执行,拿到 goal:null。
+        let data = handle_session_command(
+            &state,
+            IpcCommand::ToolCall {
+                session: Some(session.clone()),
+                name: "get_goal".to_string(),
+                arguments: "{}".to_string(),
+                origin: None,
+                depth: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let output = data["output"].as_str().unwrap();
+        assert!(output.contains("\"goal\":null"), "unexpected: {output}");
+        // 深度护栏。
+        let denied = handle_session_command(
+            &state,
+            IpcCommand::ToolCall {
+                session: Some(session),
+                name: "get_goal".to_string(),
+                arguments: "{}".to_string(),
+                origin: None,
+                depth: crate::tools::workspace::MAX_BRIDGE_DEPTH,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("recursion limit"));
     }
 
     #[tokio::test]
