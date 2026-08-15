@@ -3413,11 +3413,22 @@ impl Agent {
                     let tools = self.tools.lock().unwrap();
                     let permission = tools.permission(&call.function.name)?;
                     if !mode_allows_tool_permission(self.mode, permission) {
-                        bail!(
-                            "{} mode blocked non-read-only tool: {}",
+                        // 软失败:回给模型一条 tool error 让它换路,而不是
+                        // bail! 炸掉整轮(dsh 管线的 deny 语义)。
+                        let output = format!(
+                            "tool error: {} mode blocked non-read-only tool: {}",
                             self.mode.label(),
                             call.function.name
                         );
+                        drop(tools);
+                        on_event(AgentEvent::ToolResult {
+                            call_id: call_id.clone(),
+                            name: event_name.clone(),
+                            ok: false,
+                            output: output.clone(),
+                        })?;
+                        messages.push(ChatMessage::tool(call.id, output));
+                        continue;
                     }
                     if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode)
                         && call.function.name != "load_tools"
@@ -8647,6 +8658,94 @@ mod tests {
         let turns = state.load_turns().unwrap();
         assert_eq!(turns[0].followups.len(), 2);
         assert_eq!(turns[0].assistant_content, "final answer");
+        server.await.unwrap();
+    }
+
+    /// 权限拦截是软失败:Chat 模式下调写工具,回给模型一条 tool error
+    /// 让它换路,轮次存活拿到最终回答——而不是 bail! 炸掉整轮。
+    #[tokio::test]
+    async fn chat_mode_blocked_tool_soft_fails_and_turn_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut config = queue_test_config(base_url);
+        config.tools.enabled = true;
+        config.skills.enabled = false;
+        config.memory.enabled = false;
+
+        let mut normal_tools = ToolRegistry::new();
+        normal_tools.register(
+            ToolSpec::new(
+                "writes_tool",
+                "mutates state",
+                empty_parameters(),
+                |_| async { Ok("should never run".to_string()) },
+            )
+            .writes(),
+        );
+        let control = AgentTurnControl::new(
+            AgentMode::Chat,
+            normal_tools.clone(),
+            normal_tools.clone(),
+        );
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_test_http_request(&mut first).await;
+            write_test_sse(
+                &mut first,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"writes_tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut second).await;
+            let _ = request_tx.send(request);
+            write_test_sse(
+                &mut second,
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered answer\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .await;
+        });
+
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        let provider = config.provider(None).unwrap().clone();
+        let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+        let mut agent = Agent::new(
+            config,
+            &paths,
+            state.clone(),
+            client,
+            normal_tools,
+            AgentMode::Chat,
+        )
+        .unwrap();
+
+        let result = agent
+            .chat_stream_with_control("initial prompt", &[], &control, |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(result.content, "recovered answer");
+        let request: serde_json::Value =
+            serde_json::from_slice(&request_rx.await.unwrap()).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("blocked non-read-only tool"))
+        }));
         server.await.unwrap();
     }
 
