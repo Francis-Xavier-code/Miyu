@@ -126,10 +126,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "rename_default_session",
         apply: apply_v21_rename_default_session,
     },
+    Migration {
+        version: 22,
+        name: "session_goals",
+        apply: apply_v22_session_goals,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 21;
+pub const LATEST_VERSION: i64 = 22;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -857,6 +862,33 @@ fn apply_v21_rename_default_session(conn: &Connection) -> Result<()> {
             crate::i18n::text("Terminal session", "终端集成会话"),
             DEFAULT_SESSION_ID
         ],
+    )?;
+    Ok(())
+}
+
+/// 同会话长任务目标(dsh goal 域的 SQLite 快照形态,任务#9)。每会话至多
+/// 一个当前目标(session_id 主键):dsh 用事件日志回放,Miyu 的真源是
+/// SQLite,一行快照即全部状态,clear/替换=删行/换行,历史留在对话本身。
+/// revision 是变更 CAS(乐观并发:REPL/WebUI/QQ 多前端可能并发改),
+/// rounds_started 由续轮驱动器单独 CAS 递增,不抬 revision。armed/
+/// disarmed 激活态**有意不落库**——daemon 重启后必须人工 resume 才能
+/// 恢复自动续跑(dsh 的关键安全阀)。
+fn apply_v22_session_goals(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS goals (
+            session_id      TEXT PRIMARY KEY
+                            REFERENCES sessions(session_id) ON DELETE CASCADE,
+            goal_id         TEXT NOT NULL,
+            revision        INTEGER NOT NULL,
+            objective       TEXT NOT NULL,
+            phase           TEXT NOT NULL,
+            blocked_code    TEXT,
+            blocked_message TEXT,
+            max_rounds      INTEGER NOT NULL,
+            rounds_started  INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );",
     )?;
     Ok(())
 }

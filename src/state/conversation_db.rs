@@ -5906,3 +5906,562 @@ fn attach_followup_attachments_locked(conn: &Connection, turns: &mut [Turn]) -> 
     }
     Ok(())
 }
+
+// ============================== 会话目标(goal) ==============================
+// dsh goal 域的 SQLite 快照形态(任务#9,设计对照见 miyu-dsh 调研记忆)。
+// 每会话至多一个当前目标;revision 是变更 CAS;armed 激活态有意不在此处
+// ——它驻 daemon 内存,重启即失,人工 resume 才恢复自动续跑。
+
+/// 目标生命周期阶段(dsh GoalPhase 同款四态)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalPhase {
+    Active,
+    Paused,
+    Blocked,
+    Complete,
+}
+
+impl GoalPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::Complete => "complete",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "blocked" => Self::Blocked,
+            "complete" => Self::Complete,
+            other => bail!("unknown goal phase in db: {other}"),
+        })
+    }
+}
+
+/// 当前目标快照。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalRecord {
+    pub session_id: String,
+    pub goal_id: String,
+    pub revision: i64,
+    pub objective: String,
+    pub phase: GoalPhase,
+    pub blocked_code: Option<String>,
+    pub blocked_message: Option<String>,
+    pub max_rounds: i64,
+    pub rounds_started: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 目标变更被拒的结构化原因(供工具层 downcast 后给模型可自纠的文案)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalDenied {
+    NotFound,
+    AlreadyExists { phase: GoalPhase },
+    StaleRevision { current_goal_id: String, current_revision: i64 },
+    InvalidTransition { from: GoalPhase, verb: &'static str },
+    InvalidInput(String),
+    RoundsExhausted { max_rounds: i64 },
+}
+
+impl std::fmt::Display for GoalDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no goal is currently set for this session"),
+            Self::AlreadyExists { phase } => write!(
+                f,
+                "a goal already exists with phase {}; edit or clear it before creating another",
+                phase.as_str()
+            ),
+            Self::StaleRevision { current_goal_id, current_revision } => write!(
+                f,
+                "stale goal ref; current is {current_goal_id} revision {current_revision} — call get_goal and retry"
+            ),
+            Self::InvalidTransition { from, verb } => {
+                write!(f, "cannot {verb} a goal in phase {}", from.as_str())
+            }
+            Self::InvalidInput(message) => write!(f, "{message}"),
+            Self::RoundsExhausted { max_rounds } => write!(
+                f,
+                "goal exhausted its {max_rounds} rounds; raise max_goal_rounds via edit before resuming"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GoalDenied {}
+
+/// dsh 同款部署默认续轮上限。
+pub const DEFAULT_MAX_GOAL_ROUNDS: i64 = 256;
+
+fn goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(GoalRecord, String)> {
+    let phase_raw: String = row.get(4)?;
+    Ok((
+        GoalRecord {
+            session_id: row.get(0)?,
+            goal_id: row.get(1)?,
+            revision: row.get(2)?,
+            objective: row.get(3)?,
+            phase: GoalPhase::Active, // 占位,下面统一解析
+            blocked_code: row.get(5)?,
+            blocked_message: row.get(6)?,
+            max_rounds: row.get(7)?,
+            rounds_started: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        },
+        phase_raw,
+    ))
+}
+
+const GOAL_COLUMNS: &str = "session_id, goal_id, revision, objective, phase, \
+     blocked_code, blocked_message, max_rounds, rounds_started, created_at, updated_at";
+
+fn load_goal(conn: &Connection, session_id: &str) -> Result<Option<GoalRecord>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {GOAL_COLUMNS} FROM goals WHERE session_id = ?1"
+    ))?;
+    let mut rows = statement.query(params![session_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let (mut record, phase_raw) = goal_from_row(row)?;
+    record.phase = GoalPhase::parse(&phase_raw)?;
+    Ok(Some(record))
+}
+
+/// 时间戳防倒流钳制(dsh nextMutationTime 同款):挂钟倒退时不早于上次更新。
+fn goal_next_timestamp(previous: &str) -> String {
+    let now = Utc::now().to_rfc3339();
+    if now.as_str() < previous {
+        previous.to_string()
+    } else {
+        now
+    }
+}
+
+fn kebab_code_valid(code: &str) -> bool {
+    let mut chars = code.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !code.contains("--")
+        && !code.ends_with('-')
+}
+
+impl ConversationDb {
+    pub fn goal(&self, session_id: &str) -> Result<Option<GoalRecord>> {
+        let conn = self.conn.lock().unwrap();
+        load_goal(&conn, session_id)
+    }
+
+    /// 创建并返回新目标(revision=1, phase=active)。已有未完成目标 → 拒;
+    /// complete 目标被替换(旧行删除,历史留在对话)。
+    pub fn create_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        max_rounds: Option<i64>,
+    ) -> Result<GoalRecord> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            bail!(GoalDenied::InvalidInput(
+                "goal objective must be a non-empty string".to_string()
+            ));
+        }
+        let max_rounds = max_rounds.unwrap_or(DEFAULT_MAX_GOAL_ROUNDS);
+        if max_rounds < 1 {
+            bail!(GoalDenied::InvalidInput(
+                "max_goal_rounds must be a positive integer".to_string()
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        if let Some(current) = load_goal(&tx, session_id)? {
+            if current.phase != GoalPhase::Complete {
+                bail!(GoalDenied::AlreadyExists {
+                    phase: current.phase
+                });
+            }
+            tx.execute("DELETE FROM goals WHERE session_id = ?1", params![session_id])?;
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO goals (session_id, goal_id, revision, objective, phase, \
+                                max_rounds, rounds_started, created_at, updated_at)
+             VALUES (?1, 'goal_'||lower(hex(randomblob(8))), 1, ?2, 'active', ?3, 0, ?4, ?4)",
+            params![session_id, objective, max_rounds, now],
+        )?;
+        let record = load_goal(&tx, session_id)?.context("goal insert vanished")?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// CAS 前置:按 (goal_id, revision) 校验当前行,陈旧即拒。
+    fn expect_goal(
+        tx: &Connection,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<GoalRecord> {
+        let Some(current) = load_goal(tx, session_id)? else {
+            bail!(GoalDenied::NotFound);
+        };
+        if current.goal_id != goal_id || current.revision != revision {
+            bail!(GoalDenied::StaleRevision {
+                current_goal_id: current.goal_id,
+                current_revision: current.revision,
+            });
+        }
+        Ok(current)
+    }
+
+    /// edit:换目标文案和/或上限,保 phase 与 blocker(dsh 同款)。
+    pub fn edit_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        objective: Option<&str>,
+        max_rounds: Option<i64>,
+    ) -> Result<GoalRecord> {
+        if objective.is_none() && max_rounds.is_none() {
+            bail!(GoalDenied::InvalidInput(
+                "goal edit requires objective and/or max_goal_rounds".to_string()
+            ));
+        }
+        if let Some(objective) = objective {
+            if objective.trim().is_empty() {
+                bail!(GoalDenied::InvalidInput(
+                    "goal objective must be a non-empty string".to_string()
+                ));
+            }
+        }
+        if let Some(max_rounds) = max_rounds {
+            if max_rounds < 1 {
+                bail!(GoalDenied::InvalidInput(
+                    "max_goal_rounds must be a positive integer".to_string()
+                ));
+            }
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = Self::expect_goal(&tx, session_id, goal_id, revision)?;
+        let updated_at = goal_next_timestamp(&current.updated_at);
+        tx.execute(
+            "UPDATE goals SET revision = revision + 1,
+                 objective = COALESCE(?3, objective),
+                 max_rounds = COALESCE(?4, max_rounds),
+                 updated_at = ?5
+             WHERE session_id = ?1 AND goal_id = ?2 AND revision = ?6",
+            params![
+                session_id,
+                goal_id,
+                objective.map(str::trim),
+                max_rounds,
+                updated_at,
+                revision
+            ],
+        )?;
+        let record = load_goal(&tx, session_id)?.context("goal vanished mid-edit")?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// 共享的阶段转换(dsh transition 矩阵):
+    /// pause: active→paused; complete: active|paused|blocked→complete;
+    /// resume: active|paused|blocked→active(需余量,清 blocker)。
+    fn transition_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        verb: &'static str,
+        allowed: &[GoalPhase],
+        next: GoalPhase,
+        check_capacity: bool,
+    ) -> Result<GoalRecord> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = Self::expect_goal(&tx, session_id, goal_id, revision)?;
+        if !allowed.contains(&current.phase) {
+            bail!(GoalDenied::InvalidTransition {
+                from: current.phase,
+                verb,
+            });
+        }
+        if check_capacity && current.rounds_started >= current.max_rounds {
+            bail!(GoalDenied::RoundsExhausted {
+                max_rounds: current.max_rounds
+            });
+        }
+        let updated_at = goal_next_timestamp(&current.updated_at);
+        tx.execute(
+            "UPDATE goals SET revision = revision + 1, phase = ?3,
+                 blocked_code = NULL, blocked_message = NULL, updated_at = ?4
+             WHERE session_id = ?1 AND goal_id = ?2 AND revision = ?5",
+            params![session_id, goal_id, next.as_str(), updated_at, revision],
+        )?;
+        let record = load_goal(&tx, session_id)?.context("goal vanished mid-transition")?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn pause_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<GoalRecord> {
+        self.transition_goal(
+            session_id,
+            goal_id,
+            revision,
+            "pause",
+            &[GoalPhase::Active],
+            GoalPhase::Paused,
+            false,
+        )
+    }
+
+    pub fn resume_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<GoalRecord> {
+        self.transition_goal(
+            session_id,
+            goal_id,
+            revision,
+            "resume",
+            &[GoalPhase::Active, GoalPhase::Paused, GoalPhase::Blocked],
+            GoalPhase::Active,
+            true,
+        )
+    }
+
+    pub fn complete_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<GoalRecord> {
+        self.transition_goal(
+            session_id,
+            goal_id,
+            revision,
+            "complete",
+            &[GoalPhase::Active, GoalPhase::Paused, GoalPhase::Blocked],
+            GoalPhase::Complete,
+            false,
+        )
+    }
+
+    /// block: 仅 active;记录 kebab 代码 + 非空说明(dsh 同款校验)。
+    pub fn block_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<GoalRecord> {
+        if !kebab_code_valid(code) {
+            bail!(GoalDenied::InvalidInput(format!(
+                "goal block code must be lower-kebab-case: {code}"
+            )));
+        }
+        let message = message.trim();
+        if message.is_empty() {
+            bail!(GoalDenied::InvalidInput(
+                "goal block reason requires a non-empty message".to_string()
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = Self::expect_goal(&tx, session_id, goal_id, revision)?;
+        if current.phase != GoalPhase::Active {
+            bail!(GoalDenied::InvalidTransition {
+                from: current.phase,
+                verb: "block",
+            });
+        }
+        let updated_at = goal_next_timestamp(&current.updated_at);
+        tx.execute(
+            "UPDATE goals SET revision = revision + 1, phase = 'blocked',
+                 blocked_code = ?3, blocked_message = ?4, updated_at = ?5
+             WHERE session_id = ?1 AND goal_id = ?2 AND revision = ?6",
+            params![session_id, goal_id, code, message, updated_at, revision],
+        )?;
+        let record = load_goal(&tx, session_id)?.context("goal vanished mid-block")?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// clear:删行。历史仍在对话记录里。
+    pub fn clear_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        Self::expect_goal(&tx, session_id, goal_id, revision)?;
+        tx.execute("DELETE FROM goals WHERE session_id = ?1", params![session_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 续轮驱动器专用:认领下一轮(rounds_started+1,revision 不变)。
+    /// 双 CAS(revision + expected_round)保证并发驱动不重号;phase 必须
+    /// active 且有余量。
+    pub fn begin_goal_round(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        expected_round: i64,
+    ) -> Result<GoalRecord> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current = Self::expect_goal(&tx, session_id, goal_id, revision)?;
+        if current.phase != GoalPhase::Active {
+            bail!(GoalDenied::InvalidTransition {
+                from: current.phase,
+                verb: "begin-round",
+            });
+        }
+        if current.rounds_started != expected_round {
+            bail!(GoalDenied::StaleRevision {
+                current_goal_id: current.goal_id,
+                current_revision: current.revision,
+            });
+        }
+        if current.rounds_started >= current.max_rounds {
+            bail!(GoalDenied::RoundsExhausted {
+                max_rounds: current.max_rounds
+            });
+        }
+        let updated_at = goal_next_timestamp(&current.updated_at);
+        tx.execute(
+            "UPDATE goals SET rounds_started = rounds_started + 1, updated_at = ?3
+             WHERE session_id = ?1 AND goal_id = ?2",
+            params![session_id, goal_id, updated_at],
+        )?;
+        let record = load_goal(&tx, session_id)?.context("goal vanished mid-round")?;
+        tx.commit()?;
+        Ok(record)
+    }
+}
+
+#[cfg(test)]
+mod goal_tests {
+    use super::*;
+
+    fn db_with_session() -> (tempfile::TempDir, ConversationDb, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ConversationDb::open(temp.path()).unwrap();
+        let record = db
+            .create_session("miyu", "goal test", crate::state::USER_SESSION_KIND, None)
+            .unwrap();
+        let session = record.session_id;
+        (temp, db, session)
+    }
+
+    fn denied(error: &anyhow::Error) -> &GoalDenied {
+        error.downcast_ref::<GoalDenied>().expect("GoalDenied")
+    }
+
+    #[test]
+    fn goal_lifecycle_and_cas() {
+        let (_t, db, session) = db_with_session();
+        assert!(db.goal(&session).unwrap().is_none());
+
+        let goal = db.create_goal(&session, "修好构建", None).unwrap();
+        assert_eq!(goal.revision, 1);
+        assert_eq!(goal.phase, GoalPhase::Active);
+        assert_eq!(goal.max_rounds, DEFAULT_MAX_GOAL_ROUNDS);
+
+        // 未完成时重复创建 → AlreadyExists。
+        let error = db.create_goal(&session, "另一个", None).unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::AlreadyExists { .. }));
+
+        // 陈旧 revision → Stale。
+        let error = db
+            .edit_goal(&session, &goal.goal_id, 99, Some("x"), None)
+            .unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::StaleRevision { .. }));
+
+        // edit 保 phase,revision 递增。
+        let goal = db
+            .edit_goal(&session, &goal.goal_id, goal.revision, Some("修好构建并测试"), Some(5))
+            .unwrap();
+        assert_eq!(goal.revision, 2);
+        assert_eq!(goal.phase, GoalPhase::Active);
+        assert_eq!(goal.max_rounds, 5);
+
+        // pause → resume 清 blocker、需余量。
+        let goal = db
+            .pause_goal(&session, &goal.goal_id, goal.revision)
+            .unwrap();
+        assert_eq!(goal.phase, GoalPhase::Paused);
+        let goal = db
+            .resume_goal(&session, &goal.goal_id, goal.revision)
+            .unwrap();
+        assert_eq!(goal.phase, GoalPhase::Active);
+
+        // block 仅 active,kebab 校验。
+        let error = db
+            .block_goal(&session, &goal.goal_id, goal.revision, "Bad_Code", "x")
+            .unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::InvalidInput(_)));
+        let goal = db
+            .block_goal(&session, &goal.goal_id, goal.revision, "model-reported", "缺依赖")
+            .unwrap();
+        assert_eq!(goal.phase, GoalPhase::Blocked);
+        assert_eq!(goal.blocked_code.as_deref(), Some("model-reported"));
+
+        // blocked → complete 允许;complete 后可被新目标替换。
+        let goal = db
+            .complete_goal(&session, &goal.goal_id, goal.revision)
+            .unwrap();
+        assert_eq!(goal.phase, GoalPhase::Complete);
+        let replacement = db.create_goal(&session, "下一个目标", Some(3)).unwrap();
+        assert_ne!(replacement.goal_id, goal.goal_id);
+        assert_eq!(replacement.revision, 1);
+
+        // clear 删行。
+        db.clear_goal(&session, &replacement.goal_id, replacement.revision)
+            .unwrap();
+        assert!(db.goal(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn goal_rounds_are_claimed_with_double_cas_and_capacity() {
+        let (_t, db, session) = db_with_session();
+        let goal = db.create_goal(&session, "循环任务", Some(2)).unwrap();
+
+        let goal = db
+            .begin_goal_round(&session, &goal.goal_id, goal.revision, 0)
+            .unwrap();
+        assert_eq!(goal.rounds_started, 1);
+        // 轮号 CAS:重复认领同一轮被拒。
+        let error = db
+            .begin_goal_round(&session, &goal.goal_id, goal.revision, 0)
+            .unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::StaleRevision { .. }));
+        let goal = db
+            .begin_goal_round(&session, &goal.goal_id, goal.revision, 1)
+            .unwrap();
+        assert_eq!(goal.rounds_started, 2);
+        // 余量耗尽。
+        let error = db
+            .begin_goal_round(&session, &goal.goal_id, goal.revision, 2)
+            .unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::RoundsExhausted { .. }));
+        // resume 在无余量时也拒(引导先 edit 提高上限)。
+        let paused = db
+            .pause_goal(&session, &goal.goal_id, goal.revision)
+            .unwrap();
+        let error = db
+            .resume_goal(&session, &paused.goal_id, paused.revision)
+            .unwrap_err();
+        assert!(matches!(denied(&error), GoalDenied::RoundsExhausted { .. }));
+    }
+}

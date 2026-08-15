@@ -32,6 +32,7 @@ pub use conversation_db::{
     TurnRedoCheckpointPayload, TurnStatus, UserAttachment, UserAttachmentData,
     GLOBAL_PLATFORM_ACCOUNT_SCOPE,
     ToolFlowCall, ToolFlowRound,
+    GoalDenied, GoalPhase, GoalRecord, DEFAULT_MAX_GOAL_ROUNDS,
 };
 pub use usage::{UsageMeta, UsageRange, UsageSnapshot, UsageStats};
 
@@ -438,6 +439,77 @@ impl StateStore {
     /// stale (deleted, archived, or another persona's).
     pub fn repl_session(&self, persona: &str) -> Result<Option<String>> {
         self.conv_db.repl_session(persona)
+    }
+
+    // ---- 会话目标(goal,任务#9;armed 激活态驻 daemon 内存,不在此) ----
+
+    pub fn goal(&self, session_id: &str) -> Result<Option<GoalRecord>> {
+        self.conv_db.goal(session_id)
+    }
+
+    pub fn create_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        max_rounds: Option<i64>,
+    ) -> Result<GoalRecord> {
+        self.conv_db.create_goal(session_id, objective, max_rounds)
+    }
+
+    pub fn edit_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        objective: Option<&str>,
+        max_rounds: Option<i64>,
+    ) -> Result<GoalRecord> {
+        self.conv_db
+            .edit_goal(session_id, goal_id, revision, objective, max_rounds)
+    }
+
+    pub fn pause_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<GoalRecord> {
+        self.conv_db.pause_goal(session_id, goal_id, revision)
+    }
+
+    pub fn resume_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<GoalRecord> {
+        self.conv_db.resume_goal(session_id, goal_id, revision)
+    }
+
+    pub fn complete_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<GoalRecord> {
+        self.conv_db.complete_goal(session_id, goal_id, revision)
+    }
+
+    pub fn block_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<GoalRecord> {
+        self.conv_db
+            .block_goal(session_id, goal_id, revision, code, message)
+    }
+
+    pub fn clear_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<()> {
+        self.conv_db.clear_goal(session_id, goal_id, revision)
+    }
+
+    pub fn begin_goal_round(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        expected_round: i64,
+    ) -> Result<GoalRecord> {
+        self.conv_db
+            .begin_goal_round(session_id, goal_id, revision, expected_round)
     }
 
     pub fn set_repl_session(&self, persona: &str, session_id: &str) -> Result<()> {
