@@ -92,3 +92,21 @@ where
 pub fn current_origin_tty() -> Option<crate::ipc::OriginTty> {
     ORIGIN_TTY.try_with(|origin| origin.clone()).ok().flatten()
 }
+
+tokio::task_local! {
+    /// 触发本回合的平台侧真实发起者(如 QQ user_id)。后台任务 spawn 时捕获,
+    /// 完成唤醒的合成回合凭它继承发起者的身份与权限;不继承的话合成事件只能
+    /// 伪装成机器人自己,is_admin=false 会把工具表降级成受限集合(issue #29)。
+    static PLATFORM_SENDER: Option<String>;
+}
+
+pub async fn with_platform_sender<F>(sender: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PLATFORM_SENDER.scope(sender, future).await
+}
+
+pub fn current_platform_sender() -> Option<String> {
+    PLATFORM_SENDER.try_with(|sender| sender.clone()).ok().flatten()
+}

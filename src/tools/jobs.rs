@@ -101,6 +101,9 @@ struct JobEntry {
     /// 触发这轮回合的终端(shellhook/单次 CLI)。任务完成后 daemon 凭它把
     /// 跟进回复写回那个终端。
     origin_tty: Option<crate::ipc::OriginTty>,
+    /// 平台回合里真实发起者的 user_id(如 QQ 号)。完成唤醒的合成回合凭它
+    /// 继承发起者权限,而不是伪装成机器人自己(issue #29)。
+    platform_sender: Option<String>,
     kind: JobKind,
     started_wall: SystemTime,
     started: Instant,
@@ -127,6 +130,8 @@ pub struct JobCompletion {
     pub session_id: Option<Arc<str>>,
     /// 触发终端指纹,见 [`crate::ipc::OriginTty`]。
     pub origin_tty: Option<crate::ipc::OriginTty>,
+    /// 平台回合发起者的 user_id,唤醒合成事件用它还原身份(issue #29)。
+    pub platform_sender: Option<String>,
     pub state_label: String,
     pub exit_code: Option<i32>,
     pub runtime_seconds: u64,
@@ -464,6 +469,7 @@ pub async fn spawn_background(
         workspace: workspace.clone(),
         session_id: super::workspace::try_session(),
         origin_tty: super::workspace::current_origin_tty(),
+        platform_sender: super::workspace::current_platform_sender(),
         kind: JobKind::Command { pid },
         started_wall: SystemTime::now(),
         started: Instant::now(),
@@ -560,6 +566,7 @@ where
         workspace: super::workspace::effective_workdir(),
         session_id: super::workspace::try_session(),
         origin_tty: super::workspace::current_origin_tty(),
+        platform_sender: super::workspace::current_platform_sender(),
         kind: JobKind::Subagent {
             abort: handle.abort_handle(),
         },
@@ -613,6 +620,7 @@ fn finalize_job(job_id: &str, state: JobState, wake_requested: bool) {
             workspace: job.workspace.clone(),
             session_id: job.session_id.clone(),
             origin_tty: job.origin_tty.clone(),
+            platform_sender: job.platform_sender.clone(),
             state_label: state.label(),
             exit_code: match state {
                 JobState::Exited { code } => code,

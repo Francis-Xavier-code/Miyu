@@ -671,16 +671,30 @@ fn api_frame(action: &str, params: Value, echo: &str) -> String {
 // WebSocket endpoint
 // ---------------------------------------------------------------------------
 
+/// 合成唤醒事件的 user_id:优先 spawn 回合记录的真实发起者;私聊退回会话
+/// 对端(该私聊唯一的人类);群聊无记录时保持机器人自身——不凭空授予权限,
+/// 只是回到修复前的降级行为。
+fn wake_sender_user_id(initiator: Option<&str>, target: Target, self_id: i64) -> i64 {
+    initiator
+        .and_then(|id| id.trim().parse().ok())
+        .or(match target {
+            Target::Private { user_id } => Some(user_id),
+            Target::Group { .. } => None,
+        })
+        .unwrap_or(self_id)
+}
+
 /// Background-job completion wake: a self-initiated model turn in a bound
 /// QQ conversation. There is no inbound event — reply targeting, affection
-/// and trigger judging all no-op — and the synthetic sender is the bot
-/// account itself, so the model reads the job result and reports it into
-/// the conversation in its own voice.
+/// and trigger judging all no-op — the sender display name stays "系统",
+/// so the model reads the job result and reports it into the conversation
+/// in its own voice.
 pub(crate) async fn wake_conversation_for_job(
     state: &DaemonState,
     account_id: &str,
     conversation_kind: &str,
     conversation_id: &str,
+    initiator: Option<&str>,
     content: String,
 ) -> Result<()> {
     let self_id: i64 = account_id
@@ -704,9 +718,13 @@ pub(crate) async fn wake_conversation_for_job(
         other => bail!("unsupported QQ conversation kind: {other}"),
     };
     let config = state.manager.lock().unwrap().config.clone();
+    // issue #29:合成事件的 user_id 决定 is_admin → host_tools_allowed →
+    // 工具表选择。必须继承真实发起者的身份,伪装成机器人自己会把跟进 turn
+    // 降级成受限工具集,job_status 都不存在。
+    let sender_user_id = wake_sender_user_id(initiator, target, self_id);
     let event = json!({
         "self_id": self_id,
-        "user_id": self_id,
+        "user_id": sender_user_id,
         "sender": { "nickname": "系统" },
     });
     let context = Arc::new(platform_turn_context(
@@ -722,8 +740,8 @@ pub(crate) async fn wake_conversation_for_job(
     // like an inbound turn would.
     let prepared = context.prepare_turn(content).await;
     let mut turn_system_context = vec![
-        "本轮由系统自动触发：一个后台任务刚刚结束。这不是任何群成员或用户发来的消息；\
-         请用 job_status 查看任务输出，然后以你自己的身份把结果自然地发到会话里。"
+        "本轮由系统自动触发：一个后台任务刚刚结束，报告与结果就在本轮消息里。\
+         这不是任何群成员或用户发来的消息；以你自己的身份把结果自然地发到会话里。"
             .to_string(),
     ];
     turn_system_context.extend(prepared.turn_system_context);
@@ -5737,6 +5755,26 @@ fn text_segment(text: &str) -> Value {
 mod tests {
     use super::*;
     use crate::paths::MiyuPaths;
+
+    /// issue #29:唤醒合成事件必须继承发起者身份,不能伪装成机器人自己。
+    #[test]
+    fn wake_sender_inherits_recorded_initiator() {
+        let group = Target::Group { group_id: 777 };
+        assert_eq!(wake_sender_user_id(Some("10086"), group, 999), 10086);
+        let private = Target::Private { user_id: 555 };
+        assert_eq!(wake_sender_user_id(Some("10086"), private, 999), 10086);
+    }
+
+    #[test]
+    fn wake_sender_falls_back_to_private_peer_then_self() {
+        // 私聊无记录:对端就是这个私聊唯一的人类。
+        let private = Target::Private { user_id: 555 };
+        assert_eq!(wake_sender_user_id(None, private, 999), 555);
+        assert_eq!(wake_sender_user_id(Some("not-a-number"), private, 999), 555);
+        // 群聊无记录:保持 self_id,不凭空授予任何成员的权限。
+        let group = Target::Group { group_id: 777 };
+        assert_eq!(wake_sender_user_id(None, group, 999), 999);
+    }
 
     fn test_paths(root: &std::path::Path) -> MiyuPaths {
         MiyuPaths {

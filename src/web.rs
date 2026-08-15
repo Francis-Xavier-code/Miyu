@@ -5944,6 +5944,12 @@ async fn actor_loop(
                     .or_else(|| cwd.filter(|path| path.is_dir()))
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("."));
+                // 平台回合的真实发起者。后台任务 spawn 时从 task-local 捕获,
+                // 完成唤醒凭它还原身份(issue #29)。
+                let platform_sender = profile
+                    .as_ref()
+                    .and_then(|profile| profile.platform.as_ref())
+                    .map(|platform| platform.sender_id.clone());
                 let task = run_turn_task(
                     config.clone(),
                     paths.clone(),
@@ -5972,7 +5978,10 @@ async fn actor_loop(
                     workspace,
                     crate::tools::workspace::with_session(
                         session_id,
-                        crate::tools::workspace::with_origin_tty(origin_tty, task),
+                        crate::tools::workspace::with_origin_tty(
+                            origin_tty,
+                            crate::tools::workspace::with_platform_sender(platform_sender, task),
+                        ),
                     ),
                 ));
             }
@@ -8153,9 +8162,18 @@ async fn wake_platform_session_for_job(
     } else {
         "后台命令"
     };
+    // 与本地唤醒同款:结果直接附在唤醒里(子代理给完整结论,命令给日志尾部),
+    // 只给事实,不再指示模型「先去查一次再汇报」。
+    let result_block = tools::jobs::completion_result(
+        &completion.log_path,
+        completion.is_subagent,
+        completion.exit_code == Some(0),
+    )
+    .map(|(label, body)| format!("- {label}:\n{body}\n"))
+    .unwrap_or_default();
     let content = format!(
         "<background-job-report>{noun}「{}」已执行完毕：\n- job_id: {}\n- 任务: {}\n- 状态: {}（运行 {} 秒）\n\
-         请用 job_status 查看输出，并把结果自然地发到会话里。这是系统自动触发的跟进，不是用户消息。\
+         {result_block}这是系统自动触发的跟进，不是用户消息。\
          </background-job-report>",
         completion.title,
         completion.job_id,
@@ -8168,6 +8186,7 @@ async fn wake_platform_session_for_job(
         &binding.key.account_id,
         &binding.key.conversation_kind,
         &binding.key.conversation_id,
+        completion.platform_sender.as_deref(),
         content,
     )
     .await
