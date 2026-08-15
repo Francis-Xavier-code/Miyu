@@ -1047,7 +1047,8 @@ pub fn register_management(registry: &mut ToolRegistry) {
             |args| async move { job_stop(args).await },
         )
         .writes()
-        .with_display_name(t("Stop background task", "停止后台任务")),
+        .with_display_name(t("Stop background task", "停止后台任务"))
+        .with_always_loaded(false),
     );
 }
 
@@ -1076,7 +1077,8 @@ pub fn register_status(registry: &mut ToolRegistry) {
             }),
             |args| async move { job_status(args).await },
         )
-        .with_display_name(t("Check background tasks", "查询后台任务")),
+        .with_display_name(t("Check background tasks", "查询后台任务"))
+        .with_always_loaded(false),
     );
 }
 

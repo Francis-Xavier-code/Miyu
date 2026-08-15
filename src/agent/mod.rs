@@ -1022,6 +1022,7 @@ impl Agent {
             with_mode_reminder(base_system_prompt, mode),
             prompt_audience,
             paths,
+            mode,
         );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
@@ -1226,6 +1227,8 @@ impl Agent {
             ),
             self.prompt_audience,
             &self.paths,
+        
+            self.mode,
         );
         Ok(())
     }
@@ -1507,6 +1510,8 @@ impl Agent {
             ),
             self.prompt_audience,
             &self.paths,
+        
+            self.mode,
         );
         Ok(())
     }
@@ -2100,7 +2105,17 @@ impl Agent {
         messages.extend(prepared.hints);
         // 记忆联想不再按模式关断:dev 的 MemoryStore 指向保留人格 "dev"
         // 的独立库(构造时作用域化),联想/落库都发生在自己的命名空间里。
-        if let Some(mut association) = self.memory.association(&input)? {
+        let association_exclusion = self
+            .state
+            .oldest_visible_turn_timestamp(&turn_id)?
+            .map(|since| crate::memory::AssociationExclusion {
+                session_id: self.state.session_id().to_string(),
+                since,
+            });
+        if let Some(mut association) = self
+            .memory
+            .association(&input, association_exclusion.as_ref())?
+        {
             if association.organization_due {
                 self.wake_memory_organizer();
             }
@@ -5749,6 +5764,7 @@ fn with_host_environment(
     mut system_prompt: String,
     audience: PromptAudience,
     paths: &MiyuPaths,
+    mode: AgentMode,
 ) -> String {
     if audience != PromptAudience::Owner {
         return system_prompt;
@@ -5757,9 +5773,12 @@ fn with_host_environment(
     system_prompt.push_str(&crate::host_info::host_environment_block(&paths.root_dir));
     // 渲染能力说明(仅 owner 会话):终端与 WebUI 都支持 LaTeX。
     // 不放人格提示词里——QQ 等平台的排版能力不同,不该看到这段。
-    system_prompt.push_str(
-        "\n\n输出数学公式时使用 LaTeX:重要公式用块级定界符(`$$…$$` 或 `\\[…\\]`,独立成段)会渲染成排版图;行内用 `$…$` 或 `\\(…\\)`,会转写为 Unicode 数学文本;表格单元格内的公式同样支持,分式会排成上下结构。不要用裸 Unicode 或 ASCII 手拼公式。",
-    );
+    // dev 也不带:极简原则,编码任务用不上排版说明(验收 08-16 解剖)。
+    if mode != AgentMode::Dev {
+        system_prompt.push_str(
+            "\n\n输出数学公式时使用 LaTeX:重要公式用块级定界符(`$$…$$` 或 `\\[…\\]`,独立成段)会渲染成排版图;行内用 `$…$` 或 `\\(…\\)`,会转写为 Unicode 数学文本;表格单元格内的公式同样支持,分式会排成上下结构。不要用裸 Unicode 或 ASCII 手拼公式。",
+        );
+    }
     system_prompt
 }
 
@@ -6695,7 +6714,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
 
-        let owner = with_host_environment("base".to_string(), PromptAudience::Owner, &paths);
+        let owner = with_host_environment("base".to_string(), PromptAudience::Owner, &paths, AgentMode::Normal);
         assert!(owner.starts_with("base\n\n<host-environment os=\""));
         assert!(owner.contains("/>"));
         assert!(owner.contains("LaTeX"), "渲染能力说明应跟随 owner 提示词");
@@ -6709,7 +6728,7 @@ mod tests {
         // so they take no prefix-cache cold start from this change at all.
         for audience in [PromptAudience::External, PromptAudience::Internal] {
             assert_eq!(
-                with_host_environment("base".to_string(), audience, &paths),
+                with_host_environment("base".to_string(), audience, &paths, AgentMode::Normal),
                 "base",
                 "{audience:?} must be untouched"
             );
@@ -6722,8 +6741,8 @@ mod tests {
         let paths = test_paths(temp.path());
         // Rebuilt on every turn by `prepare_for_turn`; a value that drifted
         // between rebuilds would move the prefix and cost a cache miss a turn.
-        let first = with_host_environment(String::new(), PromptAudience::Owner, &paths);
-        let second = with_host_environment(String::new(), PromptAudience::Owner, &paths);
+        let first = with_host_environment(String::new(), PromptAudience::Owner, &paths, AgentMode::Normal);
+        let second = with_host_environment(String::new(), PromptAudience::Owner, &paths, AgentMode::Normal);
         assert_eq!(first, second);
     }
 

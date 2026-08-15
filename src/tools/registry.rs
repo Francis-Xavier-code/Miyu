@@ -807,12 +807,13 @@ fn load_target_tool_xml(tool: &ToolSpec) -> String {
 
 fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
     let summary = load_target_summary(&tool.description);
+    // 后缀只留标记:整套"先 load_tools 取契约再调用"的说明在 load_tools
+    // 自己的 description 里统一给一次,N 个 stub 各背一遍纯属重复计费
+    // (验收 08-16:每条省 ~55B)。
     let description = if summary.is_empty() {
-        "（精简条目）先调用 load_tools 获取本工具的完整参数契约，再按契约直接填写参数调用本工具。".to_string()
+        "（精简条目：契约经 load_tools 获取）".to_string()
     } else {
-        format!(
-            "{summary}（精简条目：先调用 load_tools 获取完整参数契约，再按契约直接填写参数调用本工具。）"
-        )
+        format!("{summary}（精简条目）")
     };
     ToolDefinition {
         kind: "function",

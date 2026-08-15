@@ -814,8 +814,9 @@ mod tier_schema_probe {
             "tier missing: {}",
             task.function.parameters
         );
-        // Unconfigured pools are announced as falling back to main.
-        assert!(task.function.description.contains("cheap=["));
+        // 全未配置=零追加(08-16 tools 瘦身:三行"未配置"是零信息,还把
+        // 动态文本焊进 tools 数组);配置了档位才出现状态。
+        assert!(!task.function.description.contains("cheap=["));
     }
 
     /// The description suffix lists the concrete models per tier pool.

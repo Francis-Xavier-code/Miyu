@@ -68,6 +68,7 @@
     package: [["path", { d: "m7.5 4.27 9 5.15" }], ["path", { d: "M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" }], ["path", { d: "m3.3 7 8.7 5 8.7-5" }], ["path", { d: "M12 22V12" }]],
     sparkles: [["path", { d: "M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" }], ["path", { d: "M20 3v4" }], ["path", { d: "M22 5h-4" }]],
     code: [["polyline", { points: "16 18 22 12 16 6" }], ["polyline", { points: "8 6 2 12 8 18" }]],
+    arch: [["path", { d: "M12 2c-.9 2.3-1.5 3.8-2.6 5.9.7.7 1.5 1.5 2.8 2.4-1.4-.6-2.4-1.2-3.2-1.8C7.5 11.6 5.2 16 2 22c2.9-1.7 5.4-2.8 7.7-3.3.6-2.1 1.4-3.2 2.3-3.2s1.7 1.1 2.3 3.2c2.3.5 4.8 1.6 7.7 3.3-3.2-6-5.5-10.4-7-13.5-.8.6-1.8 1.2-3.2 1.8 1.3-.9 2.1-1.7 2.8-2.4C13.5 5.8 12.9 4.3 12 2z", fill: "currentColor", stroke: "none" }]],
     "chevron-left": [["path", { d: "m15 18-6-6 6-6" }]],
     "layout-grid": [["rect", { x: "3", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "14", width: "7", height: "7", rx: "1" }], ["rect", { x: "3", y: "14", width: "7", height: "7", rx: "1" }]],
     "chart-column": [["path", { d: "M3 3v16a2 2 0 0 0 2 2h16" }], ["path", { d: "M7 15v-4m5 4V8m5 7v-6" }]],
@@ -6523,7 +6524,8 @@
     if (n === "trash_path") return "trash-2";
     if (n === "load_tools") return "package";
     if (n.includes("skill")) return "puzzle";
-    if (n.startsWith("aur_") || n.startsWith("archlinux") || n.startsWith("archwiki") || n.startsWith("online_man") || n === "install_aur_package") return "package";
+    if (n.startsWith("aur_") || n.startsWith("archlinux") || n.startsWith("archwiki") || n === "install_aur_package") return "arch";
+    if (n.startsWith("online_man")) return "package";
     if (n === "usage_query") return "chart-column";
     if (["draw_tarot_card", "draw_zhouyi_hexagram", "draw_fortune_lot"].includes(n)) return "sparkles";
     if (["create_artifact", "read_artifact", "present_artifact"].includes(n)) return "file-text";

@@ -1965,12 +1965,12 @@ textarea:disabled {
   width: fit-content;
   max-width: 100%;
   align-items: center;
-  padding: 4px 9px;
+  padding: 4px 11px;
   border-radius: 6px;
   background: var(--chip-think);
   color: var(--text);
   cursor: pointer;
-  gap: 5px;
+  gap: 7px;
   font-size: 11.5px;
   font-weight: 600;
   line-height: 1.5;
@@ -1990,7 +1990,6 @@ textarea:disabled {
 .reasoning-block summary .reasoning-icon {
   width: 13px;
   height: 13px;
-  padding-top: 2px;
   color: var(--accent);
 }
 
@@ -2304,7 +2303,6 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   width: 15px;
   height: 15px;
   flex: 0 0 15px;
-  padding-top: 2px;
   place-items: center;
   border-radius: 0;
   background: none;

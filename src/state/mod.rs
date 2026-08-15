@@ -491,6 +491,14 @@ impl StateStore {
         self.conv_db.latest_turn_seq(session_id)
     }
 
+    pub fn oldest_visible_turn_timestamp(
+        &self,
+        excluding_turn_id: &str,
+    ) -> Result<Option<String>> {
+        self.conv_db
+            .oldest_visible_turn_timestamp(&self.session(), excluding_turn_id)
+    }
+
     pub fn is_platform_session(&self, session_id: &str) -> Result<bool> {
         self.conv_db.is_platform_session(session_id)
     }

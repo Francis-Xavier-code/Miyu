@@ -808,6 +808,22 @@ impl ConversationDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// 最老可见轮的用户时间戳(排除指定回合;Utc RFC3339)。联想自回声
+    /// 过滤用它当"仍在眼前"的下界:被 compact 藏起的轮不算。
+    pub fn oldest_visible_turn_timestamp(
+        &self,
+        session_id: &str,
+        excluding_turn_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT MIN(user_timestamp) FROM turns
+              WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0 AND turn_id != ?2",
+            params![session_id, excluding_turn_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?)
+    }
+
     pub fn is_platform_session(&self, session_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
