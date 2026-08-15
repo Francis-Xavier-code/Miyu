@@ -7003,8 +7003,8 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             t("Bare `miyu` default mode", "裸 miyu 默认模式"),
             config.default_mode.clone(),
         )
-        .choices(&["normal", "dev"])
-        .empty_choice_label(t("Show mode help", "显示模式帮助")),
+        .choices(&["", "normal", "dev"])
+        .empty_choice_label(t("Help screen", "帮助信息")),
     ];
     // The read-back below is by index, so an insert in the middle silently
     // writes every later value into the wrong setting. This catches that in
@@ -7564,6 +7564,10 @@ fn localized_choice_label(value: &str, zh: bool) -> Option<&'static str> {
         return Some(label);
     }
     match (value.trim(), zh) {
+        ("normal", false) => Some("Normal mode (normal)"),
+        ("normal", true) => Some("普通模式（normal）"),
+        ("dev", false) => Some("Dev mode (dev)"),
+        ("dev", true) => Some("开发模式（dev）"),
         ("minimal", false) => Some("Minimal"),
         ("minimal", true) => Some("最低"),
         ("low", false) => Some("Low"),

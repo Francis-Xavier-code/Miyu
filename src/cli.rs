@@ -453,7 +453,7 @@ fn extract_debug_flag(args: &mut Vec<OsString>) -> bool {
 fn localized_command() -> clap::Command {
     let mut command = Cli::command();
     command = command
-        .about(t("Miyu CLI AI Agent", "Miyu 命令行 AI 助手"))
+        .about(t("Miyu AI assistant", "Miyu AI 助手"))
         .override_usage(t(
             "miyu [OPTIONS] [MESSAGE]... [COMMAND]",
             "miyu [选项] [消息]... [命令]",
@@ -479,7 +479,70 @@ fn localized_command() -> clap::Command {
     if is_zh() {
         command = apply_chinese_help_template(command);
     }
+    // 终端无缝集成组在根帮助里以静态段单独成节(这些子命令已 hide,
+    // 不进 {subcommands});最后设置以免被上面的通用中文模板覆盖。
+    command = command.help_template(root_help_template());
     command
+}
+
+fn root_help_template() -> String {
+    let shell_block = t(
+        "  fish-init          Integrate with fish; then chat in natural language directly in the terminal
+  bash-init          Integrate with bash
+  zsh-init           Integrate with zsh
+  remove-shell-hook  Safely remove installed Miyu shell hooks
+  models             Switch the terminal-integration session's model
+  variant            Switch the terminal session model's thinking level
+  history            Show conversation history
+  reset              Clear the terminal-integration session context
+  pop                Move conversation turns out of active context",
+        "  fish-init          集成到 fish，集成后可在终端直接使用自然语言交流
+  bash-init          集成到 bash
+  zsh-init           集成到 zsh
+  remove-shell-hook  安全删除已安装的 Miyu shell hook
+  models             修改终端集成会话的模型
+  variant            切换终端集成会话模型的思考档位
+  history            显示会话历史
+  reset              清除终端集成会话上下文
+  pop                将对话轮次移出当前上下文",
+    );
+    if is_zh() {
+        format!(
+            "{{about}}
+
+用法: {{usage}}
+
+命令:
+{{subcommands}}
+
+终端无缝集成相关：
+{shell_block}
+
+参数:
+{{positionals}}
+选项:
+{{options}}
+{{after-help}}"
+        )
+    } else {
+        format!(
+            "{{about}}
+
+Usage: {{usage}}
+
+Commands:
+{{subcommands}}
+
+Terminal integration:
+{shell_block}
+
+Arguments:
+{{positionals}}
+Options:
+{{options}}
+{{after-help}}"
+        )
+    }
 }
 
 fn apply_localized_help_flags(mut command: clap::Command, root: bool) -> clap::Command {
@@ -548,8 +611,8 @@ fn localize_top_args(command: clap::Command) -> clap::Command {
         })
         .mut_arg("continue_session", |arg| {
             arg.help(t(
-                "Send this one-shot message to the terminal session instead of a throwaway one",
-                "把这条一次性消息发进终端会话，而不是用完即弃的临时会话",
+                "Send the message into the terminal-integration session instead of a throwaway one-shot chat",
+                "把消息发进终端集成会话，而不是用完即弃的一次性对话",
             ))
         })
         .mut_arg("message", |arg| {
@@ -564,55 +627,54 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
     let descriptions = [
         (
             "ask",
-            "Send one message to the assistant",
-            "向助手发送一条消息",
+            "Send one message to the assistant as a one-shot chat",
+            "向助手发送一条消息，一次性对话",
+        ),
+        (
+            "normal",
+            "Enter the normal-mode REPL (full persona abilities)",
+            "进入普通模式 REPL（人格全能力）",
+        ),
+        (
+            "dev",
+            "Enter the dev-mode REPL (minimal coding form, no persona)",
+            "进入开发模式 REPL（极简编码形态，无人格）",
+        ),
+        (
+            "tool-call",
+            "Tool bridge: call AI tools from the command line",
+            "工具桥：通过命令行调用 AI 工具",
         ),
         (
             "init",
-            "Create default config and state files; use <shell>-init for shell hooks",
-            "创建默认配置和状态文件；Shell 集成请使用对应的 <shell>-init 命令",
+            "Create default config and state files",
+            "创建默认配置和状态文件",
         ),
         (
             "paths",
             "Show app config, data, and cache paths",
             "显示应用配置、数据和缓存路径",
         ),
-        ("config", "Open or manage configuration", "打开或管理配置"),
-        (
-            "reload",
-            "Reload configuration in the running Miyu daemon",
-            "在运行中的 Miyu daemon 内重新加载配置",
-        ),
+        ("config", "Configure via the TUI", "使用 TUI 进行配置"),
+        ("reload", "Reload configuration", "重新加载配置"),
         (
             "models",
-            "Switch the current session's model",
-            "切换当前会话使用的模型",
+            "Switch the terminal-integration session's model",
+            "修改终端集成会话的模型",
         ),
-        (
-            "list-models",
-            "List the global model pool with indexes",
-            "列出全局模型池并编号",
-        ),
+        ("list-models", "List available models", "列出可用模型"),
         (
             "variant",
-            "View or switch thinking level",
-            "查看或切换思考档位",
+            "Switch the terminal session model's thinking level",
+            "切换终端集成会话模型的思考档位",
         ),
         (
             "fish-init",
             "Integrate with fish so you can chat in natural language directly in the terminal",
             "集成到 fish，集成后可在终端直接使用自然语言交流。",
         ),
-        (
-            "bash-init",
-            "Integrate with bash so you can chat in natural language directly in the terminal",
-            "集成到 bash，集成后可在终端直接使用自然语言交流。",
-        ),
-        (
-            "zsh-init",
-            "Integrate with zsh so you can chat in natural language directly in the terminal",
-            "集成到 zsh，集成后可在终端直接使用自然语言交流。",
-        ),
+        ("bash-init", "Integrate with bash", "集成到 bash"),
+        ("zsh-init", "Integrate with zsh", "集成到 zsh"),
         (
             "remove-shell-hook",
             "Safely remove installed Miyu shell hooks",
@@ -624,50 +686,25 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "Move conversation turns out of active context",
             "将对话轮次移出当前上下文",
         ),
-        ("kb", "Manage local knowledge base", "管理本地知识库"),
+        ("kb", "Manage the knowledge base", "管理知识库"),
         (
             "update-default-kb",
             "Update Miyu default knowledge base",
             "更新 Miyu 默认知识库",
         ),
-        (
-            "memory",
-            "Inspect or edit assistant memory",
-            "查看或编辑助手记忆",
-        ),
+        ("memory", "Manage assistant memory", "管理记忆"),
         ("skills", "Manage assistant skills", "管理助手 skills"),
         (
             "reset",
-            "Start the current conversation over",
-            "重新开始当前会话",
+            "Clear the terminal-integration session context",
+            "清除终端集成会话上下文",
         ),
         (
             "wipe",
-            "Erase memory, all conversations, group contexts and generated skills",
-            "抹掉记忆、所有会话内容、群聊上下文和自动技能",
+            "Erase all conversation history, memory, group contexts and their artifacts",
+            "抹掉所有会话历史、记忆、群聊上下文和其产物",
         ),
-        (
-            "new",
-            "Create a new session and switch to it",
-            "创建新会话并切换过去",
-        ),
-        (
-            "session",
-            "List sessions, or switch to one (Ctrl+D deletes in the picker)",
-            "列出会话，或切换到指定会话（菜单内 Ctrl+D 删除）",
-        ),
-        ("rename", "Rename the current session", "重命名当前会话"),
-        (
-            "delete",
-            "Delete a session (current by default)",
-            "删除会话（默认当前会话）",
-        ),
-        (
-            "workspace",
-            "Show, bind, or unbind the session workspace",
-            "查看、绑定或解绑会话工作目录",
-        ),
-        ("web", "Open the local Miyu WebUI", "访问本地 Miyu WebUI"),
+                                                ("web", "Open the local Miyu WebUI", "访问本地 Miyu WebUI"),
         (
             "daemon",
             "Manage the unified Miyu background service",
@@ -675,17 +712,54 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         ),
         (
             "export",
-            "Pack this installation into a portable archive",
-            "把当前安装打包成可移植归档",
+            "Export configuration into a portable archive",
+            "导出配置，把当前配置打包成可移植归档",
         ),
-        (
-            "import",
-            "Restore an installation from an exported archive",
-            "从导出的归档恢复安装",
-        ),
+        ("import", "Import configuration", "导入配置"),
     ];
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
+    }
+    // 终端无缝集成组:从 {subcommands} 里藏掉,根帮助模板里以静态段
+    // 单独成节(clap 不支持子命令分组);`miyu <cmd> -h` 不受影响。
+    for name in [
+        "fish-init",
+        "bash-init",
+        "zsh-init",
+        "remove-shell-hook",
+        "models",
+        "variant",
+        "history",
+        "reset",
+        "pop",
+    ] {
+        command = command.mut_subcommand(name, |subcommand| subcommand.hide(true));
+    }
+    for (index, name) in [
+        "init",
+        "config",
+        "normal",
+        "dev",
+        "daemon",
+        "web",
+        "tool-call",
+        "ask",
+        "list-models",
+        "export",
+        "import",
+        "kb",
+        "memory",
+        "skills",
+        "update-default-kb",
+        "wipe",
+        "paths",
+        "reload",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        command = command
+            .mut_subcommand(name, move |subcommand| subcommand.display_order(index));
     }
     command = command
         .mut_subcommand("ask", localize_ask_command)
@@ -1018,11 +1092,6 @@ pub enum Command {
     Skills(SkillsArgs),
     Reset,
     Wipe(WipeArgs),
-    New(SessionNameArgs),
-    Session(SessionTargetArgs),
-    Rename(SessionRenameArgs),
-    Delete(SessionTargetArgs),
-    Workspace(WorkspaceArgs),
     Web(WebArgs),
     Daemon(DaemonArgs),
     /// 进入普通模式 REPL(人格全能力)
@@ -1032,26 +1101,6 @@ pub enum Command {
     /// 工具桥:以当前会话身份调用一个结构化工具(供 run_command 脚本编排)
     #[command(name = "tool-call")]
     ToolCallCmd(ToolCallArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct SessionNameArgs {
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SessionTargetArgs {
-    pub target: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SessionRenameArgs {
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct WorkspaceArgs {
-    pub path: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1524,14 +1573,9 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
             Ok(())
         }
         Some(Command::Wipe(args)) => run_wipe(&paths, args.yes).await,
-        Some(Command::New(args)) => run_session_new(&paths, args).await,
-        Some(Command::Session(args)) => run_session_command(&paths, args).await,
-        Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
-        Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
         Some(Command::ToolCallCmd(args)) => run_tool_call(&paths, args).await,
         Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
         Some(Command::Dev) => run_repl(&paths, AgentMode::Dev).await,
-        Some(Command::Workspace(args)) => run_workspace_command(&paths, args).await,
         Some(Command::Web(args)) => run_web(&paths, args).await,
         Some(Command::Daemon(args)) => run_daemon_command(&paths, args).await,
         None => {
@@ -2582,7 +2626,12 @@ async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs) -> Result<()> {
         return Ok(());
     }
     let Some(name) = args.name.clone() else {
-        bail!("用法: miyu tool-call <name> [json] [--stdin|--args-file <f>|--list|--describe]");
+        // 裸 `miyu tool-call` 是来问路的,给完整帮助而不是一行报错。
+        localized_command()
+            .find_subcommand_mut("tool-call")
+            .expect("tool-call subcommand exists")
+            .print_help()?;
+        return Ok(());
     };
     let arguments = if args.args_stdin {
         let mut raw = String::new();
@@ -3959,6 +4008,11 @@ fn inline_fuzzy_select(items: &[String], mut active: Vec<bool>) -> Result<Option
     let mut query = String::new();
     let mut selected = 0usize;
     let mut scroll = 0usize;
+    // 验收三轮:用户搜到模型直接回车,期望"切到它";多选语义却要求
+    // Tab 勾选,回车成了"确认没改"→静默未做修改。记住入场快照与是否
+    // 表达过意图(搜索/移动),回车时没动过勾选就按单选切换处理。
+    let initial = active.clone();
+    let mut navigated = false;
     let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
     let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
     loop {
@@ -4001,6 +4055,13 @@ fn inline_fuzzy_select(items: &[String], mut active: Vec<bool>) -> Result<Option
                 }
                 KeyCode::Enter => {
                     clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
+                    if active == initial && (navigated || !query.is_empty()) {
+                        if let Some((_, index)) = matches.get(selected) {
+                            let mut solo = vec![false; active.len()];
+                            solo[*index] = true;
+                            return Ok(Some(solo));
+                        }
+                    }
                     return Ok(Some(active));
                 }
                 KeyCode::Tab => {
@@ -4010,8 +4071,12 @@ fn inline_fuzzy_select(items: &[String], mut active: Vec<bool>) -> Result<Option
                         }
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    navigated = true;
+                    selected = selected.saturating_sub(1);
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
+                    navigated = true;
                     selected = (selected + 1).min(matches.len().saturating_sub(1));
                 }
                 KeyCode::Backspace => {
@@ -4247,7 +4312,7 @@ fn inline_fuzzy_item_line(item: &str, selected: bool, active: bool, width: usize
 fn inline_fuzzy_help_line(width: usize) -> String {
     let line = t(
         "type search · j/k move · Tab toggle · Enter/q confirm",
-        "输入搜索 · j/k 移动 · Tab 切换 · Enter/q 确认",
+        "输入搜索 · j/k 移动 · Enter 选定 · Tab 多选 · q 完成",
     );
     format!("\x1b[2m{}\x1b[0m", truncate_visible_width(line, width))
 }
@@ -6173,15 +6238,14 @@ fn session_select_line(entry: &SessionListEntry, active_session_id: Option<&str>
     } else {
         "  "
     };
+    // 验收三轮定版:「模式：名称 · 摘要」,轮数删掉。
     let mut line = format!(
-        "{marker}{}  {}  {} {}",
-        display_session_name(&entry.name),
+        "{marker}{}：{}",
         session_mode_label(&entry.mode),
-        entry.turns,
-        t("turns", "轮")
+        display_session_name(&entry.name),
     );
     if !entry.snippet.is_empty() {
-        line.push_str("  ");
+        line.push_str(" · ");
         line.push_str(&entry.snippet);
     }
     if let Some(workspace) = &entry.workspace {
@@ -6327,48 +6391,6 @@ async fn resolve_repl_session_target(
     }
 }
 
-fn print_session_list(entries: &[SessionListEntry]) {
-    let ansi = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    if entries.is_empty() {
-        if ansi {
-            println!("\x1b[2m{}\x1b[0m\n", t("no sessions", "没有会话"));
-        } else {
-            println!("{}\n", t("no sessions", "没有会话"));
-        }
-        return;
-    }
-    println!("{}", t("sessions:", "会话列表:"));
-    for (index, entry) in entries.iter().enumerate() {
-        println!("{}", session_list_line(index + 1, entry, ansi));
-    }
-    println!();
-}
-
-fn session_list_line(index: usize, entry: &SessionListEntry, ansi: bool) -> String {
-    let name = display_session_name(&entry.name);
-    let workspace = entry
-        .workspace
-        .as_deref()
-        .map(|workspace| format!("  [{workspace}]"))
-        .unwrap_or_default();
-    let marker = if entry.is_current { "*" } else { " " };
-    let turns_label = t("turns", "轮");
-    let details = format!(
-        "{}  {} {turns_label}  {}{workspace}",
-        session_mode_label(&entry.mode),
-        entry.turns,
-        entry.snippet
-    );
-    if ansi {
-        format!("{marker}{index:>3}. {name}  \x1b[2m{details}\x1b[0m")
-    } else {
-        format!("{marker}{index:>3}. {name}  {details}")
-    }
-}
-
-/// Repaints the queued-prompt strip from the store. A reset deletes those rows
-/// underneath the REPL, so without this the strip keeps showing prompts that no
-/// longer exist.
 fn reload_repl_queue(live: &mut LiveReplTail, paths: &MiyuPaths, session_id: &str) -> Result<()> {
     let store = StateStore::new(paths)?.pinned(session_id);
     synchronized_terminal_update(CursorAfterUpdate::Shown, || live.reload_queue(&store))
@@ -6603,237 +6625,6 @@ async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: &str) -> Result<Str
         .find(|entry| entry.name.eq_ignore_ascii_case(arg) || entry.id == arg)
         .map(|entry| entry.id)
         .ok_or_else(|| anyhow::anyhow!("{}: {arg}", t("session not found", "找不到该会话")))
-}
-
-async fn resolve_cli_session_target(
-    paths: &MiyuPaths,
-    arg: &str,
-) -> Result<crate::ipc::SessionRef> {
-    if let Ok(index) = arg.parse::<usize>() {
-        let (_, data) = session_admin(
-            paths,
-            IpcCommand::ListSessions {
-                mode: Some("all".to_string()),
-            },
-        )
-        .await?;
-        let entries = session_list_entries(&data);
-        return session_ref_from_index(&entries, index).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}: {index}",
-                t("no session with this number", "没有这个编号的会话")
-            )
-        });
-    }
-    Ok(crate::ipc::SessionRef::Name {
-        name: arg.to_string(),
-    })
-}
-
-async fn run_session_new(paths: &MiyuPaths, args: SessionNameArgs) -> Result<()> {
-    let name = args
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string);
-    let (state, _) = session_admin(
-        paths,
-        IpcCommand::CreateSession {
-            name,
-            switch: true,
-            kind: None,
-            mode: None,
-        },
-    )
-    .await?;
-    println!(
-        "{}: {}",
-        t("created and switched to session", "已创建并切换到会话"),
-        display_session_name(&state.session_name)
-    );
-    Ok(())
-}
-
-/// Runs the interactive session picker, servicing Ctrl+D deletions in place
-/// and reopening on the refreshed list until the user picks one or backs out.
-async fn cli_pick_session(
-    paths: &MiyuPaths,
-    mut entries: Vec<SessionListEntry>,
-) -> Result<Option<crate::ipc::SessionRef>> {
-    let mut cursor = None;
-    loop {
-        match select_session_target(&entries, None, cursor)? {
-            SessionPick::Cancelled => return Ok(None),
-            SessionPick::Switch(target) => return Ok(Some(target)),
-            SessionPick::Delete { session_id, index } => {
-                session_admin(
-                    paths,
-                    IpcCommand::DeleteSession {
-                        target: crate::ipc::SessionRef::Id { id: session_id },
-                    },
-                )
-                .await?;
-                let (_, data) = session_admin(
-                    paths,
-                    IpcCommand::ListSessions {
-                        mode: Some("all".to_string()),
-                    },
-                )
-                .await?;
-                entries = session_list_entries(&data);
-                if entries.is_empty() {
-                    print_session_list(&entries);
-                    return Ok(None);
-                }
-                // The rows below shift up, so holding the index parks the
-                // cursor on the next session instead of jumping to the top.
-                cursor = Some(index);
-            }
-        }
-    }
-}
-
-async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
-    let arg = args
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|arg| !arg.is_empty());
-    let target = if let Some(arg) = arg {
-        resolve_cli_session_target(paths, arg).await?
-    } else {
-        let (_, data) = session_admin(
-            paths,
-            IpcCommand::ListSessions {
-                mode: Some("all".to_string()),
-            },
-        )
-        .await?;
-        let entries = session_list_entries(&data);
-        if entries.is_empty() {
-            print_session_list(&entries);
-            return Ok(());
-        }
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            print_session_list(&entries);
-            return Ok(());
-        }
-        match cli_pick_session(paths, entries).await? {
-            Some(target) => target,
-            None => return Ok(()),
-        }
-    };
-    let (state, _) = session_admin(paths, IpcCommand::SwitchSession { target }).await?;
-    println!(
-        "{}: {}",
-        t("switched to session", "已切换到会话"),
-        display_session_name(&state.session_name)
-    );
-    Ok(())
-}
-
-async fn run_session_rename(paths: &MiyuPaths, args: SessionRenameArgs) -> Result<()> {
-    let name = args.name.trim().to_string();
-    if name.is_empty() {
-        bail!(
-            "{}",
-            t("usage: miyu rename <name>", "用法：miyu rename <新名称>")
-        );
-    }
-    session_admin(
-        paths,
-        IpcCommand::RenameSession {
-            target: crate::ipc::SessionRef::Current,
-            name: name.clone(),
-        },
-    )
-    .await?;
-    println!("{}: {name}", t("session renamed", "会话已重命名"));
-    Ok(())
-}
-
-async fn run_session_delete(paths: &MiyuPaths, args: SessionTargetArgs) -> Result<()> {
-    let target = match args
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|arg| !arg.is_empty())
-    {
-        Some(arg) => resolve_cli_session_target(paths, arg).await?,
-        None => crate::ipc::SessionRef::Current,
-    };
-    if !confirm_stdin(t(
-        "delete this session and all of its history?",
-        "确认删除该会话及其全部历史？",
-    ))? {
-        println!("{}", t("cancelled", "已取消"));
-        return Ok(());
-    }
-    let (state, _) = session_admin(paths, IpcCommand::DeleteSession { target }).await?;
-    println!("{}", t("session deleted", "会话已删除"));
-    println!(
-        "{}: {}",
-        t("switched to session", "已切换到会话"),
-        display_session_name(&state.session_name)
-    );
-    Ok(())
-}
-
-async fn run_workspace_command(paths: &MiyuPaths, args: WorkspaceArgs) -> Result<()> {
-    let Some(arg) = args
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|arg| !arg.is_empty())
-    else {
-        let (state, _) = session_admin(paths, IpcCommand::GetStatus).await?;
-        match state.workspace {
-            Some(workspace) => {
-                println!("{}: {workspace}", t("session workspace", "会话工作目录"));
-            }
-            None => println!(
-                "{}",
-                t(
-                    "no workspace bound; using the client working directory",
-                    "未绑定工作目录；使用客户端当前目录"
-                )
-            ),
-        }
-        return Ok(());
-    };
-    if arg.eq_ignore_ascii_case("clear") {
-        session_admin(
-            paths,
-            IpcCommand::SetWorkspace {
-                target: crate::ipc::SessionRef::Current,
-                path: None,
-            },
-        )
-        .await?;
-        println!("{}", t("workspace unbound", "已解绑工作目录"));
-        return Ok(());
-    }
-    let path = std::fs::canonicalize(expand_tilde(arg)).map_err(|error| {
-        anyhow::anyhow!(
-            "{}: {arg} ({error})",
-            t("invalid workspace path", "无效的工作目录路径")
-        )
-    })?;
-    session_admin(
-        paths,
-        IpcCommand::SetWorkspace {
-            target: crate::ipc::SessionRef::Current,
-            path: Some(path.clone()),
-        },
-    )
-    .await?;
-    println!(
-        "{}: {}",
-        t("workspace bound", "已绑定工作目录"),
-        path.display()
-    );
-    Ok(())
 }
 
 /// Expands a leading `~` or `~/…` to the user's home directory.
@@ -12749,7 +12540,8 @@ fn submitted_echo_lines(mode: AgentMode, input: &str, cols: usize) -> Vec<String
 fn submitted_echo_bar(mode: AgentMode) -> String {
     match mode {
         AgentMode::Normal => "\x1b[1m\x1b[34m┃\x1b[0m".to_string(),
-        AgentMode::Dev => "\x1b[1m\x1b[33m┃\x1b[0m".to_string(),
+        // 与 footer 模式标签同为 tertiary(35 酒红),整条 dev 视觉一致。
+        AgentMode::Dev => "\x1b[1m\x1b[35m┃\x1b[0m".to_string(),
     }
 }
 
@@ -15590,7 +15382,6 @@ mod repl_input_tests {
             Some(crate::ipc::SessionRef::Id { id }) if id == "active"
         ));
         assert_eq!(session_initial_selection(&[entry("only", false)], None), 0);
-        assert!(!session_list_line(1, &entries[0], false).contains('\x1b'));
     }
 
     #[test]

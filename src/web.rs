@@ -2979,10 +2979,13 @@ fn require_local_web_session(
         .is_platform_session(session_id)
         .map_err(ApiError::internal)?;
     match record {
+        // dev 会话(保留人格)对 WebUI 可见:侧栏分组列它,打开/改名/删除
+        // 也得放行,否则点进去 404「会话不存在」(验收三轮)。
         Some(record)
             if !is_platform
                 && record.kind == "user"
-                && record.persona == active_persona_scope(state) =>
+                && (record.persona == active_persona_scope(state)
+                    || record.persona == crate::state::DEV_PERSONA) =>
         {
             Ok(record)
         }
