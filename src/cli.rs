@@ -1167,6 +1167,10 @@ pub enum DaemonCommand {
 pub struct DaemonLogsArgs {
     #[arg(short = 'n', long, value_name = "N")]
     pub lines: Option<usize>,
+
+    /// `request`:开启出网请求录制并实时监控;Ctrl+C 停止并关闭录制
+    #[arg(value_name = "TOPIC")]
+    pub topic: Option<String>,
 }
 
 impl std::fmt::Debug for WebArgs {
@@ -1868,7 +1872,114 @@ fn daemon_web_status_lines(label: &str, urls: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `miyu daemon logs request`:监控期间开启录制,滚动打印每个出网请求
+/// 的摘要行;完整请求体在 JSONL 文件里(整段 prompt 打终端没法看)。
+/// Ctrl+C 退出时关闭录制——开关是 daemon 进程级内存位,不落配置。
+async fn run_request_monitor(paths: &MiyuPaths) -> Result<()> {
+    if ipc::daemon_info(paths).await.is_none() {
+        bail!(
+            "{}",
+            t(
+                "the daemon is not running; start it first (miyu daemon start)",
+                "daemon 未运行;先 miyu daemon start"
+            )
+        );
+    }
+    let (_, data) = send_ipc_admin(paths, IpcCommand::SetRequestLogging { enabled: true }).await?;
+    let file = data
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| paths.logs_dir().join("requests-<date>.jsonl").display().to_string());
+    println!(
+        "{}",
+        t(
+            "request recording is ON; full bodies append to:",
+            "出网请求录制已开启;完整请求体实时追加到:"
+        )
+    );
+    println!("  {file}");
+    println!(
+        "[2m{}[0m",
+        t(
+            "monitoring (one summary line per request) · Ctrl+C stops and turns recording off",
+            "实时监控中(每请求一行摘要) · Ctrl+C 停止并关闭录制"
+        )
+    );
+    let path = std::path::PathBuf::from(&file);
+    let mut offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let mut carry = String::new();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.len() < offset {
+            offset = 0; // 跨日换文件或被清空
+        }
+        if meta.len() == offset {
+            continue;
+        }
+        use std::io::{Read as _, Seek as _};
+        let Ok(mut handle) = std::fs::File::open(&path) else { continue };
+        if handle.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut chunk = String::new();
+        if handle.read_to_string(&mut chunk).is_err() {
+            continue;
+        }
+        offset = meta.len();
+        carry.push_str(&chunk);
+        while let Some(newline) = carry.find('\n') {
+            let line: String = carry.drain(..=newline).collect();
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let text = |key: &str| entry.get(key).and_then(serde_json::Value::as_str).unwrap_or("?");
+            let body = entry.get("body");
+            let messages = body
+                .and_then(|body| body.get("messages").or_else(|| body.get("input")))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len());
+            let size_kb = line.len() as f64 / 1024.0;
+            let stamp = text("ts").get(11..19).unwrap_or("--:--:--").to_string();
+            println!(
+                "{stamp}  {}/{}  {}  scope={}  {:.1}KB{}",
+                text("provider"),
+                text("model"),
+                text("kind"),
+                text("scope"),
+                size_kb,
+                messages
+                    .map(|count| format!("  messages={count}"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    let _ = send_ipc_admin(paths, IpcCommand::SetRequestLogging { enabled: false }).await;
+    println!(
+        "
+{}
+  {file}",
+        t(
+            "recording is OFF; inspect full bodies with jq:",
+            "录制已关闭;用 jq 查看完整请求体:"
+        )
+    );
+    Ok(())
+}
+
 async fn run_daemon_logs(paths: &MiyuPaths, args: DaemonLogsArgs) -> Result<()> {
+    match args.topic.as_deref().map(str::trim) {
+        None => {}
+        Some("request" | "requests") => return run_request_monitor(paths).await,
+        Some(other) => bail!(
+            "{}: {other}",
+            t("unknown logs topic (try: request)", "未知日志主题(可用: request)")
+        ),
+    }
     let ansi = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if let Some(lines) = args.lines {
         if !(1..=100_000).contains(&lines) {
@@ -13982,7 +14093,7 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Daemon(DaemonArgs {
-                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: None })),
+                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: None, .. })),
                 ..
             }))
         ));
@@ -13996,7 +14107,7 @@ mod repl_input_tests {
         assert!(matches!(
             cli.command,
             Some(Command::Daemon(DaemonArgs {
-                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: Some(25) })),
+                command: Some(DaemonCommand::Logs(DaemonLogsArgs { lines: Some(25), .. })),
                 ..
             }))
         ));

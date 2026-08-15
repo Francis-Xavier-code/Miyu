@@ -277,6 +277,11 @@ pub enum Command {
         #[serde(default)]
         mode: Option<String>,
     },
+    /// 出网请求录制开关(进程级,重启即关)。开着时每个 LLM 请求的完整
+    /// 序列化体追加到 logs/requests-<日期>.jsonl,供审计注入内容。
+    SetRequestLogging {
+        enabled: bool,
+    },
     /// Erases everything the persona accumulated: memory, every session's
     /// contents, group-chat contexts and auto-generated skills. Configuration
     /// is untouched. Irreversible; every frontend confirms before sending it.

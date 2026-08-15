@@ -1315,6 +1315,7 @@ impl OpenAiCompatibleClient {
     }
 
     fn restore_saved_thinking_variants(&mut self, paths: &MiyuPaths) {
+        crate::llm::request_log::install_dir(paths.logs_dir());
         let preferences = load_thinking_variant_preferences(paths);
         let selections = self
             .endpoint_model_preferences()
@@ -2006,6 +2007,14 @@ impl OpenAiCompatibleClient {
         request_id: &str,
         stage: &'static str,
     ) -> Result<reqwest::Response> {
+        crate::llm::request_log::record(
+            &self.provider.id,
+            &self.provider.default_model,
+            "chat",
+            self.request_scope,
+            url,
+            request,
+        );
         self.send_with_transport_retry(request_id, stage, || {
             self.client
                 .post(url)
@@ -2577,6 +2586,14 @@ impl OpenAiCompatibleClient {
         stage: &'static str,
     ) -> Result<reqwest::Response> {
         let url = format!("{}/messages", self.provider.base_url.trim_end_matches('/'));
+        crate::llm::request_log::record(
+            &self.provider.id,
+            &self.provider.default_model,
+            "anthropic",
+            self.request_scope,
+            &url,
+            request,
+        );
         self.send_with_transport_retry(request_id, stage, || {
             self.client
                 .post(&url)
@@ -2711,6 +2728,14 @@ impl OpenAiCompatibleClient {
             t("Responses request configured", "Responses 请求配置完成")
         );
         let url = format!("{}/responses", self.provider.base_url.trim_end_matches('/'));
+        crate::llm::request_log::record(
+            &self.provider.id,
+            &self.provider.default_model,
+            "responses",
+            self.request_scope,
+            &url,
+            &request,
+        );
         let response = self
             .send_with_transport_retry(request_id, "responses.send", || {
                 self.client

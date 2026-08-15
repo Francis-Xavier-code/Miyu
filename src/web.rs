@@ -2701,6 +2701,17 @@ async fn handle_session_command(
     let store = &state.state_store;
     let persona = active_persona_scope(state);
     match command {
+        IpcCommand::SetRequestLogging { enabled } => {
+            // 此刻可能还没构造过任何 LLM 客户端,目录未必已安装——就地
+            // 安装,免得 current_file 返回 None、监控端拿兜底路径扑空。
+            crate::llm::request_log::install_dir(state.paths.logs_dir());
+            crate::llm::request_log::set_enabled(enabled);
+            Ok(json!({
+                "enabled": enabled,
+                "file": crate::llm::request_log::current_file()
+                    .map(|path| path.display().to_string()),
+            }))
+        }
         IpcCommand::ResetMemory { mode } => {
             // dev 记忆挂保留人格名下,与 Agent 构造同一把 dev_scoped 钥匙;
             // 生成号在 reset_all 里自增,进行中的回合据此识别陈旧句柄。

@@ -1,5 +1,6 @@
 mod cache_log;
 mod openai_compatible;
+pub mod request_log;
 pub(crate) mod provider_capabilities;
 
 pub(crate) use openai_compatible::{
