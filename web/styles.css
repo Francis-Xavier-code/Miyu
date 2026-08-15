@@ -2264,12 +2264,12 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   max-width: 100%;
   min-height: 0;
   align-items: center;
-  padding: 4px 11px;
+  padding: 4px 9px;
   border-radius: 6px;
   background: var(--chip-live);
   color: var(--text);
   cursor: pointer;
-  gap: 7px;
+  gap: 5px;
   font-size: 11.5px;
   font-weight: 600;
   text-align: left;

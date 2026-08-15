@@ -6517,7 +6517,7 @@
     if (n.includes("alarm")) return "alarm-clock";
     if (n === "read_clipboard") return "clipboard";
     if (n === "get_weather") return "cloud-sun";
-    if (["calculator", "calculate_hash", "get_exchange_rate", "decode_encoded_text"].includes(n)) return "calculator";
+    if (["calculator", "scientific_calculator", "calculate_hash", "get_exchange_rate", "decode_encoded_text"].includes(n)) return "calculator";
     if (n === "read_file") return "file-text";
     if (n === "glob" || n === "grep") return "search";
     if (n === "trash_path") return "trash-2";
