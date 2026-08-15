@@ -942,6 +942,10 @@ pub struct Agent {
     /// idle cache-keepalive pings (v7 DeepSeek 高命中策略). Only populated
     /// while `cache.keepalive_seconds > 0`.
     last_request_snapshot: Option<(Vec<ChatMessage>, Vec<crate::llm::ToolDefinition>)>,
+    /// 上一条真实请求最终落在哪个 endpoint(provider_id, model):keepalive
+    /// ping 必须钉住同一缓存域,轮转调度下打到别家=白花钱不保温
+    /// (deepseek 报告 P2)。
+    last_request_endpoint: Option<(String, String)>,
     /// Cancels the currently running keepalive loop, if any.
     keepalive_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Consecutive auto-compactions that failed to bring the context back
@@ -1065,6 +1069,7 @@ impl Agent {
             repeat_chain: crate::tools::repeat_reminder::RepeatChain::default(),
             preset_dialogs,
             last_request_snapshot: None,
+            last_request_endpoint: None,
             keepalive_cancel: None,
             consecutive_compacts: std::sync::atomic::AtomicU32::new(0),
             compact_stuck: std::sync::atomic::AtomicBool::new(false),
@@ -1093,6 +1098,7 @@ impl Agent {
         let Some((messages, tools)) = self.last_request_snapshot.clone() else {
             return;
         };
+        let endpoint_hint = self.last_request_endpoint.clone();
         let max_pings = self.config.cache.keepalive_max_pings;
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.keepalive_cancel = Some(cancel.clone());
@@ -1105,7 +1111,10 @@ impl Agent {
                 if cancel.load(std::sync::atomic::Ordering::Acquire) {
                     return;
                 }
-                match client.cache_keepalive(messages.clone(), tools.clone()).await {
+                match client
+                    .cache_keepalive(messages.clone(), tools.clone(), endpoint_hint.as_ref())
+                    .await
+                {
                     Ok(Some(usage)) => {
                         tracing::info!(
                             ping = ping + 1,
@@ -1511,7 +1520,7 @@ impl Agent {
     }
 
     pub fn effective_context_tokens(&self) -> Result<u64> {
-        let messages = self.chat_messages("", "")?;
+        let (messages, _) = self.chat_messages("", "")?;
         let mut tokens = overflow::estimate_messages_tokens(&messages) as u64;
         if self.tools_enabled {
             let loaded_tools = self.initial_loaded_tools(&messages)?;
@@ -1852,11 +1861,10 @@ impl Agent {
             turn_id: candidate.turn_id.clone(),
         })?;
 
-        let mut messages = self.chat_messages(&candidate.turn_id, "")?;
-        // chat_messages ends with [.., user placeholder, runtime]; drop both
-        // and re-append the runtime right after the real redo input so the
-        // transient tail keeps sitting behind the user message.
-        let runtime_message = messages.pop();
+        let (mut messages, redo_user_index) = self.chat_messages(&candidate.turn_id, "")?;
+        // 按下标摘下 [占位用户, 瞬态尾巴...]:重放輸入接回后尾巴原样跟上,
+        // 保持"瞬态永远在用户消息之后"。
+        let tail_fossils = messages.split_off(redo_user_index + 1);
         let _ = messages.pop();
         let replay_start;
         let fossil_start;
@@ -1868,7 +1876,7 @@ impl Agent {
                 let (_, input) = prepared.pop().context("redo input is empty")?;
                 messages.push(input.message);
                 fossil_start = messages.len();
-                messages.extend(runtime_message);
+                messages.extend(tail_fossils);
                 replay_start = messages.len();
                 messages.extend(input.hints);
                 base_tool_reports = Vec::new();
@@ -1879,7 +1887,7 @@ impl Agent {
                 let checkpoint = redo.checkpoint.context("redo checkpoint is unavailable")?;
                 messages.push(self.turn_user_message(&current_turn));
                 fossil_start = messages.len();
-                messages.extend(runtime_message);
+                messages.extend(tail_fossils);
                 replay_start = messages.len();
                 messages.extend(checkpoint.replay_messages);
                 for (_, input) in prepared {
@@ -1935,6 +1943,9 @@ impl Agent {
             tokens,
             result.usage_estimated,
         )?;
+        if let (Some(provider), Some(model)) = (&result.provider_id, &result.model) {
+            self.last_request_endpoint = Some((provider.clone(), model.clone()));
+        }
         let tool_flow = derive_tool_flow(&messages, replay_start);
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
@@ -2056,11 +2067,8 @@ impl Agent {
         on_event(AgentEvent::TurnStarted {
             turn_id: turn_id.clone(),
         })?;
-        let mut messages = self.chat_messages(&turn_id, &input)?;
-        // chat_messages ends with [.., user, runtime]; swap in the prepared
-        // user message (attachments/images) at its position before the
-        // transient runtime tail.
-        let user_index = messages.len().saturating_sub(2);
+        let (mut messages, user_index) = self.chat_messages(&turn_id, &input)?;
+        // 按显式下标把占位用户消息换成带附件的成品;瞬态尾巴保持原位。
         if let Some(user) = messages.get_mut(user_index) {
             *user = prepared.message;
         }
@@ -2170,6 +2178,9 @@ impl Agent {
             tokens,
             result.usage_estimated,
         )?;
+        if let (Some(provider), Some(model)) = (&result.provider_id, &result.model) {
+            self.last_request_endpoint = Some((provider.clone(), model.clone()));
+        }
         let tool_flow = derive_tool_flow(&messages, replay_start);
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
@@ -2938,14 +2949,6 @@ impl Agent {
                 }
                 request_messages.splice(offset..offset, context_messages.clone());
             }
-            // 浮动尾部人格提醒:只追加进本次发送副本,`messages` 与化石
-            // 从不包含它,所以跨回合前缀缓存只在提醒自身处分叉(~80 tok)。
-            // Responses continuation 的服务端会话会累积输入,这条不发。
-            if responses_continuation.is_none() {
-                if let Some(reminder) = self.persona_reminder.as_deref() {
-                    request_messages.push(persona_hint::reminder_message(reminder));
-                }
-            }
             let mut reasoning_filter = ReasoningTitleFilter::default();
             if self.config.cache.write_grace_ms > 0 {
                 if let Some(previous) = last_round_completed_at {
@@ -3082,14 +3085,16 @@ impl Agent {
                             // front of the current turn's user message; the
                             // live tail (user input, runtime stamp, hints)
                             // is preserved byte-for-byte.
-                            let user_index = replay_start.saturating_sub(2).min(messages.len());
-                            let rebuilt = self.chat_messages(current_turn_id, "")?;
-                            let prefix_len = rebuilt.len().saturating_sub(2);
+                            let user_index = live_user_index(messages, replay_start)
+                                .unwrap_or_else(|| replay_start.min(messages.len()));
+                            let (rebuilt, rebuilt_user_index) =
+                                self.chat_messages(current_turn_id, "")?;
                             let tail = messages.split_off(user_index);
                             messages.clear();
-                            messages.extend(rebuilt.into_iter().take(prefix_len));
+                            messages.extend(rebuilt.into_iter().take(rebuilt_user_index));
                             messages.extend(tail);
-                            replay_start = prefix_len + 2;
+                            // 活跃轮边界随尾巴整体平移:新前缀长 + 尾内偏移。
+                            replay_start = rebuilt_user_index + (replay_start - user_index);
                             continuation_input_start = messages.len();
                             tracing::info!(
                                 folded = compact_result.folded_turns,
@@ -3564,18 +3569,22 @@ impl Agent {
                 } else {
                     None
                 };
-                let model_output = self
+                let mut model_output = self
                     .spill_tool_output(current_turn_id, &call.id, &call.function.name, &output)
                     .unwrap_or_else(|| output.clone());
-                messages.push(ChatMessage::tool(call.id.clone(), model_output));
                 // 重复调用观察:成功/失败/被拒都计数(反复撞拒绝正是要打断
-                // 的循环);提醒紧跟结果注入,只活在本轮工作消息里。
+                // 的循环)。提醒**折进工具结果字节**而不是独立消息——
+                // derive_tool_flow 只持久化 assistant/tool 消息,独立提醒
+                // 下一轮回放即消失,前缀在此掰断(缓存调研 08-16,deepseek
+                // 报告 P0-2 实证同一处)。folded 形态活体=回放,永远同源。
                 if let Some(reminder) = self
                     .repeat_chain
                     .observe(&call.function.name, &call.function.arguments)
                 {
-                    messages.push(ChatMessage::turn_context(reminder));
+                    model_output.push_str("\n\n");
+                    model_output.push_str(&reminder);
                 }
+                messages.push(ChatMessage::tool(call.id.clone(), model_output));
                 if tool_succeeded && call.function.name == "load_tools" {
                     let loaded = loaded_items_from_output(&output);
                     for name in &loaded.tools {
@@ -3799,11 +3808,14 @@ impl Agent {
         Ok(Some(ChatMessage::plain("user", description)))
     }
 
+    /// 返回 (消息序列, 当前用户消息下标)。用户消息之后是数量可变的
+    /// 瞬态尾巴(runtime 投影可跳、防失忆提醒隔轮注入),调用方必须用
+    /// 下标定位,绝不能再按"倒数第二条"猜(缓存调研 08-16 的复位地雷)。
     fn chat_messages(
         &self,
         current_turn_id: &str,
         current_input: &str,
-    ) -> Result<Vec<ChatMessage>> {
+    ) -> Result<(Vec<ChatMessage>, usize)> {
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
         // 预设对话(begin_dialogs):system 之后、历史之前,每请求注入、
         // 永不落库。模型把它当普通聊天记录,学的是轮次里的语气;作为
@@ -3834,18 +3846,34 @@ impl Agent {
                 self.push_history_turn(&mut messages, turn);
             }
         }
-        // v7 §三: the minute-level runtime stamp is transient tail and must sit
-        // AFTER the current user message. When it preceded the user message,
-        // every next turn's replayed history diverged from the provider's
-        // cached prefix exactly at this position, capping cross-turn prefix
-        // cache reuse at the end of the stored history (verified byte-level
-        // against DeepSeek prefix caching).
+        // v7 §三: the runtime stamp is transient tail and must sit AFTER the
+        // current user message. When it preceded the user message, every next
+        // turn's replayed history diverged from the provider's cached prefix
+        // exactly at this position (verified byte-level against DeepSeek
+        // prefix caching).
+        let user_index = messages.len();
         messages.push(ChatMessage::plain("user", current_input));
-        messages.push(ChatMessage::turn_context(runtime_context(
-            self.mode,
-            self.platform_context.is_some(),
-        )));
-        Ok(messages)
+        // dsh 式投影(08-16 缓存调研):运行时上下文"变了才注入"。终端面
+        // 时间已降到小时级,同一小时内 cwd/环境不变 → 与历史里最近一份
+        // 化石逐字节相同 → 本轮零新增;平台面保留分钟级,人格报时靠它。
+        let runtime = runtime_context(self.mode, self.platform_context.is_some());
+        if last_fossil_with_prefix(&messages, "<runtime ") != Some(runtime.as_str()) {
+            messages.push(ChatMessage::turn_context(runtime));
+        }
+        // 防失忆提醒(08-16 起):不再浮动,每隔 interval 轮以化石身份进
+        // 历史——纯追加,不掰前缀。计数以历史里最近一份提醒化石所在的
+        // 轮为锚。
+        if let Some(reminder) = self.persona_reminder.as_deref() {
+            let interval = self.config.prompt.persona_reminder_interval.max(1) as usize;
+            if turns_since_reminder_fossil(&self.state, current_turn_id)?
+                .map_or(true, |since| since >= interval)
+            {
+                messages.push(ChatMessage::turn_context(format!(
+                    "<persona-reminder>{reminder}</persona-reminder>"
+                )));
+            }
+        }
+        Ok((messages, user_index))
     }
 
     /// Renders one stored turn exactly as the live request rendered it
@@ -3861,15 +3889,22 @@ impl Agent {
         if turn.status == crate::state::TurnStatus::Interrupted && !turn.journal_events.is_empty() {
             messages.extend(interrupted_turn_replay_messages(self, turn));
         } else {
-            for exchange in &turn.question_exchanges {
-                messages.push(ChatMessage::plain(
-                    "assistant",
-                    crate::question::assistant_exchange_text(exchange),
-                ));
-                messages.push(ChatMessage::plain(
-                    "user",
-                    crate::question::user_exchange_text(exchange),
-                ));
+            // 问答只回放一种形态:有结构化 tool_flow 的回合,ask_question
+            // 已作为原生 tool_calls+tool 输出在 flow 里逐字节回放;再补
+            // 纯文本问答对=同一轮发两遍且字节不同于活体,前缀在此掰断
+            // (缓存调研 08-16,deepseek 报告 P0-2③实证)。纯文本对只给
+            // 无 flow 的老回合兜底。
+            if turn.tool_flow.is_empty() {
+                for exchange in &turn.question_exchanges {
+                    messages.push(ChatMessage::plain(
+                        "assistant",
+                        crate::question::assistant_exchange_text(exchange),
+                    ));
+                    messages.push(ChatMessage::plain(
+                        "user",
+                        crate::question::user_exchange_text(exchange),
+                    ));
+                }
             }
             for followup in &turn.followups {
                 push_assistant_context_messages(
@@ -4380,6 +4415,52 @@ fn visible_association_lines(messages: &[ChatMessage]) -> HashSet<&str> {
         }
     }
     seen
+}
+
+/// replay_start 之前最近一条非瞬态 user 消息=本轮真实用户输入的下标。
+fn live_user_index(messages: &[ChatMessage], replay_start: usize) -> Option<usize> {
+    let end = replay_start.min(messages.len());
+    (0..end).rev().find(|&index| {
+        let message = &messages[index];
+        message.role == "user" && !message.transient_context
+    })
+}
+
+/// 已拼装消息里最近一条以 `prefix` 开头的 user 侧文本(倒序首个)。
+/// 不检查 transient 标志:回放化石反序列化后该标志会丢(serde skip),
+/// 而以 `<runtime ` 开头的用户输入不存在——按内容前缀即可唯一识别。
+fn last_fossil_with_prefix<'a>(messages: &'a [ChatMessage], prefix: &str) -> Option<&'a str> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        match message.content.as_ref() {
+            Some(ChatContent::Text(text)) if text.starts_with(prefix) => Some(text.as_str()),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_projection_skips_byte_identical_fossil() {
+        let stamp = "<runtime now=\"2026年08月16日 Sunday 00时\" cwd=\"/x\"/>";
+        let mut messages = vec![
+            ChatMessage::system("s"),
+            ChatMessage::plain("user", "hi"),
+            ChatMessage::turn_context(stamp.to_string()),
+            ChatMessage::assistant("ok".to_string(), None),
+        ];
+        assert_eq!(last_fossil_with_prefix(&messages, "<runtime "), Some(stamp));
+        // 变化才注入:相同→跳过,不同→追加。
+        messages.push(ChatMessage::turn_context(
+            "<runtime now=\"2026年08月16日 Sunday 01时\" cwd=\"/x\"/>".to_string(),
+        ));
+        assert_ne!(last_fossil_with_prefix(&messages, "<runtime "), Some(stamp));
+    }
 }
 
 fn fossil_context_messages(tail: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -5952,6 +6033,32 @@ fn parse_reasoning_title_chunks<'a>(
 /// working directory, no shell and no terminal — those attributes were pure
 /// scaffolding there, and they were re-sent at full price on every single
 /// turn (285 chars against a ~45-char timestamp).
+/// 距最近一次防失忆提醒化石过去了多少个可见轮;None=历史里没有提醒。
+fn turns_since_reminder_fossil(
+    state: &crate::state::StateStore,
+    current_turn_id: &str,
+) -> Result<Option<usize>> {
+    let turns = state.load_visible_turns_excluding(current_turn_id)?;
+    let mut since = None;
+    for turn in &turns {
+        if turn.is_summary || turn.status == crate::state::TurnStatus::Running {
+            continue;
+        }
+        let has_reminder = turn.context_messages.iter().any(|fossil| {
+            matches!(
+                fossil.content.as_ref(),
+                Some(ChatContent::Text(text)) if text.starts_with("<persona-reminder>")
+            )
+        });
+        if has_reminder {
+            since = Some(0);
+        } else if let Some(count) = since.as_mut() {
+            *count += 1;
+        }
+    }
+    Ok(since)
+}
+
 fn runtime_context(mode: AgentMode, platform: bool) -> String {
     if platform {
         return format!(
@@ -5964,9 +6071,11 @@ fn runtime_context(mode: AgentMode, platform: bool) -> String {
         .to_string();
     let _ = mode;
     let runtime = terminal_runtime_context();
+    // 小时级而非分钟级:同一小时内整块字节不变,配合投影跳注入
+    // (缓存调研 08-16);要精确时间,终端面有 date。
     format!(
         "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
-        Local::now().format("%Y年%m月%d日 %A %H:%M"),
+        Local::now().format("%Y年%m月%d日 %A %H时"),
         xml_attr_escape(&cwd),
     )
 }
@@ -6710,11 +6819,11 @@ mod tests {
 
         assert!(agent
             .chat_messages("current", "new user")
-            .unwrap()
+            .unwrap().0
             .iter()
             .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
         agent.set_session_history_suppressed(true);
-        let messages = agent.chat_messages("current", "new user").unwrap();
+        let messages = agent.chat_messages("current", "new user").unwrap().0;
         assert!(!messages
             .iter()
             .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
@@ -6755,7 +6864,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = agent.chat_messages("current", "next question").unwrap();
+        let messages = agent.chat_messages("current", "next question").unwrap().0;
         let text = |message: &ChatMessage| format!("{:?}", message.content);
         let user = messages
             .iter()
@@ -8249,7 +8358,7 @@ model_temperature: HashMap::new(),
                 .as_deref(),
             Some("first reasoning")
         );
-        let history = agent.chat_messages("", "next prompt").unwrap();
+        let history = agent.chat_messages("", "next prompt").unwrap().0;
         assert!(history.iter().any(|message| {
             matches!(
                 message.content.as_ref(),
@@ -8764,11 +8873,11 @@ model_temperature: HashMap::new(),
         server.await.unwrap();
     }
 
-    /// 浮动尾部人格提醒:首回合先蒸馏一次并落缓存,对话请求的绝对末尾
-    /// 是 user 角色的 `<persona-reminder>`;化石与回放历史永不包含它,
-    /// 第二回合命中缓存直接对话(历史里 0 份、请求尾部 1 份)。
+    /// 防失忆提醒(08-16 版):首回合蒸馏后以化石身份进历史;间隔轮数内
+    /// 的第二回合不再注入新份——请求里只有回放的那一份,且当前轮尾部
+    /// 干净(runtime 投影同小时也跳注入),前缀纯追加。
     #[tokio::test]
-    async fn persona_reminder_rides_request_tail_and_stays_out_of_fossils() {
+    async fn persona_reminder_fossilizes_on_interval_and_replays() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8853,11 +8962,18 @@ model_temperature: HashMap::new(),
         let request: serde_json::Value =
             serde_json::from_slice(&first_chat_rx.await.unwrap()).unwrap();
         let messages = request["messages"].as_array().unwrap();
-        let last = messages.last().unwrap();
-        assert_eq!(last["role"], "user");
-        assert_eq!(last["content"], expected_reminder);
+        // 提醒以化石身份入列(位置在 runtime 之后、随机注入的表情包
+        // 提醒之前),不再断言绝对末尾——只断言恰好一份。
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["content"] == expected_reminder)
+                .count(),
+            1
+        );
         let turns = state.load_turns().unwrap();
-        assert!(!format!("{:?}", turns[0].context_messages).contains("persona-reminder"));
+        // 新语义:提醒就是化石,回放历史自带。
+        assert!(format!("{:?}", turns[0].context_messages).contains("persona-reminder"));
         assert!(paths
             .state_dir
             .join("persona-hints")
@@ -8884,8 +9000,13 @@ model_temperature: HashMap::new(),
                     .is_some_and(|content| content.contains("persona-reminder"))
             })
             .count();
+        // 间隔(默认3)未到:仅回放化石那一份,不再追加新份;绝对末尾
+        // 不再是漂浮提醒(可能是用户消息或跨分钟的新 runtime,都合法)。
         assert_eq!(reminder_count, 1);
-        assert_eq!(messages.last().unwrap()["content"], expected_reminder);
+        assert!(messages
+            .iter()
+            .any(|message| message["content"] == expected_reminder));
+        assert_ne!(messages.last().unwrap()["content"], expected_reminder);
         server.await.unwrap();
     }
 
@@ -8988,7 +9109,7 @@ model_temperature: HashMap::new(),
             AgentMode::Normal,
         )
         .unwrap();
-        let messages = agent.chat_messages("current", "新消息").unwrap();
+        let messages = agent.chat_messages("current", "新消息").unwrap().0;
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
         assert_eq!(chat_message_text(&messages[1]).unwrap(), "你好");
@@ -9027,7 +9148,7 @@ model_temperature: HashMap::new(),
             AgentMode::Dev,
         )
         .unwrap();
-        let messages = agent.chat_messages("current", "新消息").unwrap();
+        let messages = agent.chat_messages("current", "新消息").unwrap().0;
         assert_eq!(messages[0].role, "system");
         let system = chat_message_text(&messages[0]).unwrap();
         assert!(

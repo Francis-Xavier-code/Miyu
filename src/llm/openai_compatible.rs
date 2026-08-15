@@ -1538,10 +1538,19 @@ impl OpenAiCompatibleClient {
         &self,
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
+        endpoint_hint: Option<&(String, String)>,
     ) -> Result<Option<Usage>> {
         let endpoints = self.endpoints.as_ref();
-        let order = ordered_endpoint_indices(endpoints);
-        let index = order.first().copied().unwrap_or(0);
+        // 钉住上一条真实请求的 endpoint:缓存按 (供应商, 前缀) 存活,
+        // 轮转选出的"下一家"没有这份前缀,ping 过去只是白买 miss。
+        let hinted = endpoint_hint.and_then(|(provider, model)| {
+            endpoints.iter().position(|endpoint| {
+                endpoint.provider.id == *provider && endpoint.provider.default_model == *model
+            })
+        });
+        let index = hinted.unwrap_or_else(|| {
+            ordered_endpoint_indices(endpoints).first().copied().unwrap_or(0)
+        });
         let endpoint = endpoints
             .get(index)
             .context("no LLM endpoint configured for cache keepalive")?;
@@ -1596,6 +1605,16 @@ impl OpenAiCompatibleClient {
                 usage.normalize_cache_fields();
                 usage
             });
+        // 保温 ping 也进 cache-usage 记账:不然命中率诊断里多出一段
+        // "看不见的流量"(deepseek 报告 P2 的观测盲区)。
+        super::cache_log::record(
+            "keepalive",
+            &self.provider.id,
+            &self.provider.default_model,
+            0,
+            &request_id,
+            usage.as_ref(),
+        );
         Ok(usage)
     }
 

@@ -6501,7 +6501,7 @@
   // 未列家族回落扳手。全部 lucide 线稿,无 emoji。
   function toolIconName(name) {
     const n = String(name || "");
-    if (["run_command", "job_status", "job_stop"].includes(n)) return "dollar-sign";
+    if (["run_command", "job_status", "job_stop"].includes(n)) return "terminal";
     if (["web_search", "web_fetch", "search_web", "webfetch"].includes(n)) return "globe";
     if (n === "search_web_images") return "image-search";
     if (n === "apply_patch" || n === "apply_artifact_patch") return "square-pen";

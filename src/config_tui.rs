@@ -1273,6 +1273,11 @@ fn edit_custom_prompts(
                     t("Disabled", "禁用")
                 }
             ),
+            format!(
+                "{}: {}",
+                t("Reminder interval (turns)", "防失忆间隔轮数"),
+                config.prompt.persona_reminder_interval.max(1)
+            ),
         ];
         draw_menu(
             stdout,
@@ -1292,6 +1297,18 @@ fn edit_custom_prompts(
             KeyCode::Enter if selected == 1 => edit_dev_prompt(stdout, paths)?,
             KeyCode::Enter if selected == 2 => {
                 config.prompt.persona_reminder = !config.prompt.persona_reminder;
+            }
+            KeyCode::Enter if selected == 3 => {
+                if let Some(value) = edit_inline_value(
+                    stdout,
+                    t("Reminder interval (turns)", "防失忆间隔轮数"),
+                    &config.prompt.persona_reminder_interval.to_string(),
+                    false,
+                )? {
+                    if let Ok(interval) = value.trim().parse::<u32>() {
+                        config.prompt.persona_reminder_interval = interval.max(1);
+                    }
+                }
             }
             _ => {}
         }

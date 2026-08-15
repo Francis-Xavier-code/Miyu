@@ -513,6 +513,28 @@ fn add_usage(total: &mut Usage, usage: &Usage) {
     total.total_tokens = total
         .total_tokens
         .saturating_add(usage.effective_total_tokens());
+    // 缓存字段曾被丢弃:fork 式折叠明明大量命中,summary 轮与用量史却
+    // 记 0,Σ 命中率随折叠次数被系统性低估(deepseek 报告 P1 实证)。
+    if let Some(hit) = usage.prompt_cache_hit_tokens {
+        total.prompt_cache_hit_tokens =
+            Some(total.prompt_cache_hit_tokens.unwrap_or(0).saturating_add(hit));
+    }
+    if let Some(miss) = usage.prompt_cache_miss_tokens {
+        total.prompt_cache_miss_tokens = Some(
+            total
+                .prompt_cache_miss_tokens
+                .unwrap_or(0)
+                .saturating_add(miss),
+        );
+    }
+    if let Some(details) = usage.prompt_tokens_details.as_ref() {
+        if let Some(cached) = details.cached_tokens {
+            let slot = total
+                .prompt_tokens_details
+                .get_or_insert_with(Default::default);
+            slot.cached_tokens = Some(slot.cached_tokens.unwrap_or(0).saturating_add(cached));
+        }
+    }
 }
 
 fn turns_to_text(turns: &[&Turn]) -> String {

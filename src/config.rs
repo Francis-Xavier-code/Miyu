@@ -2444,9 +2444,18 @@ pub struct PromptConfig {
     pub active_persona: String,
     #[serde(default)]
     pub active_identity: String,
-    /// 平台会话尾部的人格提醒(自动蒸馏,见 persona_hint 模块)。
-    #[serde(default = "default_true")]
+    /// 防失忆提醒(自动蒸馏,见 persona_hint 模块)。08-16 起改为
+    /// 化石注入:每隔 `persona_reminder_interval` 轮进一次历史,纯追加
+    /// 不再掰前缀缓存。A/B 实证干净体制下预设对话已足够→默认禁用。
+    #[serde(default)]
     pub persona_reminder: bool,
+    /// 相邻两次防失忆提醒之间至少间隔的轮数(>=1)。
+    #[serde(default = "default_persona_reminder_interval")]
+    pub persona_reminder_interval: u32,
+}
+
+fn default_persona_reminder_interval() -> u32 {
+    3
 }
 
 /// Identifies who a model prompt is acting for. Only trusted local operator
@@ -3165,7 +3174,8 @@ impl Default for PromptConfig {
             user_identity_file: default_user_identity_file(),
             active_persona: String::new(),
             active_identity: String::new(),
-            persona_reminder: true,
+            persona_reminder: false,
+            persona_reminder_interval: default_persona_reminder_interval(),
         }
     }
 }
