@@ -31,5 +31,6 @@
   "load_policy": "summary",
   "groups": [
     "shell"
-  ]
+  ],
+  "timeout_seconds": 0
 }

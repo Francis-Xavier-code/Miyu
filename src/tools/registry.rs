@@ -132,6 +132,8 @@ pub struct ToolSpec {
     pub is_script: bool,
     pub load_policy: LoadPolicy,
     pub groups: Vec<String>,
+    /// 按工具超时（秒）。None=吃 registry 默认兜底；Some(0)=豁免。
+    pub timeout_seconds: Option<u64>,
     handler: ToolHandler,
 }
 
@@ -163,6 +165,7 @@ impl ToolSpec {
             is_script: false,
             load_policy: LoadPolicy::Summary,
             groups: Vec::new(),
+            timeout_seconds: None,
             handler: Arc::new(move |args, _progress| Box::pin(handler(args))),
         }
     }
@@ -187,6 +190,7 @@ impl ToolSpec {
             is_script: false,
             load_policy: LoadPolicy::Summary,
             groups: Vec::new(),
+            timeout_seconds: None,
             handler: Arc::new(move |args, progress| Box::pin(handler(args, progress))),
         }
     }
@@ -230,6 +234,11 @@ impl ToolSpec {
         self
     }
 
+    pub fn with_timeout_seconds(mut self, secs: u64) -> Self {
+        self.timeout_seconds = Some(secs);
+        self
+    }
+
     pub fn apply_built_in_description(mut self) -> Self {
         if let Some(desc) = crate::tools::tool_descriptions::get(&self.name) {
             // load_skill owns a dynamic catalog description, but still uses
@@ -243,6 +252,9 @@ impl ToolSpec {
             self.always_loaded = desc.always_loaded;
             self.load_policy = desc.load_policy;
             self.groups = desc.groups.clone();
+            if desc.timeout_seconds.is_some() {
+                self.timeout_seconds = desc.timeout_seconds;
+            }
         }
         self
     }
@@ -279,6 +291,11 @@ pub struct ToolRegistry {
     script_tool_names: BTreeSet<String>,
     unregistered_scripts: Vec<UnregisteredScript>,
     skill_catalog_fingerprint: Option<[u8; 32]>,
+    /// 兜底超时：工具未声明 timeout_seconds 时生效。None=不兜底（默认构
+    /// 造/测试保持旧行为），工厂函数按 config.tools.default_timeout_secs
+    /// 注入。防的是 MCP/web/生图这类没有自管超时的工具把回合无限挂死；
+    /// run_command 等自管工具用 timeout_seconds=0 豁免。
+    default_timeout: Option<std::time::Duration>,
 }
 
 impl ToolRegistry {
@@ -289,6 +306,28 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: ToolSpec) {
         let tool = tool.apply_built_in_description();
         self.tools.insert(tool.name.clone(), Arc::new(tool));
+    }
+
+    /// 0 = 关闭兜底超时。
+    pub fn set_default_timeout_secs(&mut self, secs: u64) {
+        self.default_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+
+    fn effective_timeout(&self, tool: &ToolSpec) -> Option<std::time::Duration> {
+        match tool.timeout_seconds {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => self.default_timeout,
+        }
+    }
+
+    fn timeout_error(name: &str, limit: std::time::Duration) -> anyhow::Error {
+        let secs = limit.as_secs();
+        if crate::i18n::agent_is_zh() {
+            anyhow::anyhow!("工具 `{name}` 执行超时（超过 {secs} 秒）已中止")
+        } else {
+            anyhow::anyhow!("tool `{name}` timed out after {secs}s and was aborted")
+        }
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {
@@ -485,7 +524,15 @@ impl ToolRegistry {
         if name == "load_tools" {
             return super::load_tools::execute(args, self);
         }
-        tool.call(args, ToolProgress::default()).await
+        match self.effective_timeout(tool) {
+            Some(limit) => {
+                match tokio::time::timeout(limit, tool.call(args, ToolProgress::default())).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Self::timeout_error(name, limit)),
+                }
+            }
+            None => tool.call(args, ToolProgress::default()).await,
+        }
     }
 
     pub fn call_with_progress_future(
@@ -506,7 +553,19 @@ impl ToolRegistry {
             let result = super::load_tools::execute(args, self);
             return Ok(Box::pin(async move { result }));
         }
-        Ok(tool.call_future(args, ToolProgress::new(sender)))
+        let future = tool.call_future(args, ToolProgress::new(sender));
+        Ok(match self.effective_timeout(tool) {
+            Some(limit) => {
+                let tool_name = tool.name.clone();
+                Box::pin(async move {
+                    match tokio::time::timeout(limit, future).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Self::timeout_error(&tool_name, limit)),
+                    }
+                })
+            }
+            None => future,
+        })
     }
 
     pub fn display_name(&self, name: &str) -> Option<String> {
@@ -685,6 +744,7 @@ impl ToolRegistry {
 
     pub fn clone_filtered(&self, allowed: &[&str]) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
+        registry.default_timeout = self.default_timeout;
         for name in allowed {
             if let Some(spec) = self.tools.get(*name) {
                 registry.tools.insert(spec.name.clone(), Arc::clone(spec));
@@ -767,6 +827,64 @@ fn xml_escape(text: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn sleeping_tool(name: &str, sleep_secs: u64) -> ToolSpec {
+        ToolSpec::new(
+            name,
+            "sleeps",
+            json!({"type":"object","properties":{}}),
+            move |_| async move {
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                Ok("done".to_string())
+            },
+        )
+    }
+
+    /// 兜底超时:未声明 timeout_seconds 的慢工具被中止,错误走普通
+    /// tool error 路径(轮次存活),不会无限挂死回合。
+    #[tokio::test]
+    async fn default_timeout_aborts_undeclared_slow_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.set_default_timeout_secs(2);
+        registry.register(sleeping_tool("slow_tool", 60));
+        let error = registry.call("slow_tool", "{}").await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out") || message.contains("超时"),
+            "unexpected timeout message: {message}"
+        );
+    }
+
+    /// timeout_seconds=0 = 豁免(run_command 这类自管超时的工具),
+    /// 兜底不生效。
+    #[tokio::test]
+    async fn zero_timeout_exempts_self_managed_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.set_default_timeout_secs(1);
+        registry.register(sleeping_tool("self_managed", 2).with_timeout_seconds(0));
+        let output = registry.call("self_managed", "{}").await.unwrap();
+        assert_eq!(output, "done");
+    }
+
+    /// 按工具声明覆盖兜底默认。
+    #[tokio::test]
+    async fn per_tool_timeout_overrides_default() {
+        let mut registry = ToolRegistry::new();
+        registry.set_default_timeout_secs(3600);
+        registry.register(sleeping_tool("tight_tool", 5).with_timeout_seconds(1));
+        let error = registry.call("tight_tool", "{}").await.unwrap_err();
+        assert!(error.to_string().contains("1"));
+    }
+
+    /// clone_filtered 继承兜底超时(task 的 Explore 裁剪路径)。
+    #[tokio::test]
+    async fn clone_filtered_keeps_default_timeout() {
+        let mut registry = ToolRegistry::new();
+        registry.set_default_timeout_secs(2);
+        registry.register(sleeping_tool("slow_tool", 60));
+        let filtered = registry.clone_filtered(&["slow_tool"]);
+        assert!(filtered.call("slow_tool", "{}").await.is_err());
+    }
 
     #[test]
     fn lazy_definitions_include_loaded_on_demand_tools() {

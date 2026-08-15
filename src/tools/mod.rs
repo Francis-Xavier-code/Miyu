@@ -295,6 +295,7 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
 
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     default_tools::register(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
     usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());
@@ -445,6 +446,7 @@ pub fn uses_load_tools(mode: &str) -> bool {
 
 pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     web::register_fetch(&mut registry);
     usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());
     if config.plugins.web.enabled {
@@ -472,6 +474,7 @@ pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
 /// output under the plugin's output directory, never an arbitrary host path.
 pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     web::register_fetch(&mut registry);
     weather::register(&mut registry);
     caniplayonlinux_query::register(&mut registry);

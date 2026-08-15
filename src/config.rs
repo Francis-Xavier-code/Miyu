@@ -2633,6 +2633,11 @@ pub struct ToolsConfig {
     /// How many `task` subagents from one tool batch may run concurrently.
     #[serde(default = "default_subagent_concurrency")]
     pub subagent_concurrency: usize,
+    /// 工具执行兜底超时（秒），0=关闭。防没有自管超时的工具（MCP/web/生图
+    /// 等）把回合无限挂死；run_command/task/deep_research 等自管或长跑工具
+    /// 在 descriptions JSON 里以 timeout_seconds=0 豁免。
+    #[serde(default = "default_tools_timeout_secs")]
+    pub default_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3413,6 +3418,7 @@ impl Default for ToolsConfig {
             loading_mode: default_tools_loading_mode(),
             persist_loaded_tools: default_true(),
             subagent_concurrency: default_subagent_concurrency(),
+            default_timeout_secs: default_tools_timeout_secs(),
         }
     }
 }
@@ -5528,6 +5534,10 @@ fn default_tools_loading_mode() -> String {
 
 fn default_subagent_concurrency() -> usize {
     4
+}
+
+fn default_tools_timeout_secs() -> u64 {
+    180
 }
 
 fn default_display_language() -> String {
