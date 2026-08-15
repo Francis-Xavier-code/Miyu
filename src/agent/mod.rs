@@ -2006,9 +2006,15 @@ impl Agent {
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
         self.persona_reminder = self.resolve_persona_reminder().await;
-        // 人类新回合:重复链语境重置(注意:将来 goal 自动续轮不应重置,
-        // 见任务#10)。
-        self.repeat_chain.reset();
+        // 人类新回合:重复链语境重置。goal 自动续轮/job 唤醒不算语境
+        // 变化——跨自动轮的原样重复正是最需要打断的死循环(dsh 同款:
+        // 只有 user 来源消息重置链)。
+        if matches!(
+            crate::tools::workspace::current_turn_origin(),
+            crate::tools::workspace::TurnOrigin::Human
+        ) {
+            self.repeat_chain.reset();
+        }
         let prepared = self.prepare_user_input(input, images).await?;
         let input = prepared.content.clone();
         let turn_id = format!(

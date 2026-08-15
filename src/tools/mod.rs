@@ -346,7 +346,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     apply_patch::register(&mut registry);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
-    todowrite::register(&mut registry);
+    todowrite::register(&mut registry, paths.clone());
     goal::register(&mut registry, paths.clone());
     alarm::register(&mut registry, paths.clone());
     clipboard::register(&mut registry, paths.clone());
@@ -506,7 +506,7 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     apply_patch::register(&mut registry);
     write::register(&mut registry);
     edit_replace::register(&mut registry);
-    todowrite::register(&mut registry);
+    todowrite::register(&mut registry, paths.clone());
     goal::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
     if config.plugins.web.enabled {
