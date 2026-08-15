@@ -7564,6 +7564,7 @@ mod tests {
                 platform_followup: Some(followup.clone()),
                 operation: crate::web::RunOperation::Create,
                 job_wake: false,
+                turn_origin: crate::tools::workspace::TurnOrigin::Human,
                 job_wake_label: None,
             },
         );
@@ -7594,6 +7595,7 @@ mod tests {
                 platform_followup: Some(newer.clone()),
                 operation: crate::web::RunOperation::Create,
                 job_wake: false,
+                turn_origin: crate::tools::workspace::TurnOrigin::Human,
                 job_wake_label: None,
             },
         );
@@ -7661,6 +7663,7 @@ mod tests {
                 platform_followup: Some(followup.clone()),
                 operation: crate::web::RunOperation::Create,
                 job_wake: false,
+                turn_origin: crate::tools::workspace::TurnOrigin::Human,
                 job_wake_label: None,
             },
         );
@@ -8023,6 +8026,7 @@ mod tests {
                 platform_followup: None,
                 operation: crate::web::RunOperation::Create,
                 job_wake: false,
+                turn_origin: crate::tools::workspace::TurnOrigin::Human,
                 job_wake_label: None,
             },
         );

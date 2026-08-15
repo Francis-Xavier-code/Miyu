@@ -336,6 +336,16 @@ async fn update_goal(paths: &MiyuPaths, args: Value) -> Result<String> {
     }
 }
 
+/// dsh goal-round-driver prompt.ts 同款续轮提示词:引用目标与轮号,
+/// 要求以工作区/工具结果/持久状态为准、取证后才 complete、未完则保持
+/// active。保留英文原文——dev 提示词就是英文,措辞贴训练分布。
+pub fn goal_round_prompt(objective: &str, round: i64, max_rounds: i64) -> String {
+    format!(
+        "<goal_round>\nObjective: {}\nRound: {round}/{max_rounds}\n\nContinue working toward          the objective in this same session. Treat the current workspace, tool results, and          durable session state as authoritative; inspect them instead of assuming earlier          narration is still current. Make concrete progress and verify the result. Before          claiming completion, gather evidence that the whole objective is achieved, read the          current goal, and mark it complete. If work remains, leave the goal active for the          next round. Follow the configured goal-tool policy before reporting a blocker.\n         </goal_round>",
+        serde_json::json!(objective)
+    )
+}
+
 // ------------------------------ /goal 人类命令 ------------------------------
 
 /// dsh command-goal 同款语法:`/goal [<objective>|clear|edit <objective>|pause|resume]`。

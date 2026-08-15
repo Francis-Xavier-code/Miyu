@@ -2064,6 +2064,8 @@ pub(crate) async fn run_platform_turn(
                 operation: crate::web::RunOperation::Create,
                 job_wake: false,
                 job_wake_label: None,
+                // 平台真实入站消息;wake 合成轮的来源细分待平台 goal 支持时一并做。
+                turn_origin: crate::tools::workspace::TurnOrigin::Human,
             },
         );
     }
@@ -2096,6 +2098,7 @@ pub(crate) async fn run_platform_turn(
             audience: PromptAudience::External,
             profile: Some(profile),
             cancel: cancel_rx,
+            turn_origin: Box::new(crate::tools::workspace::TurnOrigin::Human),
         })
         .is_err()
     {
