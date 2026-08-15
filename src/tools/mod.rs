@@ -55,8 +55,8 @@ use std::sync::RwLock;
 
 #[allow(unused_imports)]
 pub use registry::{
-    empty_parameters, CommandOutputStream, ToolFuture, ToolPermission, ToolProgress,
-    ToolProgressEvent, ToolRegistry, ToolSpec,
+    empty_parameters, CommandOutputStream, GuardCtx, ToolFuture, ToolGuard, ToolPermission,
+    ToolProgress, ToolProgressEvent, ToolRegistry, ToolSpec,
 };
 pub(crate) use scripts::rescan_scripts;
 pub(crate) use skills::{apply_skill_refresh, prepare_skill_refresh};
@@ -293,9 +293,51 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
     package_advisor::clear_aur_review_state(paths)
 }
 
+/// AUR 装包互斥:review 与 install 不同轮,逼一次"给用户看过再装"的确认。
+/// 原为 chat_with_tools 循环里的硬编码特判,迁入 guard 层后对所有分发路径
+/// (主循环/子代理/工具桥)一致生效。
+pub(crate) fn aur_review_install_guard() -> ToolGuard {
+    std::sync::Arc::new(|tool, _args, ctx| {
+        (tool.name == "install_aur_package"
+            && ctx.used_tools.iter().any(|name| name == "review_aur_package"))
+        .then(|| {
+            "install_aur_package cannot run in the same turn as review_aur_package; \
+             ask the user to confirm installation first"
+                .to_string()
+        })
+    })
+}
+
+/// run_command 命令拒绝子串(config.tools.command_deny)。命中即拒,
+/// 防提示注入与模型手滑;拒绝以 tool error 回给模型,轮次存活。
+pub(crate) fn command_deny_guard(patterns: Vec<String>) -> ToolGuard {
+    std::sync::Arc::new(move |tool, args, _ctx| {
+        if tool.name != "run_command" {
+            return None;
+        }
+        let command = args.get("command").and_then(serde_json::Value::as_str)?;
+        patterns
+            .iter()
+            .find(|pattern| !pattern.is_empty() && command.contains(pattern.as_str()))
+            .map(|pattern| {
+                crate::i18n::agent_is_zh()
+                    .then(|| format!("命令包含被禁止的模式 `{pattern}`,已拒绝执行"))
+                    .unwrap_or_else(|| {
+                        format!("command contains the denied pattern `{pattern}` and was rejected")
+                    })
+            })
+    })
+}
+
+fn install_builtin_guards(registry: &mut ToolRegistry, config: &AppConfig) {
+    registry.add_guard(aur_review_install_guard());
+    registry.add_guard(command_deny_guard(config.tools.command_deny.clone()));
+}
+
 pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
+    install_builtin_guards(&mut registry, config);
     default_tools::register(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
     usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());

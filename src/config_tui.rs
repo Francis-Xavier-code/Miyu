@@ -1271,13 +1271,27 @@ fn edit_custom_prompts(
                 t("Current", "当前")
             ),
             t("User identity", "用户身份").to_string(),
+            // 08-15 A/B 二轮:干净体制下预设对话单独已满分,提醒降为可关
+            // 开关;重噪声 QQ 长群聊体制未复测,默认保持启用。
+            format!(
+                "{} ({})",
+                t("Anti-amnesia reminder", "防失忆提醒"),
+                if config.prompt.persona_reminder {
+                    t("Enabled", "启用")
+                } else {
+                    t("Disabled", "禁用")
+                }
+            ),
         ];
         draw_menu(
             stdout,
             t(" CUSTOM PROMPTS ", " 自定义提示词 "),
             &options,
             selected,
-            t("[Enter]select [q]back", "[Enter]选择 [q]返回"),
+            t(
+                "[Enter]select/toggle [q]back",
+                "[Enter]选择/切换 [q]返回",
+            ),
         )?;
         match read_key()? {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
@@ -1285,6 +1299,9 @@ fn edit_custom_prompts(
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
             KeyCode::Enter if selected == 0 => edit_personas(stdout, paths, config)?,
             KeyCode::Enter if selected == 1 => edit_identities(stdout, paths, config)?,
+            KeyCode::Enter if selected == 2 => {
+                config.prompt.persona_reminder = !config.prompt.persona_reminder;
+            }
             _ => {}
         }
     }

@@ -1343,6 +1343,7 @@ impl Agent {
                         &call.function.name,
                         &call.function.arguments,
                         progress_tx,
+                        &crate::tools::GuardCtx::default(),
                     ) {
                         Ok(future) => slots.push(Slot {
                             call_index,
@@ -3459,26 +3460,17 @@ impl Agent {
                         }
                     }
                 }
-                if call.function.name == "install_aur_package"
-                    && used_tools.iter().any(|name| name == "review_aur_package")
-                {
-                    let output = "tool error: install_aur_package cannot run in the same turn as review_aur_package; ask the user to confirm installation first".to_string();
-                    on_event(AgentEvent::ToolResult {
-                        call_id: call_id.clone(),
-                        name: event_name.clone(),
-                        ok: false,
-                        output: output.clone(),
-                    })?;
-                    messages.push(ChatMessage::tool(call.id, output));
-                    continue;
-                }
                 let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                 let tool_future = {
                     let tools = self.tools.lock().unwrap();
+                    // AUR 互斥等回合级规则已迁入 guard 层,凭 used_tools 上下文判定。
                     tools.call_with_progress_future(
                         &call.function.name,
                         &call.function.arguments,
                         progress_tx,
+                        &crate::tools::GuardCtx {
+                            used_tools: &used_tools,
+                        },
                     )
                 };
                 let tool_future = match tool_future {

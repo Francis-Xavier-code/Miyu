@@ -2638,6 +2638,10 @@ pub struct ToolsConfig {
     /// 在 descriptions JSON 里以 timeout_seconds=0 豁免。
     #[serde(default = "default_tools_timeout_secs")]
     pub default_timeout_secs: u64,
+    /// run_command 命令拒绝子串。命中即拒（guard 层，回给模型 tool error）。
+    /// 防提示注入与模型手滑；默认只收录几乎不可能误伤的毁灭性模式。
+    #[serde(default = "default_command_deny")]
+    pub command_deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3419,6 +3423,7 @@ impl Default for ToolsConfig {
             persist_loaded_tools: default_true(),
             subagent_concurrency: default_subagent_concurrency(),
             default_timeout_secs: default_tools_timeout_secs(),
+            command_deny: default_command_deny(),
         }
     }
 }
@@ -5538,6 +5543,19 @@ fn default_subagent_concurrency() -> usize {
 
 fn default_tools_timeout_secs() -> u64 {
     180
+}
+
+fn default_command_deny() -> Vec<String> {
+    [
+        "rm -rf /",
+        "rm -rf ~",
+        "mkfs.",
+        "dd if=/dev/zero of=/dev/",
+        ":(){ :|:& };:",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn default_display_language() -> String {

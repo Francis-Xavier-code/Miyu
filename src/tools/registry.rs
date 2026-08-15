@@ -12,6 +12,20 @@ use tokio::sync::{mpsc, oneshot};
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 pub type ToolHandler = Arc<dyn Fn(Value, ToolProgress) -> ToolFuture + Send + Sync>;
 
+/// 单调执行守卫:返回 Some(理由) 即拒绝本次调用,返回 None 放行。
+/// 只拒不放——任何 guard 拒绝后,后续 guard 与调用方都无法翻案
+/// (dsh ToolGuard 同款语义)。拒绝以普通 tool error 回给模型,轮次存活。
+pub type ToolGuard = Arc<dyn Fn(&ToolSpec, &Value, &GuardCtx) -> Option<String> + Send + Sync>;
+
+/// 守卫可见的回合上下文。registry 自身无回合概念,由调用方(agent 主循环、
+/// 未来的工具桥)按次构造;拿不到上下文的路径(subagent 的 call)用默认值,
+/// 仅参数级守卫生效。
+#[derive(Default)]
+pub struct GuardCtx<'a> {
+    /// 本回合此前已请求过的工具名(含本次,按主循环 push 时序)。
+    pub used_tools: &'a [String],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandOutputStream {
     Stdout,
@@ -296,6 +310,8 @@ pub struct ToolRegistry {
     /// 注入。防的是 MCP/web/生图这类没有自管超时的工具把回合无限挂死；
     /// run_command 等自管工具用 timeout_seconds=0 豁免。
     default_timeout: Option<std::time::Duration>,
+    /// 单调守卫链,按注册序求值,第一个拒绝即终。
+    guards: Vec<ToolGuard>,
 }
 
 impl ToolRegistry {
@@ -311,6 +327,16 @@ impl ToolRegistry {
     /// 0 = 关闭兜底超时。
     pub fn set_default_timeout_secs(&mut self, secs: u64) {
         self.default_timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+
+    pub fn add_guard(&mut self, guard: ToolGuard) {
+        self.guards.push(guard);
+    }
+
+    fn guard_denial(&self, tool: &ToolSpec, args: &Value, ctx: &GuardCtx) -> Option<String> {
+        self.guards
+            .iter()
+            .find_map(|guard| guard(tool, args, ctx))
     }
 
     fn effective_timeout(&self, tool: &ToolSpec) -> Option<std::time::Duration> {
@@ -524,6 +550,9 @@ impl ToolRegistry {
         if name == "load_tools" {
             return super::load_tools::execute(args, self);
         }
+        if let Some(reason) = self.guard_denial(tool, &args, &GuardCtx::default()) {
+            bail!("{reason}");
+        }
         match self.effective_timeout(tool) {
             Some(limit) => {
                 match tokio::time::timeout(limit, tool.call(args, ToolProgress::default())).await {
@@ -540,6 +569,7 @@ impl ToolRegistry {
         name: &str,
         arguments: &str,
         sender: mpsc::UnboundedSender<ToolProgressEvent>,
+        guard_ctx: &GuardCtx,
     ) -> Result<ToolFuture> {
         let Some(tool) = self.tools.get(name) else {
             bail!("unknown tool: {name}");
@@ -552,6 +582,9 @@ impl ToolRegistry {
         if name == "load_tools" {
             let result = super::load_tools::execute(args, self);
             return Ok(Box::pin(async move { result }));
+        }
+        if let Some(reason) = self.guard_denial(tool, &args, guard_ctx) {
+            return Ok(Box::pin(async move { Err(anyhow::anyhow!("{reason}")) }));
         }
         let future = tool.call_future(args, ToolProgress::new(sender));
         Ok(match self.effective_timeout(tool) {
@@ -745,6 +778,7 @@ impl ToolRegistry {
     pub fn clone_filtered(&self, allowed: &[&str]) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.default_timeout = self.default_timeout;
+        registry.guards = self.guards.clone();
         for name in allowed {
             if let Some(spec) = self.tools.get(*name) {
                 registry.tools.insert(spec.name.clone(), Arc::clone(spec));
@@ -874,6 +908,78 @@ mod tests {
         registry.register(sleeping_tool("tight_tool", 5).with_timeout_seconds(1));
         let error = registry.call("tight_tool", "{}").await.unwrap_err();
         assert!(error.to_string().contains("1"));
+    }
+
+    /// AUR 互斥迁入 guard 后语义不变:同轮先 review 再 install 被拒,
+    /// 拒绝理由与原循环特判逐字一致;无 review 上下文时放行。
+    #[tokio::test]
+    async fn aur_guard_denies_install_after_review_in_same_turn() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolSpec::new(
+            "install_aur_package",
+            "installs",
+            json!({"type":"object","properties":{}}),
+            |_| async { Ok("installed".to_string()) },
+        ));
+        registry.add_guard(crate::tools::aur_review_install_guard());
+
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let used = vec!["review_aur_package".to_string(), "install_aur_package".to_string()];
+        let denied = registry
+            .call_with_progress_future(
+                "install_aur_package",
+                "{}",
+                sender.clone(),
+                &GuardCtx { used_tools: &used },
+            )
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("cannot run in the same turn"));
+
+        let clean = vec!["install_aur_package".to_string()];
+        let allowed = registry
+            .call_with_progress_future(
+                "install_aur_package",
+                "{}",
+                sender,
+                &GuardCtx { used_tools: &clean },
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(allowed, "installed");
+    }
+
+    /// 命令拒绝子串:命中即拒(轮次以 tool error 存活),未命中放行;
+    /// 只作用于 run_command。
+    #[tokio::test]
+    async fn command_deny_guard_blocks_matching_commands() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolSpec::new(
+            "run_command",
+            "runs",
+            json!({"type":"object","properties":{}}),
+            |_| async { Ok("ran".to_string()) },
+        ));
+        registry.add_guard(crate::tools::command_deny_guard(vec![
+            "rm -rf /".to_string(),
+        ]));
+
+        let denied = registry
+            .call("run_command", r#"{"command":"sudo rm -rf /"}"#)
+            .await
+            .unwrap_err();
+        let message = denied.to_string();
+        assert!(
+            message.contains("rm -rf /") || message.contains("denied pattern"),
+            "unexpected denial: {message}"
+        );
+        let allowed = registry
+            .call("run_command", r#"{"command":"ls -la"}"#)
+            .await
+            .unwrap();
+        assert_eq!(allowed, "ran");
     }
 
     /// clone_filtered 继承兜底超时(task 的 Explore 裁剪路径)。
