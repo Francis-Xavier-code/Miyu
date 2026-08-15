@@ -1965,12 +1965,12 @@ textarea:disabled {
   width: fit-content;
   max-width: 100%;
   align-items: center;
-  padding: 4px 11px;
+  padding: 4px 9px;
   border-radius: 6px;
   background: var(--chip-think);
   color: var(--text);
   cursor: pointer;
-  gap: 7px;
+  gap: 5px;
   font-size: 11.5px;
   font-weight: 600;
   line-height: 1.5;
