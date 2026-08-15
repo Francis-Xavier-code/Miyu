@@ -121,10 +121,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_tool_flow",
         apply: apply_v20_turn_tool_flow,
     },
+    Migration {
+        version: 21,
+        name: "rename_default_session",
+        apply: apply_v21_rename_default_session,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 20;
+pub const LATEST_VERSION: i64 = 21;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -356,7 +361,7 @@ fn apply_v2_sessions(conn: &Connection) -> Result<()> {
          VALUES (?1, '', ?2, 'user', ?3, ?3)",
         rusqlite::params![
             DEFAULT_SESSION_ID,
-            crate::i18n::text("Default session", "默认会话"),
+            crate::i18n::text("Terminal session", "终端集成会话"),
             now
         ],
     )?;
@@ -840,6 +845,20 @@ fn apply_v19_session_cache_tokens(conn: &Connection) -> Result<()> {
 /// 还原为原生 tool_calls + role:"tool" 消息,不再压扁成系统备忘。
 fn apply_v20_turn_tool_flow(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "turns", "tool_flow", "TEXT")
+}
+
+/// 「默认会话」实为 shellhook/CLI 快捷入口专属的 lane,改叫「终端集成
+/// 会话」;只重命名仍叫旧默认名的行,用户手动改过的名字不动。
+fn apply_v21_rename_default_session(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET name = ?1
+         WHERE session_id = ?2 AND name IN ('默认会话', 'Default session')",
+        rusqlite::params![
+            crate::i18n::text("Terminal session", "终端集成会话"),
+            DEFAULT_SESSION_ID
+        ],
+    )?;
+    Ok(())
 }
 
 fn add_column_if_missing(

@@ -1452,7 +1452,7 @@ mod tests {
                 cumulative_prompt_tokens: 20,
                 cumulative_cache_read_tokens: 10,
                 session_id: "default".to_string(),
-                session_name: "默认会话".to_string(),
+                session_name: "终端集成会话".to_string(),
                 workspace: None,
             },
             data: serde_json::json!({"ok": true}),

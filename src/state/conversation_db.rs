@@ -573,7 +573,7 @@ impl ConversationDb {
              VALUES (?1, '', ?2, 'user', ?3, ?3)",
             params![
                 super::migrations::DEFAULT_SESSION_ID,
-                t("Default session", "默认会话"),
+                t("Terminal session", "终端集成会话"),
                 now
             ],
         )?;

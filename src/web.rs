@@ -3192,7 +3192,7 @@ fn fallback_session_id(state: &DaemonState, exclude: &str) -> std::result::Resul
     }
     let record = state
         .state_store
-        .create_session(&persona, t("Default session", "默认会话"), "user", None)
+        .create_session(&persona, t("Terminal session", "终端集成会话"), "user", None)
         .map_err(|error| safe_error_message(&error))?;
     state.events.publish(
         "session.created",
