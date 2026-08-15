@@ -25,12 +25,6 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     register_readonly(registry);
     register_run_command(registry, allow_command_execution);
     registry.register(ToolSpec::new_with_progress(
-        "edit_file",
-        t("Edit an existing UTF-8 file by replacing an inclusive 1-based line range. Use after read_file identifies exact line numbers.", "按 1 起始的闭区间行号替换现有 UTF-8 文件内容。应先用 read_file 确认准确行号。"),
-        json!({"type":"object","properties":{"path":{"type":"string","description": t("Workspace-relative or absolute file path.", "工作区相对路径或绝对文件路径。")},"start_line":{"type":"integer","description": t("1-based first line to replace.", "要替换的第一行，1 起始。")},"end_line":{"type":"integer","description": t("1-based last line to replace, inclusive.", "要替换的最后一行，闭区间。")},"replacement":{"type":"string","description": t("Replacement text. May contain multiple lines. Empty text deletes the line range.", "替换文本，可包含多行；空文本会删除指定行范围。")}},"required":["path","start_line","end_line","replacement"],"additionalProperties":false}),
-        |args, progress| async move { edit_file(args, progress) },
-    ).writes());
-    registry.register(ToolSpec::new_with_progress(
         "trash_path",
         t("Move files, directories, or symlinks to the system Trash instead of permanently deleting them. Pass every path in one call — one call per path floods the transcript. Use this when the user asks to delete/remove/clean up local paths; do not use rm unless explicitly requested.", "把文件、目录或符号链接移入系统回收站，而不是永久删除。要删多个时一次性全部传入，逐个调用会刷屏。用户要求删除/移除/清理本地路径时优先使用它；除非用户明确要求，不要使用 rm。"),
         json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"description": t("Paths to move to Trash. Absolute, workspace-relative, and ~/ paths are all accepted.", "要移入回收站的路径列表。支持绝对路径、工作区相对路径和 ~/ 路径。")}},"required":["paths"],"additionalProperties":false}),

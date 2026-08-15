@@ -3848,9 +3848,31 @@ fn write_patch_result(stdout: &mut impl Write, output: &str) -> Result<bool> {
 
 fn render_patch_diff(path: &str, diff: &str) -> String {
     let mut output = String::new();
-    output.push_str(&format!(
-        "\x1b[2m{}  \x1b[38;5;250m{path}\x1b[0m\n\n",
+    // apply_patch 是唯一编辑器(增/改/删同一语义),标签按 diff 形态区分:
+    // 纯 + 无上下文=新建,纯 - 无上下文=删除,其余=修改。
+    let mut plus = false;
+    let mut minus = false;
+    let mut context = false;
+    for line in diff.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@") {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') => plus = true,
+            Some(b'-') => minus = true,
+            Some(_) => context = true,
+            None => {}
+        }
+    }
+    let label = if plus && !minus && !context {
+        t("Created", "已新建")
+    } else if minus && !plus && !context {
+        t("Deleted", "已删除")
+    } else {
         t("Modified", "已修改")
+    };
+    output.push_str(&format!(
+        "\x1b[2m{label}  \x1b[38;5;250m{path}\x1b[0m\n\n"
     ));
 
     let terminal_width = terminal::size()

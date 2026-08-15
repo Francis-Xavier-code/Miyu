@@ -160,7 +160,7 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "run_command" => t("Run command", "运行命令"),
         "job_status" => t("Check background tasks", "查询后台任务"),
         "job_stop" => t("Stop background task", "停止后台任务"),
-        "apply_patch" => t("Apply patch", "应用补丁"),
+        "apply_patch" => t("Edit files", "编辑文件"),
         "apply_artifact_patch" => t("Edit preview file", "修改预览文件"),
         "create_artifact" => t("Create preview file", "创建预览文件"),
         "read_artifact" => t("Read preview file", "读取预览文件"),
@@ -343,9 +343,9 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     default_tools::register(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
     usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());
+    // 编辑器只留 apply_patch(聚合增/改/删,diff 渲染载体);write_file/
+    // edit_file/edit_string 与 dev 同步退场(验收四轮:normal 也去冗余)。
     apply_patch::register(&mut registry);
-    write::register(&mut registry);
-    edit_replace::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
     goal::register(&mut registry, paths.clone());
     alarm::register(&mut registry, paths.clone());

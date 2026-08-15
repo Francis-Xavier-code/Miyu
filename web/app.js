@@ -6368,7 +6368,15 @@
       const page = limit !== null ? `L${start}-${start + limit - 1}` : `L${start}+`;
       return path ? `${path} (${page})` : page;
     }
-    if (["read", "write", "edit", "apply_patch", "print_image", "vision_analyze"].includes(toolName)) {
+    if (toolName === "apply_patch" || toolName === "apply_artifact_patch") {
+      // 唯一编辑器:patchText 里抠出文件名当副标题,不然标签恒空。
+      const text = String(args.patchText || args.patch_text || "");
+      const files = [...text.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1].trim());
+      if (files.length === 1) return compactPath(files[0]);
+      if (files.length > 1) return `${compactPath(files[0])} 等 ${files.length} 个文件`;
+      return "";
+    }
+    if (["read", "write", "edit", "print_image", "vision_analyze"].includes(toolName)) {
       return compactPath(args.filePath || args.file_path || args.path || args.image);
     }
     if (toolName === "grep") {

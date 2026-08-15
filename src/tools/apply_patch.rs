@@ -41,8 +41,8 @@ pub fn register_artifact(registry: &mut ToolRegistry, root: PathBuf, session_id:
     registry.register(ToolSpec::new_with_progress(
         "apply_artifact_patch",
         agent_text(
-            "Apply a patch to files in the current managed Artifact workspace. Paths must be plain Artifact file names. Supports Add File and Update File; deletion is not supported.",
-            "对当前托管 Artifact 工作区中的文件应用补丁。路径必须是 Artifact 文件名。支持 Add File 和 Update File，不支持删除。",
+            "Apply a patch to files in the current managed Artifact workspace. Paths must be plain Artifact file names. Supports Add File, Update File, and Delete File.",
+            "对当前托管 Artifact 工作区中的文件应用补丁。路径必须是 Artifact 文件名。支持 Add File、Update File 与 Delete File。",
         ),
         json!({
             "type": "object",
@@ -107,14 +107,6 @@ where
     if operations.is_empty() {
         bail!("patch rejected: empty patch")
     }
-    if managed_artifact
-        && operations
-            .iter()
-            .any(|operation| matches!(operation, Operation::Delete { .. }))
-    {
-        bail!("Artifact patches do not support Delete File")
-    }
-
     let changes = preflight_operations(operations)?;
     if managed_artifact {
         for change in &changes {
@@ -924,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_patch_rejects_unsafe_paths_delete_and_symlinks() {
+    fn artifact_patch_rejects_unsafe_paths_and_symlinks_but_allows_delete() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -940,8 +932,8 @@ mod tests {
         for patch in [
             "*** Begin Patch\n*** Add File: ../escape.md\n+bad\n*** End Patch",
             "*** Begin Patch\n*** Add File: nested/file.md\n+bad\n*** End Patch",
-            "*** Begin Patch\n*** Delete File: report.md\n*** End Patch",
             "*** Begin Patch\n*** Update File: link.md\n@@ patch\n-outside\n+changed\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: link.md\n*** End Patch",
         ] {
             assert!(apply_artifact_patch(
                 json!({"patchText": patch}),
@@ -951,9 +943,18 @@ mod tests {
             )
             .is_err());
         }
-
-        assert_eq!(std::fs::read_to_string(report).unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "original\n");
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
         assert!(!temp.path().join("escape.md").exists());
+
+        // 验收四轮:Artifact 与本地补丁同语义,普通文件的 Delete File 放行。
+        let deleted = apply_artifact_patch(
+            json!({"patchText": "*** Begin Patch\n*** Delete File: report.md\n*** End Patch"}),
+            ToolProgress::default(),
+            &root,
+            "sess_test",
+        );
+        assert!(deleted.is_ok(), "{deleted:?}");
+        assert!(!report.exists());
     }
 }

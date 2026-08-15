@@ -3425,7 +3425,13 @@ async fn run_models_for_session(
             initial.clone(),
         )? {
             if active == initial {
-                println!("{}", t("no changes", "未做修改"));
+                println!(
+                    "{}",
+                    t(
+                        "no changes (Enter picks the highlighted model; Tab multi-selects)",
+                        "未做修改（回车=选定高亮模型,Tab=多选勾选）"
+                    )
+                );
                 return Ok(());
             }
             let models = choices
