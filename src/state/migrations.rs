@@ -131,10 +131,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "session_goals",
         apply: apply_v22_session_goals,
     },
+    Migration {
+        version: 23,
+        name: "retire_session_archiving",
+        apply: apply_v23_retire_session_archiving,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 22;
+pub const LATEST_VERSION: i64 = 23;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -890,6 +895,13 @@ fn apply_v22_session_goals(conn: &Connection) -> Result<()> {
             updated_at      TEXT NOT NULL
         );",
     )?;
+    Ok(())
+}
+
+/// 归档会话功能整体移除:解冻所有存量归档行,否则它们在没有解档入口的
+/// 新版里永远不可见。列本身保留(0 值),避免无谓的表重建。
+fn apply_v23_retire_session_archiving(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE sessions SET archived = 0 WHERE archived != 0", [])?;
     Ok(())
 }
 

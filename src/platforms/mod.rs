@@ -1525,11 +1525,6 @@ pub(crate) fn resolve_platform_session(
             .state_store
             .session_record(&session_id)?
             .with_context(|| format!("bound platform session is missing: {session_id}"))?;
-        if record.archived {
-            state
-                .state_store
-                .set_session_archived(&record.session_id, false)?;
-        }
         return Ok(record.session_id.into());
     }
 
@@ -1538,7 +1533,7 @@ pub(crate) fn resolve_platform_session(
     // wins and every later account gets a fresh, correctly isolated session.
     let mut candidates = state
         .state_store
-        .list_sessions(&persona, true)?
+        .list_sessions(&persona)?
         .into_iter()
         .filter(|overview| {
             overview.record.kind == "user"
@@ -1554,11 +1549,6 @@ pub(crate) fn resolve_platform_session(
             .claim_platform_session(&key, &record.session_id)
         {
             Ok(session_id) if session_id == record.session_id => {
-                if record.archived {
-                    state
-                        .state_store
-                        .set_session_archived(&record.session_id, false)?;
-                }
                 return Ok(record.session_id.into());
             }
             Ok(session_id) => return Ok(session_id.into()),
@@ -1583,11 +1573,6 @@ pub(crate) fn resolve_platform_session(
     let (record, created) = state
         .state_store
         .create_or_get_platform_session(&key, name)?;
-    if record.archived {
-        state
-            .state_store
-            .set_session_archived(&record.session_id, false)?;
-    }
     if created {
         state.events.publish(
             "session.created",

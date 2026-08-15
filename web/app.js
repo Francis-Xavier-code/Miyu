@@ -24,10 +24,6 @@
   const DEFAULT_BOARD_TITLE = "今天想聊些什么？";
   const DEFAULT_BOARD_SUBTITLE = "从一个问题、计划或此刻的想法开始。";
   const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
-  const CONVERSATION_MODES = [
-    { id: "normal", label: "普通" },
-    { id: "chat", label: "闲聊" }
-  ];
   const THINKING_VARIANT_LABELS = Object.freeze({
     default: "默认",
     none: "关闭",
@@ -58,6 +54,8 @@
     brain: [["path", { d: "M9.5 4A2.5 2.5 0 0 1 12 6.5v11a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 5.5 13a3 3 0 0 1 .34-5.98A2.5 2.5 0 0 1 9.5 4Z" }], ["path", { d: "M14.5 4A2.5 2.5 0 0 0 12 6.5v11a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 18.5 13a3 3 0 0 0-.34-5.98A2.5 2.5 0 0 0 14.5 4Z" }]],
     check: [["path", { d: "M20 6 9 17l-5-5" }]],
     "chevron-down": [["path", { d: "m6 9 6 6 6-6" }]],
+    terminal: [["polyline", { points: "4 17 10 11 4 5" }], ["line", { x1: "12", x2: "20", y1: "19", y2: "19" }]],
+    code: [["polyline", { points: "16 18 22 12 16 6" }], ["polyline", { points: "8 6 2 12 8 18" }]],
     "chevron-left": [["path", { d: "m15 18-6-6 6-6" }]],
     "layout-grid": [["rect", { x: "3", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "3", width: "7", height: "7", rx: "1" }], ["rect", { x: "14", y: "14", width: "7", height: "7", rx: "1" }], ["rect", { x: "3", y: "14", width: "7", height: "7", rx: "1" }]],
     "chart-column": [["path", { d: "M3 3v16a2 2 0 0 0 2 2h16" }], ["path", { d: "M7 15v-4m5 4V8m5 7v-6" }]],
@@ -153,7 +151,6 @@
     "conversation.pop",
     "session.created",
     "session.renamed",
-    "session.archived",
     "session.deleted",
     "session.current_changed",
     "session.updated",
@@ -183,9 +180,6 @@
     toolExpandToggle: document.getElementById("toolExpandToggle"),
     sessionList: document.getElementById("sessionList"),
     sessionItems: document.getElementById("sessionItems"),
-    archivedSection: document.getElementById("archivedSection"),
-    archivedToggle: document.getElementById("archivedToggle"),
-    archivedList: document.getElementById("archivedList"),
     contextNumbers: document.getElementById("contextNumbers"),
     contextTrack: document.getElementById("contextTrack"),
     contextBar: document.getElementById("contextBar"),
@@ -213,7 +207,7 @@
     brandName: document.getElementById("brandName"),
     conversationTitle: document.getElementById("conversationTitle"),
     conversationMeta: document.getElementById("conversationMeta"),
-    modeCycle: document.getElementById("modeCycle"),
+    modeBadge: document.getElementById("modeBadge"),
     thinkingVariantButton: document.getElementById("thinkingVariantButton"),
     thinkingVariantPopover: document.getElementById("thinkingVariantPopover"),
     thinkingModelList: document.getElementById("thinkingModelList"),
@@ -339,11 +333,10 @@
     viewSyncTimer: null,
     runsBySession: new Map(),
     liveRuns: new Map(),
-    archivedSessions: [],
-    archivedOpen: false,
-    archivedLoading: false,
     sessionMenuFor: null,
     sessionRenaming: null,
+    modeChooserOpen: false,
+    modeChooserKeyHandler: null,
     sessionBusy: false,
     display: {
       reasoning: "summary",
@@ -406,7 +399,6 @@
     modeAnimationTimer: null,
     healthTimer: null,
     terminalRunIds: new Set(),
-    mode: "normal",
     thinkingVariantModels: [],
     thinkingVariantActiveKey: null,
     thinkingVariantLoading: false,
@@ -580,44 +572,6 @@
       card.querySelector(".tool-head")?.setAttribute("aria-expanded", String(state.toolExpanded));
     });
     if (persist) safeStorageSet("miyu.web.toolExpanded", String(state.toolExpanded));
-  }
-
-  function setMode(mode, persist = true, animate = false) {
-    const selected = CONVERSATION_MODES.some((item) => item.id === mode) ? mode : "normal";
-    const previous = state.mode;
-    const options = Array.from(elements.modeCycle.querySelectorAll("[data-mode-option]"));
-    const previousOption = options.find((option) => option.dataset.modeOption === previous);
-    const selectedOption = options.find((option) => option.dataset.modeOption === selected);
-    if (state.modeAnimationTimer) window.clearTimeout(state.modeAnimationTimer);
-    options.forEach((option) => option.classList.remove("is-entering", "is-leaving"));
-    options.forEach((option) => option.classList.toggle("is-active", option.dataset.modeOption === previous));
-    if (animate && previous !== selected) {
-      previousOption?.classList.remove("is-active");
-      previousOption?.classList.add("is-leaving");
-      selectedOption?.classList.add("is-active", "is-entering");
-      state.modeAnimationTimer = window.setTimeout(() => {
-        previousOption?.classList.remove("is-leaving");
-        selectedOption?.classList.remove("is-entering");
-        state.modeAnimationTimer = null;
-      }, 240);
-    } else {
-      options.forEach((option) => option.classList.toggle("is-active", option === selectedOption));
-    }
-    state.mode = selected;
-    elements.modeCycle.dataset.mode = selected;
-    options.forEach((option) => option.setAttribute("aria-hidden", String(option !== selectedOption)));
-    const selectedIndex = CONVERSATION_MODES.findIndex((item) => item.id === selected);
-    const selectedMode = CONVERSATION_MODES[selectedIndex];
-    const nextMode = CONVERSATION_MODES[(selectedIndex + 1) % CONVERSATION_MODES.length];
-    const description = `当前模式：${selectedMode.label}；点击切换到${nextMode.label}`;
-    elements.modeCycle.title = description;
-    elements.modeCycle.setAttribute("aria-label", description);
-    if (persist) safeStorageSet("miyu.web.mode", selected);
-  }
-
-  function cycleMode() {
-    const current = CONVERSATION_MODES.findIndex((item) => item.id === state.mode);
-    setMode(CONVERSATION_MODES[(current + 1) % CONVERSATION_MODES.length].id, true, true);
   }
 
   function thinkingVariantLabel(variant, short = false) {
@@ -3161,10 +3115,6 @@
     return state.sessions.find((session) => String(session?.session_id) === id) || null;
   }
 
-  function findArchivedSession(sessionId) {
-    const id = String(sessionId || "");
-    return state.archivedSessions.find((session) => String(session?.session_id) === id) || null;
-  }
 
   function viewSessionEntry() {
     return state.viewSessionId ? findSession(state.viewSessionId) : null;
@@ -3235,7 +3185,7 @@
   async function commitSessionRename(sessionId, value) {
     if (state.sessionRenaming !== sessionId) return;
     state.sessionRenaming = null;
-    const session = findSession(sessionId) || findArchivedSession(sessionId);
+    const session = findSession(sessionId);
     const name = String(value || "").trim();
     if (!session || !name || name === String(session.name || "").trim()) {
       renderSessionList();
@@ -3265,7 +3215,6 @@
     const actions = [{ label: "重命名", handler: () => beginSessionRename(id) }];
     if (!isDefault) actions.push({ label: "设为默认", handler: () => makeDefaultSession(id) });
     if (isDefault) actions.push({ label: "清空对话", handler: requestClearConversation });
-    actions.push({ label: "归档", handler: () => archiveSession(id) });
     actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
     for (const action of actions) {
       const button = document.createElement("button");
@@ -3299,7 +3248,8 @@
       main.title = isView ? sessionDisplayName(session) : `查看「${sessionDisplayName(session)}」`;
       main.addEventListener("click", () => openSessionView(id));
     }
-    main.appendChild(makeIconSlot("message-circle"));
+    const icon = id === "default" ? "terminal" : session?.mode === "dev" ? "code" : "message-circle";
+    main.appendChild(makeIconSlot(icon));
 
     const copy = document.createElement("span");
     copy.className = "session-copy";
@@ -3427,102 +3377,38 @@
     elements.sessionItems.replaceChildren();
     if (!multiSessionEnabled() || state.sessions.length === 0) {
       elements.sessionItems.appendChild(buildFallbackSessionItem());
-      elements.archivedSection.hidden = !multiSessionEnabled();
       return;
     }
-    for (const session of state.sessions) {
-      if (session?.archived) continue;
-      elements.sessionItems.appendChild(buildSessionItem(session));
+    // 侧栏三段:终端集成会话置顶,其余按会话模式分组(创建时定死)。
+    const terminal = state.sessions.filter((session) => String(session?.session_id) === "default");
+    const normal = state.sessions.filter(
+      (session) => String(session?.session_id) !== "default" && session?.mode !== "dev"
+    );
+    const dev = state.sessions.filter((session) => session?.mode === "dev");
+    for (const session of terminal) elements.sessionItems.appendChild(buildSessionItem(session));
+    if (normal.length) {
+      elements.sessionItems.appendChild(buildSessionGroupHeader("普通模式"));
+      for (const session of normal) elements.sessionItems.appendChild(buildSessionItem(session));
     }
-    elements.archivedSection.hidden = false;
-  }
-
-  function renderArchivedList() {
-    elements.archivedToggle.setAttribute("aria-expanded", String(state.archivedOpen));
-    elements.archivedToggle.classList.toggle("is-open", state.archivedOpen);
-    elements.archivedList.hidden = !state.archivedOpen;
-    if (!state.archivedOpen) return;
-    elements.archivedList.replaceChildren();
-    if (state.archivedLoading) {
-      const note = document.createElement("p");
-      note.className = "archived-note";
-      note.textContent = "正在载入";
-      elements.archivedList.appendChild(note);
-      return;
-    }
-    if (state.archivedSessions.length === 0) {
-      const note = document.createElement("p");
-      note.className = "archived-note";
-      note.textContent = "暂无已归档会话";
-      elements.archivedList.appendChild(note);
-      return;
-    }
-    for (const session of state.archivedSessions) {
-      const id = String(session?.session_id || "");
-      const row = document.createElement("div");
-      row.className = "archived-item";
-      const copy = document.createElement("span");
-      copy.className = "archived-copy";
-      const title = document.createElement("strong");
-      title.textContent = sessionDisplayName(session);
-      title.title = sessionDisplayName(session);
-      const meta = document.createElement("small");
-      const workspace = String(session?.workspace || "").trim();
-      const turnCount = Math.max(0, asFiniteNumber(session?.turn_count));
-      meta.textContent = workspace ? `${formatInteger(turnCount)} 轮 · ${workspace}` : `${formatInteger(turnCount)} 轮`;
-      if (workspace) meta.title = workspace;
-      copy.append(title, meta);
-      row.appendChild(copy);
-      const actions = document.createElement("span");
-      actions.className = "archived-actions";
-      const restore = document.createElement("button");
-      restore.type = "button";
-      restore.className = "text-button";
-      restore.textContent = "恢复";
-      restore.addEventListener("click", () => restoreSession(id));
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "text-button danger-text";
-      remove.textContent = "删除";
-      remove.addEventListener("click", () => deleteSession(id));
-      actions.append(restore, remove);
-      row.appendChild(actions);
-      elements.archivedList.appendChild(row);
+    if (dev.length) {
+      elements.sessionItems.appendChild(buildSessionGroupHeader("开发模式"));
+      for (const session of dev) elements.sessionItems.appendChild(buildSessionItem(session));
     }
   }
 
-  async function loadArchivedSessions() {
-    if (state.archivedLoading) return;
-    state.archivedLoading = true;
-    renderArchivedList();
-    try {
-      const response = await apiRequest("/api/sessions?include_archived=true");
-      const payload = await response.json();
-      const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
-      state.archivedSessions = sessions.filter((session) => session?.archived);
-    } catch (error) {
-      showToast(error.message || "载入归档会话失败", "error");
-    } finally {
-      state.archivedLoading = false;
-      renderArchivedList();
-    }
-  }
-
-  function toggleArchivedSection() {
-    state.archivedOpen = !state.archivedOpen;
-    renderArchivedList();
-    if (state.archivedOpen) loadArchivedSessions();
+  function buildSessionGroupHeader(label) {
+    const header = document.createElement("div");
+    header.className = "session-group-header";
+    header.textContent = label;
+    return header;
   }
 
   async function refreshSessions() {
     try {
-      const response = await apiRequest("/api/sessions?include_archived=true");
+      const response = await apiRequest("/api/sessions");
       const payload = await response.json();
-      const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
-      state.sessions = sessions.filter((session) => !session?.archived);
-      state.archivedSessions = sessions.filter((session) => session?.archived);
+      state.sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
       renderSessionList();
-      renderArchivedList();
       updateConversationChrome();
     } catch (_) {
       // 后续 SSE 或 bootstrap 会补齐会话列表。
@@ -3534,13 +3420,13 @@
     updateControlState();
   }
 
-  async function createSession() {
+  async function createSession(mode) {
     if (state.blocked || state.sessionBusy || state.adminBusy || state.submitting) return;
     setSessionBusy(true);
     try {
       const response = await apiRequest("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({})
+        body: JSON.stringify(mode === "dev" ? { mode: "dev" } : {})
       });
       const payload = await response.json();
       const record = payload?.session && typeof payload.session === "object" ? payload.session : null;
@@ -3721,45 +3607,8 @@
     }
   }
 
-  async function archiveSession(sessionId) {
-    if (state.sessionBusy) return;
-    setSessionBusy(true);
-    try {
-      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ archived: true })
-      });
-      showToast("会话已归档");
-      state.sessions = state.sessions.filter((session) => String(session?.session_id) !== String(sessionId));
-      renderSessionList();
-      if (sessionId === state.viewSessionId) await openFallbackSessionView(sessionId);
-      if (state.archivedOpen) await loadArchivedSessions();
-    } catch (error) {
-      showToast(error.message || "归档失败", "error");
-    } finally {
-      setSessionBusy(false);
-    }
-  }
-
-  async function restoreSession(sessionId) {
-    if (state.sessionBusy) return;
-    setSessionBusy(true);
-    try {
-      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ archived: false })
-      });
-      showToast("会话已恢复");
-      await refreshSessions();
-    } catch (error) {
-      showToast(error.message || "恢复失败", "error");
-    } finally {
-      setSessionBusy(false);
-    }
-  }
-
   async function deleteSession(sessionId) {
-    const session = findSession(sessionId) || findArchivedSession(sessionId);
+    const session = findSession(sessionId);
     if (!window.confirm(`删除会话「${sessionDisplayName(session)}」？此操作无法撤销。`)) return;
     if (state.sessionBusy) return;
     setSessionBusy(true);
@@ -3767,9 +3616,7 @@
       await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
       showToast("会话已删除");
       state.sessions = state.sessions.filter((item) => String(item?.session_id) !== String(sessionId));
-      state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== String(sessionId));
       renderSessionList();
-      renderArchivedList();
       if (sessionId === state.viewSessionId) await openFallbackSessionView(sessionId);
     } catch (error) {
       showToast(error.message || "删除失败", "error");
@@ -3783,13 +3630,13 @@
     if (!sessionId) return;
     if (name === "session.created") {
       if (data?.platform) return;
-      if (!findSession(sessionId) && !findArchivedSession(sessionId)) {
+      if (!findSession(sessionId)) {
         state.sessions.unshift({
           session_id: sessionId,
           name: String(data?.name || ""),
           kind: "",
           workspace: "",
-          archived: false,
+          mode: data?.mode === "dev" ? "dev" : "normal",
           created_at: null,
           updated_at: new Date().toISOString(),
           turn_count: 0,
@@ -3798,23 +3645,18 @@
         renderSessionList();
       }
     } else if (name === "session.renamed") {
-      const target = findSession(sessionId) || findArchivedSession(sessionId);
+      const target = findSession(sessionId);
       if (target) target.name = String(data?.name || "");
       renderSessionList();
-      renderArchivedList();
       if (sessionId === state.viewSessionId) updateConversationChrome();
-    } else if (name === "session.archived") {
-      refreshSessions();
     } else if (name === "session.deleted") {
       state.sessions = state.sessions.filter((item) => String(item?.session_id) !== sessionId);
-      state.archivedSessions = state.archivedSessions.filter((item) => String(item?.session_id) !== sessionId);
       renderSessionList();
-      renderArchivedList();
       if (sessionId === state.viewSessionId && !state.bootstrapPromise && !state.viewLoading) {
         openFallbackSessionView(sessionId);
       }
     } else if (name === "session.updated") {
-      const target = findSession(sessionId) || findArchivedSession(sessionId);
+      const target = findSession(sessionId);
       if (target && Object.prototype.hasOwnProperty.call(data || {}, "workspace")) {
         target.workspace = String(data?.workspace || "");
       }
@@ -3831,6 +3673,7 @@
   }
 
   function updateConversationChrome() {
+    updateModeBadge();
     const details = deriveConversationDetails();
     const current = multiSessionEnabled() ? viewSessionEntry() : null;
     const title = current ? sessionDisplayName(current) : details.title;
@@ -4131,7 +3974,7 @@
   function updateControlState() {
     const running = conversationRunning();
     const busy = state.adminBusy || state.submitting;
-    const locked = state.blocked || state.adminBusy;
+    const locked = state.blocked || state.adminBusy || state.modeChooserOpen;
     const inputCount = countCharacters(elements.composerInput.value.trim());
     const attachmentUploading = state.composerAttachments.some((item) => item.status === "uploading");
     const attachmentError = state.composerAttachments.some((item) => item.status === "error");
@@ -4143,7 +3986,6 @@
     elements.newChatButton.disabled = state.blocked || busy || state.sessionBusy || state.viewLoading;
     // 会话级模型覆盖允许在回复进行中调整，下一轮生效。
     elements.modelButton.disabled = state.blocked || state.models.length === 0;
-    elements.modeCycle.disabled = state.blocked || running || busy;
     elements.thinkingVariantButton.disabled = state.blocked || running || busy
       || state.thinkingVariantLoading || state.thinkingVariantModels.length === 0;
     if (elements.thinkingVariantButton.disabled) closeThinkingVariantPopover();
@@ -4359,8 +4201,7 @@
     try {
       const body = {
         expected_revision: candidate.revision,
-        input_id: candidate.input_id,
-        mode: state.mode
+        input_id: candidate.input_id
       };
       if (editedContent != null) body.content = editedContent;
       const response = await apiRequest(
@@ -7723,7 +7564,6 @@
     live.tools = new Map();
     live.questions = new Map();
     live.contextOperation = null;
-    if (["normal", "chat"].includes(data?.mode)) setMode(data.mode, false);
     showTypingIndicator(live);
     contentAdded();
   }
@@ -7993,7 +7833,6 @@
     }
 
     if (name === "run.started") {
-      if (live && ["normal", "chat"].includes(data?.mode)) setMode(data.mode, false);
       if (live) {
         live.operation = String(data?.operation || live.operation || "create");
         live.turnId = String(data?.turn_id || live.turnId || "") || null;
@@ -8237,11 +8076,10 @@
     state.context = snapshot?.context && typeof snapshot.context === "object" ? snapshot.context : { tokens: 0, window: null };
     state.usage = snapshot?.usage && typeof snapshot.usage === "object" ? snapshot.usage : {};
       state.capabilities = snapshot?.capabilities && typeof snapshot.capabilities === "object" ? snapshot.capabilities : {};
-    state.sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions.filter((session) => !session?.archived) : [];
+    state.sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions : [];
     state.currentSessionId = typeof snapshot?.current_session_id === "string" && snapshot.current_session_id ? snapshot.current_session_id : null;
     state.sessionMenuFor = null;
     state.sessionRenaming = null;
-    if (state.archivedOpen) loadArchivedSessions();
     state.version = snapshot?.version ?? null;
     state.pendingSubmission = null;
     const allRuns = (Array.isArray(snapshot?.runs) ? snapshot.runs : []).filter((run) => run?.run_id && run?.session_id);
@@ -8461,13 +8299,13 @@
       return;
     }
     state.submitting = true;
-    if (!queueing) state.pendingSubmission = { content, mode: state.mode, attachments: sentAttachments };
+    if (!queueing) state.pendingSubmission = { content, attachments: sentAttachments };
     clearInlineError();
     updateControlState();
     try {
       const body = queueing
         ? { content, run_id: updateTarget.runId, turn_id: updateTarget.turnId, attachment_ids: attachmentIds }
-        : { content, mode: state.mode, attachment_ids: attachmentIds };
+        : { content, attachment_ids: attachmentIds };
       if (sessionId) body.session_id = sessionId;
       const response = await apiRequest(queueing ? "/api/queue" : "/api/turns", {
         method: "POST",
@@ -8550,12 +8388,94 @@
     window.requestAnimationFrame(() => elements.resetCancelButton.focus());
   }
 
+  function openModeChooser() {
+    if (state.modeChooserOpen) return;
+    state.modeChooserOpen = true;
+    updateControlState();
+    const overlay = document.createElement("div");
+    overlay.className = "mode-chooser-overlay";
+    overlay.id = "modeChooserOverlay";
+    const panel = document.createElement("div");
+    panel.className = "mode-chooser";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "选择新会话模式");
+    const title = document.createElement("strong");
+    title.textContent = "新会话";
+    const hint = document.createElement("small");
+    hint.textContent = "选择模式后开始对话；会话模式创建后不可更改";
+    panel.append(title, hint);
+    const options = [
+      { id: "normal", label: "普通模式", icon: "message-circle", desc: "人格、记忆、全部工具" },
+      { id: "dev", label: "开发模式", icon: "code", desc: "极简提示词与编码工具，记忆独立" }
+    ];
+    for (const option of options) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "mode-chooser-option";
+      button.dataset.mode = option.id;
+      button.appendChild(makeIconSlot(option.icon));
+      const copy = document.createElement("span");
+      copy.className = "mode-chooser-copy";
+      const label = document.createElement("strong");
+      label.textContent = option.label;
+      const desc = document.createElement("small");
+      desc.textContent = option.desc;
+      copy.append(label, desc);
+      button.appendChild(copy);
+      button.addEventListener("click", () => {
+        closeModeChooser();
+        closeSidebar();
+        createSession(option.id);
+      });
+      panel.appendChild(button);
+    }
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) closeModeChooser();
+    });
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeModeChooser();
+      }
+    };
+    state.modeChooserKeyHandler = onKey;
+    document.addEventListener("keydown", onKey, true);
+    window.requestAnimationFrame(() => panel.querySelector("button")?.focus());
+  }
+
+  function closeModeChooser() {
+    if (!state.modeChooserOpen) return;
+    state.modeChooserOpen = false;
+    if (state.modeChooserKeyHandler) {
+      document.removeEventListener("keydown", state.modeChooserKeyHandler, true);
+      state.modeChooserKeyHandler = null;
+    }
+    document.getElementById("modeChooserOverlay")?.remove();
+    updateControlState();
+  }
+
+  function activeSessionMode() {
+    const session = findSession(state.viewSessionId);
+    return session?.mode === "dev" ? "dev" : "normal";
+  }
+
+  function updateModeBadge() {
+    if (!elements.modeBadge) return;
+    const mode = activeSessionMode();
+    elements.modeBadge.dataset.mode = mode;
+    const label = elements.modeBadge.querySelector(".mode-label");
+    if (label) label.textContent = mode === "dev" ? "开发" : "普通";
+    elements.modeBadge.title = mode === "dev" ? "开发模式会话（创建时定死）" : "普通模式会话（创建时定死）";
+  }
+
   function requestNewConversation() {
-    closeSidebar();
     if (multiSessionEnabled()) {
-      createSession();
+      openModeChooser();
       return;
     }
+    closeSidebar();
     if (!hasHistory()) {
       focusComposerIfDesktop();
       return;
@@ -9344,7 +9264,6 @@
     elements.sidebarScrim.addEventListener("click", closeSidebar);
     elements.sidebarCollapseButton?.addEventListener("click", () => setSidebarCollapsed(true));
     elements.sidebarExpandButton?.addEventListener("click", () => setSidebarCollapsed(false));
-    elements.archivedToggle.addEventListener("click", toggleArchivedSection);
     elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.artifactToggleButton.addEventListener("click", () => setArtifactWorkspaceOpen(!state.artifactOpen));
     elements.artifactCloseButton.addEventListener("click", () => setArtifactWorkspaceOpen(false));
@@ -9430,7 +9349,6 @@
     document.querySelectorAll("[data-chat-font]").forEach((button) => button.addEventListener("click", () => setChatFontSize(button.dataset.chatFont)));
     elements.reasoningExpandToggle?.addEventListener("click", () => setReasoningExpanded(!state.reasoningExpanded));
     elements.toolExpandToggle?.addEventListener("click", () => setToolExpanded(!state.toolExpanded));
-    elements.modeCycle.addEventListener("click", cycleMode);
     elements.thinkingVariantButton.addEventListener("click", () => {
       if (elements.thinkingVariantPopover.hidden) openThinkingVariantPopover();
       else closeThinkingVariantPopover({ restoreFocus: true });
@@ -9584,7 +9502,6 @@
     setChatFontSize(safeStorageGet("miyu.web.chatFontSize") || "15px", false);
     setReasoningExpanded(safeStorageGet("miyu.web.reasoningExpanded") === "true", false);
     setToolExpanded(safeStorageGet("miyu.web.toolExpanded") === "true", false);
-    setMode(safeStorageGet("miyu.web.mode") || "normal", false);
     const artifactRatio = Number(safeStorageGet("miyu.web.artifactWidthRatio.v2"));
     if (Number.isFinite(artifactRatio) && artifactRatio >= 0.25 && artifactRatio <= 0.9) {
       state.artifactWidthRatio = artifactRatio;

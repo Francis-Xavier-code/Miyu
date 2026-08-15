@@ -1950,7 +1950,7 @@ fn ensure_local_current_session(state_store: &StateStore, persona: &str) -> Resu
     }
 
     let target_session_id = match state_store
-        .list_local_sessions(persona, false)?
+        .list_local_sessions(persona)?
         .into_iter()
         .next()
     {
@@ -1972,7 +1972,7 @@ fn is_available_local_session(
     let usable = state_store
         .session_record(session_id)?
         .is_some_and(|record| {
-            record.persona == persona && record.kind == "user" && !record.archived
+            record.persona == persona && record.kind == "user"
         });
     Ok(usable && !state_store.is_platform_session(session_id)?)
 }
@@ -2696,18 +2696,12 @@ async fn handle_session_command(
     let store = &state.state_store;
     let persona = active_persona_scope(state);
     match command {
-        IpcCommand::ListSessions {
-            include_archived,
-            mode,
-        } => {
+        IpcCommand::ListSessions { mode } => {
             // dev 列表以 dev REPL 指针为"当前":全局指针指向普通会话,
-            // 用它高亮永远落空。
+            // 用它高亮永远落空。"all" 是管理面(miyu session):普通+dev
+            // 合并按更新时间排,别的人格仍不可见。
             let dev = mode.as_deref() == Some("dev");
-            let scope = if dev {
-                crate::state::DEV_PERSONA.to_string()
-            } else {
-                persona.clone()
-            };
+            let all = mode.as_deref() == Some("all");
             let current = if dev {
                 store
                     .repl_session(crate::state::DEV_PERSONA)
@@ -2718,9 +2712,18 @@ async fn handle_session_command(
             } else {
                 store.session_id()
             };
-            let sessions = store
-                .list_local_sessions(&scope, include_archived)
-                .map_err(|error| safe_error_message(&error))?;
+            let sessions = if all {
+                sessions_with_dev(store, &persona).map_err(|error| safe_error_message(&error))?
+            } else {
+                let scope = if dev {
+                    crate::state::DEV_PERSONA.to_string()
+                } else {
+                    persona.clone()
+                };
+                store
+                    .list_local_sessions(&scope)
+                    .map_err(|error| safe_error_message(&error))?
+            };
             let sessions: Vec<Value> = sessions
                 .iter()
                 .map(|overview| session_overview_json(overview, &current))
@@ -2847,11 +2850,6 @@ async fn handle_session_command(
         }
         IpcCommand::SwitchSession { target } => {
             let record = resolve_local_session_ref(state, &target)?;
-            if record.archived {
-                store
-                    .set_session_archived(&record.session_id, false)
-                    .map_err(|error| safe_error_message(&error))?;
-            }
             switch_session_via_actor(state, record.session_id.clone()).await?;
             Ok(json!({ "session": session_record_json(&record) }))
         }
@@ -2867,34 +2865,6 @@ async fn handle_session_command(
             state.events.publish(
                 "session.renamed",
                 json!({ "session_id": record.session_id, "name": name }),
-            );
-            Ok(json!({}))
-        }
-        IpcCommand::ArchiveSession { target, archived } => {
-            let record = resolve_local_session_ref(state, &target)?;
-            if archived
-                && state
-                    .manager
-                    .lock()
-                    .unwrap()
-                    .session_has_runs(&record.session_id)
-            {
-                return Err(t(
-                    "the session has a reply in progress",
-                    "该会话有回复正在进行",
-                )
-                .to_string());
-            }
-            if archived && &*store.session_id() == record.session_id.as_str() {
-                let fallback = fallback_session_id(state, &record.session_id)?;
-                switch_session_via_actor(state, fallback).await?;
-            }
-            store
-                .set_session_archived(&record.session_id, archived)
-                .map_err(|error| safe_error_message(&error))?;
-            state.events.publish(
-                "session.archived",
-                json!({ "session_id": record.session_id, "archived": archived }),
             );
             Ok(json!({}))
         }
@@ -3020,24 +2990,16 @@ fn require_local_web_session(
     }
 }
 
-#[derive(Deserialize)]
-struct SessionsQuery {
-    #[serde(default)]
-    include_archived: bool,
-}
-
 async fn list_sessions_http(
     State(state): State<DaemonState>,
     headers: HeaderMap,
-    Query(query): Query<SessionsQuery>,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
     let current = state.state_store.session_id();
     let persona = active_persona_scope(&state);
-    let sessions = state
-        .state_store
-        .list_local_sessions(&persona, query.include_archived)
-        .map_err(ApiError::internal)?;
+    // 侧栏按模式分组:普通+dev 一起下发,mode 字段区分(问题七)。
+    let sessions =
+        sessions_with_dev(&state.state_store, &persona).map_err(ApiError::internal)?;
     let sessions = sessions
         .iter()
         .map(|overview| session_overview_json(overview, &current))
@@ -3104,8 +3066,6 @@ async fn activate_session_http(
 struct UpdateSessionRequest {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    archived: Option<bool>,
     /// `Some("")` unbinds the workspace; a non-empty value binds it.
     #[serde(default)]
     workspace: Option<String>,
@@ -3128,17 +3088,6 @@ async fn update_session_http(
             IpcCommand::RenameSession {
                 target: target(),
                 name,
-            },
-        )
-        .await
-        .map_err(session_api_error)?;
-    }
-    if let Some(archived) = request.archived {
-        handle_session_command(
-            &state,
-            IpcCommand::ArchiveSession {
-                target: target(),
-                archived,
             },
         )
         .await
@@ -3317,11 +3266,7 @@ fn resolve_available_local_session_ref(
     state: &DaemonState,
     target: &ipc::SessionRef,
 ) -> std::result::Result<crate::state::SessionRecord, String> {
-    let record = resolve_local_session_ref(state, target)?;
-    if record.archived {
-        return Err(t("session is archived", "会话已归档").to_string());
-    }
-    Ok(record)
+    resolve_local_session_ref(state, target)
 }
 
 /// Turn targets and deletions additionally accept one-shot `ask` sessions.
@@ -3330,13 +3275,13 @@ const TURN_TARGET_KINDS: &[&str] = &[
     crate::state::ASK_SESSION_KIND,
 ];
 
-/// Most recently updated other unarchived user session, or a fresh default
-/// session when none is left.
+/// Most recently updated other user session, or a fresh default session when
+/// none is left.
 fn fallback_session_id(state: &DaemonState, exclude: &str) -> std::result::Result<String, String> {
     let persona = active_persona_scope(state);
     let sessions = state
         .state_store
-        .list_local_sessions(&persona, false)
+        .list_local_sessions(&persona)
         .map_err(|error| safe_error_message(&error))?;
     if let Some(overview) = sessions
         .iter()
@@ -3406,15 +3351,30 @@ async fn switch_session_via_actor_reserved(
     }
 }
 
+/// 普通人格 + dev 保留人格的本地会话合并,按更新时间排。WebUI 侧栏与
+/// `miyu session` 管理面共用:mode 字段(session_record_json)区分分组。
+fn sessions_with_dev(
+    store: &StateStore,
+    persona: &str,
+) -> anyhow::Result<Vec<crate::state::SessionOverview>> {
+    let mut rows = store.list_local_sessions(persona)?;
+    if persona != crate::state::DEV_PERSONA {
+        rows.extend(store.list_local_sessions(crate::state::DEV_PERSONA)?);
+    }
+    rows.sort_by(|a, b| b.record.updated_at.cmp(&a.record.updated_at));
+    Ok(rows)
+}
+
 fn session_record_json(record: &crate::state::SessionRecord) -> Value {
     json!({
         "session_id": record.session_id,
         "name": record.name,
         "kind": record.kind,
         "workspace": record.workspace,
-        "archived": record.archived,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        // 会话模式由人格推导(创建时定死),列表/选择器靠它标注类型。
+        "mode": if record.persona == crate::state::DEV_PERSONA { "dev" } else { "normal" },
     })
 }
 
@@ -3459,9 +3419,6 @@ fn resolve_turn_session(
                 &ipc::SessionRef::Id { id: session_id },
                 TURN_TARGET_KINDS,
             )?;
-            if record.archived {
-                return Err(t("session is archived", "会话已归档").to_string());
-            }
             Ok(record.session_id.into())
         }
     }
@@ -4449,9 +4406,7 @@ async fn bootstrap(
     let external_queue_available = external_target
         .is_some_and(|target| target.queue_session_id.is_some() && target.owner_pid.is_some());
     let current_session_id = state.state_store.session_id().to_string();
-    let sessions = state
-        .state_store
-        .list_local_sessions(&config.active_persona_scope(), false)
+    let sessions = sessions_with_dev(&state.state_store, &config.active_persona_scope())
         .map_err(ApiError::internal)?
         .iter()
         .map(|overview| session_overview_json(overview, &current_session_id))
@@ -7332,7 +7287,7 @@ fn session_for_persona(
         }
     }
     if let Some(overview) = state_store
-        .list_local_sessions(persona, false)?
+        .list_local_sessions(persona)?
         .into_iter()
         .next()
     {
@@ -10975,7 +10930,6 @@ mod tests {
         let listed = handle_session_command(
             &state,
             IpcCommand::ListSessions {
-                include_archived: true,
                 mode: None,
             },
         )
@@ -11127,7 +11081,6 @@ mod tests {
         let data = handle_session_command(
             &state,
             IpcCommand::ListSessions {
-                include_archived: false,
                 mode: None,
             },
         )
@@ -11446,7 +11399,6 @@ mod tests {
         let listed = handle_session_command(
             &state,
             IpcCommand::ListSessions {
-                include_archived: false,
                 mode: Some("dev".to_string()),
             },
         )
@@ -11462,7 +11414,6 @@ mod tests {
         let normal = handle_session_command(
             &state,
             IpcCommand::ListSessions {
-                include_archived: false,
                 mode: None,
             },
         )

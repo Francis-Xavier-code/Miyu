@@ -622,7 +622,7 @@ impl ConversationDb {
         };
         let valid = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND persona = ?2 AND kind = ?3 AND archived = 0)",
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND persona = ?2 AND kind = ?3)",
                 params![session_id, persona, super::USER_SESSION_KIND],
                 |row| row.get::<_, bool>(0),
             )?;
@@ -764,29 +764,20 @@ impl ConversationDb {
 
     /// User-facing sessions of a persona, most recently updated first.
     /// Subagent sessions (`kind != 'user'`) are excluded.
-    pub fn list_sessions(
-        &self,
-        persona: &str,
-        include_archived: bool,
-    ) -> Result<Vec<SessionOverview>> {
-        self.list_sessions_filtered(persona, include_archived, false)
+    pub fn list_sessions(&self, persona: &str) -> Result<Vec<SessionOverview>> {
+        self.list_sessions_filtered(persona, false)
     }
 
     /// Local user sessions suitable for CLI/WebUI navigation. Sessions
     /// owned by a messaging-platform binding keep their history but are not
     /// exposed as local conversations.
-    pub fn list_local_sessions(
-        &self,
-        persona: &str,
-        include_archived: bool,
-    ) -> Result<Vec<SessionOverview>> {
-        self.list_sessions_filtered(persona, include_archived, true)
+    pub fn list_local_sessions(&self, persona: &str) -> Result<Vec<SessionOverview>> {
+        self.list_sessions_filtered(persona, true)
     }
 
     fn list_sessions_filtered(
         &self,
         persona: &str,
-        include_archived: bool,
         local_only: bool,
     ) -> Result<Vec<SessionOverview>> {
         let conn = self.conn.lock().unwrap();
@@ -800,14 +791,14 @@ impl ConversationDb {
                         AND hidden = 0 AND is_summary = 0
                       ORDER BY seq DESC LIMIT 1) AS last_user_content
              FROM sessions
-             WHERE persona = ?1 AND kind = 'user' AND (?2 OR archived = 0)
-               AND (?3 = 0 OR NOT EXISTS (
+             WHERE persona = ?1 AND kind = 'user'
+               AND (?2 = 0 OR NOT EXISTS (
                     SELECT 1 FROM platform_session_bindings
                     WHERE platform_session_bindings.session_id = sessions.session_id
                ))
              ORDER BY updated_at DESC"
         ))?;
-        let rows = stmt.query_map(params![persona, include_archived, local_only], |row| {
+        let rows = stmt.query_map(params![persona, local_only], |row| {
             Ok(SessionOverview {
                 record: session_record_from_row(row)?,
                 turn_count: row.get("turn_count")?,
@@ -837,7 +828,7 @@ impl ConversationDb {
                   WHERE sessions.persona = ?1
                     AND sessions.kind = 'user'
                     AND (
-                        (sessions.archived = 0 AND NOT EXISTS (
+                        (NOT EXISTS (
                             SELECT 1 FROM platform_session_bindings
                              WHERE platform_session_bindings.session_id = sessions.session_id
                         ))
@@ -1023,20 +1014,6 @@ impl ConversationDb {
         self.update_session_field(session_id, "model_override", value)
     }
 
-    pub fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let updated = conn.execute(
-            "UPDATE sessions SET archived = ?2, updated_at = ?3 WHERE session_id = ?1",
-            params![session_id, archived, Utc::now().to_rfc3339()],
-        )?;
-        if updated == 0 {
-            bail!("session not found: {session_id}");
-        }
-        Ok(())
-    }
-
-    /// Deletes the session row; turns, queued prompts, loaded items, and
-    /// (via turns) images and question exchanges are removed by FK cascade.
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -4285,7 +4262,7 @@ impl ConversationDb {
                   WHERE sessions.persona = ?1
                     AND sessions.kind = 'user'
                     AND (
-                        (sessions.archived = 0 AND NOT EXISTS (
+                        (NOT EXISTS (
                             SELECT 1 FROM platform_session_bindings
                              WHERE platform_session_bindings.session_id = sessions.session_id
                         ))

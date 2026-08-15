@@ -366,7 +366,9 @@ fn colored_footer_mode_label(mode: AgentMode) -> String {
     let label = mode.label();
     match mode {
         AgentMode::Normal => primary_footer_text(label),
-        AgentMode::Dev => format!("\x1b[1m\x1b[33m{label}\x1b[0m"),
+        // tertiary(35 酒红,与 render/webui 的 tertiary 一致),区别于普通
+        // 模式的 primary 蓝。
+        AgentMode::Dev => format!("\x1b[1m\x1b[35m{label}\x1b[0m"),
     }
 }
 
@@ -655,7 +657,6 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "列出会话，或切换到指定会话（菜单内 Ctrl+D 删除）",
         ),
         ("rename", "Rename the current session", "重命名当前会话"),
-        ("archive", "Archive the current session", "归档当前会话"),
         (
             "delete",
             "Delete a session (current by default)",
@@ -1020,7 +1021,6 @@ pub enum Command {
     New(SessionNameArgs),
     Session(SessionTargetArgs),
     Rename(SessionRenameArgs),
-    Archive,
     Delete(SessionTargetArgs),
     Workspace(WorkspaceArgs),
     Web(WebArgs),
@@ -1527,7 +1527,6 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::New(args)) => run_session_new(&paths, args).await,
         Some(Command::Session(args)) => run_session_command(&paths, args).await,
         Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
-        Some(Command::Archive) => run_session_archive(&paths).await,
         Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
         Some(Command::ToolCallCmd(args)) => run_tool_call(&paths, args).await,
         Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
@@ -6106,6 +6105,8 @@ struct SessionListEntry {
     turns: u64,
     snippet: String,
     workspace: Option<String>,
+    /// "dev" | "normal",由 daemon 按会话人格推导。
+    mode: String,
 }
 
 fn session_list_entries(data: &serde_json::Value) -> Vec<SessionListEntry> {
@@ -6145,6 +6146,7 @@ fn session_list_entry(session: &serde_json::Value) -> SessionListEntry {
             })
             .unwrap_or_default(),
         workspace: text("workspace"),
+        mode: text("mode").unwrap_or_else(|| "normal".to_string()),
     }
 }
 
@@ -6172,8 +6174,9 @@ fn session_select_line(entry: &SessionListEntry, active_session_id: Option<&str>
         "  "
     };
     let mut line = format!(
-        "{marker}{}  {} {}",
+        "{marker}{}  {}  {} {}",
         display_session_name(&entry.name),
+        session_mode_label(&entry.mode),
         entry.turns,
         t("turns", "轮")
     );
@@ -6189,11 +6192,21 @@ fn session_select_line(entry: &SessionListEntry, active_session_id: Option<&str>
 
 fn session_select_search(entry: &SessionListEntry) -> String {
     format!(
-        "{} {} {}",
+        "{} {} {} {}",
         display_session_name(&entry.name),
+        session_mode_label(&entry.mode),
         entry.snippet,
         entry.workspace.as_deref().unwrap_or_default()
     )
+}
+
+/// 会话类型标(验收:列表看不出普通/开发)。
+fn session_mode_label(mode: &str) -> &'static str {
+    if mode == "dev" {
+        t("dev", "开发")
+    } else {
+        t("normal", "普通")
+    }
 }
 
 fn session_initial_selection(
@@ -6279,7 +6292,6 @@ async fn resolve_repl_session_target(
             paths,
             live,
             IpcCommand::ListSessions {
-                include_archived: false,
                 mode: repl_list_mode(mode),
             },
         )
@@ -6342,8 +6354,10 @@ fn session_list_line(index: usize, entry: &SessionListEntry, ansi: bool) -> Stri
     let marker = if entry.is_current { "*" } else { " " };
     let turns_label = t("turns", "轮");
     let details = format!(
-        "{} {turns_label}  {}{workspace}",
-        entry.turns, entry.snippet
+        "{}  {} {turns_label}  {}{workspace}",
+        session_mode_label(&entry.mode),
+        entry.turns,
+        entry.snippet
     );
     if ansi {
         format!("{marker}{index:>3}. {name}  \x1b[2m{details}\x1b[0m")
@@ -6429,7 +6443,6 @@ async fn repl_fallback_session_state(
         paths,
         live,
         IpcCommand::ListSessions {
-            include_archived: false,
             mode: None,
         },
     )
@@ -6472,7 +6485,6 @@ async fn repl_pick_session(
             paths,
             live,
             IpcCommand::ListSessions {
-                include_archived: false,
                 mode: repl_list_mode(mode),
             },
         )
@@ -6572,7 +6584,6 @@ async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: &str) -> Result<Str
     let (_, data) = session_admin(
         paths,
         IpcCommand::ListSessions {
-            include_archived: true,
             mode: None,
         },
     )
@@ -6602,8 +6613,7 @@ async fn resolve_cli_session_target(
         let (_, data) = session_admin(
             paths,
             IpcCommand::ListSessions {
-                include_archived: false,
-                mode: None,
+                mode: Some("all".to_string()),
             },
         )
         .await?;
@@ -6667,8 +6677,7 @@ async fn cli_pick_session(
                 let (_, data) = session_admin(
                     paths,
                     IpcCommand::ListSessions {
-                        include_archived: false,
-                        mode: None,
+                        mode: Some("all".to_string()),
                     },
                 )
                 .await?;
@@ -6697,8 +6706,7 @@ async fn run_session_command(paths: &MiyuPaths, args: SessionTargetArgs) -> Resu
         let (_, data) = session_admin(
             paths,
             IpcCommand::ListSessions {
-                include_archived: false,
-                mode: None,
+                mode: Some("all".to_string()),
             },
         )
         .await?;
@@ -6742,24 +6750,6 @@ async fn run_session_rename(paths: &MiyuPaths, args: SessionRenameArgs) -> Resul
     )
     .await?;
     println!("{}: {name}", t("session renamed", "会话已重命名"));
-    Ok(())
-}
-
-async fn run_session_archive(paths: &MiyuPaths) -> Result<()> {
-    let (state, _) = session_admin(
-        paths,
-        IpcCommand::ArchiveSession {
-            target: crate::ipc::SessionRef::Current,
-            archived: true,
-        },
-    )
-    .await?;
-    println!("{}", t("session archived", "当前会话已归档"));
-    println!(
-        "{}: {}",
-        t("switched to session", "已切换到会话"),
-        display_session_name(&state.session_name)
-    );
     Ok(())
 }
 
@@ -7217,12 +7207,16 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     let mut history = load_repl_input_history(&history_state, paths)?;
     drop(history_state);
     let mut cumulative_tokens = state_cumulative(&daemon_state);
+    // footer 的模型标签与思考程度必须同源:都从会话作用域配置推导。
+    // 曾经 client 用全局配置,标签显示会话覆盖模型、·max 却算的全局
+    // 模型,两边各说各话(验收#23)。
+    let session_config = footer_config_for_session(paths, &config, &active_session_id);
     let mut footer = ReplFooterStatus::from_config(
-        &footer_config_for_session(paths, &config, &active_session_id),
+        &session_config,
         daemon_state.context_tokens,
         cumulative_tokens,
     );
-    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+    let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
     let thinking_summary = client.thinking_variant_summary();
     footer.update_thinking_variant(thinking_summary.as_deref());
     footer.update_context_window(daemon_state.context_window);
@@ -7511,41 +7505,6 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         )?;
                     }
                 }
-                ReplSlashCommand::Archive => {
-                    let Some((_, _)) = repl_ipc_admin(
-                        paths,
-                        &mut live_repl,
-                        IpcCommand::ArchiveSession {
-                            target: crate::ipc::SessionRef::Id {
-                                id: active_session_id.clone(),
-                            },
-                            archived: true,
-                        },
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    repl_note(
-                        &mut live_repl,
-                        &format!("\x1b[2m{}\x1b[0m", t("session archived", "当前会话已归档")),
-                    )?;
-                    let Some(state) = repl_fallback_session_state(paths, &mut live_repl, mode).await?
-                    else {
-                        continue;
-                    };
-                    apply_repl_session_switch(
-                        paths,
-                        &config,
-                        &state,
-                        &mut active_session_id,
-                        &mut history,
-                        &mut live_repl,
-                        &mut footer,
-                        &mut cumulative_tokens,
-                    )
-                    .await?;
-                }
                 ReplSlashCommand::Delete => {
                     let arg = command_args.trim();
                     let target = if arg.is_empty() {
@@ -7812,12 +7771,15 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         .await?;
                     }
                     cumulative_tokens = state_cumulative(&state);
+                    // 同源约束(验收#23):标签与思考程度都取会话作用域配置。
+                    let session_config =
+                        footer_config_for_session(paths, &config, &active_session_id);
                     footer = ReplFooterStatus::from_config(
-                        &footer_config_for_session(paths, &config, &active_session_id),
+                        &session_config,
                         state.context_tokens,
                         cumulative_tokens,
                     );
-                    let client = OpenAiCompatibleClient::from_config(&config, paths)?;
+                    let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
                     footer.update_context_window(state.context_window);
@@ -13420,7 +13382,6 @@ enum ReplSlashCommand {
     New,
     Session,
     Rename,
-    Archive,
     Delete,
     Workspace,
     Models,
@@ -13472,13 +13433,6 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "<name>",
         help_en: "rename the current session",
         help_zh: "重命名当前会话",
-    },
-    ReplCommandSpec {
-        name: "/archive",
-        command: ReplSlashCommand::Archive,
-        arg_hint: "",
-        help_en: "archive the current session",
-        help_zh: "归档当前会话",
     },
     ReplCommandSpec {
         name: "/delete",
@@ -15625,6 +15579,7 @@ mod repl_input_tests {
             turns: 0,
             snippet: String::new(),
             workspace: None,
+            mode: "normal".to_string(),
         };
         let entries = vec![entry("default", true), entry("active", false)];
 

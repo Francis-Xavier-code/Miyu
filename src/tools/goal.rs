@@ -376,6 +376,12 @@ fn render_goal_human(title: &str, goal: &GoalRecord, session_id: &str) -> String
         "激活: {}",
         if is_armed(session_id) { "armed(自动续跑)" } else { "disarmed(等待 resume)" }
     ));
+    // 验收反馈:创建后"接下来会发生什么"不说清,用户会以为没反应。
+    if goal.phase == GoalPhase::Active && is_armed(session_id) {
+        lines.push(
+            "Miyu 会在空闲时自动开轮推进;你随时插话,人类消息优先,目标在后台继续。".to_string(),
+        );
+    }
     let hint = match goal.phase {
         GoalPhase::Active if is_armed(session_id) => "/goal edit <objective>、/goal pause、/goal clear",
         GoalPhase::Active | GoalPhase::Paused | GoalPhase::Blocked => {

@@ -326,9 +326,8 @@ pub enum Command {
         question_id: String,
     },
     ListSessions {
-        #[serde(default)]
-        include_archived: bool,
-        /// `dev` 列开发模式会话(保留人格 "dev" 名下);缺省=当前人格。
+        /// `dev` 列开发模式会话(保留人格 "dev" 名下),`all` 普通+dev
+        /// 合并(管理面);缺省=当前人格。
         #[serde(default)]
         mode: Option<String>,
     },
@@ -385,10 +384,6 @@ pub enum Command {
     RenameSession {
         target: SessionRef,
         name: String,
-    },
-    ArchiveSession {
-        target: SessionRef,
-        archived: bool,
     },
     DeleteSession {
         target: SessionRef,

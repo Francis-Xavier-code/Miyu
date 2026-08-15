@@ -7781,7 +7781,7 @@ mod tests {
         let persona = state.manager.lock().unwrap().config.active_persona_scope();
         let sessions_before = state
             .state_store
-            .list_sessions(&persona, true)
+            .list_sessions(&persona)
             .unwrap()
             .len();
 
@@ -7797,7 +7797,7 @@ mod tests {
         assert_eq!(
             state
                 .state_store
-                .list_sessions(&persona, true)
+                .list_sessions(&persona)
                 .unwrap()
                 .len(),
             sessions_before
@@ -7868,7 +7868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wipe_clears_active_persona_state_and_preserves_archived_local_sessions() {
+    async fn wipe_clears_every_local_session_of_the_active_persona() {
         let temp = tempfile::tempdir().unwrap();
         let (state, actor_join) =
             DaemonState::for_test_with_actor(test_paths(temp.path()), 8300).unwrap();
@@ -7883,17 +7883,13 @@ mod tests {
             .state_store
             .create_session(&persona, "active", "user", None)
             .unwrap();
-        let archived = state
+        let second = state
             .state_store
-            .create_session(&persona, "archived", "user", None)
-            .unwrap();
-        state
-            .state_store
-            .set_session_archived(&archived.session_id, true)
+            .create_session(&persona, "second", "user", None)
             .unwrap();
         for (session_id, turn_id) in [
             (&active.session_id, "active-before-reset-all"),
-            (&archived.session_id, "archived-before-reset-all"),
+            (&second.session_id, "second-before-reset-all"),
         ] {
             let store = state.state_store.pinned(session_id);
             store
@@ -7961,15 +7957,13 @@ mod tests {
             .load_turns()
             .unwrap()
             .is_empty());
-        assert_eq!(
-            state
-                .state_store
-                .pinned(&archived.session_id)
-                .load_turns()
-                .unwrap()
-                .len(),
-            1
-        );
+        // 归档豁免已随功能移除:/reset all 现在清掉本人格全部本地会话。
+        assert!(state
+            .state_store
+            .pinned(&second.session_id)
+            .load_turns()
+            .unwrap()
+            .is_empty());
         assert!(!generated_skill.exists());
         assert!(!state.manager.lock().unwrap().admin_busy);
 
