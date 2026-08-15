@@ -2153,20 +2153,35 @@ async fn handle_ipc_connection(
             )
             .await?;
         }
-        IpcCommand::GetReplSession => {
-            let persona = active_persona_scope(&state);
+        IpcCommand::GetReplSession { mode } => {
+            let dev = mode.as_deref() == Some("dev");
+            let persona = if dev {
+                crate::state::DEV_PERSONA.to_string()
+            } else {
+                active_persona_scope(&state)
+            };
             let store = &state.state_store;
             // A stale pointer (session deleted or archived elsewhere) must not
             // strand the REPL: fall back to the terminal session and heal the
-            // pointer so the next start is a plain read.
-            let session_id = store
-                .repl_session(&persona)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| store.session_id().to_string());
+            // pointer so the next start is a plain read. Dev 无「终端会话」
+            // 可退,指针缺失时自举一个新的 dev 会话。
+            let session_id = match store.repl_session(&persona).ok().flatten() {
+                Some(session_id) => session_id,
+                None if dev => {
+                    store
+                        .create_session(crate::state::DEV_PERSONA, "", crate::state::USER_SESSION_KIND, None)
+                        .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?
+                        .session_id
+                }
+                None => store.session_id().to_string(),
+            };
             let target = ipc::SessionRef::Id { id: session_id };
             let session_id = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record.session_id,
+                Err(_) if dev => store
+                    .create_session(crate::state::DEV_PERSONA, "", crate::state::USER_SESSION_KIND, None)
+                    .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?
+                    .session_id,
                 Err(_) => store.session_id().to_string(),
             };
             let _ = store.set_repl_session(&persona, &session_id);
@@ -2666,7 +2681,7 @@ async fn handle_session_command(
                 .collect();
             Ok(json!({ "current": &*current, "sessions": sessions }))
         }
-        IpcCommand::CreateSession { name, switch, kind } => {
+        IpcCommand::CreateSession { name, switch, kind, mode } => {
             // Whitelisted: `ask` is the only non-user kind a client may mint,
             // and it is deliberately unswitchable — subagent audit sessions and
             // anything else stay daemon-internal.
@@ -2680,8 +2695,14 @@ async fn handle_session_command(
             // No explicit name: leave it empty; the session is auto-named
             // from the first prompt when its first turn completes.
             let name = name.map(|name| name.trim().to_string()).unwrap_or_default();
+            // dev 会话建到保留人格名下,模式由 persona 推导(见 DEV_PERSONA)。
+            let session_persona = if mode.as_deref() == Some("dev") {
+                crate::state::DEV_PERSONA
+            } else {
+                persona.as_str()
+            };
             let record = store
-                .create_session(&persona, &name, kind, None)
+                .create_session(session_persona, &name, kind, None)
                 .map_err(|error| safe_error_message(&error))?;
             if kind == crate::state::USER_SESSION_KIND {
                 state.events.publish(
@@ -2697,7 +2718,7 @@ async fn handle_session_command(
         IpcCommand::SetReplSession { target } => {
             let record = resolve_available_local_session_ref(state, &target)?;
             store
-                .set_repl_session(&persona, &record.session_id)
+                .set_repl_session(&record.persona, &record.session_id)
                 .map_err(|error| safe_error_message(&error))?;
             Ok(json!({ "session": session_record_json(&record) }))
         }
@@ -2908,6 +2929,9 @@ struct CreateSessionRequest {
     name: Option<String>,
     #[serde(default)]
     switch: bool,
+    /// "dev" 建 Build 模式会话(保留人格 dev);缺省=当前人格普通会话。
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2927,6 +2951,7 @@ async fn create_session_http(
             name: request.name,
             switch: request.switch,
             kind: None,
+            mode: request.mode,
         },
     )
     .await
@@ -3275,6 +3300,24 @@ fn session_overview_json(overview: &crate::state::SessionOverview, current: &str
 /// Resolves an optional turn-target session id: validates existence and that
 /// it is a user or one-shot session; `None` falls back to the global current
 /// session.
+/// 会话模式创建时定死:dev 人格(DEV_PERSONA)会话永远 Dev,其余永远
+/// Normal——客户端传什么都不构成中途切换路径。
+fn turn_mode_for_session(
+    store: &StateStore,
+    session_id: &str,
+    requested: AgentMode,
+) -> AgentMode {
+    match store.session_record(session_id) {
+        Ok(Some(record)) if record.persona == crate::state::DEV_PERSONA => AgentMode::Dev,
+        _ => {
+            if requested == AgentMode::Dev {
+                tracing::debug!(%session_id, "client asked for dev mode on a non-dev session; forcing normal");
+            }
+            AgentMode::Normal
+        }
+    }
+}
+
 fn resolve_turn_session(
     state: &DaemonState,
     session_id: Option<String>,
@@ -3326,11 +3369,14 @@ async fn handle_ipc_turn(
     let run_id = random_id("run", 18);
     let session_id = match resolve_turn_session(state, session_id) {
         Ok(session_id) => session_id,
+        // (mode 在会话解析后按会话记录强制,见下。)
         Err(message) => {
             ipc::send(stream, &IpcFrame::error(message)).await?;
             return Ok(());
         }
     };
+    // 会话模式创建时定死:以会话记录为准强制,客户端传参只是遗留字段。
+    let mode = turn_mode_for_session(&state.state_store, &session_id, mode);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let busy = {
         let mut manager = state.manager.lock().unwrap();
@@ -10588,6 +10634,7 @@ mod tests {
                 name: Some("一次性对话".to_string()),
                 switch: false,
                 kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+                mode: None,
             },
         )
         .await
@@ -10633,6 +10680,7 @@ mod tests {
                 name: None,
                 switch: false,
                 kind: Some("subagent".to_string()),
+                mode: None,
             },
         )
         .await
@@ -10643,6 +10691,7 @@ mod tests {
                 name: None,
                 switch: true,
                 kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+                mode: None,
             },
         )
         .await
@@ -10787,6 +10836,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_sessions_live_under_the_reserved_persona_and_pin_dev_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        // mode:"dev" 建到保留人格 dev 名下。
+        let data = handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: Some("dev work".to_string()),
+                switch: false,
+                kind: None,
+                mode: Some("dev".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let session_id = data["session"]["session_id"].as_str().unwrap().to_string();
+        let record = state
+            .state_store
+            .session_record(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.persona, crate::state::DEV_PERSONA);
+        // 会话模式由记录强制:dev 会话怎么请求都是 Dev,普通会话反之。
+        assert_eq!(
+            turn_mode_for_session(&state.state_store, &session_id, AgentMode::Normal),
+            AgentMode::Dev
+        );
+        let normal_id = state.state_store.session_id().to_string();
+        assert_eq!(
+            turn_mode_for_session(&state.state_store, &normal_id, AgentMode::Dev),
+            AgentMode::Normal
+        );
+    }
+
+    #[tokio::test]
     async fn creating_a_repl_session_does_not_move_the_default_session() {
         let temp = tempfile::tempdir().unwrap();
         let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
@@ -10803,6 +10887,7 @@ mod tests {
                 name: Some("repl local".to_string()),
                 switch: false,
                 kind: None,
+                mode: None,
             },
         )
         .await

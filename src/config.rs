@@ -55,6 +55,10 @@ pub struct AppConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub system_prompt_file: Option<String>,
+    /// 裸 `miyu` 的默认模式:"normal" | "dev";空(默认)=打印带模式说明的
+    /// 帮助,逼一次显式选择。`miyu normal` / `miyu dev` 子命令始终可用。
+    #[serde(default)]
+    pub default_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "SubagentTiersConfig::is_empty")]
@@ -3141,6 +3145,7 @@ impl Default for AppConfig {
             plugins: PluginsConfig::default(),
             memory: MemoryConfig::default(),
             system_prompt_file: Some("system-prompt.md".to_string()),
+            default_mode: String::new(),
             system_prompt: None,
             subagent_tiers: SubagentTiersConfig::default(),
             platforms: PlatformsConfig::default(),

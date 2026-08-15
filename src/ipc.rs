@@ -332,10 +332,17 @@ pub enum Command {
         /// back one-shot turns and stay out of every listing.
         #[serde(default)]
         kind: Option<String>,
+        /// `"dev"` 建到保留人格 dev 名下(Build 模式会话);缺省=当前人格。
+        #[serde(default)]
+        mode: Option<String>,
     },
     /// Session the REPL was last on. Falls back to the current session and
     /// heals the stored pointer when it has gone stale.
-    GetReplSession,
+    GetReplSession {
+        /// `"dev"` 取 dev 人格的 REPL 指针(无则自举一个 dev 会话)。
+        #[serde(default)]
+        mode: Option<String>,
+    },
     SetReplSession {
         target: SessionRef,
     },

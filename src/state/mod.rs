@@ -38,6 +38,10 @@ pub use usage::{UsageMeta, UsageRange, UsageSnapshot, UsageStats};
 /// The only session kind users can list, name, switch to, or bind a platform
 /// to. Everything else is infrastructure and stays out of the session list.
 pub const USER_SESSION_KIND: &str = "user";
+/// Build/Dev 模式的保留人格 scope:dev 会话全部挂在它名下,借现有
+/// 按人格隔离机制白拿会话/记忆/REPL 指针的分家;模式由会话的
+/// persona==DEV_PERSONA 推导,无需迁移。
+pub const DEV_PERSONA: &str = "dev";
 /// Backs a one-shot `miyu ask` / `miyu '<message>'` turn: created just before
 /// the turn, deleted right after, and invisible to every listing in between.
 pub const ASK_SESSION_KIND: &str = "ask";

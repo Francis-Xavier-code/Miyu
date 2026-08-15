@@ -1025,6 +1025,10 @@ pub enum Command {
     Workspace(WorkspaceArgs),
     Web(WebArgs),
     Daemon(DaemonArgs),
+    /// 进入普通模式 REPL(人格全能力)
+    Normal,
+    /// 进入开发模式 REPL(极简编码形态,无人格)
+    Dev,
 }
 
 #[derive(Debug, Args)]
@@ -1502,6 +1506,8 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::Rename(args)) => run_session_rename(&paths, args).await,
         Some(Command::Archive) => run_session_archive(&paths).await,
         Some(Command::Delete(args)) => run_session_delete(&paths, args).await,
+        Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
+        Some(Command::Dev) => run_repl(&paths, AgentMode::Dev).await,
         Some(Command::Workspace(args)) => run_workspace_command(&paths, args).await,
         Some(Command::Web(args)) => run_web(&paths, args).await,
         Some(Command::Daemon(args)) => run_daemon_command(&paths, args).await,
@@ -1517,7 +1523,26 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
                         )
                     );
                 }
-                run_repl(&paths, mode).await
+                // 裸 miyu:按 default_mode 配置分流;未配置则打印模式说明,
+                // 逼一次显式选择(miyu normal / miyu dev)。
+                let default_mode = AppConfig::load_or_default(&paths)
+                    .map(|config| config.default_mode.trim().to_ascii_lowercase())
+                    .unwrap_or_default();
+                match default_mode.as_str() {
+                    "normal" => run_repl(&paths, AgentMode::Normal).await,
+                    "dev" => run_repl(&paths, AgentMode::Dev).await,
+                    "" => {
+                        print_mode_help();
+                        Ok(())
+                    }
+                    other => bail!(
+                        "{}: {other}",
+                        t(
+                            "invalid default_mode (expected normal or dev)",
+                            "default_mode 配置无效(应为 normal 或 dev)"
+                        )
+                    ),
+                }
             } else {
                 let session =
                     one_shot_session(&paths, session_arg.as_deref(), continue_session).await?;
@@ -4936,6 +4961,7 @@ async fn create_ephemeral_session(paths: &MiyuPaths) -> Result<String> {
             name: Some(ephemeral_session_name()),
             switch: false,
             kind: Some(crate::state::ASK_SESSION_KIND.to_string()),
+            mode: None,
         },
     )
     .await?;
@@ -6435,6 +6461,7 @@ async fn run_session_new(paths: &MiyuPaths, args: SessionNameArgs) -> Result<()>
             name,
             switch: true,
             kind: None,
+            mode: None,
         },
     )
     .await?;
@@ -6972,6 +6999,22 @@ fn print_variant_updated() {
     println!("{}\n", t("thinking variants updated", "已更新思考档位"));
 }
 
+fn print_mode_help() {
+    if crate::i18n::is_zh() {
+        println!("Miyu 现在按模式进入会话(创建时定死,中途不可切换):\n");
+        println!("  miyu normal   普通模式——人格、记忆、全量工具,日常主力");
+        println!("  miyu dev      开发模式——一行提示词、极简编码工具、无人格");
+        println!("\n一次性提问不变:miyu \"问题\"(普通模式)。");
+        println!("想让裸 miyu 直接进某个模式:config.jsonc 设 default_mode = \"normal\" 或 \"dev\"。");
+    } else {
+        println!("Miyu enters a session by mode (fixed at creation, no mid-session switch):\n");
+        println!("  miyu normal   full-capability persona mode");
+        println!("  miyu dev      minimal coding mode (one-line prompt, no persona)");
+        println!("\nOne-shot asks are unchanged: miyu \"question\" (normal mode).");
+        println!("Set default_mode = \"normal\" | \"dev\" in config.jsonc to skip this screen.");
+    }
+}
+
 async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     if direct_mode_requested() {
         run_direct_repl(paths, initial_mode).await
@@ -6990,7 +7033,13 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
     // The REPL resumes its own lane rather than the terminal session, so
     // reopening a REPL lands back where the last one left off while shell-hook
     // keeps talking to whatever session it was on.
-    let (daemon_state, _) = send_ipc_admin(paths, IpcCommand::GetReplSession).await?;
+    let (daemon_state, _) = send_ipc_admin(
+        paths,
+        IpcCommand::GetReplSession {
+            mode: (mode == AgentMode::Dev).then(|| "dev".to_string()),
+        },
+    )
+    .await?;
     let mut active_session_id = daemon_state.session_id.clone();
     let history_state = StateStore::new(paths)?.pinned(&active_session_id);
     let mut history = load_repl_input_history(&history_state, paths)?;
@@ -7181,6 +7230,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                             name: (!name.is_empty()).then(|| name.to_string()),
                             switch: false,
                             kind: None,
+                            mode: (mode == AgentMode::Dev).then(|| "dev".to_string()),
                         },
                     )
                     .await?
@@ -8029,9 +8079,23 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
     state.init_files()?;
     // Same lane as the remote REPL: resume where the last REPL was, not where
     // shell-hook happens to be pointing.
-    let persona = config.active_persona_scope();
+    let persona = if initial_mode == AgentMode::Dev {
+        crate::state::DEV_PERSONA.to_string()
+    } else {
+        config.active_persona_scope()
+    };
     if let Ok(Some(session_id)) = state.repl_session(&persona) {
         state.adopt_session(&session_id);
+    } else if initial_mode == AgentMode::Dev {
+        // dev 无「终端会话」可退:自举一个 dev 会话并钉住指针。
+        let record = state.create_session(
+            crate::state::DEV_PERSONA,
+            "",
+            crate::state::USER_SESSION_KIND,
+            None,
+        )?;
+        state.adopt_session(&record.session_id);
+        let _ = state.set_repl_session(&persona, &record.session_id);
     } else {
         let _ = state.set_repl_session(&persona, &state.session_id());
     }
