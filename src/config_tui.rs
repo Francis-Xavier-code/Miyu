@@ -6638,12 +6638,6 @@ fn edit_provider_form(
     stdout: &mut io::Stdout,
     provider: ProviderConfig,
 ) -> Result<Option<ProviderConfig>> {
-    let current_context_window = provider
-        .model_context_window
-        .get(&provider.default_model)
-        .copied()
-        .unwrap_or_default();
-
     // 将 extra_body 格式化为 JSON 字符串，方便编辑
     let extra_body_string = provider
         .extra_body
@@ -6671,17 +6665,9 @@ fn edit_provider_form(
             provider.default_model.clone(),
         ),
         Field::new(
-            t(
-                "Model context window (tokens, 0=auto)",
-                "模型上下文窗口 (tokens, 0=自动)",
-            ),
-            current_context_window.to_string(),
-        ),
-        Field::new(
             t("Timeout (seconds)", "超时秒数"),
             provider.timeout_seconds.to_string(),
         ),
-        Field::new("Temperature", provider.temperature.to_string()),
         Field::textarea(
             t("Extra request body (JSON)", "额外请求体 (JSON)"),
             extra_body_string,
@@ -6694,30 +6680,18 @@ fn edit_provider_form(
             return Ok(None);
         }
 
-        // 提取各个字段的值（索引保持不变）
+        // 温度与上下文窗口都是按模型的事,归模型菜单管;供应商表单
+        // 不再放这两项(验收:曾牵连全部模型)。
         let default_model = fields[5].value.trim().to_string();
-        let model_context_window_raw = fields[6].value.trim().parse::<usize>().unwrap_or_default();
-        let timeout = fields[7].value.trim().parse().unwrap_or(60);
-        let temperature = fields[8].value.trim().parse().unwrap_or(1.0);
+        let timeout = fields[6].value.trim().parse().unwrap_or(60);
 
-        let extra_body = match parse_extra_body(&fields[9].value) {
+        let extra_body = match parse_extra_body(&fields[7].value) {
             Ok(extra_body) => extra_body,
             Err(error) => {
                 message(stdout, &error)?;
                 continue;
             }
         };
-
-        // 构建 model_context_window
-        let mut model_context_window = provider.model_context_window.clone();
-        match model_context_window_raw {
-            0 => {
-                model_context_window.remove(&default_model);
-            }
-            value => {
-                model_context_window.insert(default_model.clone(), value);
-            }
-        }
 
         let mut models = provider.models.clone();
         if !default_model.trim().is_empty() && !models.iter().any(|item| item == &default_model) {
@@ -6732,12 +6706,13 @@ fn edit_provider_form(
             protocol: fields[3].value.trim().to_string(),
             api_key: Some(fields[4].value.trim().to_string()).filter(|value| !value.is_empty()),
             models,
-            model_context_window,
+            model_context_window: provider.model_context_window.clone(),
+            model_temperature: provider.model_temperature.clone(),
             model_modalities: provider.model_modalities.clone(),
             model_costs: provider.model_costs.clone(),
             default_model,
             timeout_seconds: timeout,
-            temperature,
+            temperature: provider.temperature,
             anthropic_max_tokens: provider.anthropic_max_tokens,
             extra_body,
         }));
@@ -6810,7 +6785,14 @@ fn edit_model_form(
             context_window.to_string(),
         ),
         thinking_variant_field(&variant_options, stored_variant.as_deref()),
-        Field::new("Temperature", provider.temperature.to_string()),
+        Field::new(
+            t("Temperature (empty = provider default)", "Temperature (留空=供应商默认)"),
+            provider
+                .model_temperature
+                .get(model)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
         Field::new(
             t(
                 "Price currency (empty = models.dev)",
@@ -6919,7 +6901,14 @@ fn edit_model_form(
         if selected_variant != initial_variant {
             thinking_variants.set(&provider.id, model, selected_variant);
         }
-        provider.temperature = fields[4].value.trim().parse().unwrap_or(1.0);
+        match fields[4].value.trim().parse::<f32>() {
+            Ok(value) => {
+                provider.model_temperature.insert(model.to_string(), value);
+            }
+            Err(_) => {
+                provider.model_temperature.remove(model);
+            }
+        }
         return Ok(true);
     }
 }
@@ -7009,13 +6998,20 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
             t("Turns replayed when reopening the REPL", "重开 REPL 回放的轮数"),
             config.display.repl_replay_turns.to_string(),
         ),
+        // 验收:default_mode 只能改 config.jsonc 不像话——空=裸 miyu 出帮助。
+        Field::new(
+            t("Bare `miyu` default mode", "裸 miyu 默认模式"),
+            config.default_mode.clone(),
+        )
+        .choices(&["normal", "dev"])
+        .empty_choice_label(t("Show mode help", "显示模式帮助")),
     ];
     // The read-back below is by index, so an insert in the middle silently
     // writes every later value into the wrong setting. This catches that in
     // debug builds; new fields go on the end.
     debug_assert_eq!(
         fields.len(),
-        15,
+        16,
         "global settings fields changed: update the positional read-back below"
     );
     run_form_without_buttons(stdout, t(" GLOBAL SETTINGS ", " 全局设置 "), &mut fields)?;
@@ -7044,6 +7040,7 @@ fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> 
         .trim()
         .parse::<usize>()?
         .min(MAX_REPL_REPLAY_TURNS);
+    config.default_mode = fields[15].value.trim().to_string();
     Ok(())
 }
 
@@ -8201,9 +8198,18 @@ fn draw_form(
 }
 
 fn field_display_value(field: &Field, reveal_sensitive: bool) -> String {
-    if field.textarea && field.value.is_empty() {
-        t("(Enter opens $EDITOR)", "(Enter 打开 $EDITOR)").to_string()
-    } else if field.sensitive && !field.value.is_empty() && !reveal_sensitive {
+    if field.dialog_list {
+        // 列表式字段没有 $EDITOR;摘要成对数,原始序列化文本不上屏。
+        let pairs = crate::persona_hint::parse_dialogs(&field.value).len();
+        return if pairs == 0 {
+            t("(empty; Enter opens the list)", "(空,回车进列表)").to_string()
+        } else if is_zh() {
+            format!("[{pairs} 对对话]")
+        } else {
+            format!("[{pairs} dialog pair(s)]")
+        };
+    }
+    if field.sensitive && !field.value.is_empty() && !reveal_sensitive {
         if field.textarea {
             if is_zh() {
                 format!("[已配置 {} 项]", parse_key_list(&field.value).len())
@@ -8585,13 +8591,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_sensitive_textarea_keeps_editor_placeholder() {
+    fn empty_sensitive_textarea_renders_empty() {
         let field = Field::textarea("API Keys", String::new()).sensitive();
 
-        assert_eq!(
-            field_display_value(&field, false),
-            t("(Enter opens $EDITOR)", "(Enter 打开 $EDITOR)")
-        );
+        assert_eq!(field_display_value(&field, false), "");
     }
 
     #[test]

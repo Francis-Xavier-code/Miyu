@@ -1565,7 +1565,7 @@ impl OpenAiCompatibleClient {
         let request = ChatRequest {
             model: self.provider.default_model.clone(),
             messages,
-            temperature: self.provider.temperature,
+            temperature: self.provider.effective_temperature(),
             stream: false,
             stream_options: None,
             max_tokens: Some(1),
@@ -1887,7 +1887,7 @@ impl OpenAiCompatibleClient {
         let mut request = ChatRequest {
             model: self.provider.default_model.clone(),
             messages,
-            temperature: self.provider.temperature,
+            temperature: self.provider.effective_temperature(),
             stream: true,
             stream_options: Some(ChatStreamOptions {
                 include_usage: true,
@@ -2564,7 +2564,7 @@ impl OpenAiCompatibleClient {
                 .max_tokens_override
                 .map(|cap| cap.min(self.provider.anthropic_max_tokens))
                 .unwrap_or(self.provider.anthropic_max_tokens),
-            temperature: Some(self.provider.temperature),
+            temperature: Some(self.provider.effective_temperature()),
             thinking: variant_thinking,
             extra_body,
         }
@@ -2688,7 +2688,7 @@ impl OpenAiCompatibleClient {
             stream: true,
             tools: (!tools.is_empty()).then(|| lower_responses_tools(tools)),
             reasoning: self.responses_reasoning(),
-            temperature: Some(self.provider.temperature),
+            temperature: Some(self.provider.effective_temperature()),
             extra_body,
         };
         let reasoning_effort = request
@@ -7986,6 +7986,7 @@ mod tests {
             api_key: None,
             models: Vec::new(),
             model_context_window: std::collections::HashMap::new(),
+            model_temperature: std::collections::HashMap::new(),
             model_modalities: std::collections::HashMap::new(),
             model_costs: std::collections::HashMap::new(),
             default_model: String::new(),

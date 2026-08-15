@@ -7075,6 +7075,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             models: vec!["vision-model".to_string()],
             model_context_window: Default::default(),
+model_temperature: HashMap::new(),
             model_modalities: [(
                 "vision-model".to_string(),
                 vec!["text".to_string(), "image".to_string()],
@@ -9293,6 +9294,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 models: vec!["test-model".to_string()],
                 model_context_window: Default::default(),
+model_temperature: HashMap::new(),
                 model_modalities: Default::default(),
                 model_costs: Default::default(),
                 default_model: "test-model".to_string(),

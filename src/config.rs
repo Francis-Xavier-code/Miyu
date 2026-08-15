@@ -2396,6 +2396,10 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_context_window: HashMap<String, usize>,
+    /// 按模型温度覆盖;缺项回退 `temperature`(供应商默认)。验收:模型
+    /// 菜单里的温度曾误写供应商全局,牵连所有模型。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_temperature: HashMap<String, f32>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_modalities: HashMap<String, Vec<String>>,
     /// 手动模型价格,键为模型名;设了就覆盖 models.dev 目录价。
@@ -3497,6 +3501,15 @@ impl Default for ContextConfig {
 }
 
 impl ProviderConfig {
+    /// 当前选中模型(`default_model`)的有效温度:按模型覆盖优先,缺项
+    /// 回退供应商默认。
+    pub fn effective_temperature(&self) -> f32 {
+        self.model_temperature
+            .get(&self.default_model)
+            .copied()
+            .unwrap_or(self.temperature)
+    }
+
     pub fn default_opencodezen() -> Self {
         Self {
             id: OPENCODE_PROVIDER_ID.to_string(),
@@ -3506,6 +3519,7 @@ impl ProviderConfig {
             api_key: None,
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
             model_context_window: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::new(),
             default_model: OPENCODE_DEFAULT_CHAT_MODEL.to_string(),
@@ -3525,6 +3539,7 @@ impl ProviderConfig {
             api_key: Some("$env:ANTHROPIC_API_KEY".to_string()),
             models: Vec::new(),
             model_context_window: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::new(),
             default_model: String::new(),
@@ -3569,6 +3584,7 @@ impl ProviderConfig {
             api_key: None,
             models: Vec::new(),
             model_context_window: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::new(),
             default_model: String::new(),
@@ -3588,6 +3604,7 @@ impl ProviderConfig {
             api_key: None,
             models: Vec::new(),
             model_context_window: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::new(),
             default_model: String::new(),
@@ -5961,6 +5978,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_temperature_override_beats_provider_default() {
+        let mut provider = ProviderConfig::default_opencodezen();
+        provider.temperature = 0.6;
+        provider.default_model = "a".to_string();
+        assert_eq!(provider.effective_temperature(), 0.6);
+        provider.model_temperature.insert("a".to_string(), 0.1);
+        assert_eq!(provider.effective_temperature(), 0.1);
+        // 别的模型不受覆盖牵连(验收:曾把供应商全局温度当模型温度写)。
+        provider.default_model = "b".to_string();
+        assert_eq!(provider.effective_temperature(), 0.6);
+    }
+
+    #[test]
     fn a_stale_xdg_output_dir_is_healed_and_its_files_follow() {
         // The value being healed is one an earlier upgrade wrote itself: it
         // remapped onto data_dir while data_dir still pointed at the legacy
@@ -7990,6 +8020,7 @@ mod tests {
             api_key: None,
             models: vec![],
             model_context_window: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::new(),
             default_model: String::new(),

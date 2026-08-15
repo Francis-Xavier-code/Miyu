@@ -857,6 +857,7 @@ mod tests {
             api_key: None,
             models: vec!["m".to_string()],
             model_context_window: HashMap::new(),
+model_temperature: HashMap::new(),
             model_modalities: HashMap::new(),
             model_costs: HashMap::from([(
                 "m".to_string(),
