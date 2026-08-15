@@ -495,6 +495,7 @@ fn root_help_template() -> String {
   variant            Switch the terminal session model's thinking level
   history            Show conversation history
   reset              Clear the terminal-integration session context
+  reset-memory       Erase this persona's long-term memory
   pop                Move conversation turns out of active context",
         "  fish-init          集成到 fish，集成后可在终端直接使用自然语言交流
   bash-init          集成到 bash
@@ -504,6 +505,7 @@ fn root_help_template() -> String {
   variant            切换终端集成会话模型的思考档位
   history            显示会话历史
   reset              清除终端集成会话上下文
+  reset-memory       清空长期记忆
   pop                将对话轮次移出当前上下文",
     );
     if is_zh() {
@@ -700,6 +702,11 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
             "清除终端集成会话上下文",
         ),
         (
+            "reset-memory",
+            "Erase this persona's long-term memory",
+            "清空长期记忆",
+        ),
+        (
             "wipe",
             "Erase all conversation history, memory, group contexts and their artifacts",
             "抹掉所有会话历史、记忆、群聊上下文和其产物",
@@ -731,6 +738,7 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         "variant",
         "history",
         "reset",
+        "reset-memory",
         "pop",
     ] {
         command = command.mut_subcommand(name, |subcommand| subcommand.hide(true));
@@ -1091,6 +1099,8 @@ pub enum Command {
     Memory(MemoryArgs),
     Skills(SkillsArgs),
     Reset,
+    #[command(name = "reset-memory")]
+    ResetMemoryCli,
     Wipe(WipeArgs),
     Web(WebArgs),
     Daemon(DaemonArgs),
@@ -1557,6 +1567,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::UpdateDefaultKb) => run_update_default_kb(&paths).await,
         Some(Command::Memory(args)) => run_memory(&paths, args),
         Some(Command::Skills(args)) => run_skills(&paths, args),
+        Some(Command::ResetMemoryCli) => run_reset_memory_command(&paths).await,
         Some(Command::Reset) => {
             if ipc::daemon_info(&paths).await.is_some() {
                 send_ipc_admin(
@@ -7843,8 +7854,8 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     if !confirm_inline(
                         &mut live_repl,
                         t(
-                            "erase this mode's long-term memory (facts, diary, episodes)? conversations stay",
-                            "确认清空当前模式的长期记忆（事实/日记/经历）？会话历史保留",
+                            "erase this mode's long-term memory (facts, diary, episodes)?",
+                            "确认清空当前模式的长期记忆（事实/日记/经历）？",
                         ),
                     )? {
                         repl_note(
@@ -7869,8 +7880,8 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                         &format!(
                             "\x1b[2m{}\x1b[0m\n",
                             t(
-                                "long-term memory erased; conversations untouched",
-                                "长期记忆已清空；会话历史未动"
+                                "long-term memory erased",
+                                "长期记忆已清空"
                             )
                         ),
                     )?;
@@ -8406,8 +8417,8 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         }
         if command.eq_ignore_ascii_case("/reset-memory") {
             if !confirm_stdin(t(
-                "erase this mode's long-term memory (facts, diary, episodes)? conversations stay",
-                "确认清空当前模式的长期记忆（事实/日记/经历）？会话历史保留",
+                "erase this mode's long-term memory (facts, diary, episodes)?",
+                "确认清空当前模式的长期记忆（事实/日记/经历）？",
             ))? {
                 println!("{}", t("cancelled", "已取消"));
                 continue;
@@ -8415,10 +8426,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             agent.wipe_memory()?;
             println!(
                 "{}",
-                t(
-                    "long-term memory erased; conversations untouched",
-                    "长期记忆已清空；会话历史未动"
-                )
+                t("long-term memory erased", "长期记忆已清空")
             );
             continue;
         }
@@ -13375,8 +13383,8 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         name: "/reset-memory",
         command: ReplSlashCommand::ResetMemory,
         arg_hint: "",
-        help_en: "erase this mode's long-term memory (conversations stay)",
-        help_zh: "清空当前模式的长期记忆（会话历史保留）",
+        help_en: "erase this mode's long-term memory",
+        help_zh: "清空当前模式的长期记忆",
     },
     ReplCommandSpec {
         name: "/wipe",
@@ -15994,6 +16002,35 @@ async fn run_reset(paths: &MiyuPaths) -> Result<()> {
     memory.clear_evicted_context()?;
     memory.clear_pending_events()?;
     tools::clear_aur_review_state(paths)?;
+    Ok(())
+}
+
+/// `miyu reset-memory`:清空当前人格的长期记忆。daemon 在跑走 IPC,
+/// 否则本地直清;终端确认后执行。
+async fn run_reset_memory_command(paths: &MiyuPaths) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "{}",
+            t(
+                "reset-memory needs a terminal to confirm",
+                "reset-memory 需要在终端确认"
+            )
+        );
+    }
+    if !confirm_stdin(t(
+        "erase this persona's long-term memory (facts, diary, episodes)?",
+        "确认清空长期记忆（事实/日记/经历）？",
+    ))? {
+        println!("{}", t("cancelled", "已取消"));
+        return Ok(());
+    }
+    if ipc::daemon_info(paths).await.is_some() {
+        send_ipc_admin(paths, IpcCommand::ResetMemory { mode: None }).await?;
+    } else {
+        let config = AppConfig::load_or_default(paths)?;
+        MemoryStore::new(&config, paths).reset_all(false)?;
+    }
+    println!("{}", t("long-term memory erased", "长期记忆已清空"));
     Ok(())
 }
 
