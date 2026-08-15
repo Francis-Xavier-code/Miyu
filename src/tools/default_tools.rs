@@ -23,14 +23,7 @@ pub(crate) const TOOL_SUMMARY_PREFIX: &str = "__tool_summary__";
 
 pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     register_readonly(registry);
-    registry.register(ToolSpec::new_with_progress(
-        "run_command",
-        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
-        move |args, progress| async move {
-            run_command(args, allow_command_execution, progress).await
-        },
-    ).writes());
+    register_run_command(registry, allow_command_execution);
     registry.register(ToolSpec::new_with_progress(
         "edit_file",
         t("Edit an existing UTF-8 file by replacing an inclusive 1-based line range. Use after read_file identifies exact line numbers.", "按 1 起始的闭区间行号替换现有 UTF-8 文件内容。应先用 read_file 确认准确行号。"),
@@ -42,6 +35,19 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
         t("Move files, directories, or symlinks to the system Trash instead of permanently deleting them. Pass every path in one call — one call per path floods the transcript. Use this when the user asks to delete/remove/clean up local paths; do not use rm unless explicitly requested.", "把文件、目录或符号链接移入系统回收站，而不是永久删除。要删多个时一次性全部传入，逐个调用会刷屏。用户要求删除/移除/清理本地路径时优先使用它；除非用户明确要求，不要使用 rm。"),
         json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"description": t("Paths to move to Trash. Absolute, workspace-relative, and ~/ paths are all accepted.", "要移入回收站的路径列表。支持绝对路径、工作区相对路径和 ~/ 路径。")}},"required":["paths"],"additionalProperties":false}),
         |args, progress| async move { trash_paths(args, progress) },
+    ).writes());
+}
+
+/// `run_command` 单独可注册:dev 模式只挂它(+后台任务管理),不连带
+/// coreutils 可替代的读写全家(验收三轮裁剪)。
+pub fn register_run_command(registry: &mut ToolRegistry, allow_command_execution: bool) {
+    registry.register(ToolSpec::new_with_progress(
+        "run_command",
+        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
+        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
+        move |args, progress| async move {
+            run_command(args, allow_command_execution, progress).await
+        },
     ).writes());
 }
 

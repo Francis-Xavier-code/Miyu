@@ -489,31 +489,30 @@ pub fn uses_load_tools(mode: &str) -> bool {
     is_hybrid_loading_mode(mode) || is_stub_loading_mode(mode)
 }
 
-/// Build/Dev 模式工具目录:极简开发形态(閑聊 chat_registry 已随该模式
-/// 删除)。只注册编码核心:run_command+后台任务管理、读写/补丁/字符串
-/// 编辑、grep/glob,外加 task 子代理、todo、web 检索、知识库与 MCP
-/// (常驻还是 stub 由各工具 descriptions 的 always_loaded 决定,stub
-/// 加载模式下数组字节恒定)。人格/娱乐/平台类一概**不注册**——不是
-/// stub 化,是不存在。记忆工具**注册**,但作用域切到保留人格 "dev"
-/// 的独立命名空间(`dev_scoped`),不会写脏默认 Miyu 人格的记忆库。
+/// Build/Dev 模式工具目录:极简开发形态,"模型可见表面积最小化"。
+/// 只注册:run_command+后台任务管理、apply_patch(唯一编辑器,聚合
+/// 增/改/删文件,存在意义=diff 渲染)、todo、goal、task 子代理、web
+/// 检索与 MCP。读检索(read_file/glob/grep)、check_os_info、
+/// trash_path、知识库、多余编辑器都不注册——bash+coreutils 干得更好
+/// (验收三轮裁剪)。人格/娱乐/平台类一概不存在。记忆工具**注册**,
+/// 但作用域切到保留人格 "dev" 的独立命名空间(`dev_scoped`)。
 /// ask_question 等界面胶水与 normal 同路,由 daemon/CLI 按 surface 追加。
 pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     install_builtin_guards(&mut registry, config);
-    default_tools::register(&mut registry, config.skills.allow_command_execution);
+    // 验收三轮裁剪定稿:凡 coreutils 干得更好的都不注册——读检索
+    // (read_file/glob/grep)、check_os_info、trash_path、知识库全砍;
+    // 编辑只留 apply_patch(Add/Update/Delete File 全聚合,留它是为了
+    // diff 渲染),write_file/edit_file/edit_string 一并退场。
+    default_tools::register_run_command(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
     apply_patch::register(&mut registry);
-    write::register(&mut registry);
-    edit_replace::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
     goal::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
-    }
-    if config.plugins.knowledge_base.enabled {
-        knowledge_base::register(&mut registry, config.clone(), paths.clone());
     }
     if config.memory_config().enabled {
         // dev 独立记忆:同一套工具,库切到保留人格 "dev" 的命名空间,
