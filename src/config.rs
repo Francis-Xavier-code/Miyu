@@ -2909,7 +2909,8 @@ pub struct MemesPluginConfig {
     pub search_max_results: usize,
     #[serde(default)]
     pub allow_gif_animation: bool,
-    #[serde(default)]
+    /// 终端/WebUI 会话的自动提示发送表情,默认开。
+    #[serde(default = "default_true")]
     pub auto_send_enabled: bool,
     /// 通讯平台会话的自动提示发送表情:与终端/WebUI 的 auto_send_enabled
     /// 独立,默认开——表情包本来就是平台聊天的语言。
@@ -3334,7 +3335,7 @@ impl Default for MemesPluginConfig {
             max_image_mb: default_memes_max_image_mb(),
             search_max_results: default_memes_search_max_results(),
             allow_gif_animation: false,
-            auto_send_enabled: false,
+            auto_send_enabled: true,
             auto_send_platform_enabled: true,
             auto_send_probability: default_memes_auto_send_probability(),
         }
@@ -7909,7 +7910,7 @@ mod tests {
             memes.library_for_persona("Custom Persona"),
             "custom-persona"
         );
-        assert!(!memes.auto_send_enabled);
+        assert!(memes.auto_send_enabled);
         assert!(memes.auto_send_platform_enabled);
         assert_eq!(memes.search_max_results, 1);
         assert_eq!(memes.auto_send_probability, 0.05);

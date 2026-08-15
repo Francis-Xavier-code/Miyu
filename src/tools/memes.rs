@@ -1560,13 +1560,16 @@ mod tests {
         assert_eq!(sanitize_library("默认 表情"), "default");
     }
 
-    /// 自动提示发送表情的平台/本地开关相互独立:默认平台开、本地关。
+    /// 自动提示发送表情的平台/本地开关相互独立(两者默认都开)。
     #[test]
     fn platform_and_local_auto_send_gates_are_independent() {
         let mut config = AppConfig::default();
         config.plugins.memes.auto_send_probability = 1.0;
         assert!(auto_meme_reminder(&config, "你好", true).is_some());
+        assert!(auto_meme_reminder(&config, "你好", false).is_some());
+        config.plugins.memes.auto_send_enabled = false;
         assert!(auto_meme_reminder(&config, "你好", false).is_none());
+        assert!(auto_meme_reminder(&config, "你好", true).is_some());
         config.plugins.memes.auto_send_enabled = true;
         config.plugins.memes.auto_send_platform_enabled = false;
         assert!(auto_meme_reminder(&config, "你好", false).is_some());
