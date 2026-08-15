@@ -8437,6 +8437,30 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
             continue;
         }
+        // 命令泄漏守门(任务#14):直连道的 if 链只实现了命令表的子集,
+        // 落到这里的表内命令(如 /new /session)以前会原文发给模型当聊天
+        // ——人格实验冒烟时实锤过。现在一律拦下提示,绝不进对话;完整的
+        // 双 dispatch 后端归一记为技术债,此守门先消灭整个 bug 类。
+        if input.starts_with('/') {
+            let known = REPL_COMMAND_TABLE
+                .iter()
+                .any(|spec| spec.name.eq_ignore_ascii_case(&command));
+            if known {
+                println!(
+                    "{}",
+                    t(
+                        "this command needs the full (daemon) REPL; start without MIYU_DIRECT to use it",
+                        "该命令需要完整(daemon)REPL;不带 MIYU_DIRECT 启动即可使用"
+                    )
+                );
+            } else {
+                println!(
+                    "{}: {command_input}",
+                    t("unknown command", "未知命令")
+                );
+            }
+            continue;
+        }
         if input.is_empty() {
             continue;
         }
