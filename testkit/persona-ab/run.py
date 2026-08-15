@@ -122,8 +122,9 @@ class Repl:
         env.setdefault("LANG", "zh_CN.UTF-8")
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
+        # 裸 miyu 自②批起打印模式帮助退出;测具显式进普通模式。
         self.proc = subprocess.Popen(
-            [str(MIYU_BIN)],
+            [str(MIYU_BIN), "normal"],
             stdin=slave,
             stdout=slave,
             stderr=slave,
