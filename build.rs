@@ -12,8 +12,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/prompts/miyu.md");
     println!("cargo:rerun-if-changed=src/prompts/miyu.hint.md");
     println!("cargo:rerun-if-changed=src/prompts/miyu-dialogs.md");
-    println!("cargo:rerun-if-changed=src/prompts/plan.md");
-    println!("cargo:rerun-if-changed=src/prompts/chat.md");
     println!("cargo:rerun-if-changed=assets/o200k_base.tiktoken");
     println!("cargo:rerun-if-changed=assets/jieba/dict.txt");
     // Rerun on any source or frontend change so MIYU_BUILD_ID uniquely
