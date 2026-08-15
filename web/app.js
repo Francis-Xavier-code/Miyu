@@ -8783,7 +8783,11 @@
   }
   function usageCacheRate(cacheRead, prompt) {
     if (!prompt) return null;
-    return Math.min(100, Math.round((cacheRead / prompt) * 100));
+    const rate = Math.min(100, (cacheRead / prompt) * 100);
+    // 两位小数;逼近满分时(>99.99)直接封顶 100——命中率是这套缓存
+    // 工程的成绩单,四舍五入吃掉小数没有冲击力(验收 08-16)。
+    if (rate > 99.99) return "100";
+    return rate.toFixed(2);
   }
 
   function consoleOpen() {
