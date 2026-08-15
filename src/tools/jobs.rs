@@ -110,9 +110,6 @@ struct JobEntry {
     finished: Option<Instant>,
     log_path: PathBuf,
     state: JobState,
-    /// Set once the host reported the finished job (model wake delivered or
-    /// direct-REPL user moved on); acknowledged jobs leave the overview.
-    acknowledged: bool,
 }
 
 /// Completion details handed to the host hook (daemon: model wake-up).
@@ -224,7 +221,8 @@ fn overview_of(job: &JobEntry) -> JobOverview {
 /// are reported by the wake follow-up, so a terminal chip carries no
 /// information.
 pub fn overview() -> Vec<JobOverview> {
-    let jobs = jobs().lock().unwrap();
+    let mut jobs = jobs().lock().unwrap();
+    prune_expired_terminal(&mut jobs);
     let mut rows = jobs
         .values()
         .filter(|job| !job.state.is_terminal())
@@ -233,13 +231,30 @@ pub fn overview() -> Vec<JobOverview> {
     rows.into_iter().map(overview_of).collect()
 }
 
-/// Mark a finished job as reported; it disappears from the overview.
+/// 完成且已报告的任务直接从注册表移除(验收 08-16 用户反馈:"做完了
+/// 也不删除,一直留着占用后台"——此前只打标记,条目终身堆积)。日志
+/// 文件留在磁盘,唤醒消息里带着 log_path,要翻旧账用 read_file。
 pub fn acknowledge(job_id: &str) {
-    if let Some(job) = jobs().lock().unwrap().get_mut(job_id) {
-        if job.state.is_terminal() {
-            job.acknowledged = true;
-        }
+    let mut jobs = jobs().lock().unwrap();
+    let terminal = jobs
+        .get(job_id)
+        .is_some_and(|job| job.state.is_terminal());
+    if terminal {
+        jobs.remove(job_id);
     }
+}
+
+/// 兜底:唤醒没送达(宿主死亡/失败路径)的终态条目,完成满一小时后
+/// 清出注册表——注册表只该装"还需要被看见"的任务。
+const TERMINAL_RETENTION: Duration = Duration::from_secs(3600);
+
+fn prune_expired_terminal(jobs: &mut HashMap<String, JobEntry>) {
+    jobs.retain(|_, job| {
+        !(job.state.is_terminal()
+            && job
+                .finished
+                .is_some_and(|finished| finished.elapsed() > TERMINAL_RETENTION))
+    });
 }
 
 /// Install the host completion hook (daemon: wake the model). Replaces any
@@ -481,7 +496,6 @@ pub async fn spawn_background(
         finished: None,
         log_path: log_path.clone(),
         state: JobState::Running,
-        acknowledged: false,
     };
     let started = overview_of(&entry);
     jobs().lock().unwrap().insert(job_id.clone(), entry);
@@ -580,7 +594,6 @@ where
         finished: None,
         log_path: log_path.clone(),
         state: JobState::Running,
-        acknowledged: false,
     };
     let started = overview_of(&entry);
     jobs().lock().unwrap().insert(job_id.clone(), entry);
@@ -861,7 +874,8 @@ async fn job_status(args: Value) -> Result<String> {
     let Some(job_id) = ids.first().map(String::as_str) else {
         // No job_id: list this session's jobs (all=true lists every
         // session's). 完成会自动唤醒调用方,这里不提供阻塞等待。
-        let jobs = jobs().lock().unwrap();
+        let mut jobs = jobs().lock().unwrap();
+        prune_expired_terminal(&mut jobs);
         let mut rows = jobs
             .values()
             .filter(|job| job_visible(job, current.as_deref(), all))
@@ -1189,7 +1203,8 @@ mod tests {
             "stopping blocked for {elapsed:?}, expected well under {STOP_GRACE:?}"
         );
         for id in &ids {
-            assert!(job_snapshot(id).unwrap().state.is_terminal());
+            // 停止即报告:条目可能已出表;仍在表内则必为终态。
+            assert!(job_snapshot(id).is_none_or(|job| job.state.is_terminal()));
         }
     }
 
@@ -1428,9 +1443,9 @@ mod tests {
         let stopped: Value =
             serde_json::from_str(&job_stop(json!({"job_id": job_id})).await.unwrap()).unwrap();
         assert_eq!(stopped["status"], "stopped");
-        let status: Value =
-            serde_json::from_str(&job_status(json!({"job_id": job_id})).await.unwrap()).unwrap();
-        assert_eq!(status["status"], "stopped");
+        // 新语义(08-16):停止即报告,条目当场出表;日志仍在磁盘。
+        let error = job_status(json!({"job_id": job_id})).await.unwrap_err();
+        assert!(format!("{error:#}").contains("不存在"), "{error:#}");
     }
 
     #[tokio::test]
