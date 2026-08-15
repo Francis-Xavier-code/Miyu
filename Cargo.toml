@@ -82,5 +82,4 @@ tiktoken-rs = "0.12"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
 strip = "symbols"
