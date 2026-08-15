@@ -1,5 +1,6 @@
 mod conversation_db;
 mod migrations;
+pub use migrations::DEFAULT_SESSION_ID;
 pub(crate) mod usage;
 
 /// Newest `conversation.db` schema this build can open — the gate an import

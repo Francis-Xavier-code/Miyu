@@ -1310,7 +1310,10 @@ struct AttachmentQuery {
 #[serde(deny_unknown_fields)]
 struct CreateTurnRequest {
     content: String,
-    mode: String,
+    /// 兼容字段:旧前端仍会带 mode;会话模式创建时定死,daemon 按会话
+    /// 记录强制,这个值只解析不采信。缺省即普通。
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     attachment_ids: Vec<String>,
     /// Target session; defaults to the global current session. The turn runs
@@ -1364,7 +1367,9 @@ struct RedoTurnRequest {
     input_id: String,
     #[serde(default)]
     content: Option<String>,
-    mode: String,
+    /// 同 CreateTurnRequest.mode:兼容旧前端,只解析不采信。
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2848,13 +2853,15 @@ async fn handle_session_command(
                 .map_err(|error| safe_error_message(&error))?;
             Ok(json!({ "session": session_record_json(&record) }))
         }
-        IpcCommand::SwitchSession { target } => {
-            let record = resolve_local_session_ref(state, &target)?;
-            switch_session_via_actor(state, record.session_id.clone()).await?;
-            Ok(json!({ "session": session_record_json(&record) }))
-        }
         IpcCommand::RenameSession { target, name } => {
             let record = resolve_local_session_ref(state, &target)?;
+            if record.session_id == crate::state::DEFAULT_SESSION_ID {
+                return Err(t(
+                    "the terminal-integration session cannot be renamed",
+                    "终端集成会话不可重命名",
+                )
+                .to_string());
+            }
             let name = name.trim();
             if name.is_empty() {
                 return Err(t("session name cannot be empty", "会话名称不能为空").to_string());
@@ -2871,6 +2878,15 @@ async fn handle_session_command(
         IpcCommand::DeleteSession { target } => {
             // Accepts `ask` too: a one-shot turn deletes its own session here.
             let record = resolve_local_session_ref_with_kinds(state, &target, TURN_TARGET_KINDS)?;
+            // 终端集成会话是 CLI/shellhook 的固定入口,永远只有这一个;
+            // 清空用 /reset,删除免谈(验收:WebUI 不许改默认会话)。
+            if record.session_id == crate::state::DEFAULT_SESSION_ID {
+                return Err(t(
+                    "the terminal-integration session cannot be deleted",
+                    "终端集成会话不可删除",
+                )
+                .to_string());
+            }
             reserve_admin_for_session(&state.manager, &record.session_id)
                 .map_err(|error| error.message)?;
             if &*store.session_id() == record.session_id.as_str() {
@@ -3045,24 +3061,6 @@ async fn create_session_http(
     .await
     .map_err(session_api_error)?;
     Ok((StatusCode::CREATED, Json(data)).into_response())
-}
-
-async fn activate_session_http(
-    State(state): State<DaemonState>,
-    headers: HeaderMap,
-    Path(session_id): Path<String>,
-) -> std::result::Result<Response, ApiError> {
-    require_mutation(&headers, &state)?;
-    require_local_web_session(&state, &session_id)?;
-    let data = handle_session_command(
-        &state,
-        IpcCommand::SwitchSession {
-            target: ipc::SessionRef::Id { id: session_id },
-        },
-    )
-    .await
-    .map_err(session_api_error)?;
-    Ok(Json(data).into_response())
 }
 
 #[derive(Deserialize)]
@@ -3727,10 +3725,6 @@ fn router(state: DaemonState) -> Router {
         .route(
             "/api/sessions/{session_id}",
             patch(update_session_http).delete(delete_session_http),
-        )
-        .route(
-            "/api/sessions/{session_id}/activate",
-            post(activate_session_http),
         )
         .route("/api/sessions/{session_id}/turns", get(session_turns_http))
         .route(
@@ -5218,7 +5212,7 @@ async fn redo_turn(
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
     require_local_web_session(&state, &session_id)?;
-    let mode = parse_mode(&request.mode)?;
+    let mode = parse_mode(request.mode.as_deref().unwrap_or("normal"))?;
     let store = state.state_store.pinned_for_turn(&session_id);
     let candidate = store
         .redo_candidate()
@@ -5373,7 +5367,7 @@ async fn create_turn(
     require_mutation(&headers, &state)?;
     let attachment_ids = request.attachment_ids;
     let display_content = validate_message_content(request.content, !attachment_ids.is_empty())?;
-    let mode = parse_mode(&request.mode)?;
+    let mode = parse_mode(request.mode.as_deref().unwrap_or("normal"))?;
     let session_id = resolve_turn_session(&state, request.session_id).map_err(session_api_error)?;
     state
         .state_store
@@ -10944,19 +10938,12 @@ mod tests {
             .iter()
             .all(|session| session["session_id"] != ask_id.as_str()));
 
-        // A turn may target it; switching to it may not.
+        // A turn may target it. (SwitchSession 已随「终端集成会话不可改」
+        // 整体移除,外部再无切换全局指针的入口。)
         assert_eq!(
             resolve_turn_session(&state, Some(ask_id.clone())).unwrap(),
             ask_id.clone().into()
         );
-        assert!(handle_session_command(
-            &state,
-            IpcCommand::SwitchSession {
-                target: ipc::SessionRef::Id { id: ask_id.clone() },
-            },
-        )
-        .await
-        .is_err());
 
         // Other kinds are not mintable over IPC, and `ask` may not be created
         // as the session to switch into.

@@ -3202,7 +3202,6 @@
       showToast(error.message || "重命名失败", "error");
     }
     renderSessionList();
-    renderArchivedList();
     if (sessionId === state.viewSessionId) updateConversationChrome();
   }
 
@@ -3212,10 +3211,12 @@
     menu.className = "session-menu";
     menu.setAttribute("role", "menu");
     menu.setAttribute("aria-label", `会话操作：${sessionDisplayName(session)}`);
-    const actions = [{ label: "重命名", handler: () => beginSessionRename(id) }];
-    if (!isDefault) actions.push({ label: "设为默认", handler: () => makeDefaultSession(id) });
+    // 终端集成会话是固定入口:不可改名、不可删除、不可被顶替,
+    // 菜单只留「清空对话」;其余会话不再提供「设为默认」。
+    const actions = [];
+    if (!isDefault) actions.push({ label: "重命名", handler: () => beginSessionRename(id) });
     if (isDefault) actions.push({ label: "清空对话", handler: requestClearConversation });
-    actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
+    if (!isDefault) actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
     for (const action of actions) {
       const button = document.createElement("button");
       button.type = "button";
@@ -3235,7 +3236,8 @@
   function buildSessionItem(session) {
     const id = String(session?.session_id || "");
     const isView = Boolean(id) && id === state.viewSessionId;
-    const isDefault = Boolean(id) && id === state.currentSessionId;
+    // 终端集成会话固定为 id "default",不再跟随可变的全局指针。
+    const isDefault = id === "default";
     const item = document.createElement("div");
     item.className = `session-item${isView ? " active" : ""}`;
     item.dataset.sessionId = id;
@@ -3590,21 +3592,6 @@
       : String(state.sessions.find((session) => String(session?.session_id) !== excluded)?.session_id || "");
     if (fallback) await loadSessionView(fallback);
     else await loadBootstrap();
-  }
-
-  async function makeDefaultSession(sessionId) {
-    if (!sessionId || state.sessionBusy) return;
-    setSessionBusy(true);
-    try {
-      await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/activate`, { method: "POST" });
-      state.currentSessionId = sessionId;
-      renderSessionList();
-      showToast("已设为默认会话");
-    } catch (error) {
-      showToast(error.message || "设为默认失败", "error");
-    } finally {
-      setSessionBusy(false);
-    }
   }
 
   async function deleteSession(sessionId) {

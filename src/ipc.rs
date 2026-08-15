@@ -378,9 +378,6 @@ pub enum Command {
         #[serde(default)]
         input: String,
     },
-    SwitchSession {
-        target: SessionRef,
-    },
     RenameSession {
         target: SessionRef,
         name: String,
