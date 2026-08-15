@@ -2,10 +2,8 @@ use base64::Engine;
 
 include!(concat!(env!("OUT_DIR"), "/default_miyu_prompt.rs"));
 
-pub const CHAT_REMINDER: &str = include_str!("prompts/chat.md");
 pub const MEME_DESCRIPTION_PROMPT: &str = include_str!("prompts/meme-description.md");
 pub const COMPACT_SYSTEM_PROMPT: &str = include_str!("prompts/compact.md");
-pub const COMPACT_CHAT_SYSTEM_PROMPT: &str = include_str!("prompts/compact_chat.md");
 
 fn decode_embedded_prompt(encoded: &str) -> String {
     let bytes = base64::engine::general_purpose::STANDARD

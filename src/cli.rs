@@ -366,7 +366,7 @@ fn colored_footer_mode_label(mode: AgentMode) -> String {
     let label = mode.label();
     match mode {
         AgentMode::Normal => primary_footer_text(label),
-        AgentMode::Chat => format!("\x1b[1m\x1b[32m{label}\x1b[0m"),
+        AgentMode::Dev => format!("\x1b[1m\x1b[33m{label}\x1b[0m"),
     }
 }
 
@@ -5660,7 +5660,7 @@ async fn try_run_remote_chat(
                         })
                         .unwrap_or_default();
                     let consumed_mode = match ipc_text(&data, "mode") {
-                        "chat" => AgentMode::Chat,
+                        "dev" => AgentMode::Dev,
                         _ => AgentMode::Normal,
                     };
                     renderer.prepare_for_external_output()?;
@@ -6725,7 +6725,7 @@ fn remote_image_preview(asset: &crate::state::ImageAssetData) -> Result<tempfile
 fn ipc_mode_name(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Chat => "chat",
+        AgentMode::Dev => "dev",
     }
 }
 
@@ -8407,7 +8407,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             build_tool_registry(
                 &config,
                 paths,
-                AgentMode::Chat,
+                AgentMode::Dev,
                 crate::question_tui::available(false),
             )?,
         );
@@ -9328,10 +9328,8 @@ impl LiveReplEditor {
                             self.history_clean_index = None;
                         }
                     } else {
-                        self.mode = match self.mode {
-                            AgentMode::Normal => AgentMode::Chat,
-                            AgentMode::Chat => AgentMode::Normal,
-                        };
+                        // 会话模式创建时定死:Tab 切换已随闲聊模式一并删除
+                        // (中途换模式=系统提示词换血=全量缓存作废)。
                     }
                 }
                 KeyCode::Esc => {
@@ -11496,7 +11494,7 @@ async fn follow_wake_run(
                     })
                     .unwrap_or_default();
                 let consumed_mode = match ipc_text(&data, "mode") {
-                    "chat" => AgentMode::Chat,
+                    "dev" => AgentMode::Dev,
                     _ => AgentMode::Normal,
                 };
                 renderer.prepare_for_external_output()?;
@@ -11744,7 +11742,7 @@ async fn run_live_agent_turn(
 
 fn read_repl_input(
     paths: &MiyuPaths,
-    mut mode: AgentMode,
+    mode: AgentMode,
     prefill: Option<String>,
     history: &[String],
     footer: &ReplFooterStatus,
@@ -11841,10 +11839,7 @@ fn read_repl_input(
                             history_clean_index = None;
                         }
                     } else {
-                        mode = match mode {
-                            AgentMode::Normal => AgentMode::Chat,
-                            AgentMode::Chat => AgentMode::Normal,
-                        };
+                        // 会话模式创建时定死:Tab 切换已随闲聊模式一并删除。
                     }
                     is_pasted = false;
                     render_repl_input(
@@ -12494,7 +12489,7 @@ fn submitted_echo_lines(mode: AgentMode, input: &str, cols: usize) -> Vec<String
 fn submitted_echo_bar(mode: AgentMode) -> String {
     match mode {
         AgentMode::Normal => "\x1b[1m\x1b[34m┃\x1b[0m".to_string(),
-        AgentMode::Chat => "\x1b[1m\x1b[32m┃\x1b[0m".to_string(),
+        AgentMode::Dev => "\x1b[1m\x1b[33m┃\x1b[0m".to_string(),
     }
 }
 
@@ -12505,8 +12500,8 @@ fn input_prompt_bar(mode: AgentMode) -> String {
 fn repl_shortcut_hint_line(mode: AgentMode, cols: usize) -> String {
     let bar = input_prompt_bar(mode);
     let text = t(
-        "Tab switch mode; Shift+Enter newline; Ctrl+J newline; Ctrl+V paste clipboard",
-        "Tab 切换模式；Shift+Enter 换行；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
+        "Shift+Enter newline; Ctrl+J newline; Ctrl+V paste clipboard",
+        "Shift+Enter 换行；Ctrl+J 换行；Ctrl+V 粘贴剪贴板",
     );
     let text_width = cols.saturating_sub(visible_width(&bar)).max(1);
     format!(
@@ -14641,7 +14636,7 @@ mod repl_input_tests {
         let mut footer = ReplFooterStatus::from_config(&config, 0, TurnTokens::default());
         footer.update_thinking_variant(Some("high"));
 
-        for mode in [AgentMode::Normal, AgentMode::Chat] {
+        for mode in [AgentMode::Normal, AgentMode::Dev] {
             let line = repl_footer_left(mode, &footer, 120);
             assert!(line.contains("\x1b[1m\x1b[34mhigh\x1b[0m"));
             assert_eq!(
@@ -14720,7 +14715,7 @@ mod repl_input_tests {
         };
 
         let normal = queued_prompt_lines(std::slice::from_ref(&prompt), AgentMode::Normal, 80);
-        let chat = queued_prompt_lines(&[prompt], AgentMode::Chat, 80);
+        let chat = queued_prompt_lines(&[prompt], AgentMode::Dev, 80);
 
         assert_eq!(normal.len(), 4);
         assert_eq!(normal[0], submitted_echo_bar(AgentMode::Normal));
@@ -14730,7 +14725,7 @@ mod repl_input_tests {
         assert!(chat
             .iter()
             .filter(|line| !line.is_empty())
-            .all(|line| line.starts_with(&submitted_echo_bar(AgentMode::Chat))));
+            .all(|line| line.starts_with(&submitted_echo_bar(AgentMode::Dev))));
         assert_ne!(normal[0], chat[0]);
     }
 
@@ -15285,8 +15280,9 @@ mod repl_input_tests {
 
     #[test]
     fn shortcut_hint_line_is_bar_aligned_and_truncated() {
+        // Tab 切换模式已随闲聊模式删除,提示行首个词条现在是换行快捷键。
         let line = repl_shortcut_hint_line(AgentMode::Normal, 24);
-        assert!(strip_terminal_control_sequences(&line).contains("Tab"));
+        assert!(strip_terminal_control_sequences(&line).contains("Shift+Enter"));
         assert!(visible_width(&line) <= 24);
     }
 
@@ -15954,7 +15950,7 @@ pub(crate) fn build_tool_registry(
     let mut registry = if config.tools.enabled {
         match mode {
             AgentMode::Normal => tools::builtin_registry(config, paths),
-            AgentMode::Chat => tools::chat_registry(config, paths),
+            AgentMode::Dev => tools::dev_registry(config, paths),
         }
     } else {
         tools::ToolRegistry::new()

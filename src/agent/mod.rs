@@ -22,7 +22,7 @@ use crate::state::{
     QueuedPrompt, QueuedPromptAttachment, RedoCandidate, RedoInputKind, StateStore,
     TurnRedoCheckpointPayload,
 };
-use crate::tools::{self, memes, vision, ToolPermission, ToolRegistry};
+use crate::tools::{self, memes, vision, ToolRegistry};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Local;
@@ -165,17 +165,21 @@ pub struct RedoPromptInput {
     pub images: Vec<Option<PastedImage>>,
 }
 
+/// 会话模式,创建时定死、中途不可切(切换=系统提示词换血=全量缓存作废)。
+/// Normal=人格全能力;Dev=极简开发形态(一行可编辑提示词、无人格全家、
+/// 精简工具目录)。原「闲聊(Chat)」模式已删除:平台路径从来只跑 Normal,
+/// 安全靠 restricted registry(工具不存在)而非模式门,REPL 侧实测也无人用。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AgentMode {
     Normal,
-    Chat,
+    Dev,
 }
 
 #[derive(Clone)]
 pub struct AgentTurnControl {
     mode: Arc<Mutex<AgentMode>>,
     normal_tools: ToolRegistry,
-    chat_tools: ToolRegistry,
+    dev_tools: ToolRegistry,
     queue_ingress: Option<Arc<QueueIngressBarrier>>,
     supersede: Option<Arc<TurnSupersedeSignal>>,
     supersede_seen: Arc<AtomicU64>,
@@ -280,12 +284,12 @@ impl AgentTurnControl {
     pub fn new(
         mode: AgentMode,
         normal_tools: ToolRegistry,
-        chat_tools: ToolRegistry,
+        dev_tools: ToolRegistry,
     ) -> Self {
         Self {
             mode: Arc::new(Mutex::new(mode)),
             normal_tools,
-            chat_tools,
+            dev_tools,
             queue_ingress: None,
             supersede: None,
             supersede_seen: Arc::new(AtomicU64::new(0)),
@@ -320,7 +324,7 @@ impl AgentTurnControl {
     fn tools(&self, mode: AgentMode) -> ToolRegistry {
         match mode {
             AgentMode::Normal => self.normal_tools.clone(),
-            AgentMode::Chat => self.chat_tools.clone(),
+            AgentMode::Dev => self.dev_tools.clone(),
         }
     }
 }
@@ -330,20 +334,20 @@ impl AgentMode {
         if crate::i18n::is_zh() {
             match self {
                 Self::Normal => "普通",
-                Self::Chat => "闲聊",
+                Self::Dev => "开发",
             }
         } else {
             match self {
                 Self::Normal => "NORMAL",
-                Self::Chat => "CHAT",
+                Self::Dev => "DEV",
             }
         }
     }
 
     fn reminder(self) -> Option<&'static str> {
+        // Dev 遵循极简原则:不注入任何模式提醒。
         match self {
-            Self::Normal => None,
-            Self::Chat => Some(crate::prompts::CHAT_REMINDER),
+            Self::Normal | Self::Dev => None,
         }
     }
 }
@@ -1002,7 +1006,7 @@ impl Agent {
         // init) so concurrent turns can each build their own Agent; startup
         // maintenance (prompt-change reset, stale-turn recovery) lives in
         // `prepare_for_turn`.
-        let base_system_prompt = config.system_prompt_for(paths, prompt_audience)?;
+        let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
         let system_prompt = with_host_environment(
             with_mode_reminder(base_system_prompt, mode),
             prompt_audience,
@@ -1010,8 +1014,12 @@ impl Agent {
         );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
-        let preset_dialogs =
-            persona_hint::load_dialogs(&config, paths, &config.active_persona_scope());
+        // Dev 无人格:预设对话整套跳过。
+        let preset_dialogs = if mode == AgentMode::Dev {
+            Vec::new()
+        } else {
+            persona_hint::load_dialogs(&config, paths, &config.active_persona_scope())
+        };
         let memory = MemoryStore::new(&config, paths);
         memory.init()?;
         let (memory_database_id, memory_generation) = memory.identity()?;
@@ -1179,11 +1187,13 @@ impl Agent {
     }
 
     pub fn prepare_for_turn(&mut self) -> Result<()> {
-        let effective_system_prompt = self
-            .config
-            .system_prompt_for(&self.paths, self.prompt_audience)?;
-        if matches!(self.mode, AgentMode::Normal | AgentMode::Chat) {
-            let fingerprint_prompt = self.config.base_system_prompt(&self.paths)?;
+        let effective_system_prompt =
+            mode_system_prompt(&self.config, &self.paths, self.mode, self.prompt_audience)?;
+        {
+            let fingerprint_prompt = match self.mode {
+                AgentMode::Dev => effective_system_prompt.clone(),
+                AgentMode::Normal => self.config.base_system_prompt(&self.paths)?,
+            };
             let compatible_previous = matches!(self.prompt_audience, PromptAudience::Owner)
                 .then_some(effective_system_prompt.as_str());
             self.state.reset_if_prompt_changed_with_compatible(
@@ -1472,9 +1482,8 @@ impl Agent {
     /// `reset_if_prompt_changed` must never fire (it would wipe the very
     /// turn that is running).
     fn refresh_system_prompt(&mut self) -> Result<()> {
-        let base_system_prompt = self
-            .config
-            .system_prompt_for(&self.paths, self.prompt_audience)?;
+        let base_system_prompt =
+            mode_system_prompt(&self.config, &self.paths, self.mode, self.prompt_audience)?;
         self.system_prompt = with_host_environment(
             with_runtime_system_context(
                 with_mode_reminder(base_system_prompt, self.mode),
@@ -1916,7 +1925,7 @@ impl Agent {
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         }
-        if self.memory.process_after_turn(
+        if self.mode != AgentMode::Dev && self.memory.process_after_turn(
             &diary_input,
             &result.content,
             &self.memory_origin,
@@ -1965,6 +1974,10 @@ impl Agent {
     /// 缓存时只是一次小文件读,缓存未建时对同一 client 蒸馏一次(每份
     /// 人格内容一生只发生一次)。蒸馏失败降级为无提醒,绝不阻断回合。
     async fn resolve_persona_reminder(&self) -> Option<String> {
+        // Dev 无人格,自然无防失忆提醒。
+        if self.mode == AgentMode::Dev {
+            return None;
+        }
         if !self.config.prompt.persona_reminder {
             return None;
         }
@@ -2057,7 +2070,7 @@ impl Agent {
             }
         }
         messages.extend(prepared.hints);
-        if self.mode != AgentMode::Chat {
+        if self.mode == AgentMode::Normal {
             if let Some(mut association) = self.memory.association(&input)? {
                 if association.organization_due {
                     self.wake_memory_organizer();
@@ -2140,7 +2153,7 @@ impl Agent {
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
         }
-        if self.memory.process_after_turn(
+        if self.mode != AgentMode::Dev && self.memory.process_after_turn(
             // C10 三份内容分离(最小实现):日记读平台包装前的原文快照,
             // 而不是带指令样板和群聊记录块的完整 prompt 内容。
             self.memory_content.as_deref().unwrap_or(&input),
@@ -2402,7 +2415,6 @@ impl Agent {
             context_window,
             check.reserved_tokens,
             self.compact_tail_budget(context_window),
-            matches!(self.mode, AgentMode::Chat),
             self.preset_dialogs.len(),
         );
         let mut on_chunk = |chunk: ChatStreamChunk| on_event(AgentEvent::CompactChunk(chunk));
@@ -2513,13 +2525,7 @@ impl Agent {
     /// geometry is what stops the re-compaction loop); chat sessions default
     /// smaller because casual history has less verbatim value.
     fn compact_tail_budget(&self, context_window: usize) -> usize {
-        self.config.context.compact_tail_tokens.unwrap_or({
-            if matches!(self.mode, AgentMode::Chat) {
-                8192
-            } else {
-                16384.min(context_window / 4)
-            }
-        })
+        self.config.context.compact_tail_tokens.unwrap_or(16384.min(context_window / 4))
     }
 
     async fn handle_overflow<F>(
@@ -2628,7 +2634,6 @@ impl Agent {
                     window,
                     check.reserved_tokens,
                     self.compact_tail_budget(window),
-                    matches!(self.mode, AgentMode::Chat),
                     self.preset_dialogs.len(),
                 );
                 let mut on_chunk =
@@ -2841,7 +2846,7 @@ impl Agent {
         loop {
             let tool_limit_reached = self.max_tool_rounds > 0 && tool_round >= self.max_tool_rounds;
 
-            if self.mode != AgentMode::Chat && self.config.skills.enabled {
+            if self.config.skills.enabled {
                 if self.mode == AgentMode::Normal {
                     let mut registry = self.tools.lock().unwrap();
                     tools::rescan_scripts(&mut registry, &self.paths);
@@ -3032,7 +3037,6 @@ impl Agent {
                             window,
                             check.reserved_tokens,
                             self.compact_tail_budget(window),
-                            matches!(self.mode, AgentMode::Chat),
                             self.preset_dialogs.len(),
                         );
                         let mut on_compact_chunk =
@@ -3328,7 +3332,7 @@ impl Agent {
             // Multiple `task` calls in one batch run concurrently (subagents
             // are independent by design); everything else stays serial.
             let mut parallel_task_outputs =
-                if defer_sibling_tools || self.mode == AgentMode::Chat {
+                if defer_sibling_tools {
                     std::collections::HashMap::new()
                 } else {
                     self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
@@ -3437,27 +3441,11 @@ impl Agent {
                     continue;
                 }
                 used_tools.push(call.function.name.clone());
+                // 模式级 ReadOnly 权限门随闲聊模式一并删除:拒绝层现在是
+                // registry 的单调 guard(软失败),不可用工具靠 registry 组合
+                // 不注册(平台 restricted 同理),未知工具在分发处软失败。
                 {
                     let tools = self.tools.lock().unwrap();
-                    let permission = tools.permission(&call.function.name)?;
-                    if !mode_allows_tool_permission(self.mode, permission) {
-                        // 软失败:回给模型一条 tool error 让它换路,而不是
-                        // bail! 炸掉整轮(dsh 管线的 deny 语义)。
-                        let output = format!(
-                            "tool error: {} mode blocked non-read-only tool: {}",
-                            self.mode.label(),
-                            call.function.name
-                        );
-                        drop(tools);
-                        on_event(AgentEvent::ToolResult {
-                            call_id: call_id.clone(),
-                            name: event_name.clone(),
-                            ok: false,
-                            output: output.clone(),
-                        })?;
-                        messages.push(ChatMessage::tool(call.id, output));
-                        continue;
-                    }
                     if tools::is_hybrid_loading_mode(&self.config.tools.loading_mode)
                         && call.function.name != "load_tools"
                         && tools.requires_lazy_load(&call.function.name, &loaded_tools)
@@ -4056,13 +4044,6 @@ fn tool_output_succeeded(output: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn mode_allows_tool_permission(mode: AgentMode, permission: ToolPermission) -> bool {
-    match mode {
-        AgentMode::Normal => true,
-        AgentMode::Chat => permission == ToolPermission::ReadOnly,
-    }
-}
-
 #[derive(Debug)]
 struct AutoArtifactCandidate {
     call_id: String,
@@ -4431,7 +4412,7 @@ fn replace_request_mode_context(
 fn continuation_system_prompt(system_prompt: &str, mode: AgentMode) -> String {
     let mode = match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Chat => "chat",
+        AgentMode::Dev => "dev",
     };
     format!(
         "<mode-update active=\"{mode}\">This supersedes all earlier mode-specific instructions.</mode-update>\n\n{system_prompt}"
@@ -5649,6 +5630,21 @@ fn with_runtime_system_context(mut system_prompt: String, context: &[String]) ->
 /// skipping the append outright — rather than adding an empty block — keeps
 /// those sessions' system prompt byte-identical to what the provider already
 /// has cached, so the platform side sees no cold start at all.
+
+/// 模式选提示词源:Dev=一行可编辑开发提示词(无人格全家、无用户身份,
+/// 极简原则);Normal=人格提示词(按 audience 附用户档案)。
+fn mode_system_prompt(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    mode: AgentMode,
+    audience: PromptAudience,
+) -> Result<String> {
+    match mode {
+        AgentMode::Dev => config.dev_system_prompt(paths),
+        AgentMode::Normal => config.system_prompt_for(paths, audience),
+    }
+}
+
 fn with_host_environment(
     mut system_prompt: String,
     audience: PromptAudience,
@@ -5945,20 +5941,13 @@ fn runtime_context(mode: AgentMode, platform: bool) -> String {
     let cwd = crate::tools::workspace::effective_workdir()
         .display()
         .to_string();
-    if mode == AgentMode::Chat {
-        format!(
-            "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\"/>",
-            Local::now().format("%Y年%m月%d日 %A %H:%M"),
-            xml_attr_escape(&cwd),
-        )
-    } else {
-        let runtime = terminal_runtime_context();
-        format!(
-            "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
-            Local::now().format("%Y年%m月%d日 %A %H:%M"),
-            xml_attr_escape(&cwd),
-        )
-    }
+    let _ = mode;
+    let runtime = terminal_runtime_context();
+    format!(
+        "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
+        Local::now().format("%Y年%m月%d日 %A %H:%M"),
+        xml_attr_escape(&cwd),
+    )
 }
 
 fn terminal_runtime_context() -> String {
@@ -6038,27 +6027,6 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     struct NoopPlatformAdapter;
-
-    /// 闲聊模式比普通模式更紧:连 Presentation 都不放行,只留只读。
-    #[test]
-    fn chat_mode_allows_read_only_tools_and_nothing_else() {
-        assert!(mode_allows_tool_permission(
-            AgentMode::Chat,
-            ToolPermission::ReadOnly
-        ));
-        assert!(!mode_allows_tool_permission(
-            AgentMode::Chat,
-            ToolPermission::Presentation
-        ));
-        assert!(!mode_allows_tool_permission(
-            AgentMode::Chat,
-            ToolPermission::Writes
-        ));
-        assert!(mode_allows_tool_permission(
-            AgentMode::Normal,
-            ToolPermission::Writes
-        ));
-    }
 
     #[test]
     fn artifact_delivery_detection_is_conservative() {
@@ -6283,10 +6251,9 @@ mod tests {
         assert_eq!(prompt, "base");
         assert!(!prompt.contains("<runtime"));
 
-        let prompt = with_mode_reminder("base".to_string(), AgentMode::Chat);
-        assert!(prompt.contains("base"));
-        assert!(prompt.contains(crate::prompts::CHAT_REMINDER));
-        assert!(!prompt.contains("<runtime"));
+        // Dev 遵循极简原则:与 Normal 一样零模式提醒。
+        let prompt = with_mode_reminder("base".to_string(), AgentMode::Dev);
+        assert_eq!(prompt, "base");
     }
 
     #[test]
@@ -8150,7 +8117,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let _ = read_test_http_request(&mut first).await;
-            server_control.set_mode(AgentMode::Chat);
+            server_control.set_mode(AgentMode::Dev);
             write_test_sse(
                 &mut first,
                 concat!(
@@ -8220,7 +8187,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "continued answer");
-        assert_eq!(agent.mode(), AgentMode::Chat);
+        assert_eq!(agent.mode(), AgentMode::Dev);
         let request: serde_json::Value =
             serde_json::from_slice(&request_rx.await.unwrap()).unwrap();
         let messages = request["messages"].as_array().unwrap();
@@ -8441,7 +8408,7 @@ mod tests {
             let (mut first, _) = listener.accept().await.unwrap();
             let first_request = read_test_http_request(&mut first).await;
             let _ = first_request_tx.send(first_request);
-            server_control.set_mode(AgentMode::Chat);
+            server_control.set_mode(AgentMode::Dev);
             write_test_sse(
                 &mut first,
                 concat!(
@@ -8491,7 +8458,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "final answer");
-        assert_eq!(agent.mode(), AgentMode::Chat);
+        assert_eq!(agent.mode(), AgentMode::Dev);
         assert!(result.responses_continuation.is_none());
         assert!(result.usage_estimated);
         let tool_only_tokens =
@@ -8536,8 +8503,7 @@ mod tests {
         let is_mode_update = |item: &Value| {
             let text = item_text(item);
             item["role"] == "user"
-                && text.contains("<mode-update active=\"chat\">")
-                && text.contains(crate::prompts::CHAT_REMINDER)
+                && text.contains("<mode-update active=\"dev\">")
         };
         let mode_index = input.iter().position(is_mode_update).unwrap();
         assert!(input.iter().any(is_mode_update));
@@ -8604,7 +8570,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let _ = read_test_http_request(&mut first).await;
-            server_control.set_mode(AgentMode::Chat);
+            server_control.set_mode(AgentMode::Dev);
             write_test_sse(
                 &mut first,
                 concat!(
@@ -8664,10 +8630,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.content, "final answer");
-        assert_eq!(agent.mode(), AgentMode::Chat);
+        assert_eq!(agent.mode(), AgentMode::Dev);
         assert_eq!(
             consumed,
-            Some((vec!["q1".to_string(), "q2".to_string()], AgentMode::Chat))
+            Some((vec!["q1".to_string(), "q2".to_string()], AgentMode::Dev))
         );
         let request: serde_json::Value =
             serde_json::from_slice(&request_rx.await.unwrap()).unwrap();
@@ -8688,10 +8654,10 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// 权限拦截是软失败:Chat 模式下调写工具,回给模型一条 tool error
-    /// 让它换路,轮次存活拿到最终回答——而不是 bail! 炸掉整轮。
+    /// guard 拒绝是软失败:命令拒绝子串拦下 run_command,回给模型一条
+    /// tool error 让它换路,轮次存活拿到最终回答——而不是炸掉整轮。
     #[tokio::test]
-    async fn chat_mode_blocked_tool_soft_fails_and_turn_continues() {
+    async fn guard_denied_tool_soft_fails_and_turn_continues() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8702,17 +8668,17 @@ mod tests {
         config.memory.enabled = false;
 
         let mut normal_tools = ToolRegistry::new();
-        normal_tools.register(
-            ToolSpec::new(
-                "writes_tool",
-                "mutates state",
-                empty_parameters(),
-                |_| async { Ok("should never run".to_string()) },
-            )
-            .writes(),
-        );
+        normal_tools.register(ToolSpec::new(
+            "run_command",
+            "runs commands",
+            empty_parameters(),
+            |_| async { Ok("should never run".to_string()) },
+        ));
+        normal_tools.add_guard(crate::tools::command_deny_guard(vec![
+            "rm -rf /".to_string(),
+        ]));
         let control = AgentTurnControl::new(
-            AgentMode::Chat,
+            AgentMode::Normal,
             normal_tools.clone(),
             normal_tools.clone(),
         );
@@ -8723,7 +8689,7 @@ mod tests {
             write_test_sse(
                 &mut first,
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"writes_tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"sudo rm -rf /\\\"}\"}}]}}]}\n\n",
                     "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
@@ -8754,7 +8720,7 @@ mod tests {
             state.clone(),
             client,
             normal_tools,
-            AgentMode::Chat,
+            AgentMode::Normal,
         )
         .unwrap();
 
@@ -8769,9 +8735,9 @@ mod tests {
         let messages = request["messages"].as_array().unwrap();
         assert!(messages.iter().any(|message| {
             message["role"] == "tool"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("blocked non-read-only tool"))
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("denied pattern") || content.contains("被禁止的模式")
+                })
         }));
         server.await.unwrap();
     }
@@ -8836,7 +8802,7 @@ mod tests {
             state.clone(),
             client,
             ToolRegistry::new(),
-            AgentMode::Chat,
+            AgentMode::Normal,
         )
         .unwrap();
         let context = Arc::new(PlatformTurnContext::new(
@@ -8943,7 +8909,7 @@ mod tests {
             state.clone(),
             client,
             ToolRegistry::new(),
-            AgentMode::Chat,
+            AgentMode::Normal,
         )
         .unwrap();
         let context = Arc::new(PlatformTurnContext::new(
@@ -8997,7 +8963,7 @@ mod tests {
             state,
             client,
             ToolRegistry::new(),
-            AgentMode::Chat,
+            AgentMode::Normal,
         )
         .unwrap();
         let messages = agent.chat_messages("current", "新消息").unwrap();
@@ -9011,6 +8977,45 @@ mod tests {
         let turns = agent.state.load_turns().unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_content, "历史问题");
+    }
+
+    /// Dev 模式极简组装:系统提示词是 dev-prompt.md 的一行(缺省内置默认),
+    /// 人格全家(预设对话/用户档案)整套绕开——即使 dialogs 文件存在。
+    #[test]
+    fn dev_mode_uses_one_line_prompt_and_skips_persona_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let config = AppConfig::default();
+        // 人格侧的预设对话文件在场,dev 也必须无视。
+        let dialogs = crate::persona_hint::dialogs_path(&config, &paths, "default");
+        std::fs::create_dir_all(dialogs.parent().unwrap()).unwrap();
+        std::fs::write(&dialogs, "user: 你好\nassistant: 哼，又来一个。\n").unwrap();
+        let state = StateStore::new(&paths).unwrap();
+        state.init_files().unwrap();
+        state.start_turn("turn_h", "历史问题", 999999).unwrap();
+        state.complete_turn("turn_h", "历史回答", None).unwrap();
+        let client =
+            OpenAiCompatibleClient::new(config.provider(None).unwrap(), &config, &paths).unwrap();
+        let agent = Agent::new(
+            config,
+            &paths,
+            state,
+            client,
+            ToolRegistry::new(),
+            AgentMode::Dev,
+        )
+        .unwrap();
+        let messages = agent.chat_messages("current", "新消息").unwrap();
+        assert_eq!(messages[0].role, "system");
+        let system = chat_message_text(&messages[0]).unwrap();
+        assert!(
+            system.contains(crate::config::DEFAULT_DEV_SYSTEM_PROMPT),
+            "dev 系统提示词应为内置默认一行: {system}"
+        );
+        assert!(!system.contains("<current-user-profile>"), "dev 无用户身份");
+        // 第一条对话消息直接是历史,没有预设对话对。
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(chat_message_text(&messages[1]).unwrap(), "历史问题");
     }
 
     /// 回合内每次模型请求结束都发射 RoundUsage(provider 未报 usage 时走
@@ -9046,7 +9051,7 @@ mod tests {
             state,
             client,
             ToolRegistry::new(),
-            AgentMode::Chat,
+            AgentMode::Normal,
         )
         .unwrap();
         let rounds = std::cell::RefCell::new(Vec::new());

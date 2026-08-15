@@ -250,7 +250,7 @@ impl TurnEngineState {
 struct TurnResources {
     client: OpenAiCompatibleClient,
     normal_tools: tools::ToolRegistry,
-    chat_tools: tools::ToolRegistry,
+    dev_tools: tools::ToolRegistry,
     restricted_tools: tools::ToolRegistry,
 }
 
@@ -304,7 +304,7 @@ impl TurnResourceCache {
         let resources = Arc::new(TurnResources {
             client: OpenAiCompatibleClient::from_config(config, paths)?,
             normal_tools: build_tool_registry(config, paths, AgentMode::Normal, false)?,
-            chat_tools: build_tool_registry(config, paths, AgentMode::Chat, false)?,
+            dev_tools: build_tool_registry(config, paths, AgentMode::Dev, false)?,
             restricted_tools,
         });
 
@@ -6459,10 +6459,10 @@ async fn run_turn_task(
         } else {
             resources.normal_tools.clone()
         };
-        let mut chat_tools = if restricted {
+        let mut dev_tools = if restricted {
             resources.restricted_tools.clone()
         } else {
-            resources.chat_tools.clone()
+            resources.dev_tools.clone()
         };
         if !restricted {
             if let Some(context) = platform_context {
@@ -6483,11 +6483,11 @@ async fn run_turn_task(
             .is_some_and(|profile| !profile.memory_write_enabled)
         {
             normal_tools.unregister("remember_fact");
-            chat_tools.unregister("remember_fact");
+            dev_tools.unregister("remember_fact");
         }
         if platform_context.is_none() && config.tools.enabled {
             tools::register_ask_question(&mut normal_tools);
-            tools::register_ask_question(&mut chat_tools);
+            tools::register_ask_question(&mut dev_tools);
         }
         if config.tools.enabled {
             if let Some(context) = profile
@@ -6495,12 +6495,12 @@ async fn run_turn_task(
                 .and_then(|profile| profile.platform.clone())
             {
                 platforms::register_platform_tools(&mut normal_tools, context.clone());
-                platforms::register_platform_tools(&mut chat_tools, context);
+                platforms::register_platform_tools(&mut dev_tools, context);
             }
         }
         let active_tools = match mode {
             AgentMode::Normal => normal_tools.clone(),
-            AgentMode::Chat => chat_tools.clone(),
+            AgentMode::Dev => dev_tools.clone(),
         };
         let mut agent = Agent::new_for_audience(
             config.clone(),
@@ -6598,7 +6598,7 @@ async fn run_turn_task(
             agent.set_memory_organizer(organizer);
         }
         agent.prepare_for_turn()?;
-        let mut control = AgentTurnControl::new(mode, normal_tools, chat_tools);
+        let mut control = AgentTurnControl::new(mode, normal_tools, dev_tools);
         if let Some(signal) = manager
             .lock()
             .unwrap()
@@ -10271,10 +10271,12 @@ fn parse_mode(mode: &str) -> std::result::Result<AgentMode, ApiError> {
         "normal" => Ok(AgentMode::Normal),
         // 历史会话可能存过 plan：模式已移除，回落到普通模式而不是让会话打不开。
         "plan" => Ok(AgentMode::Normal),
-        "chat" => Ok(AgentMode::Chat),
+        // 闲聊模式已删除:历史会话存过 "chat" 的回落普通模式,老会话照常打开。
+        "chat" => Ok(AgentMode::Normal),
+        "dev" => Ok(AgentMode::Dev),
         _ => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "mode must be normal or chat",
+            "mode must be normal or dev",
         )),
     }
 }
@@ -10282,7 +10284,7 @@ fn parse_mode(mode: &str) -> std::result::Result<AgentMode, ApiError> {
 fn mode_name(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Normal => "normal",
-        AgentMode::Chat => "chat",
+        AgentMode::Dev => "dev",
     }
 }
 

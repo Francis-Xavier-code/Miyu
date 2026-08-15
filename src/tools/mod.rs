@@ -487,22 +487,35 @@ pub fn uses_load_tools(mode: &str) -> bool {
     is_hybrid_loading_mode(mode) || is_stub_loading_mode(mode)
 }
 
-pub fn chat_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
+/// Build/Dev 模式工具目录:极简开发形态(閑聊 chat_registry 已随该模式
+/// 删除)。只注册编码核心:run_command+后台任务管理、读写/补丁/字符串
+/// 编辑、grep/glob,外加 task 子代理、todo、web 检索、知识库与 MCP
+/// (常驻还是 stub 由各工具 descriptions 的 always_loaded 决定,stub
+/// 加载模式下数组字节恒定)。人格/娱乐/平台/记忆类一概**不注册**——
+/// 不是 stub 化,是不存在;记忆工具待独立 dev 命名空间落地后再进
+/// (直接注册会写脏默认 Miyu 人格的记忆库)。ask_question 等界面
+/// 胶水与 normal 同路,由 daemon/CLI 按 surface 追加。
+pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
+    install_builtin_guards(&mut registry, config);
+    default_tools::register(&mut registry, config.skills.allow_command_execution);
+    jobs::register_management(&mut registry);
+    apply_patch::register(&mut registry);
+    write::register(&mut registry);
+    edit_replace::register(&mut registry);
+    todowrite::register(&mut registry);
     web::register_fetch(&mut registry);
-    usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
     }
-    if config.plugins.vision.enabled {
-        vision::register(&mut registry, config.clone(), paths.clone(), true);
+    if config.plugins.knowledge_base.enabled {
+        knowledge_base::register(&mut registry, config.clone(), paths.clone());
     }
-    if config.plugins.memes.enabled {
-        memes::register_chat(&mut registry, config.clone(), paths.clone());
-    }
-    if config.plugins.api_quota.enabled {
-        api_quota::register(&mut registry, config.plugins.api_quota.clone());
+    let task_tools = registry.clone();
+    task::register(&mut registry, config.clone(), paths.clone(), task_tools);
+    if config.mcp.enabled {
+        mcp::register(&mut registry, config.clone());
     }
     if uses_load_tools(&config.tools.loading_mode) {
         load_tools::register(&mut registry);
@@ -708,8 +721,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let chat =
-            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Chat, false)
+        let dev =
+            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false)
                 .unwrap();
 
         for name in [
@@ -720,10 +733,10 @@ mod tests {
             "list_skill_drafts",
         ] {
             assert!(normal.contains(name), "{name}");
-            assert!(!chat.contains(name), "{name}");
+            assert!(!dev.contains(name), "{name}");
         }
         assert!(normal.contains("load_skill"));
-        assert!(chat.contains("load_skill"));
+        assert!(dev.contains("load_skill"));
     }
 
     #[test]

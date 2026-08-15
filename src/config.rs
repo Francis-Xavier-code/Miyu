@@ -10,6 +10,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const MAX_COMMAND_OUTPUT_LINES: usize = 1_000;
+
+/// Dev 模式提示词文件名(config 目录下,可编辑;清空=回退内置默认)。
+pub const DEV_PROMPT_FILE: &str = "dev-prompt.md";
+/// Dev 模式内置默认提示词。dsh 极简变体同款措辞——贴近编码 RL 训练分布
+/// 是它强的主因(08-15 与用户讨论定稿,修正了社区传言的拼写错误)。
+pub const DEFAULT_DEV_SYSTEM_PROMPT: &str = "You are a helpful software engineer assistant.";
 /// Replay redraws whole turns, so a large value floods the screen on startup.
 pub const MAX_REPL_REPLAY_TURNS: usize = 20;
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
@@ -3783,7 +3789,23 @@ impl AppConfig {
         if !paths.config_file.exists() {
             Self::default().save(paths)?;
         }
+        // Dev 模式提示词:一行、可编辑、不混淆(与 Miyu 人格提示词的内嵌
+        // 不可编辑形成对照)。缺失时写默认;用户改成什么都以文件为准。
+        let dev_prompt = paths.config_dir.join(DEV_PROMPT_FILE);
+        if !dev_prompt.exists() {
+            std::fs::write(&dev_prompt, format!("{DEFAULT_DEV_SYSTEM_PROMPT}\n"))?;
+        }
         Ok(())
+    }
+
+    /// Dev 模式系统提示词:读 `config/dev-prompt.md`,缺失或清空回退内置
+    /// 默认一行(极简原则 + 贴近训练分布的措辞,见 08-15 实验记录)。
+    pub fn dev_system_prompt(&self, paths: &MiyuPaths) -> Result<String> {
+        let path = paths.config_dir.join(DEV_PROMPT_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => Ok(content.trim().to_string()),
+            _ => Ok(DEFAULT_DEV_SYSTEM_PROMPT.to_string()),
+        }
     }
 
     pub fn save(&self, paths: &MiyuPaths) -> Result<()> {

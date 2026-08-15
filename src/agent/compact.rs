@@ -1,7 +1,7 @@
 use crate::llm::{
     ChatMessage, ChatResult, ChatStreamChunk, OpenAiCompatibleClient, ToolDefinition, Usage,
 };
-use crate::prompts::{COMPACT_CHAT_SYSTEM_PROMPT, COMPACT_SYSTEM_PROMPT};
+use crate::prompts::COMPACT_SYSTEM_PROMPT;
 use crate::state::{StateStore, Turn};
 use anyhow::{bail, Result};
 
@@ -40,7 +40,6 @@ pub struct Compactor {
     tail_budget_tokens: usize,
     /// Chat mode uses the persona/social summary template instead of the
     /// coding one.
-    chat_mode: bool,
     /// 折叠前缀开头的预设对话对数(begin_dialogs)。它们为对齐实况请求的
     /// 缓存字节而留在前缀里,但不是真实会话——摘要指令按这个数量明确
     /// 排除,防止样板对话被总结成伪造的会话事实。
@@ -69,7 +68,6 @@ impl Compactor {
         context_window: usize,
         reserved_tokens: usize,
         tail_budget_tokens: usize,
-        chat_mode: bool,
         preset_dialog_pairs: usize,
     ) -> Self {
         // Safety cap: on a small window the tail itself must stay well under
@@ -87,17 +85,12 @@ impl Compactor {
             context_window,
             reserved_tokens,
             tail_budget_tokens,
-            chat_mode,
             preset_dialog_pairs,
         }
     }
 
     fn system_prompt(&self) -> &'static str {
-        if self.chat_mode {
-            COMPACT_CHAT_SYSTEM_PROMPT
-        } else {
-            COMPACT_SYSTEM_PROMPT
-        }
+        COMPACT_SYSTEM_PROMPT
     }
 
     /// Fork summarization: the live conversation prefix (same bytes, same
