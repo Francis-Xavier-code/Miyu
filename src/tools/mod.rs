@@ -32,6 +32,7 @@ mod package_advisor;
 mod patch_preview;
 mod protondb_query;
 mod registry;
+pub(crate) mod repeat_reminder;
 mod scripts;
 mod skills;
 mod subagent_runner;

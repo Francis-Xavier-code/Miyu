@@ -926,6 +926,10 @@ pub struct Agent {
     /// `request_messages`,永不进 `messages`,因此不化石化、不落库——
     /// 见 persona_hint 模块头注释。
     persona_reminder: Option<String>,
+    /// 重复调用链(advisory 防死循环,见 tools::repeat_reminder 模块头)。
+    /// 人类新输入(新回合/排队插话)重置;注入的提醒只进本轮工作消息,
+    /// 不进化石。
+    repeat_chain: crate::tools::repeat_reminder::RepeatChain,
     /// 预设对话(begin_dialogs):system 之后、真实历史之前的 user/assistant
     /// 示例对,每请求注入、永不落库。构造时从当前人格 scope 的
     /// dialogs/<scope>.md 加载。
@@ -1043,6 +1047,7 @@ impl Agent {
             platform_context: None,
             context_images: Vec::new(),
             persona_reminder: None,
+            repeat_chain: crate::tools::repeat_reminder::RepeatChain::default(),
             preset_dialogs,
             last_request_snapshot: None,
             keepalive_cancel: None,
@@ -1537,6 +1542,8 @@ impl Agent {
         F: FnMut(AgentEvent) -> Result<()>,
     {
         on_event(AgentEvent::FlushJournal)?;
+        // 排队插话=人类语境变化,重复链重置。
+        self.repeat_chain.reset();
         let mut prepared = Vec::with_capacity(queued.len());
         for prompt in queued {
             let images = self.queued_prompt_images(&prompt)?;
@@ -1986,6 +1993,9 @@ impl Agent {
         self.state.recover_stale_turns()?;
         self.trim_visible_context()?;
         self.persona_reminder = self.resolve_persona_reminder().await;
+        // 人类新回合:重复链语境重置(注意:将来 goal 自动续轮不应重置,
+        // 见任务#10)。
+        self.repeat_chain.reset();
         let prepared = self.prepare_user_input(input, images).await?;
         let input = prepared.content.clone();
         let turn_id = format!(
@@ -3532,6 +3542,14 @@ impl Agent {
                     .spill_tool_output(current_turn_id, &call.id, &call.function.name, &output)
                     .unwrap_or_else(|| output.clone());
                 messages.push(ChatMessage::tool(call.id.clone(), model_output));
+                // 重复调用观察:成功/失败/被拒都计数(反复撞拒绝正是要打断
+                // 的循环);提醒紧跟结果注入,只活在本轮工作消息里。
+                if let Some(reminder) = self
+                    .repeat_chain
+                    .observe(&call.function.name, &call.function.arguments)
+                {
+                    messages.push(ChatMessage::turn_context(reminder));
+                }
                 if tool_succeeded && call.function.name == "load_tools" {
                     let loaded = loaded_items_from_output(&output);
                     for name in &loaded.tools {
