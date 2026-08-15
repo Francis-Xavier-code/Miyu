@@ -346,6 +346,14 @@ pub enum Command {
     SetReplSession {
         target: SessionRef,
     },
+    /// `/goal` 人类命令:daemon 侧解析五分支语法并执行,返回直接打印的
+    /// 文本;命令输出永不进模型历史(dsh 命令平面同款边界)。
+    Goal {
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        input: String,
+    },
     SwitchSession {
         target: SessionRef,
     },

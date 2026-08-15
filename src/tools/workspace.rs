@@ -110,3 +110,38 @@ where
 pub fn current_platform_sender() -> Option<String> {
     PLATFORM_SENDER.try_with(|sender| sender.clone()).ok().flatten()
 }
+
+/// 本回合的发起来源(dsh goal 权限模型的 Miyu 化:不扫会话事件,发起方
+/// 在起回合时如实声明)。goal 工具凭它做权限二元分立:create/edit/pause/
+/// resume 只认人类发起轮;complete/blocked 额外接受"恰好当前 goal round"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOrigin {
+    /// 人类输入(REPL/WebUI/平台真实消息)。
+    Human,
+    /// goal 续轮驱动器注入的自动轮(任务#10)。
+    GoalRound {
+        goal_id: String,
+        revision: i64,
+        round: i64,
+    },
+    /// 后台任务完成唤醒的合成轮。
+    JobWake,
+}
+
+tokio::task_local! {
+    static TURN_ORIGIN: TurnOrigin;
+}
+
+pub async fn with_turn_origin<F>(origin: TurnOrigin, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TURN_ORIGIN.scope(origin, future).await
+}
+
+/// 缺省 Human:直连 CLI/测试没有包装层,而那里敲键盘的就是人。
+pub fn current_turn_origin() -> TurnOrigin {
+    TURN_ORIGIN
+        .try_with(|origin| origin.clone())
+        .unwrap_or(TurnOrigin::Human)
+}

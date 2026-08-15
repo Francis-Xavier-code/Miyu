@@ -2715,6 +2715,18 @@ async fn handle_session_command(
             }
             Ok(json!({ "session": session_record_json(&record) }))
         }
+        IpcCommand::Goal { session, input } => {
+            let session_id = match session {
+                Some(session) => {
+                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
+                        .session_id
+                }
+                None => store.session_id().to_string(),
+            };
+            let text =
+                tools::goal::execute_goal_command(&state.paths, &session_id, &input);
+            Ok(json!({ "text": text }))
+        }
         IpcCommand::SetReplSession { target } => {
             let record = resolve_available_local_session_ref(state, &target)?;
             store

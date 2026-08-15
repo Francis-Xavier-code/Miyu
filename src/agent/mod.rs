@@ -3555,6 +3555,14 @@ impl Agent {
                 {
                     messages.push(ChatMessage::turn_context(reminder));
                 }
+                // goal 收尾指令(任务#11):自主轮报 complete/blocked 后,
+                // 工具挂出 wrapup,紧跟结果注入——模型面向用户写结案陈词
+                // 而不是硬停;人类直改不触发(侧信道为空)。
+                if let Some(wrapup) =
+                    crate::tools::goal::take_pending_wrapup(&self.state.session_id())
+                {
+                    messages.push(ChatMessage::turn_context(wrapup));
+                }
                 if tool_succeeded && call.function.name == "load_tools" {
                     let loaded = loaded_items_from_output(&output);
                     for name in &loaded.tools {

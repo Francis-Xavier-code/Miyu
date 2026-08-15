@@ -7819,6 +7819,26 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     footer.update_context_window(state.context_window);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
+                ReplSlashCommand::Goal => {
+                    let Some((_, data)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::Goal {
+                            session: Some(active_session_id.clone()),
+                            input: command_args.trim().to_string(),
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    let text = data
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    repl_note(&mut live_repl, text)?;
+                    continue;
+                }
                 ReplSlashCommand::Compact => {
                     repl_note(
                         &mut live_repl,
@@ -8435,6 +8455,17 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             agent.reset_memory()?;
             cumulative_tokens = TurnTokens::default();
             footer.reset_token_usage(agent.effective_context_tokens()?, agent.context_window());
+            continue;
+        }
+        if command.eq_ignore_ascii_case("/goal") {
+            println!(
+                "{}",
+                crate::tools::goal::execute_goal_command(
+                    paths,
+                    &state.session_id(),
+                    command_args.trim(),
+                )
+            );
             continue;
         }
         // 命令泄漏守门(任务#14):直连道的 if 链只实现了命令表的子集,
@@ -13206,6 +13237,7 @@ fn colorize_repl_placeholders(line: &str) -> String {
 /// Identity of a REPL slash command, dispatched via `parse_repl_input`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplSlashCommand {
+    Goal,
     New,
     Session,
     Rename,
@@ -13331,6 +13363,13 @@ const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "[count]",
         help_en: "pop selected turns or the oldest count from active context",
         help_zh: "从当前上下文弹出所选轮次或最旧的指定轮数",
+    },
+    ReplCommandSpec {
+        name: "/goal",
+        command: ReplSlashCommand::Goal,
+        arg_hint: "[<objective>|clear|edit <objective>|pause|resume]",
+        help_en: "set or view the long-task goal for this session",
+        help_zh: "设置或查看本会话的长任务目标",
     },
     ReplCommandSpec {
         name: "/compact",
