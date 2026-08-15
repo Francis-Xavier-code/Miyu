@@ -1990,6 +1990,7 @@ textarea:disabled {
 .reasoning-block summary .reasoning-icon {
   width: 13px;
   height: 13px;
+  padding-top: 2px;
   color: var(--accent);
 }
 
@@ -2303,6 +2304,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   width: 15px;
   height: 15px;
   flex: 0 0 15px;
+  padding-top: 2px;
   place-items: center;
   border-radius: 0;
   background: none;

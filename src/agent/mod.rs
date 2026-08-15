@@ -4869,9 +4869,11 @@ fn push_assistant_message_with_reasoning(
         messages.push(message);
         return;
     }
-    if let Some(reasoning) = reasoning.and_then(private_reasoning_memory) {
-        messages.push(ChatMessage::turn_context(reasoning));
-    }
+    // 跨轮思考回放退役(验收 08-16):正常完成轮的正式回复已承载结论,
+    // 思维链副本纯属冗余——官方语义 reasoning 是轮内产物(普通轮回传被
+    // API 忽略),dsh 同款丢弃。中断恢复不走这里:journal 专道
+    // (interrupted_turn_replay_messages)仍原样重放中断前的思考。
+    let _ = reasoning;
     if force_assistant_message || !content.trim().is_empty() {
         messages.push(ChatMessage::assistant(content, None));
     }
@@ -4881,7 +4883,13 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
     let mut messages = vec![ChatMessage::plain("user", &turn.user_content)];
     // Fossilized transient tail is replayed with the turn, so count it.
     messages.extend(turn.context_messages.iter().cloned());
-    for exchange in &turn.question_exchanges {
+    // 与 push_history_turn 同步:有结构化 flow 的回合问答对不再回放。
+    let replay_exchanges: &[crate::question::QuestionExchange] = if turn.tool_flow.is_empty() {
+        &turn.question_exchanges
+    } else {
+        &[]
+    };
+    for exchange in replay_exchanges {
         messages.push(ChatMessage::plain(
             "assistant",
             crate::question::assistant_exchange_text(exchange),
@@ -4915,16 +4923,6 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
         )));
     }
     overflow::estimate_messages_tokens(&messages)
-}
-
-fn assistant_replay_content(turn: &crate::state::Turn) -> &str {
-    if !turn.assistant_content.trim().is_empty() {
-        return &turn.assistant_content;
-    }
-    turn.assistant_reasoning
-        .as_deref()
-        .filter(|reasoning| !reasoning.trim().is_empty())
-        .unwrap_or(&turn.assistant_content)
 }
 
 fn followup_assistant_replay_content(followup: &crate::state::TurnFollowup) -> Option<&str> {
@@ -7584,25 +7582,18 @@ model_temperature: HashMap::new(),
         let with_reasoning = turn_context_tokens(&turn);
         turn.assistant_reasoning = None;
         let without_reasoning = turn_context_tokens(&turn);
-        assert!(with_reasoning > without_reasoning);
+        // 跨轮思考回放退役:完成轮的思维链不再计入(也不再发送)。
+        assert_eq!(with_reasoning, without_reasoning);
 
         turn.tool_reports.push("persisted tool result".to_string());
         assert!(turn_context_tokens(&turn) > without_reasoning);
 
-        turn.tool_reports.clear();
-        turn.assistant_content.clear();
-        turn.assistant_reasoning = Some("replayed reasoning ".repeat(1_000));
-        assert_eq!(
-            assistant_replay_content(&turn),
-            turn.assistant_reasoning.as_deref().unwrap()
-        );
-        let with_replayed_reasoning = turn_context_tokens(&turn);
-        turn.assistant_reasoning = None;
-        assert!(with_replayed_reasoning > turn_context_tokens(&turn));
     }
 
     #[test]
-    fn assistant_reasoning_is_replayed_as_private_context() {
+    fn assistant_reasoning_is_not_replayed_across_turns() {
+        // 跨轮思考回放退役(08-16):完成轮只回放正式回复;中断恢复走
+        // journal 专道(interrupted_turn_replay_messages),不经此函数。
         let mut messages = Vec::new();
         push_assistant_context_messages(
             &mut messages,
@@ -7611,18 +7602,10 @@ model_temperature: HashMap::new(),
             true,
         );
 
-        assert_eq!(messages.len(), 2);
-        // Rides as a `user` block: a mid-conversation `system` message resets
-        // the provider's whole prefix cache.
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
         assert!(matches!(
             messages[0].content.as_ref(),
-            Some(ChatContent::Text(content))
-                if content.contains("<previous_assistant_reasoning>\nraw provider reasoning")
-        ));
-        assert_eq!(messages[1].role, "assistant");
-        assert!(matches!(
-            messages[1].content.as_ref(),
             Some(ChatContent::Text(content)) if content == "visible answer"
         ));
     }
@@ -8340,10 +8323,11 @@ model_temperature: HashMap::new(),
                     })
             })
             .unwrap();
-        assert!(messages.iter().any(|message| {
+        // 跨轮思考回放退役:live 与回放同刀,followup 边界不再夹带思维链。
+        assert!(!messages.iter().any(|message| {
             message["role"] == "user"
                 && message["content"].as_str().is_some_and(|content| {
-                    content.contains("<previous_assistant_reasoning>\nfirst reasoning")
+                    content.contains("<previous_assistant_reasoning>")
                 })
         }));
         assert!(first_answer < followup);
