@@ -337,6 +337,9 @@ impl PlatformsConfig {
         if let Some(instance) = self.qq.plugins.get_mut(REAL_CONTEXT_PLUGIN_ID) {
             normalize_real_context_instance(instance);
         }
+        if let Some(instance) = self.qq.plugins.get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID) {
+            normalize_group_join_approval_instance(instance);
+        }
         self.qq
             .plugins
             .retain(|name, instance| !name.trim().is_empty() && !instance.is_empty());
@@ -519,6 +522,7 @@ pub const QQ_MESSAGE_HISTORY_PLUGIN_ID: &str = "qq_message_history";
 pub const QQ_GROUP_MANAGEMENT_PLUGIN_ID: &str = "qq_group_management";
 pub const QQ_MESSAGE_RECALL_PLUGIN_ID: &str = "qq_message_recall";
 pub const QQ_MEME_COLLECTOR_PLUGIN_ID: &str = "qq_meme_collector";
+pub const QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID: &str = "qq_group_join_approval";
 
 const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValidator)] = &[
     ("reply_processor", validate_reply_processor_plugin_config),
@@ -538,6 +542,10 @@ const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValidator)] = &[
     (
         QQ_MEME_COLLECTOR_PLUGIN_ID,
         validate_qq_meme_collector_plugin_config,
+    ),
+    (
+        QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID,
+        validate_qq_group_join_approval_plugin_config,
     ),
 ];
 
@@ -664,6 +672,111 @@ impl QqMemeCollectorPluginSettings {
         serde_json::from_value(serde_json::Value::Object(instance.settings.clone()))
             .context("invalid qq_meme_collector plugin settings")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QqGroupJoinApprovalGroupConfig {
+    pub group_id: i64,
+    pub approve_condition: String,
+}
+
+/// Configuration contract for the built-in QQ group-join approval plugin.
+///
+/// Like the real-context plugin, values stay flat in the generic
+/// platform-plugin map. `text_models` follows the same rule as
+/// `RealContextPluginSettings::text_models`: `None` inherits the QQ-wide
+/// text model pool, `Some` pins an explicit approval model pool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QqGroupJoinApprovalPluginSettings {
+    /// Wall-clock deadline for one approval decision, including retries.
+    pub timeout_seconds: u64,
+    /// Extra attempts only after an unparsable JSON response.
+    pub max_retries: usize,
+    /// None inherits the QQ platform text model pool.
+    pub text_models: Option<Vec<ActiveProviderModelConfig>>,
+    pub groups: Vec<QqGroupJoinApprovalGroupConfig>,
+}
+
+impl Default for QqGroupJoinApprovalPluginSettings {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 60,
+            max_retries: 1,
+            text_models: None,
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl QqGroupJoinApprovalPluginSettings {
+    pub fn from_instance(instance: &PlatformPluginInstanceConfig) -> Result<Self> {
+        serde_json::from_value(serde_json::Value::Object(instance.settings.clone()))
+            .context("invalid qq_group_join_approval plugin settings")
+    }
+
+    pub fn normalize(&mut self) {
+        normalize_route_pool(&mut self.text_models);
+        for group in &mut self.groups {
+            group.approve_condition = group.approve_condition.trim().to_string();
+        }
+        self.groups.sort_unstable_by_key(|group| group.group_id);
+        let mut indexes = HashMap::with_capacity(self.groups.len());
+        let mut unique = Vec::with_capacity(self.groups.len());
+        for group in self.groups.drain(..) {
+            if let Some(index) = indexes.get(&group.group_id).copied() {
+                unique[index] = group;
+            } else {
+                indexes.insert(group.group_id, unique.len());
+                unique.push(group);
+            }
+        }
+        self.groups = unique;
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3_600).contains(&self.timeout_seconds) {
+            bail!(
+                "platform plugin qq_group_join_approval.timeout_seconds must be between 1 and 3600"
+            );
+        }
+        if self.max_retries > 3 {
+            bail!("platform plugin qq_group_join_approval.max_retries must be between 0 and 3");
+        }
+        if let Some(models) = &self.text_models {
+            if models.is_empty() {
+                bail!("platform plugin qq_group_join_approval.text_models must be omitted instead of empty");
+            }
+            let mut seen = HashSet::with_capacity(models.len());
+            if models.iter().any(|model| {
+                model.provider_id.trim().is_empty()
+                    || model.model.trim().is_empty()
+                    || !seen.insert((&model.provider_id, &model.model))
+            }) {
+                bail!("platform plugin qq_group_join_approval.text_models must contain unique, non-empty model references");
+            }
+        }
+        let mut group_ids = HashSet::with_capacity(self.groups.len());
+        if self.groups.len() > 10_000
+            || self.groups.iter().any(|group| {
+                group.group_id <= 0
+                    || group.approve_condition.is_empty()
+                    || group.approve_condition.trim() != group.approve_condition
+                    || group.approve_condition.chars().count() > 200_000
+                    || group.approve_condition.chars().any(char::is_control)
+                    || !group_ids.insert(group.group_id)
+            })
+        {
+            bail!("platform plugin qq_group_join_approval.groups must contain unique positive group ids and valid approval conditions");
+        }
+        Ok(())
+    }
+}
+
+fn validate_qq_group_join_approval_plugin_config(
+    instance: &PlatformPluginInstanceConfig,
+) -> Result<()> {
+    QqGroupJoinApprovalPluginSettings::from_instance(instance)?.validate()
 }
 
 fn validate_qq_group_management_plugin_config(
@@ -1267,6 +1380,35 @@ fn normalize_real_context_instance(instance: &mut PlatformPluginInstanceConfig) 
     };
     settings.normalize();
     merge_real_context_settings(instance, &settings);
+}
+
+fn normalize_group_join_approval_instance(instance: &mut PlatformPluginInstanceConfig) {
+    let Ok(mut settings) = QqGroupJoinApprovalPluginSettings::from_instance(instance) else {
+        return;
+    };
+    settings.normalize();
+    merge_group_join_approval_settings(instance, &settings);
+}
+
+pub(crate) fn merge_group_join_approval_settings(
+    instance: &mut PlatformPluginInstanceConfig,
+    settings: &QqGroupJoinApprovalPluginSettings,
+) {
+    let Ok(serde_json::Value::Object(known)) = serde_json::to_value(settings) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(defaults)) =
+        serde_json::to_value(QqGroupJoinApprovalPluginSettings::default())
+    else {
+        return;
+    };
+    for (key, value) in known {
+        if defaults.get(&key) == Some(&value) {
+            instance.settings.remove(&key);
+        } else {
+            instance.settings.insert(key, value);
+        }
+    }
 }
 
 fn migrate_message_history_instance(plugins: &mut PlatformPluginsConfig) {
@@ -4397,6 +4539,17 @@ impl AppConfig {
                     )?;
                 }
             }
+            if plugin_id == QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID {
+                let settings = QqGroupJoinApprovalPluginSettings::from_instance(instance)?;
+                if let Some(models) = settings.text_models.as_deref() {
+                    validate_unique_existing_pool(
+                        &self.providers,
+                        "group-join-approval text",
+                        models,
+                        false,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -7115,6 +7268,180 @@ mod tests {
         assert_eq!(settings.history_search_max_results, 0);
         assert_eq!(settings.history_safe_page_limit, 500);
         assert!(settings.allow_cross_conversation_search);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn qq_group_join_approval_defaults_are_safe() {
+        let settings = QqGroupJoinApprovalPluginSettings::default();
+
+        assert_eq!(settings.timeout_seconds, 60);
+        assert_eq!(settings.max_retries, 1);
+        assert!(settings.text_models.is_none());
+        assert!(settings.groups.is_empty());
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn qq_group_join_approval_settings_are_validated() {
+        let mut config = route_test_config();
+        config.platforms.qq.plugins.insert(
+            QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID.to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: Some(true),
+                settings: serde_json::json!({
+                    "timeout_seconds": 60,
+                    "max_retries": 1,
+                    "groups": [
+                        {"group_id": 130515298, "approve_condition": "Arch 相关通过"}
+                    ]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config
+            .platforms
+            .qq
+            .plugins
+            .get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+            .unwrap()
+            .settings["groups"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "group_id": 130515298,
+                "approve_condition": "duplicate"
+            }));
+        assert!(config.validate().is_err());
+
+        let instance = config
+            .platforms
+            .qq
+            .plugins
+            .get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+            .unwrap();
+        instance.settings = serde_json::json!({
+            "timeout_seconds": 60,
+            "max_retries": 1,
+            "groups": [{"group_id": 0, "approve_condition": "invalid group"}]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(config.validate().is_err());
+
+        let instance = config
+            .platforms
+            .qq
+            .plugins
+            .get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+            .unwrap();
+        instance.settings = serde_json::json!({
+            "timeout_seconds": 0,
+            "groups": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(config.validate().is_err());
+
+        let instance = config
+            .platforms
+            .qq
+            .plugins
+            .get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+            .unwrap();
+        instance.settings = serde_json::json!({
+            "max_retries": 4,
+            "groups": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn qq_group_join_approval_rejects_invalid_conditions_and_unknown_fields_pass() {
+        let mut config = route_test_config();
+        let long = "x".repeat(200_001);
+        for condition in [
+            String::new(),
+            "  padded  ".to_string(),
+            format!("bad\0condition"),
+            long,
+        ] {
+            config.platforms.qq.plugins.insert(
+                QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID.to_string(),
+                PlatformPluginInstanceConfig {
+                    enabled: None,
+                    settings: serde_json::json!({
+                        "groups": [{"group_id": 1, "approve_condition": condition}]
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                },
+            );
+            assert!(
+                config.validate().is_err(),
+                "condition should fail: {condition:?}"
+            );
+        }
+
+        config.platforms.qq.plugins.insert(
+            QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID.to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: None,
+                settings: serde_json::json!({
+                    "future_option": 1,
+                    "groups": [{"group_id": 1, "approve_condition": "valid"}]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn qq_group_join_approval_normalizes_groups_and_merges_defaults() {
+        let mut config = route_test_config();
+        config.platforms.qq.plugins.insert(
+            QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID.to_string(),
+            PlatformPluginInstanceConfig {
+                enabled: Some(true),
+                settings: serde_json::json!({
+                    "timeout_seconds": 60,
+                    "max_retries": 1,
+                    "groups": [
+                        {"group_id": 2, "approve_condition": "  second  "},
+                        {"group_id": 1, "approve_condition": " first "},
+                        {"group_id": 2, "approve_condition": " replaced "}
+                    ]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            },
+        );
+
+        config.normalize_platform_model_routes();
+
+        let instance = &config.platforms.qq.plugins[QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID];
+        assert_eq!(instance.enabled, Some(true));
+        assert!(instance.settings.get("timeout_seconds").is_none());
+        assert!(instance.settings.get("max_retries").is_none());
+        let settings = QqGroupJoinApprovalPluginSettings::from_instance(instance).unwrap();
+        assert_eq!(settings.groups.len(), 2);
+        assert_eq!(settings.groups[0].group_id, 1);
+        assert_eq!(settings.groups[0].approve_condition, "first");
+        assert_eq!(settings.groups[1].approve_condition, "replaced");
         assert!(settings.validate().is_ok());
     }
 

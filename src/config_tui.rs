@@ -1,12 +1,13 @@
 use crate::config::{
-    merge_real_context_settings, ActiveProviderModelConfig, ApiQuotaAccountConfig,
-    ApiQuotaProviderConfig, AppConfig, PlatformCommandPermission, PlatformConversationConfig,
-    PlatformConversationKind, PlatformModelPoolInheritance, PlatformModelRoute,
-    PlatformPersonaOverride, PlatformRateLimit, PlatformSessionLimits, ProviderConfig,
-    ProviderModelChoice, QqMemeCollectorPluginSettings, QqMessageHistoryPluginSettings,
-    RealContextIdentityMapping, RealContextPluginSettings, MAX_COMMAND_OUTPUT_LINES,
-    MAX_PLATFORM_COMMAND_PREFIX_CHARS, MAX_PLATFORM_SESSION_QUEUED, MAX_PLATFORM_SESSION_RUNNING,
-    MAX_REPL_REPLAY_TURNS,
+    merge_group_join_approval_settings, merge_real_context_settings, ActiveProviderModelConfig,
+    ApiQuotaAccountConfig, ApiQuotaProviderConfig, AppConfig, PlatformCommandPermission,
+    PlatformConversationConfig, PlatformConversationKind, PlatformModelPoolInheritance,
+    PlatformModelRoute, PlatformPersonaOverride, PlatformRateLimit, PlatformSessionLimits,
+    ProviderConfig, ProviderModelChoice, QqGroupJoinApprovalGroupConfig,
+    QqGroupJoinApprovalPluginSettings, QqMemeCollectorPluginSettings,
+    QqMessageHistoryPluginSettings, RealContextIdentityMapping, RealContextPluginSettings,
+    MAX_COMMAND_OUTPUT_LINES, MAX_PLATFORM_COMMAND_PREFIX_CHARS, MAX_PLATFORM_SESSION_QUEUED,
+    MAX_PLATFORM_SESSION_RUNNING, MAX_REPL_REPLAY_TURNS, QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID,
     QQ_MEME_COLLECTOR_PLUGIN_ID, QQ_MESSAGE_HISTORY_PLUGIN_ID, REAL_CONTEXT_PLUGIN_ID,
 };
 use crate::default_models::{OPENCODE_DEFAULT_VISION_MODEL, OPENCODE_PROVIDER_ID};
@@ -4724,6 +4725,18 @@ fn select_platform_plugins(
         } else {
             t("disabled", "未启用")
         };
+        let group_join_approval_enabled = config
+            .platforms
+            .qq
+            .plugins
+            .get(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+            .map(|plugin| plugin.enabled_or(true))
+            .unwrap_or(true);
+        let group_join_approval_state = if group_join_approval_enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
         let options = [
             format!("{}: {reply_state}", t("Reply processor", "回复处理")),
             format!(
@@ -4737,6 +4750,10 @@ fn select_platform_plugins(
             format!(
                 "{}: {meme_collector_state}",
                 t("QQ meme pocket", "QQ 表情口袋")
+            ),
+            format!(
+                "{}: {group_join_approval_state}",
+                t("Group join approval", "入群审批")
             ),
         ];
         draw_menu(
@@ -4758,6 +4775,302 @@ fn select_platform_plugins(
                 1 => edit_real_context(stdout, paths, config)?,
                 2 => edit_message_history(stdout, config)?,
                 3 => edit_meme_collector(stdout, config)?,
+                4 => edit_group_join_approval(stdout, config)?,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn group_join_approval_values(
+    config: &AppConfig,
+) -> Result<(bool, QqGroupJoinApprovalPluginSettings)> {
+    let Some(instance) = config
+        .platforms
+        .qq
+        .plugins
+        .get(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID)
+    else {
+        return Ok((true, QqGroupJoinApprovalPluginSettings::default()));
+    };
+    Ok((
+        instance.enabled_or(true),
+        QqGroupJoinApprovalPluginSettings::from_instance(instance)?,
+    ))
+}
+
+fn apply_group_join_approval_values(
+    config: &mut AppConfig,
+    enabled: bool,
+    settings: &QqGroupJoinApprovalPluginSettings,
+) {
+    let instance = config
+        .platforms
+        .qq
+        .plugins
+        .entry(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID.to_string())
+        .or_default();
+    instance.enabled = (!enabled).then_some(false);
+    merge_group_join_approval_settings(instance, settings);
+}
+
+fn group_join_approval_group_label(group: &QqGroupJoinApprovalGroupConfig) -> String {
+    format!(
+        "{} · {}",
+        group.group_id,
+        if group.approve_condition.is_empty() {
+            t("not set", "未设置")
+        } else {
+            t("set", "已设置")
+        }
+    )
+}
+
+fn edit_group_join_approval_groups(
+    stdout: &mut io::Stdout,
+    settings: &mut QqGroupJoinApprovalPluginSettings,
+) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let mut options = vec![t("+ Add one", "+ 新增一项").to_string()];
+        options.extend(settings.groups.iter().map(group_join_approval_group_label));
+        selected = selected.min(options.len().saturating_sub(1));
+        draw_menu(
+            stdout,
+            t(" GROUP JOIN APPROVAL CONDITIONS ", " 分群审批条件 "),
+            &options,
+            selected,
+            t(
+                "[Enter]configure [Delete]remove [j/k]move [q]back",
+                "[Enter]配置 [Delete]删除 [j/k]移动 [q]返回",
+            ),
+        )?;
+        match read_key()? {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(options.len().saturating_sub(1))
+            }
+            KeyCode::Enter if selected == 0 => {
+                if let Some(group) = prompt_group_join_approval_group(stdout, None)? {
+                    upsert_group_join_approval_group(&mut settings.groups, group);
+                    settings.normalize();
+                }
+            }
+            KeyCode::Enter => {
+                let index = selected - 1;
+                if let Some(group) =
+                    prompt_group_join_approval_group(stdout, settings.groups.get(index).cloned())?
+                {
+                    upsert_group_join_approval_group(&mut settings.groups, group);
+                    settings.normalize();
+                }
+            }
+            KeyCode::Delete | KeyCode::Backspace if selected >= 1 => {
+                settings.groups.remove(selected - 1);
+                selected = selected.min(settings.groups.len());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prompt_group_join_approval_group(
+    stdout: &mut io::Stdout,
+    current: Option<QqGroupJoinApprovalGroupConfig>,
+) -> Result<Option<QqGroupJoinApprovalGroupConfig>> {
+    let current = current.unwrap_or(QqGroupJoinApprovalGroupConfig {
+        group_id: 0,
+        approve_condition: String::new(),
+    });
+    let mut fields = vec![
+        Field::new(
+            t("Group id", "群号"),
+            if current.group_id > 0 {
+                current.group_id.to_string()
+            } else {
+                String::new()
+            },
+        ),
+        Field::textarea(
+            t("Approval condition", "通过条件"),
+            current.approve_condition.clone(),
+        ),
+    ];
+    if !run_form_editing(
+        stdout,
+        t(" GROUP JOIN APPROVAL CONDITION ", " 编辑入群审批条件 "),
+        &mut fields,
+    )? {
+        return Ok(None);
+    }
+    let group_id = match parse_positive_id(&fields[0].value) {
+        Ok(id) => id,
+        Err(error) => {
+            message(stdout, &error)?;
+            return Ok(None);
+        }
+    };
+    let approve_condition = fields[1].value.trim().to_string();
+    if approve_condition.is_empty() {
+        message(
+            stdout,
+            t(
+                "The approval condition cannot be empty.",
+                "通过条件不能为空。",
+            ),
+        )?;
+        return Ok(None);
+    }
+    Ok(Some(QqGroupJoinApprovalGroupConfig {
+        group_id,
+        approve_condition,
+    }))
+}
+
+fn upsert_group_join_approval_group(
+    groups: &mut Vec<QqGroupJoinApprovalGroupConfig>,
+    group: QqGroupJoinApprovalGroupConfig,
+) {
+    if let Some(existing) = groups
+        .iter_mut()
+        .find(|existing| existing.group_id == group.group_id)
+    {
+        *existing = group;
+    } else {
+        groups.push(group);
+    }
+}
+
+fn edit_group_join_approval(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+    let (mut enabled, mut settings) = group_join_approval_values(config)?;
+    let mut selected = 0usize;
+    let mut editing: Option<(usize, String, usize)> = None;
+    loop {
+        let state = if enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
+        let labels = [
+            t("Plugin", "插件状态"),
+            t("Approval timeout seconds", "审批超时秒数"),
+            t("Parse retry count", "解析失败重试次数"),
+            t("Text model pool", "文本模型池"),
+            t("Group approval conditions", "分群审批条件"),
+        ];
+        let options = vec![
+            format!("{}: {state}", labels[0]),
+            format!("{}: {}", labels[1], settings.timeout_seconds),
+            format!("{}: {}", labels[2], settings.max_retries),
+            format!(
+                "{}: {}",
+                labels[3],
+                real_context_model_pool_summary(settings.text_models.as_deref())
+            ),
+            format!(
+                "{}: {} {}",
+                labels[4],
+                settings.groups.len(),
+                t("groups", "个群")
+            ),
+        ];
+        draw_menu_with_editing(
+            stdout,
+            t(" GROUP JOIN APPROVAL ", " 入群审批 "),
+            &options,
+            selected,
+            "",
+            editing
+                .as_ref()
+                .map(|(index, value, cursor)| (*index, labels[*index], value.as_str(), *cursor)),
+        )?;
+        let key = read_key()?;
+        if let Some((_, value, cursor)) = editing.as_mut() {
+            match key {
+                KeyCode::Esc => editing = None,
+                KeyCode::Enter => {
+                    let (index, value, _) = editing.take().unwrap();
+                    let value = value.trim().to_string();
+                    match index {
+                        1 => match value.parse::<u64>() {
+                            Ok(parsed) if (1..=3_600).contains(&parsed) => {
+                                settings.timeout_seconds = parsed;
+                            }
+                            _ => message(
+                                stdout,
+                                t(
+                                    "Timeout must be between 1 and 3600 seconds.",
+                                    "超时秒数必须在 1 到 3600 之间。",
+                                ),
+                            )?,
+                        },
+                        2 => match value.parse::<usize>() {
+                            Ok(parsed) if parsed <= 3 => settings.max_retries = parsed,
+                            _ => message(
+                                stdout,
+                                t(
+                                    "Retry count must be between 0 and 3.",
+                                    "重试次数必须在 0 到 3 之间。",
+                                ),
+                            )?,
+                        },
+                        _ => {}
+                    }
+                }
+                KeyCode::Left => *cursor = cursor.saturating_sub(1),
+                KeyCode::Right => *cursor = (*cursor + 1).min(value.chars().count()),
+                KeyCode::Home => *cursor = 0,
+                KeyCode::End => *cursor = value.chars().count(),
+                KeyCode::Backspace => {
+                    if *cursor > 0 {
+                        remove_char_before_cursor(value, cursor);
+                    }
+                }
+                KeyCode::Delete => remove_char_at_cursor(value, *cursor),
+                KeyCode::Char(character) => insert_char_at_cursor(value, cursor, character),
+                _ => {}
+            }
+            continue;
+        }
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                settings.normalize();
+                let mut candidate = config.clone();
+                apply_group_join_approval_values(&mut candidate, enabled, &settings);
+                candidate.normalize_platform_model_routes();
+                if let Err(error) = candidate.validate() {
+                    message(stdout, &error.to_string())?;
+                    continue;
+                }
+                apply_group_join_approval_values(config, enabled, &settings);
+                config.normalize_platform_model_routes();
+                return Ok(());
+            }
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Enter => match selected {
+                0 => enabled = select_bool(stdout, t("Plugin", "插件状态"), enabled)?,
+                1 => {
+                    let value = settings.timeout_seconds.to_string();
+                    let cursor = value.chars().count();
+                    editing = Some((1, value, cursor));
+                }
+                2 => {
+                    let value = settings.max_retries.to_string();
+                    let cursor = value.chars().count();
+                    editing = Some((2, value, cursor));
+                }
+                3 => select_model_pool(
+                    stdout,
+                    config.text_provider_model_choices(),
+                    &mut settings.text_models,
+                    false,
+                    t(" GROUP JOIN APPROVAL TEXT MODELS ", " 入群审批文本模型 "),
+                    t("Inherit QQ platform model pool", "继承 QQ 平台模型池"),
+                )?,
+                4 => edit_group_join_approval_groups(stdout, &mut settings)?,
                 _ => {}
             },
             _ => {}
@@ -7977,6 +8290,95 @@ fn draw_menu(
     Ok(())
 }
 
+fn draw_menu_with_editing(
+    stdout: &mut io::Stdout,
+    title: &str,
+    options: &[String],
+    selected: usize,
+    status: &str,
+    editing: Option<(usize, &str, &str, usize)>,
+) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let editing_width = editing
+        .map(|(_, label, value, _)| {
+            format!("{label}: {value}")
+                .chars()
+                .count()
+                .saturating_add(2)
+        })
+        .unwrap_or(0);
+    let content_w = options
+        .iter()
+        .map(|option| option.chars().count())
+        .max()
+        .unwrap_or(20)
+        .max(title.chars().count())
+        .max(menu_help(status).chars().count())
+        .max(editing_width)
+        + 6;
+    let width = (content_w as u16).min(cols.saturating_sub(4)).max(56);
+    let height = (options.len() as u16 + 5)
+        .min(rows.saturating_sub(2))
+        .max(7);
+    let x = cols.saturating_sub(width) / 2;
+    let y = rows.saturating_sub(height) / 2;
+    let visible_rows = height.saturating_sub(4).max(1) as usize;
+    let window = menu_window(options.len(), selected, visible_rows);
+    let inner_width = width.saturating_sub(4) as usize;
+
+    queue!(stdout, Clear(ClearType::All))?;
+    draw_box(stdout, x, y, width, height, title)?;
+    let footer = if editing.is_some() {
+        t(
+            "[Enter]save [Esc]cancel [Left/Right/Home/End]edit",
+            "[Enter]保存 [Esc]取消 [Left/Right/Home/End]编辑",
+        )
+    } else {
+        menu_help(status)
+    };
+    queue!(
+        stdout,
+        MoveTo(x + 2, y + height - 1),
+        SetAttribute(Attribute::Dim),
+        Print(truncate(footer, inner_width)),
+        SetAttribute(Attribute::Reset)
+    )?;
+    for (row, index) in window.enumerate() {
+        queue!(stdout, MoveTo(x + 2, y + row as u16 + 2))?;
+        if let Some((edit_index, label, value, cursor)) = editing {
+            if edit_index == index {
+                let prefix = format!("> {label}: ");
+                let before_cursor = format!("{prefix}{}", take_chars(value, cursor));
+                let line = format!("{prefix}{value}");
+                queue!(
+                    stdout,
+                    SetAttribute(Attribute::Reverse),
+                    Print(pad(&line, inner_width)),
+                    SetAttribute(Attribute::Reset),
+                    MoveTo(
+                        x + 2 + display_width(&truncate(&before_cursor, inner_width)) as u16,
+                        y + row as u16 + 2,
+                    ),
+                    Show,
+                )?;
+                continue;
+            }
+        }
+        if index == selected {
+            queue!(
+                stdout,
+                SetAttribute(Attribute::Reverse),
+                Print(pad(&options[index], inner_width)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(stdout, Print(pad(&options[index], inner_width)))?;
+        }
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
 fn menu_window(item_count: usize, selected: usize, visible_rows: usize) -> std::ops::Range<usize> {
     if item_count == 0 || visible_rows == 0 {
         return 0..0;
@@ -8529,18 +8931,20 @@ impl Field {
 mod tests {
     use super::{
         apply_real_context_values, apply_reply_processor_values, choice_display_label,
-        field_display_value, language_choice_label, language_choice_value, menu_window,
-        parse_extra_body, parse_id_lines, parse_id_list, parse_keyword_lines,
-        parse_real_context_identity_lines, parse_real_context_string_lines,
-        platform_conversation_id_label, platform_conversation_kind_label, platform_persona_summary,
-        real_context_values, reply_processor_mode_label, reply_processor_mode_value,
-        reply_processor_values, route_pool_summary, t, thinking_variant_field,
+        field_display_value, group_join_approval_group_label, group_join_approval_values,
+        language_choice_label, language_choice_value, menu_window, parse_extra_body, parse_id_lines,
+        parse_id_list, parse_keyword_lines, parse_real_context_identity_lines,
+        parse_real_context_string_lines, platform_conversation_id_label,
+        platform_conversation_kind_label, platform_persona_summary, real_context_values,
+        reply_processor_mode_label, reply_processor_mode_value, reply_processor_values,
+        route_pool_summary, t, thinking_variant_field, upsert_group_join_approval_group,
         validate_reply_processor_settings, vision_provider_model_choice_values, Field,
         PersonaMenuTarget, ReplyProcessorSettingsForm, REPLY_PROCESSOR_PLUGIN_ID,
     };
     use crate::config::{
         AppConfig, PlatformConversationKind, PlatformModelPoolInheritance, PlatformPersonaOverride,
-        PlatformPluginInstanceConfig, RealContextPluginSettings, REAL_CONTEXT_PLUGIN_ID,
+        PlatformPluginInstanceConfig, QqGroupJoinApprovalGroupConfig, RealContextPluginSettings,
+        REAL_CONTEXT_PLUGIN_ID,
     };
     use crate::llm::ThinkingVariantOptions;
 
@@ -8558,6 +8962,51 @@ mod tests {
 
         assert_eq!(field_display_value(&field, false), "");
     }
+
+    #[test]
+    fn group_join_approval_defaults_to_enabled_with_empty_groups() {
+        let config = AppConfig::default();
+        let (enabled, settings) = group_join_approval_values(&config).unwrap();
+        assert!(enabled);
+        assert!(settings.groups.is_empty());
+        assert_eq!(settings.timeout_seconds, 60);
+        assert_eq!(settings.max_retries, 1);
+        assert!(settings.text_models.is_none());
+    }
+
+    #[test]
+    fn group_join_approval_upsert_keeps_one_entry_per_group() {
+        let mut groups = vec![
+            QqGroupJoinApprovalGroupConfig {
+                group_id: 1,
+                approve_condition: "first".to_string(),
+            },
+            QqGroupJoinApprovalGroupConfig {
+                group_id: 2,
+                approve_condition: "second".to_string(),
+            },
+        ];
+        upsert_group_join_approval_group(
+            &mut groups,
+            QqGroupJoinApprovalGroupConfig {
+                group_id: 1,
+                approve_condition: "replaced".to_string(),
+            },
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0],
+            QqGroupJoinApprovalGroupConfig {
+                group_id: 1,
+                approve_condition: "replaced".to_string(),
+            }
+        );
+        assert!(
+            group_join_approval_group_label(&groups[1]).starts_with("2 · "),
+            "group label should contain the group id"
+        );
+    }
+
 
     #[test]
     fn thinking_variant_field_uses_raw_model_options_and_default_choice() {
