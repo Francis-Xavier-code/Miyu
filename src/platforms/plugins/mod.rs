@@ -1,6 +1,6 @@
 use super::types::{
-    OutboundMessage, OutboundOrigin, PlatformContextImageRef, PlatformConversation,
-    PlatformInboundEvent, SendReceipt, TriggerDecision,
+    OutboundMessage, OutboundOrigin, PlatformContextFileRef, PlatformContextImageRef,
+    PlatformConversation, PlatformInboundEvent, SendReceipt, TriggerDecision,
 };
 use super::PlatformTurnContext;
 use crate::config::AppConfig;
@@ -38,7 +38,7 @@ mod group_management;
 mod meme_collector;
 mod message_history;
 mod message_recall;
-mod real_context;
+pub(crate) mod real_context;
 mod renderer;
 mod reply_processor;
 
@@ -70,6 +70,7 @@ pub(crate) struct PlatformTurnInput {
     /// stays byte-stable no matter how often they come and go.
     pub(crate) turn_system_context: Vec<String>,
     pub(crate) context_images: Vec<PlatformContextImageRef>,
+    pub(crate) context_files: Vec<PlatformContextFileRef>,
 }
 
 pub(crate) struct PlatformPersonaResetContext<'a> {

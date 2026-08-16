@@ -144,6 +144,10 @@ pub(crate) struct MediaPlaceholder {
     pub(crate) kind: MediaKind,
     pub(crate) label: Option<String>,
     pub(crate) mime: Option<String>,
+    /// Provider-side media id retained only for files: `read_platform_file`
+    /// needs it to ask the bridge for a download URL. Never a local path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) media_id: Option<String>,
 }
 
 impl MediaPlaceholder {
@@ -156,7 +160,13 @@ impl MediaPlaceholder {
             kind,
             label: label.map(Into::into),
             mime: mime.map(Into::into),
+            media_id: None,
         }
+    }
+
+    pub(crate) fn with_media_id(mut self, media_id: Option<impl Into<String>>) -> Self {
+        self.media_id = media_id.map(Into::into);
+        self
     }
 
     fn sanitized(mut self) -> Self {
@@ -167,6 +177,10 @@ impl MediaPlaceholder {
         self.mime = self
             .mime
             .map(|value| sanitize_single_line(&value, MAX_MIME_BYTES))
+            .filter(|value| !value.is_empty());
+        self.media_id = self
+            .media_id
+            .map(|value| sanitize_single_line(&value, MAX_IDENTIFIER_BYTES))
             .filter(|value| !value.is_empty());
         self
     }

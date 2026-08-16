@@ -14,11 +14,11 @@ use super::{
     commands, download_capped, markdown_to_plain, resolve_platform_session, run_platform_turn,
     sniff_image_mime, split_reply, BotGroupRole, BotSendAvailability, ConversationKind,
     ForwardNode, OutboundBody, OutboundMessage, OutboundOrigin, OutboundSegment, PartialSendError,
-    PlatformAdapter, PlatformConversation, PlatformFollowupRun, PlatformGroupMember,
-    PlatformImageData, PlatformInboundEvent, PlatformInboundEventKind, PlatformInboundMedia,
-    PlatformMediaKind, PlatformMention, PlatformMessageInfo, PlatformMessagePosition,
-    PlatformPrincipal, PlatformTurnContext, RateDecision, ResponseTarget, SendReceipt,
-    TriggerDecision, TurnDispatch, TurnProfile,
+    PlatformAdapter, PlatformContextFileRef, PlatformConversation, PlatformFileDownload,
+    PlatformFollowupRun, PlatformGroupMember, PlatformImageData, PlatformInboundEvent,
+    PlatformInboundEventKind, PlatformInboundMedia, PlatformMediaKind, PlatformMention,
+    PlatformMessageInfo, PlatformMessagePosition, PlatformPrincipal, PlatformTurnContext,
+    RateDecision, ResponseTarget, SendReceipt, TriggerDecision, TurnDispatch, TurnProfile,
 };
 use crate::config::{
     AppConfig, OneBotConfig, PlatformConversationKind, PlatformRateLimit,
@@ -770,6 +770,7 @@ pub(crate) async fn wake_conversation_for_job(
         turn_system_context,
         memory_content: Some(prepared.memory_content),
         context_images: prepared.context_images,
+        context_files: prepared.context_files.into_boxed_slice(),
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),
         memory_write_enabled: context.config.platforms.qq.memory.write_enabled,
@@ -1054,6 +1055,24 @@ async fn connection_loop(
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
                 handle_message_with_activity(state, handle, frame, ingress_order, activity).await;
+            });
+        } else if is_group_upload_notice(&frame) {
+            let connection_permit = match permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::warn!(target: "miyu::qq",
+                        self_id = bound_self_id,
+                        "{}",
+                        t("OneBot connection concurrency is full; dropping a group upload notice", "OneBot 连接并发已满，丢弃群文件上传通知")
+                    );
+                    continue;
+                }
+            };
+            let state = state.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let _connection_permit = connection_permit;
+                handle_group_file_upload(state, handle, frame).await;
             });
         } else if is_message_recall(&frame) {
             let connection_permit = match permits.clone().try_acquire_owned() {
@@ -1493,6 +1512,49 @@ struct FileRef {
     file_id: Option<String>,
     name: String,
     url: Option<String>,
+}
+
+fn inbound_file_placeholders(
+    message_id: &str,
+    files: &[FileRef],
+) -> (String, Vec<PlatformContextFileRef>) {
+    let mut text = String::new();
+    let mut refs = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let provider_id = file
+            .file_id
+            .clone()
+            .or_else(|| file.url.clone())
+            .unwrap_or_default();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if provider_id.is_empty() {
+            text.push_str(&format!(
+                "[{}: {}]",
+                t("file", "文件"),
+                crate::platforms::plugins::real_context::safe_prompt_field(&file.name)
+            ));
+            continue;
+        }
+        let file_index = index + 1;
+        let id = format!("file_{}_{}", message_id, file_index);
+        text.push_str(&format!(
+            "[{} id={}, label={}]",
+            t("file", "文件"),
+            id,
+            crate::platforms::plugins::real_context::safe_prompt_field(&file.name)
+        ));
+        refs.push(PlatformContextFileRef {
+            id,
+            message_id: message_id.to_string(),
+            file_index,
+            file_id: provider_id,
+            file_name: file.name.clone(),
+            url: file.url.clone(),
+        });
+    }
+    (text, refs)
 }
 
 /// A conversation no other test shares. The delivered-image ledger is
@@ -1949,6 +2011,11 @@ fn is_message_recall(event: &Value) -> bool {
         )
 }
 
+fn is_group_upload_notice(event: &Value) -> bool {
+    event.get("post_type").and_then(Value::as_str) == Some("notice")
+        && event.get("notice_type").and_then(Value::as_str) == Some("group_upload")
+}
+
 fn is_friend_add_request(event: &Value) -> bool {
     event.get("post_type").and_then(Value::as_str) == Some("request")
         && event.get("request_type").and_then(Value::as_str) == Some("friend")
@@ -2077,6 +2144,111 @@ fn recall_event(target: Target, event: &Value, user_id: i64) -> PlatformInboundE
             .map(str::to_string),
         duration_seconds: None,
     }
+}
+
+fn group_upload_event(event: &Value) -> Option<PlatformInboundEvent> {
+    let self_id = event.get("self_id").and_then(Value::as_i64)?;
+    let group_id = event.get("group_id").and_then(Value::as_i64)?;
+    let user_id = event.get("user_id").and_then(Value::as_i64)?;
+    let file = event.get("file")?;
+    let file_id = file.get("id").and_then(Value::as_str).map(str::trim);
+    let file_name = file
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if self_id == 0 || group_id == 0 || user_id == 0 {
+        return None;
+    }
+    let Some(file_id) = file_id.filter(|id| !id.is_empty()) else {
+        return None;
+    };
+    let media_id = file_id.to_string();
+    let message_id = format!(
+        "group_file_{}",
+        file_id
+            .trim_start_matches('/')
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    );
+    Some(PlatformInboundEvent {
+        kind: PlatformInboundEventKind::GroupFileUpload,
+        conversation: platform_conversation(Target::Group { group_id }, self_id),
+        conversation_display_name: None,
+        message_id,
+        sender_id: user_id.to_string(),
+        sender_display_name: String::new(),
+        operator_id: None,
+        timestamp: event.get("time").and_then(Value::as_i64).unwrap_or(0),
+        received_at: Instant::now(),
+        message_position: None,
+        ingress_order: Some(next_ingress_order()),
+        text: String::new(),
+        reply_to_message_id: None,
+        replied_message: None,
+        mentioned_user_ids: Vec::new(),
+        mentioned_users: Vec::new(),
+        mentioned_bot: false,
+        media: vec![PlatformInboundMedia {
+            kind: PlatformMediaKind::File,
+            id: Some(media_id),
+            name: file_name.map(str::to_string),
+            url: None,
+        }],
+        notice_sub_type: None,
+        duration_seconds: None,
+    })
+}
+
+async fn handle_group_file_upload(state: DaemonState, conn: ConnectionHandle, event: Value) {
+    let app_config = state.manager.lock().unwrap().config.clone();
+    let config = &app_config.platforms.qq;
+    if !config.enabled {
+        return;
+    }
+    let self_id = event.get("self_id").and_then(Value::as_i64).unwrap_or(0);
+    let user_id = event.get("user_id").and_then(Value::as_i64).unwrap_or(0);
+    let Some(group_id) = event
+        .get("group_id")
+        .and_then(Value::as_i64)
+        .filter(|group_id| *group_id != 0)
+    else {
+        return;
+    };
+    let Some(mut inbound) = group_upload_event(&event) else {
+        return;
+    };
+    let target = Target::Group { group_id };
+    if !admission_for_with_state(config, &state.state_store, target, self_id, user_id).allowed {
+        return;
+    }
+    let context = match platform_turn_context(
+        &state,
+        conn,
+        target,
+        &event,
+        app_config,
+        Some(inbound.clone()),
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(target: "miyu::qq", error = %error, "{}", t("OneBot group-file observer initialization failed", "OneBot 群文件观察器初始化失败"));
+            return;
+        }
+    };
+    if inbound.sender_display_name.trim().is_empty() {
+        if let Ok(Some(member)) = context.group_member(&inbound.sender_id).await {
+            inbound.sender_display_name = member.display_name().trim().to_string();
+        }
+    }
+    context.observe_inbound(&inbound).await;
 }
 
 fn group_management_notice(event: &Value) -> Option<PlatformInboundEvent> {
@@ -3679,6 +3851,7 @@ fn platform_turn_context_with_activity(
         self_id,
         target,
         max_reply_chars: config.platforms.qq.max_reply_chars,
+        file_store_lock: state.platforms.file_store_lock.clone(),
     });
     let mut context = PlatformTurnContext::new(
         conversation,
@@ -3954,7 +4127,7 @@ fn reserve_tool_followup(
 async fn enqueue_tool_followup(
     state: &DaemonState,
     conn: &ConnectionHandle,
-    target: Target,
+    _target: Target,
     event: &Value,
     mut parsed: InboundMessage,
     inbound_event: &PlatformInboundEvent,
@@ -4008,32 +4181,13 @@ async fn enqueue_tool_followup(
             }
         }
     }
-    for file in &parsed.files {
-        match fetch_inbound_file(state, conn, target, file).await {
-            Ok(path) => {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&format!(
-                    "[{} {} {} {}]",
-                    t("the user sent a file", "用户发来文件"),
-                    file.name,
-                    t("saved at", "已保存于"),
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, file = %file.name, "{}", t("OneBot follow-up file download failed", "OneBot 后续消息文件下载失败"));
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&format!(
-                    "[{}: {}]",
-                    t("file download failed", "文件接收失败"),
-                    file.name
-                ));
-            }
+    let (file_placeholders, queued_files) =
+        inbound_file_placeholders(&current_message_id, &parsed.files);
+    if !file_placeholders.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
         }
+        content.push_str(&file_placeholders);
     }
     if content.is_empty() {
         if !attachments.is_empty() {
@@ -4092,7 +4246,7 @@ async fn enqueue_tool_followup(
     }
 
     context.observe_inbound(inbound_event).await;
-    enqueue_turn_update(
+    let receipt = enqueue_turn_update(
         state,
         TurnUpdateRequest {
             run_id: run_id.to_string(),
@@ -4106,6 +4260,11 @@ async fn enqueue_tool_followup(
             mode,
         },
     )?;
+    if !queued_files.is_empty() {
+        followup
+            .context
+            .stash_queued_files(&receipt.prompt.prompt_id, queued_files);
+    }
     followup.context.accept_followup(inbound_event);
     Ok(())
 }
@@ -4113,7 +4272,7 @@ async fn enqueue_tool_followup(
 async fn build_and_run_turn(
     state: &DaemonState,
     conn: &ConnectionHandle,
-    target: Target,
+    _target: Target,
     event: &Value,
     mut parsed: InboundMessage,
     context: Arc<PlatformTurnContext>,
@@ -4180,34 +4339,17 @@ async fn build_and_run_turn(
         );
     }
 
-    for file in &parsed.files {
-        match fetch_inbound_file(state, conn, target, file).await {
-            Ok(path) => {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&format!(
-                    "[{} {} {} {}]",
-                    t("the user sent a file", "用户发来文件"),
-                    file.name,
-                    t("saved at", "已保存于"),
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, file = %file.name, "{}", t("OneBot file download failed", "OneBot 文件下载失败"));
-                let _ = context
-                    .send_bypass_plugins(OutboundMessage::text(
-                        OutboundOrigin::Command,
-                        format!(
-                            "{}{}",
-                            t("Couldn't fetch the file: ", "文件接收失败："),
-                            file.name
-                        ),
-                    ))
-                    .await;
-            }
+    let inbound_message_id = context
+        .inbound_event()
+        .map(|event| event.message_id.clone())
+        .unwrap_or_default();
+    let (file_placeholders, current_files) =
+        inbound_file_placeholders(&inbound_message_id, &parsed.files);
+    if !file_placeholders.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
         }
+        content.push_str(&file_placeholders);
     }
 
     if content.is_empty() {
@@ -4247,7 +4389,8 @@ async fn build_and_run_turn(
     if context.turn_is_superseded() {
         return Ok(None);
     }
-    let prepared = context.prepare_turn(content).await;
+    let mut prepared = context.prepare_turn(content).await;
+    prepared.context_files.extend(current_files);
     let content = prepared.content;
     let group_name = context
         .inbound_event()
@@ -4293,6 +4436,7 @@ async fn build_and_run_turn(
         turn_system_context,
         memory_content: Some(prepared.memory_content),
         context_images: prepared.context_images,
+        context_files: prepared.context_files.into_boxed_slice(),
         image_cache_namespace: Some("qq".to_string()),
         image_source_label: Some("QQ".to_string()),
         memory_write_enabled: context.config.platforms.qq.memory.write_enabled,
@@ -4367,60 +4511,41 @@ fn legacy_session_name_for(target: Target) -> String {
     }
 }
 
-/// Resolves a download URL for an inbound file (direct, or via the
-/// NapCat file-URL APIs), downloads it capped and saves it under the
-/// data dir. Returns the saved path.
-async fn fetch_inbound_file(
-    state: &DaemonState,
-    conn: &ConnectionHandle,
-    target: Target,
-    file: &FileRef,
-) -> Result<PathBuf> {
-    let url = match &file.url {
-        Some(url) => url.clone(),
-        None => {
-            let file_id = file
-                .file_id
-                .as_deref()
-                .context("the file has no url and no file_id")?;
-            let data = match target {
-                Target::Group { group_id } => {
-                    conn.call_api(
-                        "get_group_file_url",
-                        json!({ "file_id": file_id, "group_id": group_id }),
-                    )
-                    .await?
-                }
-                Target::Private { .. } => {
-                    conn.call_api("get_private_file_url", json!({ "file_id": file_id }))
-                        .await?
-                }
-            };
-            data.get("url")
-                .and_then(Value::as_str)
-                .context("the file-url API returned no url")?
-                .to_string()
+/// QQ files are cached under `<cache>/platform_files/qq/`, never under the
+/// durable data tree. Downloads are lazy: only `read_platform_file` asks for
+/// them, so merely receiving a file costs no disk growth.
+fn platform_file_storage_root(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("platform_files").join("qq")
+}
+
+/// One-time best-effort move of the old eager-download cache from
+/// `<data>/platform_files/` to `<cache>/platform_files/qq/`.
+async fn migrate_legacy_platform_file_cache(paths: &crate::paths::MiyuPaths) {
+    let legacy = paths.data_dir.join("platform_files");
+    if !legacy.exists() {
+        return;
+    }
+    let target = platform_file_storage_root(&paths.cache_dir);
+    let result = async {
+        tokio::fs::create_dir_all(&target).await?;
+        let mut entries = tokio::fs::read_dir(&legacy).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let destination = target.join(entry.file_name());
+            if destination.exists() {
+                continue;
+            }
+            tokio::fs::rename(entry.path(), destination).await?;
         }
-    };
-    let _file_store_guard = state.platforms.file_store_lock.lock().await;
-    ensure_platform_file_capacity(
-        &state.paths.data_dir,
-        MAX_INBOUND_FILE_BYTES as u64,
-        PLATFORM_FILE_STORAGE_BYTES,
-        PLATFORM_FILE_STORAGE_ENTRIES,
-        PLATFORM_FILE_TTL,
-    )
-    .await?;
-    let http = state.platforms.http_client()?;
-    download_platform_file_capped(
-        &http,
-        &url,
-        &state.paths.data_dir,
-        &file.name,
-        MAX_INBOUND_FILE_BYTES,
-        FILE_DOWNLOAD_TIMEOUT,
-    )
-    .await
+        let _ = tokio::fs::remove_dir(&legacy).await;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(error = %error, legacy = %legacy.display(), "legacy platform file cache migration incomplete");
+    }
 }
 
 async fn ensure_platform_file_capacity(
@@ -4430,7 +4555,7 @@ async fn ensure_platform_file_capacity(
     max_entries: usize,
     ttl: Duration,
 ) -> Result<()> {
-    let dir = data_dir.join("platform_files");
+    let dir = platform_file_storage_root(data_dir);
     tokio::fs::create_dir_all(&dir).await?;
     let mut entries = tokio::fs::read_dir(&dir).await?;
     let mut bytes = 0_u64;
@@ -4514,7 +4639,7 @@ async fn download_platform_file_capped(
     Ok(path)
 }
 
-/// Saves inbound bytes under `<data_dir>/platform_files/`, keeping only
+/// Saves inbound bytes under `<cache>/platform_files/qq/`, keeping only
 /// the basename (no path traversal) and suffixing on collision.
 async fn save_platform_file(
     data_dir: &std::path::Path,
@@ -4534,7 +4659,7 @@ async fn create_platform_file(
     data_dir: &std::path::Path,
     name: &str,
 ) -> Result<(PathBuf, tokio::fs::File)> {
-    let dir = data_dir.join("platform_files");
+    let dir = platform_file_storage_root(data_dir);
     tokio::fs::create_dir_all(&dir).await?;
     let safe = sanitize_file_name(name);
     for counter in 0..=1000 {
@@ -5214,6 +5339,7 @@ struct OneBotAdapter {
     self_id: i64,
     target: Target,
     max_reply_chars: usize,
+    file_store_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn onebot_id_value(value: &str) -> Value {
@@ -5554,6 +5680,14 @@ impl PlatformAdapter for OneBotAdapter {
         })
     }
 
+    fn fetch_platform_file<'a>(
+        &'a self,
+        file_ref: &'a PlatformContextFileRef,
+        paths: &'a crate::paths::MiyuPaths,
+    ) -> BoxFuture<'a, Result<PlatformFileDownload>> {
+        Box::pin(async move { self.fetch_platform_file_impl(file_ref, paths).await })
+    }
+
     fn group_members<'a>(&'a self) -> BoxFuture<'a, Result<Vec<PlatformGroupMember>>> {
         Box::pin(async move {
             let Target::Group { group_id } = self.target else {
@@ -5746,6 +5880,64 @@ impl OneBotAdapter {
             .unwrap()
             .handle(self.self_id)
             .unwrap_or_else(|| self.conn.clone())
+    }
+
+    async fn fetch_platform_file_impl(
+        &self,
+        file_ref: &PlatformContextFileRef,
+        paths: &crate::paths::MiyuPaths,
+    ) -> Result<PlatformFileDownload> {
+        migrate_legacy_platform_file_cache(paths).await;
+        let url = if let Some(url) = file_ref.url.as_deref() {
+            url.to_string()
+        } else {
+            let (action, params) = match self.target {
+                Target::Group { group_id } => (
+                    "get_group_file_url",
+                    json!({ "group_id": group_id, "file_id": file_ref.file_id }),
+                ),
+                Target::Private { user_id } => (
+                    "get_private_file_url",
+                    json!({ "user_id": user_id, "file_id": file_ref.file_id }),
+                ),
+            };
+            let data = self
+                .connection()
+                .call_api_with_timeout(action, params, FILE_DOWNLOAD_TIMEOUT)
+                .await?;
+            data.get("url")
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .context("the platform file URL API returned no usable url")?
+                .to_string()
+        };
+        let _file_store_guard = self.file_store_lock.lock().await;
+        ensure_platform_file_capacity(
+            &paths.cache_dir,
+            MAX_INBOUND_FILE_BYTES as u64,
+            PLATFORM_FILE_STORAGE_BYTES,
+            PLATFORM_FILE_STORAGE_ENTRIES,
+            PLATFORM_FILE_TTL,
+        )
+        .await?;
+        let path = download_platform_file_capped(
+            &self.http,
+            &url,
+            &paths.cache_dir,
+            &file_ref.file_name,
+            MAX_INBOUND_FILE_BYTES,
+            FILE_DOWNLOAD_TIMEOUT,
+        )
+        .await?;
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(PlatformFileDownload {
+            path,
+            name: file_ref.file_name.clone(),
+            size,
+        })
     }
 
     async fn send_message(&self, message: OutboundMessage) -> Result<SendReceipt> {
@@ -7020,6 +7212,58 @@ mod tests {
             &prepared.attachments[1],
             Some(ImageAttachment::Binary { mime, .. }) if mime == "image/jpeg"
         ));
+    }
+
+    #[test]
+    fn inbound_file_placeholders_are_lazy_and_carry_provider_refs() {
+        let files = vec![FileRef {
+            file_id: Some("/file-id".to_string()),
+            name: "README.md".to_string(),
+            url: Some("https://example.invalid/README.md".to_string()),
+        }];
+        let (text, refs) = inbound_file_placeholders("msg-1", &files);
+        assert!(text.contains("file_msg-1_1"));
+        assert!(text.contains("README.md"));
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].file_id, "/file-id");
+        assert_eq!(
+            refs[0].url.as_deref(),
+            Some("https://example.invalid/README.md")
+        );
+    }
+
+    #[test]
+    fn group_upload_notice_becomes_a_file_history_event() {
+        let event = json!({
+            "post_type": "notice",
+            "notice_type": "group_upload",
+            "time": 1786691192,
+            "self_id": 10000,
+            "group_id": 130515,
+            "user_id": 29313,
+            "file": {
+                "id": "/8b25e30e-8ee2-4223-9e30-fd45ee24c797",
+                "name": "配置.txt",
+                "size": 11035,
+                "busid": 102
+            }
+        });
+        let inbound = group_upload_event(&event).expect("group upload notice should parse");
+        assert_eq!(inbound.kind, PlatformInboundEventKind::GroupFileUpload);
+        assert_eq!(inbound.sender_id, "29313");
+        assert_eq!(inbound.timestamp, 1786691192);
+        assert_eq!(
+            inbound.message_id,
+            "group_file_8b25e30e-8ee2-4223-9e30-fd45ee24c797"
+        );
+        assert_eq!(inbound.media.len(), 1);
+        assert_eq!(inbound.media[0].kind, PlatformMediaKind::File);
+        assert_eq!(
+            inbound.media[0].id.as_deref(),
+            Some("/8b25e30e-8ee2-4223-9e30-fd45ee24c797")
+        );
+        assert_eq!(inbound.media[0].name.as_deref(), Some("配置.txt"));
+        assert!(inbound.ingress_order.is_some());
     }
 
     #[test]
@@ -9022,6 +9266,7 @@ mod tests {
             self_id: 10000,
             target,
             max_reply_chars: 0,
+            file_store_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

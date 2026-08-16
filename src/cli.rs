@@ -644,8 +644,8 @@ fn localize_subcommands(mut command: clap::Command) -> clap::Command {
         ),
         (
             "tool-call",
-            "Tool bridge: call AI tools from the command line",
-            "工具桥：通过命令行调用 AI 工具",
+            "Tool bridge: call this session's AI tools from the command line",
+            "工具桥：以本会话身份调用 AI 工具",
         ),
         (
             "init",
@@ -1207,6 +1207,9 @@ pub struct ToolArgs {
     pub arguments: Option<String>,
 }
 
+/// 工具桥:以本会话身份(MIYU_SESSION)调用结构化工具。--list 列出的即
+/// 本会话可调用的集合;内层调用在 daemon 侧的会话工作区执行,不继承本
+/// shell 的环境变量与当前目录,跨工具传数据走参数 JSON 或文件。
 #[derive(Debug, Args)]
 pub struct ToolCallArgs {
     /// 工具名(--list 时可省略)
@@ -1219,7 +1222,7 @@ pub struct ToolCallArgs {
     /// 从文件读参数 JSON
     #[arg(long)]
     pub args_file: Option<std::path::PathBuf>,
-    /// 列出当前可用工具(名称+显示名)
+    /// 列出本会话当前可调用的工具(名称+显示名)
     #[arg(long)]
     pub list: bool,
     /// 打印指定工具的完整合同(描述+参数 schema)
@@ -2717,10 +2720,79 @@ async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs) -> Result<()> {
         AgentMode::Normal
     };
     if args.list || args.describe {
+        if args.describe && args.name.is_none() {
+            bail!("--describe 需要工具名");
+        }
+        // daemon 存活时目录走 IPC:与 ToolCall 同一条会话→模式→registry
+        // 解析链,--list 列出的就是本会话真能调的集合。此前本地建表按
+        // MIYU_TURN_MODE 环境变量定模式(run_command 并不注入它),dev 会话
+        // 里 --list 展示普通人格全量目录,实测逐个调用全报 unknown tool。
+        if ipc::daemon_info(paths).await.is_some() {
+            let session = std::env::var("MIYU_SESSION").ok().filter(|s| !s.is_empty());
+            let (_, data) = send_ipc_admin(
+                paths,
+                IpcCommand::ToolCatalog {
+                    session,
+                    name: args.describe.then(|| args.name.clone()).flatten(),
+                },
+            )
+            .await?;
+            let mode_label = data
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            if args.list {
+                let tools = data
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                // 来源说明走 stderr,stdout 保持纯 name\tdisplay 供脚本管道。
+                eprintln!(
+                    "{}",
+                    if is_zh() {
+                        format!("# 本会话目录({mode_label} 模式,{} 个工具);列出即可调用", tools.len())
+                    } else {
+                        format!("# session catalog ({mode_label} mode, {} tools); listed = callable", tools.len())
+                    }
+                );
+                for tool in &tools {
+                    let name = tool
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    match tool
+                        .get("display_name")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|display| !display.is_empty())
+                    {
+                        Some(display) => println!("{name}\t{display}"),
+                        None => println!("{name}"),
+                    }
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        data.get("tool").unwrap_or(&serde_json::Value::Null)
+                    )?
+                );
+            }
+            return Ok(());
+        }
+        // 直连回退:本地建表,与下方调用回退同一构建方式,依旧同源。
         let registry = build_tool_registry(&config, paths, mode, false)?;
         if args.list {
             let mut names = registry.tool_names();
             names.sort();
+            eprintln!(
+                "{}",
+                if is_zh() {
+                    format!("# 直连目录(daemon 不在,{} 个工具)", names.len())
+                } else {
+                    format!("# direct catalog (daemon absent, {} tools)", names.len())
+                }
+            );
             for name in names {
                 let display = registry.display_name(&name).unwrap_or_default();
                 if display.is_empty() {
@@ -2731,11 +2803,9 @@ async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs) -> Result<()> {
             }
             return Ok(());
         }
-        let Some(name) = args.name.as_deref() else {
-            bail!("--describe 需要工具名");
-        };
+        let name = args.name.as_deref().expect("checked above");
         let Some(spec) = registry.get(name) else {
-            bail!("unknown tool: {name}");
+            return Err(registry.unknown_tool_error(name));
         };
         println!(
             "{}",
@@ -2798,6 +2868,16 @@ async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs) -> Result<()> {
         bail!("tool bridge recursion limit reached (depth {depth})");
     }
     let registry = build_tool_registry(&config, paths, mode, false)?;
+    if !registry.contains(&name) {
+        bail!(
+            "{:#}. {}",
+            registry.unknown_tool_error(&name),
+            t(
+                "run `miyu tool-call --list` to see tools callable in this session",
+                "用 `miyu tool-call --list` 查看本会话可调用的工具"
+            )
+        );
+    }
     let turn_origin: crate::tools::workspace::TurnOrigin = origin
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())

@@ -12,7 +12,7 @@ use crate::llm::{
 use crate::memory::{EvictedTurn, MemoryAccess, MemoryOrganizerHandle, MemoryOrigin, MemoryStore};
 use crate::paths::MiyuPaths;
 use crate::persona_hint;
-use crate::platforms::{PlatformContextImageRef, PlatformTurnContext};
+use crate::platforms::{PlatformContextFileRef, PlatformContextImageRef, PlatformTurnContext};
 use crate::question::{
     answered_tool_output, closed_tool_output, unavailable_tool_output, QuestionCancelled,
     QuestionExchange, QuestionRequest, QuestionResponse,
@@ -926,6 +926,9 @@ pub struct Agent {
     image_platform_label: Option<String>,
     platform_context: Option<Arc<PlatformTurnContext>>,
     context_images: Vec<PlatformContextImageRef>,
+    /// Files from structured platform history that `read_platform_file` may
+    /// resolve by their context id in this turn.
+    context_files: Vec<PlatformContextFileRef>,
     /// 本回合的浮动尾部人格提醒全文。只追加进发送副本
     /// `request_messages`,永不进 `messages`,因此不化石化、不落库——
     /// 见 persona_hint 模块头注释。
@@ -1066,6 +1069,7 @@ impl Agent {
             image_platform_label: None,
             platform_context: None,
             context_images: Vec::new(),
+            context_files: Vec::new(),
             persona_reminder: None,
             repeat_chain: crate::tools::repeat_reminder::RepeatChain::default(),
             preset_dialogs,
@@ -1298,6 +1302,19 @@ impl Agent {
     ) {
         self.platform_context = Some(context);
         self.context_images = images;
+    }
+
+    pub(crate) fn set_platform_context_files(
+        &mut self,
+        context: Arc<PlatformTurnContext>,
+        files: Vec<PlatformContextFileRef>,
+    ) {
+        self.platform_context = Some(context.clone());
+        self.context_files = files.clone();
+        if self.tools_enabled {
+            let mut tools = self.tools.lock().unwrap();
+            crate::platforms::file_reader::register(&mut tools, context, files);
+        }
     }
 
     pub fn set_turn_persistence(
@@ -1614,6 +1631,15 @@ impl Agent {
                 .filter(|model| !model.trim().is_empty()),
             checkpoint,
         )?;
+        for (prompt, _) in &prepared {
+            if let Some(context) = self.platform_context.clone() {
+                let files = context.take_queued_files(&prompt.prompt_id);
+                if !files.is_empty() {
+                    self.context_files.extend(files);
+                    self.set_platform_context_files(context, self.context_files.clone());
+                }
+            }
+        }
         on_event(AgentEvent::QueuedPromptsConsumed {
             prompt_ids: consumed.iter().map(|(id, _)| id.clone()).collect(),
             mode,

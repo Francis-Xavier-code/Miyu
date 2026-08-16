@@ -2803,6 +2803,18 @@ async fn handle_session_command(
             let config = { state.manager.lock().unwrap().config.clone() };
             let registry = crate::cli::build_tool_registry(&config, &state.paths, mode, false)
                 .map_err(|error| safe_error_message(&error))?;
+            if !registry.contains(&name) {
+                // 桥专属报错:dev 实测里裸 "unknown tool" 让脚本作者盲试了
+                // 一轮,这里把近似建议和"查目录"的路标一并给出。
+                return Err(format!(
+                    "tool error: {:#}. {}",
+                    registry.unknown_tool_error(&name),
+                    t(
+                        "run `miyu tool-call --list` to see tools callable in this session",
+                        "用 `miyu tool-call --list` 查看本会话可调用的工具"
+                    )
+                ));
+            }
             let turn_origin: crate::tools::workspace::TurnOrigin = origin
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok())
@@ -2829,6 +2841,57 @@ async fn handle_session_command(
             .await
             .map_err(|error| format!("tool error: {error:#}"))?;
             Ok(json!({ "output": output }))
+        }
+        IpcCommand::ToolCatalog { session, name } => {
+            // 与 ToolCall 同一条解析链(会话→模式→registry):`--list` 列出的
+            // 就是本会话真能调的集合,`--describe` 查的合同也同源。此前
+            // 客户端本地建表(按 MIYU_TURN_MODE 环境变量,run_command 并不
+            // 注入它),dev 会话里 --list 展示的是普通人格全量目录,实测
+            // 逐个调用全报 unknown tool。
+            let session_id = match session {
+                Some(session) => {
+                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
+                        .session_id
+                }
+                None => store.session_id().to_string(),
+            };
+            let mode = turn_mode_for_session(store, &session_id, AgentMode::Normal);
+            let config = { state.manager.lock().unwrap().config.clone() };
+            let registry = crate::cli::build_tool_registry(&config, &state.paths, mode, false)
+                .map_err(|error| safe_error_message(&error))?;
+            let mode_label = match mode {
+                AgentMode::Dev => "dev",
+                AgentMode::Normal => "normal",
+            };
+            match name {
+                Some(name) => {
+                    let Some(spec) = registry.get(&name) else {
+                        return Err(format!("{:#}", registry.unknown_tool_error(&name)));
+                    };
+                    Ok(json!({
+                        "mode": mode_label,
+                        "tool": {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": spec.parameters,
+                        },
+                    }))
+                }
+                None => {
+                    let mut names = registry.tool_names();
+                    names.sort();
+                    let tools = names
+                        .iter()
+                        .map(|name| {
+                            json!({
+                                "name": name,
+                                "display_name": registry.display_name(name),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(json!({ "mode": mode_label, "tools": tools }))
+                }
+            }
         }
         IpcCommand::SetReplSession { target } => {
             let record = resolve_available_local_session_ref(state, &target)?;
@@ -6714,7 +6777,8 @@ async fn run_turn_task(
                 });
             }
             if let Some(context) = profile.platform.clone() {
-                agent.set_platform_context_images(context, profile.context_images.clone());
+                agent.set_platform_context_images(context.clone(), profile.context_images.clone());
+                agent.set_platform_context_files(context, profile.context_files.to_vec());
             }
         }
         if let Some(organizer) = memory_organizer.clone() {
@@ -10951,6 +11015,98 @@ mod tests {
         .await
         .unwrap_err();
         assert!(denied.contains("recursion limit"));
+    }
+
+    /// 目录↔调用同源(dev 实测回归):--list 走的 ToolCatalog 与 ToolCall
+    /// 同一条会话→模式→registry 解析链;dev 目录=dev registry,普通会话
+    /// 反之;未列出的名字调用报 unknown + `--list` 路标。
+    #[tokio::test]
+    async fn tool_catalog_matches_the_bridge_callable_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = DaemonState::for_test(test_paths(temp.path()), 8300).unwrap();
+        let data = handle_session_command(
+            &state,
+            IpcCommand::CreateSession {
+                name: Some("dev bridge".to_string()),
+                switch: false,
+                kind: None,
+                mode: Some("dev".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let dev_session = data["session"]["session_id"].as_str().unwrap().to_string();
+
+        let catalog = handle_session_command(
+            &state,
+            IpcCommand::ToolCatalog {
+                session: Some(dev_session.clone()),
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog["mode"], "dev");
+        let names = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"run_command"), "{names:?}");
+        assert!(names.contains(&"apply_patch"), "{names:?}");
+        assert!(
+            !names.contains(&"trash_path"),
+            "dev 目录不应混入普通人格工具: {names:?}"
+        );
+
+        // 未列出的名字调用即报 unknown,且带 --list 路标。
+        let denied = handle_session_command(
+            &state,
+            IpcCommand::ToolCall {
+                session: Some(dev_session.clone()),
+                name: "trash_path".to_string(),
+                arguments: "{}".to_string(),
+                origin: None,
+                depth: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("unknown tool"), "{denied}");
+        assert!(denied.contains("--list"), "{denied}");
+
+        // 普通会话(缺省=当前会话)目录反之。
+        let catalog = handle_session_command(
+            &state,
+            IpcCommand::ToolCatalog {
+                session: None,
+                name: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog["mode"], "normal");
+        let names = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"trash_path"), "{names:?}");
+
+        // describe 同源返回完整合同。
+        let described = handle_session_command(
+            &state,
+            IpcCommand::ToolCatalog {
+                session: Some(dev_session),
+                name: Some("run_command".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(described["tool"]["name"], "run_command");
+        assert!(described["tool"]["parameters"]["properties"]["command"].is_object());
     }
 
     #[tokio::test]

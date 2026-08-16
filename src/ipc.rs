@@ -382,6 +382,15 @@ pub enum Command {
         #[serde(default)]
         depth: u32,
     },
+    /// 工具桥目录:`--list/--describe` 与 ToolCall 同一条解析链(会话→
+    /// 模式→registry),杜绝"--list 列全量、调用却 unknown tool"的错位
+    /// (dev 会话实测踩坑)。name=None 列全表,Some(name) 查单个合同。
+    ToolCatalog {
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     RenameSession {
         target: SessionRef,
         name: String,

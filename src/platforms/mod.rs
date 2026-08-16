@@ -10,6 +10,7 @@ mod access_control;
 mod assets;
 pub(crate) mod avatar;
 pub(crate) mod commands;
+pub(crate) mod file_reader;
 pub(crate) mod onebot;
 pub(crate) mod plugins;
 mod tool;
@@ -18,10 +19,10 @@ mod types;
 pub(crate) use types::{
     BotGroupRole, BotSendAvailability, ConversationKind, ForwardNode, OutboundBody,
     OutboundMessage, OutboundOrigin, OutboundSegment, PartialSendError, PlatformAdapter,
-    PlatformContextImageRef, PlatformConversation, PlatformGroupMember, PlatformImageData,
-    PlatformInboundEvent, PlatformInboundEventKind, PlatformInboundMedia, PlatformMediaKind,
-    PlatformMention, PlatformMessageInfo, PlatformMessagePosition, PlatformPrincipal,
-    ResponseTarget, SendReceipt, TriggerDecision,
+    PlatformContextFileRef, PlatformContextImageRef, PlatformConversation, PlatformFileDownload,
+    PlatformGroupMember, PlatformImageData, PlatformInboundEvent, PlatformInboundEventKind,
+    PlatformInboundMedia, PlatformMediaKind, PlatformMention, PlatformMessageInfo,
+    PlatformMessagePosition, PlatformPrincipal, ResponseTarget, SendReceipt, TriggerDecision,
 };
 
 use crate::agent::{AgentMode, QueueIngressBarrier, QueueIngressReservation};
@@ -555,6 +556,7 @@ pub(crate) struct TurnProfile {
     /// keeps the agent's default of recording the turn content as-is.
     pub(crate) memory_content: Option<String>,
     pub(crate) context_images: Vec<PlatformContextImageRef>,
+    pub(crate) context_files: Box<[PlatformContextFileRef]>,
     pub(crate) platform: Option<Arc<PlatformTurnContext>>,
     pub(crate) image_cache_namespace: Option<String>,
     pub(crate) image_source_label: Option<String>,
@@ -577,6 +579,7 @@ impl Default for TurnProfile {
             turn_system_context: Vec::new(),
             memory_content: None,
             context_images: Vec::new(),
+            context_files: Vec::new().into_boxed_slice(),
             platform: None,
             image_cache_namespace: None,
             image_source_label: None,
@@ -647,6 +650,8 @@ pub(crate) struct PlatformTurnContext {
     group_member_cache: Mutex<HashMap<String, PlatformGroupMember>>,
     plugin_values: Mutex<BTreeMap<String, Value>>,
     delivered_image_digests: Mutex<HashSet<blake3::Hash>>,
+    /// Lazy file refs for queued follow-up prompts, keyed by prompt id.
+    queued_files: Mutex<BTreeMap<String, Vec<PlatformContextFileRef>>>,
     reply_rate_available: AtomicBool,
     pending_final_reply_suppression: AtomicBool,
     pending_prior_reply_suppression: AtomicBool,
@@ -682,6 +687,7 @@ impl PlatformTurnContext {
             group_member_cache: Mutex::new(HashMap::new()),
             plugin_values: Mutex::new(BTreeMap::new()),
             delivered_image_digests: Mutex::new(HashSet::new()),
+            queued_files: Mutex::new(BTreeMap::new()),
             reply_rate_available: AtomicBool::new(true),
             pending_final_reply_suppression: AtomicBool::new(false),
             pending_prior_reply_suppression: AtomicBool::new(false),
@@ -878,6 +884,7 @@ impl PlatformTurnContext {
             system_context: Vec::new(),
             turn_system_context: Vec::new(),
             context_images: Vec::new(),
+            context_files: Vec::new(),
         };
         self.plugins.before_turn(self, &mut input).await;
         input
@@ -1206,6 +1213,33 @@ impl PlatformTurnContext {
                 .map(|member| (member.user_id.clone(), member)),
         );
         Ok(members)
+    }
+
+    /// Store lazy file refs for a queued prompt until the running agent claims
+    /// them before its next model request.
+    pub(crate) fn stash_queued_files(&self, prompt_id: &str, files: Vec<PlatformContextFileRef>) {
+        self.queued_files
+            .lock()
+            .unwrap()
+            .insert(prompt_id.to_string(), files);
+    }
+
+    pub(crate) fn take_queued_files(&self, prompt_id: &str) -> Vec<PlatformContextFileRef> {
+        self.queued_files
+            .lock()
+            .unwrap()
+            .remove(prompt_id)
+            .unwrap_or_default()
+    }
+
+    /// Resolve one `read_platform_file` context id into a locally cached file.
+    pub(crate) async fn fetch_platform_file(
+        &self,
+        file_ref: &PlatformContextFileRef,
+    ) -> Result<PlatformFileDownload> {
+        self.adapter
+            .fetch_platform_file(file_ref, &self.paths)
+            .await
     }
 
     pub(crate) async fn group_member(&self, user_id: &str) -> Result<Option<PlatformGroupMember>> {

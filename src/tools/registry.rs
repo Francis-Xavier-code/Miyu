@@ -540,7 +540,7 @@ impl ToolRegistry {
 
     pub async fn call(&self, name: &str, arguments: &str) -> Result<String> {
         let Some(tool) = self.tools.get(name) else {
-            bail!("unknown tool: {name}");
+            return Err(self.unknown_tool_error(name));
         };
         let args = if arguments.trim().is_empty() {
             json!({})
@@ -572,7 +572,7 @@ impl ToolRegistry {
         guard_ctx: &GuardCtx,
     ) -> Result<ToolFuture> {
         let Some(tool) = self.tools.get(name) else {
-            bail!("unknown tool: {name}");
+            return Err(self.unknown_tool_error(name));
         };
         let args = if arguments.trim().is_empty() {
             json!({})
@@ -616,6 +616,50 @@ impl ToolRegistry {
 
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
+    }
+
+    /// 拼错工具名时的近似候选:子串命中优先,其余按编辑距离,太远不猜。
+    /// 供 unknown-tool 报错引导用(dev 实测:裸报错会让调用方盲试一轮)。
+    pub fn suggest_similar(&self, name: &str) -> Vec<String> {
+        let needle = name.to_ascii_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut scored = self
+            .tools
+            .keys()
+            .filter_map(|candidate| {
+                let hay = candidate.to_ascii_lowercase();
+                let score = if hay.contains(&needle) || needle.contains(&hay) {
+                    0
+                } else {
+                    let distance = levenshtein(&needle, &hay);
+                    if distance > needle.len().max(3) / 3 + 1 {
+                        return None;
+                    }
+                    distance
+                };
+                Some((score, candidate))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .take(3)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    pub fn unknown_tool_error(&self, name: &str) -> anyhow::Error {
+        let suggestions = self.suggest_similar(name);
+        if suggestions.is_empty() {
+            anyhow::anyhow!("unknown tool: {name}")
+        } else {
+            anyhow::anyhow!(
+                "unknown tool: {name} (did you mean: {}?)",
+                suggestions.join(", ")
+            )
+        }
     }
 
     pub(crate) fn loadable_tools(&self, loaded: &BTreeSet<String>) -> Vec<&ToolSpec> {
@@ -850,6 +894,25 @@ fn load_target_summary(description: &str) -> String {
     summary
 }
 
+/// 经典两行 DP 编辑距离,只服务 suggest_similar 的小字符串,不引依赖。
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, ch_a) in a.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, ch_b) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ch_a != ch_b);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -909,6 +972,34 @@ mod tests {
         registry.register(sleeping_tool("tight_tool", 5).with_timeout_seconds(1));
         let error = registry.call("tight_tool", "{}").await.unwrap_err();
         assert!(error.to_string().contains("1"));
+    }
+
+    /// unknown tool 报错带近似建议:拼错给候选,子串命中优先,毫不相干
+    /// 不硬猜(dev 实测:裸报错会让桥调用方盲试一轮)。
+    #[tokio::test]
+    async fn unknown_tool_error_suggests_near_matches() {
+        let mut registry = ToolRegistry::new();
+        registry.register(sleeping_tool("run_command", 0));
+        registry.register(sleeping_tool("web_search", 0));
+        registry.register(sleeping_tool("web_fetch", 0));
+        let error = registry
+            .call("run_comand", "{}")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown tool: run_comand"), "{error}");
+        assert!(error.contains("run_command"), "{error}");
+        let subs = registry.suggest_similar("web");
+        assert!(
+            subs.contains(&"web_search".to_string()) && subs.contains(&"web_fetch".to_string()),
+            "{subs:?}"
+        );
+        let error = registry
+            .call("totally_unrelated_zzz", "{}")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unknown tool: totally_unrelated_zzz");
     }
 
     /// AUR 互斥迁入 guard 后语义不变:同轮先 review 再 install 被拒,

@@ -319,9 +319,9 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 - [Claude Code](https://github.com/anthropics/claude-code)
 - [Pi](https://github.com/earendil-works/pi)
 - [Deepseek-Reasonix](https://github.com/esengine/deepseek-reasonix)
+- [Deeepseek-Harness](https://github.com/deepseek-ai/deepseek-harness)
 - [Astrbot](https://github.com/AstrBotDevs/AstrBot) 
 - [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 
-
 
 #### 插件设计参考
 
@@ -331,7 +331,6 @@ Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.json
 - [Railgun19457/astrbot_plugin_image_generation](Railgun19457/astrbot_plugin_image_generation)
 - [xiewoc/astrbot_plugin_weather_wttr_in](xiewoc/astrbot_plugin_weather_wttr_in)
 - [muyouzhi6/astrbot_plugin_recall_cancel](muyouzhi6/astrbot_plugin_recall_cancel)
-- []()
 
 ## 许可
 

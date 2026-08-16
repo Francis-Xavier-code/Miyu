@@ -10,3 +10,4 @@
 *.pkg.tar.zst
 *.part
 *.old
+.claude
