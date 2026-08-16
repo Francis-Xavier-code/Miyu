@@ -511,6 +511,11 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());
     }
+    if config.plugins.vision.enabled {
+        // 看图对 coding 是刚需(UI 截图排错、设计稿、测试产出的图表);
+        // 聊天模型不带眼睛时由 vision 插件路由给专用视觉模型。
+        vision::register(&mut registry, config.clone(), paths.clone(), true);
+    }
     if config.memory_config().enabled {
         // dev 独立记忆:同一套工具,库切到保留人格 "dev" 的命名空间,
         // 与默认人格的记忆互不可见(验收问题一:开发模式也要有记忆)。
@@ -568,6 +573,23 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归:dev 模式要有看图(vision_analyze),且随 vision 插件开关走。
+    #[test]
+    fn dev_registry_vision_follows_plugin_switch() {
+        let paths = crate::paths::MiyuPaths::new().unwrap();
+        let mut config = crate::config::AppConfig::default();
+        let names = |registry: &ToolRegistry| -> Vec<String> {
+            registry
+                .definitions()
+                .iter()
+                .map(|d| d.function.name.clone())
+                .collect()
+        };
+        assert!(names(&dev_registry(&config, &paths)).contains(&"vision_analyze".to_string()));
+        config.plugins.vision.enabled = false;
+        assert!(!names(&dev_registry(&config, &paths)).contains(&"vision_analyze".to_string()));
+    }
 
     fn test_paths(root: &std::path::Path) -> MiyuPaths {
         MiyuPaths {
