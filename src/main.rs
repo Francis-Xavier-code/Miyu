@@ -12,6 +12,7 @@ mod default_models;
 mod host_info;
 mod i18n;
 mod ipc;
+mod json_extract;
 mod llm;
 mod logging;
 mod memory;

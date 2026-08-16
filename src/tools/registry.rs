@@ -398,10 +398,15 @@ impl ToolRegistry {
             if !names.insert(script.name.clone()) {
                 bail!("duplicate script id: {}", script.name);
             }
+            // occupant 是否脚本按注册表现状判断,不依赖 script_tool_names:
+            // 脚本先注册、同名 MCP 工具后覆盖时,名单还挂着旧名字,按名单
+            // 判会把 MCP 工具当成脚本顶掉。
             if script.name == "load_tools"
                 || crate::tools::tool_descriptions::get(&script.name).is_some()
-                || (self.tools.contains_key(&script.name)
-                    && !self.script_tool_names.contains(&script.name))
+                || self
+                    .tools
+                    .get(&script.name)
+                    .is_some_and(|tool| !tool.is_script)
             {
                 continue;
             }
@@ -409,7 +414,9 @@ impl ToolRegistry {
         }
 
         for name in &self.script_tool_names {
-            self.tools.remove(name);
+            if self.tools.get(name).is_some_and(|tool| tool.is_script) {
+                self.tools.remove(name);
+            }
         }
         self.script_tool_names.clear();
 

@@ -4318,6 +4318,10 @@ fn inline_fuzzy_select_single(items: &[String], initial: usize) -> Result<Option
     let mut query = String::new();
     let mut selected = 0usize;
     let mut scroll = 0usize;
+    // initial 恒被标记,此前 Enter 无脑取 marked 导致"搜索后回车选不中
+    // 高亮项":只有用户 Tab 过才尊重标记,否则搜索/移动后回车确认高亮项。
+    let mut marked_by_user = false;
+    let mut navigated = false;
     let (_, cursor_y) = cursor::position().unwrap_or((0, menu_lines.saturating_sub(1)));
     let anchor_y = cursor_y.saturating_sub(menu_lines.saturating_sub(1));
     loop {
@@ -4361,8 +4365,14 @@ fn inline_fuzzy_select_single(items: &[String], initial: usize) -> Result<Option
                 KeyCode::Enter => {
                     clear_inline_fuzzy(&mut session.stdout, anchor_y, menu_lines)?;
                     let marked = active.iter().position(|value| *value);
-                    let fallback = matches.get(selected).map(|(_, index)| *index);
-                    return Ok(marked.or(fallback));
+                    let highlighted = matches.get(selected).map(|(_, index)| *index);
+                    return Ok(if marked_by_user {
+                        marked.or(highlighted)
+                    } else if navigated || !query.is_empty() {
+                        highlighted.or(marked)
+                    } else {
+                        marked.or(highlighted)
+                    });
                 }
                 KeyCode::Tab => {
                     if let Some((_, index)) = matches.get(selected) {
@@ -4372,10 +4382,15 @@ fn inline_fuzzy_select_single(items: &[String], initial: usize) -> Result<Option
                         if let Some(slot) = active.get_mut(*index) {
                             *slot = true;
                         }
+                        marked_by_user = true;
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    navigated = true;
+                    selected = selected.saturating_sub(1);
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
+                    navigated = true;
                     selected = (selected + 1).min(matches.len().saturating_sub(1));
                 }
                 KeyCode::Backspace => {
@@ -5092,7 +5107,12 @@ fn extract_image_placeholders(
         let segment: String = chars[*start..*end].iter().collect();
         let name_str = segment
             .strip_prefix("[Image ")
-            .and_then(|s| s.strip_prefix(|c: char| c.is_ascii_digit()))
+            .and_then(|s| {
+                // 序号可能是多位数("[Image 10: ...]"),char pattern 的
+                // strip_prefix 只剥一位,会把第 10 张起的图静默丢弃。
+                let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
+                (rest.len() < s.len()).then_some(rest)
+            })
             .and_then(|s| s.strip_prefix(':'))
             .and_then(|s| s.strip_suffix(']'))
             .map(|s| s.trim().to_string());
@@ -7269,6 +7289,9 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
             // 后台任务归 daemon 管:前端死了任务照跑,完成后有唤醒
             // (验收:dsh 语义,前端退出不拖死会话任务)。
             let _ = (&paths, &feed);
+            // SIGTERM 时终端往往还活着:process::exit 绕过 Drop,先尽力
+            // 恢复 raw mode,否则用户的 shell 停在原始模式里。
+            let _ = crossterm::terminal::disable_raw_mode();
             std::process::exit(0);
         });
     }

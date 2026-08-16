@@ -26,18 +26,34 @@ fn todos_path(paths: &MiyuPaths, session: &str) -> PathBuf {
 }
 
 fn load_todos(paths: &MiyuPaths, session: &str) -> Vec<Todo> {
-    std::fs::read_to_string(todos_path(paths, session))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Ok(raw) = std::fs::read_to_string(todos_path(paths, session)) else {
+        return Vec::new();
+    };
+    match serde_json::from_str(&raw) {
+        Ok(todos) => todos,
+        Err(error) => {
+            // 容错语义保留(损坏即重新开始),但必须留痕:任务清单无声消失
+            // 会让模型以为自己从没建过清单。
+            tracing::warn!(
+                session,
+                error = %error,
+                "todo list file is corrupt; starting with an empty list"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn save_todos(paths: &MiyuPaths, session: &str, todos: &[Todo]) -> Result<()> {
     let path = todos_path(paths, session);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(todos)?)?;
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("todo path has no parent directory");
+    };
+    std::fs::create_dir_all(parent)?;
+    // 原子写:崩溃在写回中途不能把清单留成截断的半个 JSON。
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    std::fs::write(temp.path(), serde_json::to_string_pretty(todos)?)?;
+    temp.persist(&path)?;
     Ok(())
 }
 
@@ -179,20 +195,22 @@ fn todo_write(args: Value, todos: TodoList) -> Result<String> {
         if content.is_empty() {
             anyhow::bail!("todo content must not be empty");
         }
+        // 与 todoupdate 同一套校验:enum 外的值静默入库会让 pending 计数
+        // 和状态展示错乱。
         let status = item
             .get("status")
             .and_then(Value::as_str)
-            .unwrap_or("pending")
-            .to_string();
+            .unwrap_or("pending");
+        validate_status(status)?;
         let priority = item
             .get("priority")
             .and_then(Value::as_str)
-            .unwrap_or("medium")
-            .to_string();
+            .unwrap_or("medium");
+        validate_priority(priority)?;
         list.push(Todo {
             content,
-            status,
-            priority,
+            status: status.to_string(),
+            priority: priority.to_string(),
         });
     }
 

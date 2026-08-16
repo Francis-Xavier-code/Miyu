@@ -1769,13 +1769,24 @@ impl ConversationDb {
     /// Deletes subagent audit sessions older than the retention window;
     /// their turns/images/queues cascade away.
     pub fn delete_subagent_sessions_older_than(&self, days: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // 与 delete_ask_sessions_older_than 同理:queued_prompts.session_id
+        // 经 ALTER 而来没有级联外键,必须先手动清,否则留孤儿行。
+        tx.execute(
+            "DELETE FROM queued_prompts WHERE session_id IN (
+                 SELECT session_id FROM sessions
+                 WHERE kind = 'subagent'
+                   AND datetime(updated_at) < datetime('now', '-' || ?1 || ' days'))",
+            params![days],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM sessions
              WHERE kind = 'subagent'
                AND datetime(updated_at) < datetime('now', '-' || ?1 || ' days')",
             params![days],
         )?;
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -2308,6 +2319,13 @@ impl ConversationDb {
             "DELETE FROM turn_redo_backups WHERE turn_id = ?1 AND revision = ?2",
             params![turn_id, revision],
         )?;
+        // redo 重写了整个回合:先清掉旧修订的重放转写再按新修订快照,
+        // 否则重开 REPL 仍显示被弃用的旧回复(空 journal 时也必须清)。
+        tx.execute(
+            "UPDATE turns SET replay_journal = NULL WHERE turn_id = ?1",
+            params![turn_id],
+        )?;
+        store_replay_journal(&tx, turn_id)?;
         tx.execute(
             "DELETE FROM turn_journal_segments WHERE turn_id = ?1",
             params![turn_id],
@@ -5504,10 +5522,13 @@ pub struct TurnReplay {
 /// output blobs — is dropped; what is left is the ordered prose/tool sequence
 /// the REPL redraws when the session is reopened.
 fn store_replay_journal(tx: &Transaction, turn_id: &str) -> Result<()> {
+    // 只取当前修订的事件:被 redo 的 interrupted 回合会同时残留新旧两个
+    // revision 的事件(interrupt 不删 segments),混着快照会串台。
     let mut stmt = tx.prepare(
         "SELECT kind, call_id, name, text_payload, ok
            FROM turn_journal_events
           WHERE turn_id = ?1
+            AND revision = (SELECT revision FROM turns WHERE turn_id = ?1)
             AND kind IN ('assistant_content', 'tool_call', 'tool_result')
           ORDER BY event_id",
     )?;

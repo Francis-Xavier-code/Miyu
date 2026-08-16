@@ -123,6 +123,8 @@ impl AccountKey {
 pub(crate) enum HistoryScope {
     Group(GroupKey),
     Private(ConversationKey),
+    /// 账号下全部群聊(不含私聊):`all_groups` 参数的字面语义。
+    AllGroups(AccountKey),
     Account(AccountKey),
 }
 
@@ -1434,6 +1436,16 @@ fn query_search(conn: &Connection, query: SearchQuery) -> Result<HistoryPage> {
                  AND m.conversation_kind = ?{kind} AND m.conversation_id = ?{conversation_id}"
             ));
         }
+        HistoryScope::AllGroups(account) => {
+            arguments.push(SqlValue::Text(account.platform.clone()));
+            let platform = arguments.len();
+            arguments.push(SqlValue::Text(account.account_id.clone()));
+            let account = arguments.len();
+            conditions.push(format!(
+                "m.platform = ?{platform} AND m.account_id = ?{account} \
+                 AND m.conversation_kind = 'group'"
+            ));
+        }
         HistoryScope::Account(account) => {
             arguments.push(SqlValue::Text(account.platform.clone()));
             let platform = arguments.len();
@@ -1690,6 +1702,27 @@ fn delete_message_batch(
                 batch_size as i64,
             ],
         )?),
+        HistoryScope::AllGroups(account) => Ok(tx.execute(
+            "DELETE FROM messages WHERE id IN (
+                 SELECT id FROM messages
+                 WHERE platform = ?1 AND account_id = ?2
+                   AND conversation_kind = 'group'
+                   AND (?3 IS NULL OR sent_at < ?3)
+                   AND (?4 IS NULL OR sender_id = ?4)
+                   AND (?5 IS NULL OR sent_at >= ?5)
+                   AND (?6 IS NULL OR sent_at <= ?6)
+                 ORDER BY id LIMIT ?7
+             )",
+            params![
+                account.platform,
+                account.account_id,
+                cutoff,
+                sender_id,
+                since,
+                until,
+                batch_size as i64,
+            ],
+        )?),
         HistoryScope::Account(account) => Ok(tx.execute(
             "DELETE FROM messages WHERE id IN (
                  SELECT id FROM messages
@@ -1745,6 +1778,29 @@ fn delete_recall_batch(
                 batch_size as i64,
             ],
         )?),
+        HistoryScope::AllGroups(account) => Ok(tx.execute(
+            "DELETE FROM recalls WHERE id IN (
+                 SELECT r.id FROM recalls AS r
+                 WHERE r.platform = ?1 AND r.account_id = ?2
+                   AND r.conversation_kind = 'group'
+                   AND (?3 IS NULL OR (
+                       r.recalled_at < ?3 AND NOT EXISTS (
+                           SELECT 1 FROM messages AS m
+                           WHERE m.platform = r.platform AND m.account_id = r.account_id
+                             AND m.conversation_kind = r.conversation_kind
+                             AND m.conversation_id = r.conversation_id
+                             AND m.message_id = r.message_id
+                       )
+                   ))
+                 ORDER BY r.id LIMIT ?4
+             )",
+            params![
+                account.platform,
+                account.account_id,
+                cutoff,
+                batch_size as i64,
+            ],
+        )?),
         HistoryScope::Account(account) => Ok(tx.execute(
             "DELETE FROM recalls WHERE id IN (
                  SELECT r.id FROM recalls AS r
@@ -1788,6 +1844,13 @@ fn delete_boundaries(
                 conversation.conversation_id,
                 cutoff
             ],
+        )?),
+        HistoryScope::AllGroups(account) => Ok(tx.execute(
+            "DELETE FROM context_boundaries
+             WHERE platform = ?1 AND account_id = ?2
+               AND conversation_kind = 'group'
+               AND (?3 IS NULL OR reset_at < ?3)",
+            params![account.platform, account.account_id, cutoff],
         )?),
         HistoryScope::Account(account) => Ok(tx.execute(
             "DELETE FROM context_boundaries

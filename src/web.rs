@@ -322,7 +322,8 @@ impl TurnResourceCache {
 #[derive(Clone)]
 struct WebAuth {
     password_digest: Option<[u8; 32]>,
-    sessions: Arc<Mutex<HashSet<String>>>,
+    /// 按登录先后有序:超限淘汰最旧令牌,而不是把全部在用会话一起登出。
+    sessions: Arc<Mutex<Vec<String>>>,
     attempts: Arc<Mutex<HashMap<IpAddr, LoginAttempt>>>,
 }
 
@@ -347,7 +348,7 @@ impl WebAuth {
         });
         Self {
             password_digest,
-            sessions: Arc::new(Mutex::new(HashSet::new())),
+            sessions: Arc::new(Mutex::new(Vec::new())),
             attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -360,7 +361,13 @@ impl WebAuth {
         if !self.required() {
             return true;
         }
-        supplied.is_some_and(|token| self.sessions.lock().unwrap().contains(token))
+        supplied.is_some_and(|token| {
+            self.sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|existing| existing == token)
+        })
     }
 
     fn login(&self, peer: IpAddr, password: &str) -> std::result::Result<String, LoginFailure> {
@@ -396,10 +403,10 @@ impl WebAuth {
 
         let token = random_token(32);
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.insert(token.clone());
+        sessions.push(token.clone());
+        // 第 65 个登录淘汰最旧的一个令牌;此前是 sessions.clear() 全员登出。
         if sessions.len() > 64 {
-            sessions.clear();
-            sessions.insert(token.clone());
+            sessions.remove(0);
         }
         Ok(token)
     }
@@ -1913,6 +1920,15 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
         println!("Miyu WebUI: {url}");
+    }
+    if password.is_none() && !bind_ip.is_loopback() {
+        eprintln!(
+            "{}",
+            t(
+                "WARNING: the WebUI is listening on a non-loopback address without a password; anyone who can reach this port has full control. Pass a password or bind to 127.0.0.1.",
+                "警告：WebUI 正在无密码监听非回环地址，任何能访问该端口的人都拥有完全控制权。请设置访问密码或绑定 127.0.0.1。"
+            )
+        );
     }
     std::io::stdout().flush().ok();
 
@@ -10590,7 +10606,27 @@ pub(crate) fn safe_error_message(error: impl std::fmt::Display) -> String {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // systemd stop / `kill` 发的是 SIGTERM：必须与 SIGINT 一样走优雅停机
+    // （落盘运行中回合、清理 IPC lease），否则默认动作直接杀进程。
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

@@ -1735,6 +1735,18 @@ impl Agent {
     pub fn switch_mode(&mut self, mode: AgentMode, tools: ToolRegistry) {
         self.mode = mode;
         self.tools = Arc::new(Mutex::new(tools));
+        // 预设对话跟人格走:Normal↔Dev 切换后必须重算,否则 Dev 带着
+        // 人格 dialogs(违反"Dev 无人格"),Dev→Normal 则永远没有。
+        self.refresh_preset_dialogs();
+    }
+
+    fn refresh_preset_dialogs(&mut self) {
+        // Dev 无人格:预设对话整套跳过(与构造期一致)。
+        self.preset_dialogs = if self.mode == AgentMode::Dev {
+            Vec::new()
+        } else {
+            persona_hint::load_dialogs(&self.config, &self.paths, &self.config.active_persona_scope())
+        };
     }
 
     pub fn replace_client(&mut self, client: OpenAiCompatibleClient) {
@@ -1765,6 +1777,7 @@ impl Agent {
         );
         self.memory.init()?;
         (self.memory_database_id, self.memory_generation) = self.memory.identity()?;
+        self.refresh_preset_dialogs();
         self.prepare_for_turn()
     }
 
@@ -1977,10 +1990,11 @@ impl Agent {
         if let (Some(provider), Some(model)) = (&result.provider_id, &result.model) {
             self.last_request_endpoint = Some((provider.clone(), model.clone()));
         }
+        // 无条件覆盖:redo 前的旧修订可能留有 tool_flow,新修订没有工具
+        // 调用时空 flow 也必须写入,否则旧工具流会被冒名回放。
         let tool_flow = derive_tool_flow(&messages, replay_start);
-        if !tool_flow.is_empty() {
-            self.state.set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
-        }
+        self.state
+            .set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         if self.memory.process_after_turn(
             &diary_input,
             &result.content,
@@ -2449,13 +2463,26 @@ impl Agent {
         F: FnMut(AgentEvent) -> Result<()>,
     {
         let mut on_event = on_event;
-        let context_window = self.context_window().or_else(|| {
-            if crate::models_cache::is_loaded() {
-                return None;
+        let context_window = match self.context_window() {
+            Some(window) => Some(window),
+            None if crate::models_cache::is_loaded() => None,
+            None => {
+                // refresh_blocking 持全局 REFRESH_LOCK 做最长 30s 的阻塞
+                // 网络请求:在 actor 的单线程 runtime 上同步调用会把所有
+                // 会话所有 turn 一起冻结,必须移到阻塞线程池。
+                let paths = self.paths.clone();
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    crate::models_cache::refresh_blocking(&paths).is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                if refreshed {
+                    self.context_window()
+                } else {
+                    None
+                }
             }
-            crate::models_cache::refresh_blocking(&self.paths).ok()?;
-            self.context_window()
-        });
+        };
         let Some(context_window) = context_window else {
             let missing = self.client.models_without_context_window(&self.config);
             if missing.is_empty() {
@@ -2794,6 +2821,26 @@ impl Agent {
                         }
                     } else {
                         self.rapid_compacts.store(0, Ordering::Relaxed);
+                    }
+                } else {
+                    // cut=0(可见历史全部落在保尾预算内)却仍越过触发线:
+                    // 没有任何东西可折,再触发也只会空转。与"压后仍超"
+                    // 走同一失败闩,否则每轮都白跑一次压缩流程。
+                    let post_tokens =
+                        usize::try_from(self.effective_context_tokens()?).unwrap_or(usize::MAX);
+                    if check.check_tokens(post_tokens) {
+                        let runs = self.consecutive_compacts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if runs >= 2 && !self.compact_stuck.swap(true, Ordering::Relaxed) {
+                            on_event(AgentEvent::Notice {
+                                text: crate::i18n::text(
+                                    "Automatic context compaction paused: the context window is too small for compaction to help (the system prompt plus the verbatim tail already exceed the trigger). Raise context window or reduce tool output; compaction resumes once the context drops.",
+                                    "自动上下文压缩已暂停：上下文窗口太小，压缩无法奏效（system prompt 加逐字尾巴已超过触发线）。请调大上下文窗口或减小工具输出；上下文回落后自动恢复。",
+                                )
+                                .to_string(),
+                            })?;
+                        }
+                    } else {
+                        self.consecutive_compacts.store(0, Ordering::Relaxed);
                     }
                 }
                 result
@@ -3361,6 +3408,14 @@ impl Agent {
                 .is_some_and(|reason| reason.eq_ignore_ascii_case("length"))
                 && !result.tool_calls.is_empty()
             {
+                // 续传簿记与正常路径同步:跳过它会让下一轮带着上一轮的旧
+                // response id 续传,服务端 400 后再走自愈,白费一次请求。
+                // start 必须在 push tool 错误之前设定(续传输入=工具输出段)。
+                if next_responses_continuation.is_some() {
+                    continuation_input_start = messages.len();
+                }
+                responses_continuation = next_responses_continuation;
+                continuation_context = None;
                 // A "length" stop means the output hit the token limit, so every
                 // tool call in this message may carry silently truncated
                 // arguments. Refuse to execute any of them and let the model
@@ -4952,13 +5007,42 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
         );
         messages.push(ChatMessage::plain("user", &followup.content));
     }
+    // 与 push_history_turn 同步:工具轮以原生 tool_calls + tool 输出回放,
+    // 漏计 tool_flow 会让 trim/压缩预算对工具密集回合失真数十倍。
+    for round in &turn.tool_flow {
+        push_assistant_message_with_reasoning(
+            &mut messages,
+            round.assistant_content.clone(),
+            round.assistant_reasoning.as_deref(),
+            None,
+            Some(
+                round
+                    .calls
+                    .iter()
+                    .map(|call| ToolCall {
+                        id: call.id.clone(),
+                        kind: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
+            false,
+        );
+        for call in &round.calls {
+            messages.push(ChatMessage::tool(call.id.clone(), call.output.clone()));
+        }
+    }
     push_assistant_context_messages(
         &mut messages,
         &turn.assistant_content,
         turn.assistant_reasoning.as_deref(),
         true,
     );
-    if !turn.tool_reports.is_empty() {
+    // 与 push_history_turn 同步:reports 压扁只在无结构化 flow 时回放。
+    if turn.tool_flow.is_empty() && !turn.tool_reports.is_empty() {
         messages.push(ChatMessage::turn_context(private_tool_memory(
             &turn.tool_reports,
         )));

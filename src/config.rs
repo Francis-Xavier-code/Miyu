@@ -360,6 +360,12 @@ impl PlatformsConfig {
                 normalize_route_pool(pool);
             }
         });
+        mutate_group_join_approval_settings(&mut self.qq.plugins, |settings| {
+            if let Some(models) = &mut settings.text_models {
+                models.retain(|model| active_model_exists(providers, model));
+            }
+            normalize_route_pool(&mut settings.text_models);
+        });
         self.normalize_model_routes();
     }
 
@@ -386,6 +392,13 @@ impl PlatformsConfig {
                 }
                 normalize_route_pool(pool);
             }
+        });
+        mutate_group_join_approval_settings(&mut self.qq.plugins, |settings| {
+            if let Some(models) = &mut settings.text_models {
+                models
+                    .retain(|entry| !(entry.provider_id == provider_id && entry.model == model));
+            }
+            normalize_route_pool(&mut settings.text_models);
         });
         self.normalize_model_routes();
     }
@@ -417,6 +430,12 @@ impl PlatformsConfig {
                 normalize_route_pool(pool);
             }
         });
+        mutate_group_join_approval_settings(&mut self.qq.plugins, |settings| {
+            if let Some(models) = &mut settings.text_models {
+                models.retain(|entry| entry.provider_id != provider_id);
+            }
+            normalize_route_pool(&mut settings.text_models);
+        });
         self.normalize_model_routes();
     }
 
@@ -441,6 +460,12 @@ impl PlatformsConfig {
                 }
                 normalize_route_pool(pool);
             }
+        });
+        mutate_group_join_approval_settings(&mut self.qq.plugins, |settings| {
+            if let Some(models) = &mut settings.text_models {
+                rename_provider_in_pool(models, old_id, new_id);
+            }
+            normalize_route_pool(&mut settings.text_models);
         });
     }
 
@@ -473,6 +498,16 @@ impl PlatformsConfig {
                 }
                 normalize_route_pool(pool);
             }
+        });
+        mutate_group_join_approval_settings(&mut self.qq.plugins, |settings| {
+            if let Some(models) = &mut settings.text_models {
+                for entry in models {
+                    if entry.provider_id == provider_id && entry.model == old {
+                        entry.model = new.to_string();
+                    }
+                }
+            }
+            normalize_route_pool(&mut settings.text_models);
         });
     }
 }
@@ -1536,6 +1571,23 @@ fn migrate_real_context_settings_map(settings: &mut serde_json::Map<String, serd
     for key in DEPRECATED_REAL_CONTEXT_SETTINGS {
         settings.remove(*key);
     }
+}
+
+/// 与 [`mutate_real_context_settings`] 同构:入群审批插件的 `text_models`
+/// 也持有 provider/model 引用,provider 删除/改名的引用维护必须覆盖它,
+/// 否则悬空引用会让审批模型静默失效。
+fn mutate_group_join_approval_settings(
+    plugins: &mut PlatformPluginsConfig,
+    mutate: impl FnOnce(&mut QqGroupJoinApprovalPluginSettings),
+) {
+    let Some(instance) = plugins.get_mut(QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID) else {
+        return;
+    };
+    let Ok(mut settings) = QqGroupJoinApprovalPluginSettings::from_instance(instance) else {
+        return;
+    };
+    mutate(&mut settings);
+    merge_group_join_approval_settings(instance, &settings);
 }
 
 fn mutate_real_context_settings(
@@ -4018,7 +4070,14 @@ impl AppConfig {
             config.system_prompt_file = Some("system-prompt.md".to_string());
         }
         let raw = serde_json::to_string_pretty(&config)?;
-        std::fs::write(&paths.config_file, format!("{raw}\n"))?;
+        // 原子写:写回瞬间断电/崩溃不能让 config.json 留下截断的半个 JSON。
+        let config_dir = paths
+            .config_file
+            .parent()
+            .context("config file has no parent directory")?;
+        let temp = tempfile::NamedTempFile::new_in(config_dir)?;
+        std::fs::write(temp.path(), format!("{raw}\n"))?;
+        temp.persist(&paths.config_file)?;
         Ok(())
     }
 
@@ -4748,6 +4807,9 @@ impl AppConfig {
         if self.plugins.knowledge_base.embedding_provider_id == old_id {
             self.plugins.knowledge_base.embedding_provider_id = new_id.to_string();
         }
+        if self.embedding.provider_id == old_id {
+            self.embedding.provider_id = new_id.to_string();
+        }
     }
 
     /// Removes references after a provider has been deleted from `providers`.
@@ -4767,6 +4829,10 @@ impl AppConfig {
         if self.plugins.knowledge_base.embedding_provider_id == provider_id {
             self.plugins.knowledge_base.embedding_provider_id.clear();
             self.plugins.knowledge_base.embedding_model.clear();
+        }
+        if self.embedding.provider_id == provider_id {
+            self.embedding.provider_id.clear();
+            self.embedding.model.clear();
         }
         if self.active_provider == provider_id {
             self.active_provider = self
@@ -4987,6 +5053,10 @@ impl AppConfig {
         {
             self.plugins.knowledge_base.embedding_provider_id.clear();
             self.plugins.knowledge_base.embedding_model.clear();
+        }
+        if self.embedding.provider_id == provider_id && self.embedding.model == model {
+            self.embedding.provider_id.clear();
+            self.embedding.model.clear();
         }
         retain_nonempty_pool(&mut self.active_provider_models);
         retain_nonempty_pool(&mut self.active_multimodal_provider_models);

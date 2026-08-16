@@ -75,6 +75,30 @@ const MAX_CQ_FIELDS: usize = 32;
 const MAX_ONEBOT_ID_BYTES: usize = 128;
 const MAX_INBOUND_FILE_NAME_CHARS: usize = 512;
 const MAX_OUTBOUND_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_OUTBOUND_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_OUTBOUND_IMAGE_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// 校验字节可解码为图片(解码结果仅校验即丢)。带解码限额:几十 KB 的
+/// 30000×30000 像素炸弹解压时会分配数 GB,分配失败直接 abort 全进程。
+/// 同步解码放 spawn_blocking,不占 actor 单线程 runtime。
+async fn validate_outbound_image(bytes: Vec<u8>, path: PathBuf) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .with_context(|| format!("decoding image {}", path.display()))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_OUTBOUND_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_OUTBOUND_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_OUTBOUND_IMAGE_DECODE_ALLOC);
+        reader.limits(limits);
+        reader
+            .decode()
+            .with_context(|| format!("decoding image {}", path.display()))?;
+        Ok(bytes)
+    })
+    .await
+    .context("outbound image validation task failed")?
+}
 const MAX_OUTBOUND_FILE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_BASE64_FILE_BYTES: usize = 16 * 1024 * 1024;
 const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -481,8 +505,10 @@ impl ConnectionHandle {
         }
         let result = tokio::time::timeout(timeout, rx).await;
         self.pending.lock().unwrap().remove(&echo);
-        let Ok(Ok(response)) = result else {
-            bail!("OneBot API {action} timed out");
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => bail!("OneBot API {action} failed: connection closed"),
+            Err(_) => bail!("OneBot API {action} timed out"),
         };
         let retcode = response.get("retcode").and_then(value_i64).unwrap_or(-1);
         if retcode != 0 {
@@ -1016,11 +1042,14 @@ async fn connection_loop(
         if frame.get("post_type").and_then(Value::as_str) == Some("message") {
             let ingress_order = next_ingress_order();
             let activity = observe_message_activity(&state, &frame, bound_self_id, Instant::now());
-            let config = state.manager.lock().unwrap().config.clone();
-            if config.platforms.qq.enabled {
+            // 平台关闭或事件不成立时不做 AppConfig 全量深拷贝:这是每条
+            // 入站消息(含不触发回复的普通消息)都会走到的热路径。
+            let qq_enabled = state.manager.lock().unwrap().config.platforms.qq.enabled;
+            if qq_enabled {
                 if let Some(inbound) =
                     ingress_message_event(&frame, bound_self_id, ingress_order, activity.as_ref())
                 {
+                    let config = state.manager.lock().unwrap().config.clone();
                     match state.platforms.plugins() {
                         Ok(plugins) => {
                             plugins
@@ -1163,6 +1192,10 @@ async fn connection_loop(
             .unwrap()
             .remove_account(bound_self_id);
     }
+    // 显式 drain pending：handle 的克隆仍被在途消息处理 task 持有，Arc 不会
+    // 因本循环退出而归零，必须主动 drop 所有 tx 让在途 call_api 立即失败，
+    // 而不是各等满超时（附件发送最长 180s）。
+    handle.pending.lock().unwrap().clear();
     writer.abort();
     tracing::info!(target: "miyu::qq",
         self_id = bound_self_id,
@@ -1293,16 +1326,21 @@ fn ingress_message_event(
         },
         _ => return None,
     };
-    let mut normalized_event = event.clone();
-    normalized_event["self_id"] = Value::from(self_id);
-    let parsed = parse_message(
-        normalized_event.get("message"),
-        normalized_event.get("raw_message"),
-        self_id,
-    );
+    // 绝大多数帧自带正确 self_id,覆写是恒等操作:只在确需归一时才整帧
+    // 深拷贝,避免每条入站消息为此付一次完整 Value 克隆。
+    let normalized_event;
+    let event_ref = if event.get("self_id").and_then(Value::as_i64) == Some(self_id) {
+        event
+    } else {
+        let mut cloned = event.clone();
+        cloned["self_id"] = Value::from(self_id);
+        normalized_event = cloned;
+        &normalized_event
+    };
+    let parsed = parse_message(event_ref.get("message"), event_ref.get("raw_message"), self_id);
     let mut inbound = message_event_at(
         target,
-        &normalized_event,
+        event_ref,
         &parsed,
         activity
             .map(|activity| activity.received_at)
@@ -2492,13 +2530,9 @@ fn parse_group_join_decision(text: &str) -> Result<(GroupJoinDecision, String)> 
     let value: Value = match serde_json::from_str::<Value>(trimmed) {
         Ok(value) if value.is_object() => value,
         _ => {
-            let start = trimmed
-                .find('{')
-                .context("group join approval JSON has no opening brace")?;
-            let end = trimmed
-                .rfind('}')
-                .context("group join approval JSON has no closing brace")?;
-            let value: Value = serde_json::from_str(&trimmed[start..=end])?;
+            let json_text = crate::json_extract::extract_json_object(trimmed)
+                .context("group join approval output contains no complete JSON object")?;
+            let value: Value = serde_json::from_str(json_text)?;
             if !value.is_object() {
                 bail!("group join approval JSON is not an object");
             }
@@ -4548,13 +4582,11 @@ async fn migrate_legacy_platform_file_cache(paths: &crate::paths::MiyuPaths) {
     }
 }
 
-async fn ensure_platform_file_capacity(
+/// 扫描配额目录:顺带清理过期文件,返回 (存量字节, 存量条数)。
+async fn scan_platform_file_storage(
     data_dir: &std::path::Path,
-    reserve: u64,
-    max_bytes: u64,
-    max_entries: usize,
     ttl: Duration,
-) -> Result<()> {
+) -> Result<(u64, usize)> {
     let dir = platform_file_storage_root(data_dir);
     tokio::fs::create_dir_all(&dir).await?;
     let mut entries = tokio::fs::read_dir(&dir).await?;
@@ -4579,6 +4611,17 @@ async fn ensure_platform_file_capacity(
             .context("platform file storage size overflow")?;
         count = count.saturating_add(1);
     }
+    Ok((bytes, count))
+}
+
+async fn ensure_platform_file_capacity(
+    data_dir: &std::path::Path,
+    reserve: u64,
+    max_bytes: u64,
+    max_entries: usize,
+    ttl: Duration,
+) -> Result<()> {
+    let (bytes, count) = scan_platform_file_storage(data_dir, ttl).await?;
     if count >= max_entries || bytes.saturating_add(reserve) > max_bytes {
         bail!("platform file storage quota is full");
     }
@@ -5911,7 +5954,9 @@ impl OneBotAdapter {
                 .context("the platform file URL API returned no usable url")?
                 .to_string()
         };
-        let _file_store_guard = self.file_store_lock.lock().await;
+        // 配额预检不持锁(尽力而为,明显已满时省掉一次下载);下载本身也
+        // 不持锁——此前全局锁跨最长 60s 的下载持有,一个慢文件会让所有
+        // 群所有用户的文件下载排队。
         ensure_platform_file_capacity(
             &paths.cache_dir,
             MAX_INBOUND_FILE_BYTES as u64,
@@ -5929,6 +5974,27 @@ impl OneBotAdapter {
             FILE_DOWNLOAD_TIMEOUT,
         )
         .await?;
+        // 落位复查才持锁:锁只护"清点→裁决"窗口。复查针对既成事实
+        // (存量已含刚写入的文件),并发下载一起冲破配额时超额者自删。
+        let verdict = {
+            let _file_store_guard = self.file_store_lock.lock().await;
+            scan_platform_file_storage(&paths.cache_dir, PLATFORM_FILE_TTL)
+                .await
+                .map(|(bytes, count)| {
+                    count <= PLATFORM_FILE_STORAGE_ENTRIES && bytes <= PLATFORM_FILE_STORAGE_BYTES
+                })
+        };
+        match verdict {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                bail!("platform file storage quota is full");
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error);
+            }
+        }
         let size = tokio::fs::metadata(&path)
             .await
             .map(|metadata| metadata.len())
@@ -6017,8 +6083,7 @@ impl OneBotAdapter {
                     let bytes = read_file_capped(&path, MAX_OUTBOUND_IMAGE_BYTES).await?;
                     // Decode dimensions before giving untrusted/generated bytes
                     // to the adapter, matching WebUI image safety expectations.
-                    image::load_from_memory(&bytes)
-                        .with_context(|| format!("decoding image {}", path.display()))?;
+                    let bytes = validate_outbound_image(bytes, path).await?;
                     current_image_digests.push(blake3::hash(&bytes));
                     current.push(image_segment(&bytes));
                 }
@@ -6116,8 +6181,7 @@ impl OneBotAdapter {
                     }
                     OutboundSegment::ImagePath { path, .. } => {
                         let bytes = read_file_capped(&path, MAX_OUTBOUND_IMAGE_BYTES).await?;
-                        image::load_from_memory(&bytes)
-                            .with_context(|| format!("decoding image {}", path.display()))?;
+                        let bytes = validate_outbound_image(bytes, path).await?;
                         image_digests.push(blake3::hash(&bytes));
                         content.push(image_segment(&bytes));
                     }
@@ -6232,8 +6296,10 @@ impl OneBotAdapter {
                 json!({ "group_id": group_id, "file": source, "name": name }),
             ),
         };
+        // connection() 取 registry 里的现任连接:NapCat 重连换代后,构造期
+        // 快照 self.conn 的 writer 已关闭,直接用它上传必报 writer closed。
         let data = self
-            .conn
+            .connection()
             .call_api_with_timeout(action, params, FILE_DOWNLOAD_TIMEOUT)
             .await?;
         Ok(data.get("file_id").and_then(value_id_string))
@@ -6297,8 +6363,9 @@ fn partial_send_error(error: anyhow::Error, receipt: SendReceipt) -> anyhow::Err
 /// should take.
 ///
 /// `MAX_SEND_TIMEOUT` stays as a backstop rather than a budget. Losing the
-/// connection already frees an in-flight call — `pending` hangs off the
-/// per-connection `ConnectionHandle`, which `connection_loop` drops on exit,
+/// connection already frees an in-flight call — `connection_loop` explicitly
+/// drains the per-connection `pending` map on exit (clones of the handle held
+/// by message tasks keep the Arc alive, so dropping alone would not do it),
 /// so every waiting `oneshot` resolves immediately. The backstop only covers
 /// a NapCat that stays connected but never answers this one echo, which would
 /// otherwise wedge the conversation forever (same-conversation turns are

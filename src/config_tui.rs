@@ -141,34 +141,64 @@ fn run_main_menu(
                     return Ok(false);
                 }
                 if confirm_save_on_exit(stdout)? {
-                    config.save(paths)?;
-                    thinking_variants.save(paths)?;
-                    return Ok(true);
+                    match config.save(paths) {
+                        Ok(()) => {
+                            thinking_variants.save(paths)?;
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            // 保存失败(如校验不过)不能崩出:崩出会丢掉本次
+                            // 全部内存修改,留在菜单让用户改完再存。
+                            show_tui_error(stdout, &error)?;
+                            continue;
+                        }
+                    }
                 }
                 return Ok(false);
             }
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
-            KeyCode::Enter => match selected {
-                0 => ProviderBrowser::new(paths, config, thinking_variants).run(stdout)?,
-                1 => select_active_provider(stdout, config)?,
-                2 => select_active_multimodal_provider(stdout, config)?,
-                3 => edit_embedding_model(stdout, config)?,
-                4 => select_subagent_tiers(stdout, config)?,
-                5 => edit_plugins(stdout, config)?,
-                6 => edit_custom_prompts(stdout, paths, config)?,
-                7 => select_platforms(stdout, paths, config)?,
-                8 => edit_settings(stdout, config)?,
-                9 => {
-                    config.save(paths)?;
-                    thinking_variants.save(paths)?;
-                    return Ok(true);
+            KeyCode::Enter => {
+                let outcome = match selected {
+                    0 => ProviderBrowser::new(paths, config, thinking_variants).run(stdout),
+                    1 => select_active_provider(stdout, config),
+                    2 => select_active_multimodal_provider(stdout, config),
+                    3 => edit_embedding_model(stdout, config),
+                    4 => select_subagent_tiers(stdout, config),
+                    5 => edit_plugins(stdout, config),
+                    6 => edit_custom_prompts(stdout, paths, config),
+                    7 => select_platforms(stdout, paths, config),
+                    8 => edit_settings(stdout, config),
+                    9 => match config.save(paths) {
+                        Ok(()) => {
+                            thinking_variants.save(paths)?;
+                            return Ok(true);
+                        }
+                        Err(error) => Err(error),
+                    },
+                    _ => Ok(()),
+                };
+                if let Err(error) = outcome {
+                    // 子界面的表单解析/保存错误只作废当次输入,config 的
+                    // 内存态还在;显示错误后回主菜单,不让 TUI 整个崩出。
+                    show_tui_error(stdout, &error)?;
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
+}
+
+/// 子界面出错时的兜底提示:错误只作废当次表单输入,绝不让它穿透主循环
+/// 把 TUI 崩出(崩出会连带丢掉本次全部未保存修改)。
+fn show_tui_error(stdout: &mut io::Stdout, error: &anyhow::Error) -> Result<()> {
+    let options = vec![
+        format!("{error:#}"),
+        t("Press any key to go back", "按任意键返回").to_string(),
+    ];
+    draw_menu(stdout, t(" ERROR ", " 错误 "), &options, 1, "")?;
+    let _ = read_key()?;
+    Ok(())
 }
 
 fn edit_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
@@ -386,7 +416,9 @@ fn toggle_plugin(config: &mut AppConfig, index: usize) {
 }
 
 fn edit_plugin_detail(stdout: &mut io::Stdout, config: &mut AppConfig, index: usize) -> Result<()> {
-    if index == 13 {
+    // api_quota 是 plugin_names() 的最后一项(下标 12):它有专门的账号
+    // 管理界面,不走通用表单。
+    if index == plugin_names().len() - 1 {
         return edit_api_quota(stdout, config);
     }
     let title = format!(" {}: {} ", t("PLUGIN", "插件"), plugin_names()[index].1);

@@ -326,6 +326,8 @@
     lastEventId: 0,
     replayRunIds: null,
     replayCutoff: 0,
+    replayResyncCount: 0,
+    replayResyncAt: 0,
     turns: [],
     queuedPrompts: [],
     models: [],
@@ -1009,6 +1011,13 @@
     const boardSubtitle = String(value?.board_subtitle || "").trim() || DEFAULT_BOARD_SUBTITLE;
     const configuredPrompts = Array.isArray(value?.starter_prompts) ? value.starter_prompts : [];
     const starterPrompts = DEFAULT_STARTER_PROMPTS.map((fallback, index) => String(configuredPrompts[index] || "").trim() || fallback);
+    // revision 只在图片 URL 真正变化时更新:每次快照都取 Date.now() 会让
+    // 头像/看板图的浏览器缓存永远击穿,每次 bootstrap 都重新下载。
+    const previous = state.persona;
+    const revision =
+      previous && previous.avatar_url === avatarUrl && previous.board_image_url === boardImageUrl
+        ? previous.revision
+        : `${Date.now()}`;
     return {
       name,
       avatar_url: avatarUrl,
@@ -1016,7 +1025,7 @@
       board_title: boardTitle,
       board_subtitle: boardSubtitle,
       starter_prompts: starterPrompts,
-      revision: `${Date.now()}`
+      revision
     };
   }
 
@@ -2165,6 +2174,7 @@
       const file = picker.files?.[0];
       if (!file) return;
       if (file.size > 8 * 1024 * 1024) return showToast("图片不能超过 8 MiB", "error");
+      if (preview.src && preview.src.startsWith("blob:")) URL.revokeObjectURL(preview.src);
       preview.src = URL.createObjectURL(file);
       preview.classList.remove("is-missing");
       pickButton.disabled = true;
@@ -3571,6 +3581,15 @@
   }
 
   function beginRunReplay() {
+    // 事件环形缓冲已滚过上限时,after=0 必然触发 resync_required →
+    // bootstrap → 又 replay 的循环:短窗口内连续吃到 resync 就放弃从头
+    // 重放,live 状态由 bootstrap 快照兜底,增量从当前事件 id 继续。
+    const now = Date.now();
+    if (state.replayResyncCount >= 2 && now - state.replayResyncAt < 15000) {
+      state.replayRunIds = null;
+      connectEventSource(state.lastEventId);
+      return;
+    }
     state.replayRunIds = new Set(state.liveRuns.keys());
     state.replayCutoff = Math.max(state.lastEventId, state.replayCutoff, state.latestEventId);
     state.lastEventId = 0;
@@ -7962,6 +7981,12 @@
     const eventId = Math.max(0, asFiniteNumber(event.lastEventId));
     if (!eventShouldBeHandled(name, data, eventId)) return;
     if (name === "resync_required") {
+      if (state.replayRunIds) {
+        state.replayResyncCount += 1;
+        state.replayResyncAt = Date.now();
+      } else {
+        state.replayResyncCount = 0;
+      }
       if (!state.resyncing) {
         state.resyncing = true;
         loadBootstrap().finally(() => {

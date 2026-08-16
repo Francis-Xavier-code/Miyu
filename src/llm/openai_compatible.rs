@@ -1694,11 +1694,18 @@ impl OpenAiCompatibleClient {
             t("LLM request started", "LLM 请求已开始")
         );
         let mut exhausted: Vec<String> = Vec::new();
+        let mut previous_endpoint: Option<String> = None;
         for (attempt, index) in order.into_iter().enumerate() {
             let endpoint = &endpoints[index];
             if exhausted.contains(&endpoint.id()) {
                 continue;
             }
+            // 同端点的填充重试稍作退避:5xx/断流是瞬时故障,零间隔连打同
+            // 一端点多半撞上同一故障;切到不同端点仍零间隔(failover 不变)。
+            if previous_endpoint.as_deref() == Some(endpoint.id().as_str()) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            previous_endpoint = Some(endpoint.id());
             let client = self.with_endpoint(endpoint);
             if attempt > 0 {
                 on_chunk(ChatStreamChunk {
@@ -2642,6 +2649,7 @@ impl OpenAiCompatibleClient {
             for data in buffer.push(&chunk)? {
                 if handle_anthropic_sse_data(&data, &mut state, &mut *on_chunk)? {
                     let signature = state.thinking_signature.take();
+                    let stop_reason = state.stop_reason.take();
                     let mut result = finalize_stream_result(
                         state.content,
                         state.reasoning,
@@ -2650,6 +2658,7 @@ impl OpenAiCompatibleClient {
                         dsml,
                     )?;
                     result.thinking_signature = signature;
+                    result.finish_reason = map_anthropic_stop_reason(stop_reason);
                     return Ok(result);
                 }
             }
@@ -2673,6 +2682,7 @@ impl OpenAiCompatibleClient {
         )?;
         let reasoning_part_active = state.reasoning_part_active;
         let signature = state.thinking_signature.take();
+        let stop_reason = state.stop_reason.take();
         let mut result = finalize_stream_result(
             state.content,
             state.reasoning,
@@ -2681,6 +2691,7 @@ impl OpenAiCompatibleClient {
             dsml,
         )?;
         result.thinking_signature = signature;
+        result.finish_reason = map_anthropic_stop_reason(stop_reason);
         if reasoning_part_active {
             on_chunk(ChatStreamChunk {
                 kind: ChatStreamKind::ReasoningPartEnd,
@@ -2846,7 +2857,16 @@ impl OpenAiCompatibleClient {
             }
         }
         if !terminal_event_received {
-            bail!("OpenAI Responses stream ended before a terminal event");
+            // 与 chat 路径 (:finish_reason 缺失分支) 同型:截断按传输失败
+            // 分类,冷却/重试机制才会把这种端点降权,而不是裸错误穿透。
+            return Err(
+                anyhow::anyhow!("OpenAI Responses stream ended before a terminal event").context(
+                    TransportFailure {
+                        stage: "responses.stream",
+                        kind: TransportFailureKind::Other,
+                    },
+                ),
+            );
         }
         finalize_responses_stream_result(
             content,
@@ -3717,6 +3737,10 @@ struct AnthropicStreamDelta {
     partial_json: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     signature: Option<String>,
+    /// `message_delta` 携带终止原因;丢掉它会让 Anthropic 路径的
+    /// finish_reason 恒为 None,max_tokens 截断的工具参数照常执行。
+    #[serde(default, deserialize_with = "null_as_default")]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3749,6 +3773,20 @@ struct AnthropicStreamState {
     thinking_signature: Option<String>,
     usage: Option<Usage>,
     tool_calls: AnthropicToolAccumulator,
+    stop_reason: Option<String>,
+}
+
+/// Anthropic stop_reason → OpenAI 风格 finish_reason(消费方按后者判断)。
+fn map_anthropic_stop_reason(stop_reason: Option<String>) -> Option<String> {
+    stop_reason.map(|reason| {
+        match reason.as_str() {
+            "max_tokens" => "length",
+            "tool_use" => "tool_calls",
+            "end_turn" | "stop_sequence" => "stop",
+            other => other,
+        }
+        .to_string()
+    })
 }
 
 /// Upper bound on streamed tool calls per response. Indices come from the
@@ -4899,6 +4937,13 @@ where
             if let Some(usage) = event.usage {
                 merge_anthropic_usage(&mut state.usage, usage);
             }
+            if let Some(stop_reason) = event
+                .delta
+                .as_ref()
+                .and_then(|delta| delta.stop_reason.clone())
+            {
+                state.stop_reason = Some(stop_reason);
+            }
             flush_anthropic_state(state, on_chunk)?;
         }
         "message_stop" => {
@@ -5398,6 +5443,23 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn strip_tagged_sections_handles_truncated_open_tag() {
+        // 流被 finish_reason=length 截断在标签中间：恰以 `<system-reminder`
+        // 结尾（无 `>`）曾触发 content_start 越界 panic。
+        let text = "text before <system-reminder".to_string();
+        assert_eq!(
+            strip_tagged_sections(text, "system-reminder"),
+            "text before "
+        );
+        let multibyte = "前文<system-reminder中".to_string();
+        assert_eq!(strip_tagged_sections(multibyte, "system-reminder"), "前文");
+        let normal = "a<system-reminder>hidden</system-reminder>b".to_string();
+        assert_eq!(strip_tagged_sections(normal, "system-reminder"), "ab");
+        let unclosed = "a<system-reminder>hidden".to_string();
+        assert_eq!(strip_tagged_sections(unclosed, "system-reminder"), "a");
+    }
 
     #[derive(Debug)]
     struct ResponsesTestOutput {
@@ -8567,17 +8629,20 @@ mod tests {
 }
 
 fn strip_tagged_sections(mut text: String, tag: &str) -> String {
-    let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let open_prefix = format!("<{tag}");
     loop {
         let Some(start) = text.find(&open_prefix) else {
             break;
         };
-        let content_start = text[start..]
-            .find('>')
-            .map(|offset| start + offset + 1)
-            .unwrap_or(start + open.len());
+        // start 之后没有任何 `>`（流在标签中间被截断）时，`</tag>` 也必然
+        // 不存在：直接按未闭合标签截掉其后全部内容。用 `start + open.len()`
+        // 猜内容起点会在文本恰以 `<tag` 结尾时越界 panic。
+        let Some(offset) = text[start..].find('>') else {
+            text.replace_range(start.., "");
+            break;
+        };
+        let content_start = start + offset + 1;
         let Some(relative_end) = text[content_start..].find(&close) else {
             text.replace_range(start.., "");
             break;

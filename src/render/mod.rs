@@ -952,6 +952,9 @@ pub struct StreamRenderer {
     tool_preparing: Option<(&'static str, std::time::Instant)>,
     subagent_mode: Option<ChatStreamKind>,
     sent_meme_filter: SentMemeStreamFilter,
+    /// 模型正文/思维链的流式转义过滤状态:与命令输出同一套状态机,
+    /// 拦截 `\x1b[2J`/OSC 等正文里的终端控制序列(清屏/藏光标/伪造 UI)。
+    stream_control: TerminalControlState,
 }
 
 impl StreamRenderer {
@@ -991,6 +994,7 @@ impl StreamRenderer {
             tool_preparing: None,
             subagent_mode: None,
             sent_meme_filter: SentMemeStreamFilter::default(),
+            stream_control: TerminalControlState::default(),
         }
     }
 
@@ -1196,6 +1200,10 @@ impl StreamRenderer {
             self.hide_cursor()?;
         }
         let text = normalize_stream_text(&chunk.text);
+        // 正文/思维链与命令输出同权:全部过转义状态机,模型输出里的
+        // `\x1b[2J`、OSC 8 等控制序列不能直接打到用户终端上生效。
+        // 状态跨 delta 持有,序列被 delta 切断也拦得住。
+        let text = sanitize_stream_chunk(&mut self.stream_control, &text);
         let text = if chunk.kind == ChatStreamKind::Content {
             self.sent_meme_filter.push(&text)
         } else {
@@ -4179,6 +4187,18 @@ impl Drop for StreamRenderer {
 
 fn normalize_stream_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 流式版终端转义过滤:与 [`sanitize_terminal_text`] 同一状态机,但状态由
+/// 调用方跨 delta 持有,转义序列被流切成两半也能整段拦下。
+fn sanitize_stream_chunk(state: &mut TerminalControlState, text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if let Some(ch) = sanitize_terminal_char(state, ch) {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn write_full_reasoning_chunk(writer: &mut impl Write, text: &str) -> Result<()> {

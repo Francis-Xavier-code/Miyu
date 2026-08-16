@@ -1108,15 +1108,17 @@ impl MemoryStore {
             [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )?;
+        // 已被遗忘(主动 forget 或衰减)的日记不参与整理:否则会被组织
+        // 批次"复活"为长期记忆。
         let forced = count_where(
             &conn,
             "episodes",
-            "retention='short_term' AND promotion_pending=1",
+            "retention='short_term' AND promotion_pending=1 AND status != 'forgotten'",
         )?;
         let unconsolidated = count_where(
             &conn,
             "episodes",
-            "retention='short_term' AND consolidated_at IS NULL",
+            "retention='short_term' AND consolidated_at IS NULL AND status != 'forgotten'",
         )?;
         if forced == 0 && unconsolidated < self.config.diary_batch_size as i64 {
             return Ok(None);
@@ -1130,6 +1132,7 @@ impl MemoryStore {
                         origin_sender_display_name, origin_session_id, origin_message_id
                  FROM episodes
                  WHERE retention='short_term' AND promotion_pending=1
+                   AND status != 'forgotten'
                  ORDER BY id LIMIT ?1",
                 self.config.diary_batch_size.max(1),
             )
@@ -1141,6 +1144,7 @@ impl MemoryStore {
                         origin_sender_display_name, origin_session_id, origin_message_id
                  FROM episodes
                  WHERE retention='short_term' AND consolidated_at IS NULL
+                   AND status != 'forgotten'
                  ORDER BY id LIMIT ?1",
                 self.config.diary_batch_size,
             )

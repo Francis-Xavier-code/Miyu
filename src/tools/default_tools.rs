@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -38,7 +37,7 @@ pub fn register_run_command(registry: &mut ToolRegistry, allow_command_execution
     registry.register(ToolSpec::new_with_progress(
         "run_command",
         t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds. Ignored when background=true.", "可选超时时间，单位秒；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
+        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds (1-120, default 30). Ignored when background=true.", "可选超时时间，单位秒（1-120，默认 30）；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
         move |args, progress| async move {
             run_command(args, allow_command_execution, progress).await
         },
@@ -324,7 +323,6 @@ fn trash_paths(args: Value, progress: ToolProgress) -> Result<String> {
         args,
         &progress,
         |path| trash::delete(path).map_err(|err| anyhow::anyhow!("failed to move to trash: {err}")),
-        find_recent_trash_item,
     )
 }
 
@@ -340,7 +338,6 @@ fn trash_paths_with(
     args: Value,
     progress: &ToolProgress,
     mut move_to_trash: impl FnMut(&Path) -> Result<()>,
-    mut locate_trash_item: impl FnMut(&Path, i64) -> Option<String>,
 ) -> Result<String> {
     let inputs = paths_arg(&args)?;
     let total = inputs.len();
@@ -350,7 +347,7 @@ fn trash_paths_with(
     // 走完,那行进度还没被画出来就被下一条覆盖了,白发一串消息。真正慢的是
     // 模型吐这串路径的时间,那段由 `preparing_phase` 的「准备删除」盖住。
     for input in &inputs {
-        match trash_one(input, &mut move_to_trash, &mut locate_trash_item) {
+        match trash_one(input, &mut move_to_trash) {
             Ok(path) => moved_paths.push(path),
             Err(error) => failures.push(json!({
                 "path": input.display().to_string(),
@@ -390,13 +387,11 @@ fn trash_paths_with(
 fn trash_one(
     input: &Path,
     move_to_trash: &mut impl FnMut(&Path) -> Result<()>,
-    locate_trash_item: &mut impl FnMut(&Path, i64) -> Option<String>,
 ) -> Result<String> {
     let resolved = resolve_existing_path_without_following_leaf(input)?;
     ensure_safe_trash_target(&resolved)?;
     std::fs::symlink_metadata(&resolved)?;
     let original_path = resolved.display().to_string();
-    let timestamp_before = current_unix_seconds();
     move_to_trash(&resolved)?;
     if std::fs::symlink_metadata(&resolved).is_ok() {
         bail!(
@@ -407,7 +402,6 @@ fn trash_one(
             )
         );
     }
-    let _ = locate_trash_item(&resolved, timestamp_before);
     Ok(original_path)
 }
 
@@ -454,6 +448,8 @@ async fn glob_files(args: Value) -> Result<String> {
             .arg(".")
             .current_dir(&search_path)
             .stdin(Stdio::null())
+            // 超时丢弃 future 时同步回收 rg,否则孤儿进程继续扫整盘。
+            .kill_on_drop(true)
             .output(),
     )
     .await??;
@@ -500,6 +496,7 @@ async fn grep_text(args: Value) -> Result<String> {
         command
             .current_dir(search_root)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output(),
     )
     .await??;
@@ -519,11 +516,12 @@ async fn run_command(args: Value, allowed: bool, progress: ToolProgress) -> Resu
         let title = args.get("title").and_then(Value::as_str);
         return super::jobs::spawn_background(&command, title, &progress).await;
     }
+    // 下限 1:timeout_seconds=0 会立即超时,命令根本没机会执行。
     let timeout = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)
         .unwrap_or(30)
-        .min(120);
+        .clamp(1, 120);
     execute_command(&command, timeout, progress).await
 }
 
@@ -908,50 +906,6 @@ fn path_kind(metadata: &std::fs::Metadata) -> &'static str {
     }
 }
 
-fn current_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn find_recent_trash_item(original_path: &Path, timestamp_before: i64) -> Option<String> {
-    #[cfg(any(
-        target_os = "windows",
-        all(
-            unix,
-            not(target_os = "macos"),
-            not(target_os = "ios"),
-            not(target_os = "android")
-        )
-    ))]
-    {
-        let items = trash::os_limited::list().ok()?;
-        items
-            .into_iter()
-            .filter(|item| item.original_path() == original_path)
-            .filter(|item| {
-                item.time_deleted < 0 || item.time_deleted >= timestamp_before.saturating_sub(2)
-            })
-            .max_by_key(|item| item.time_deleted)
-            .map(|item| item.id.to_string_lossy().to_string())
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        all(
-            unix,
-            not(target_os = "macos"),
-            not(target_os = "ios"),
-            not(target_os = "android")
-        )
-    )))]
-    {
-        let _ = original_path;
-        let _ = timestamp_before;
-        None
-    }
-}
-
 fn max_results(args: &Value) -> usize {
     args.get("max_results")
         .and_then(Value::as_u64)
@@ -1016,7 +970,6 @@ mod tests {
                 }
                 Ok(())
             },
-            |_, _| None,
         )
     }
 

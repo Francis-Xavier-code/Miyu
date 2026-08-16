@@ -177,8 +177,8 @@ fn read_platform_text(path: &Path, name: &str, size: u64) -> Result<String> {
     let truncated = bytes.len() > MAX_PLATFORM_FILE_READ_BYTES;
     if truncated {
         bytes.truncate(MAX_PLATFORM_FILE_READ_BYTES);
-        while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
-            bytes.pop();
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            bytes.truncate(error.valid_up_to());
         }
     }
     if bytes.iter().any(|byte| *byte == 0) {

@@ -95,8 +95,10 @@ pub(super) async fn require_ai_confirmation(
     action: &str,
     arguments: &Value,
 ) -> Result<Option<String>> {
+    // 免确认门槛用 fresh 查询而非回合缓存:刚被撤权的请求者不该还能在
+    // 缓存窗口内跳过二次确认(执行侧校验同样走 fresh,两处口径一致)。
     let requester_is_manager = context
-        .group_member(&context.sender_id)
+        .group_member_fresh(&context.sender_id)
         .await?
         .is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"));
     if context.is_admin || requester_is_manager {
