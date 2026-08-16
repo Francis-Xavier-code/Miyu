@@ -8064,7 +8064,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
         if input.is_empty() {
             continue;
         }
-        history.push(input.to_string());
+        push_history_capped(&mut history, input);
         live_repl.editor.record_history(input);
         persist_repl_history_entry(paths, input);
         match try_run_remote_chat(
@@ -8578,7 +8578,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
         if input.is_empty() {
             continue;
         }
-        input_history.push(input.to_string());
+        push_history_capped(&mut input_history, input);
         persist_repl_history_entry(paths, input);
         if let Some(live) = live_repl.as_mut() {
             live.editor.record_history(input);
@@ -9280,6 +9280,17 @@ fn load_persistent_repl_history(paths: &MiyuPaths) -> Vec<String> {
     entries
 }
 
+/// 会话内输入历史的容量上限:REPL 常开数天时防无界增长,超限丢最老。
+const REPL_HISTORY_LIMIT: usize = 500;
+
+fn push_history_capped(history: &mut Vec<String>, content: &str) {
+    history.push(content.to_string());
+    if history.len() > REPL_HISTORY_LIMIT {
+        let excess = history.len() - REPL_HISTORY_LIMIT;
+        history.drain(..excess);
+    }
+}
+
 fn persist_repl_history_entry(paths: &MiyuPaths, entry: &str) {
     let entry = entry.trim();
     if entry.is_empty() {
@@ -9472,7 +9483,7 @@ impl LiveReplEditor {
     }
 
     fn record_history(&mut self, content: &str) {
-        self.history.push(content.to_string());
+        push_history_capped(&mut self.history, content);
         self.history_index = self.history.len();
     }
 
@@ -11102,6 +11113,11 @@ struct SharedJobsFeed {
     rendered_turns: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// 两个去重集合的容量兜底。常开 REPL 的后台唤醒一直发生,集合只增不减;
+/// 死掉的 id 不会再被查到(run 不再出现在 wake_runs、turn 已过水位线),
+/// 超限时清掉无副作用。
+const JOBS_FEED_MARK_LIMIT: usize = 4_096;
+
 #[derive(Clone)]
 struct BackgroundReport {
     turn_id: String,
@@ -11169,6 +11185,9 @@ impl JobsFeed {
         let mut followed = shared.followed_runs.lock().unwrap();
         for (run_id, run_session, label) in wake_runs.iter() {
             if run_session == session && !followed.contains(run_id) {
+                if followed.len() >= JOBS_FEED_MARK_LIMIT {
+                    followed.retain(|id| wake_runs.iter().any(|(r, _, _)| r == id));
+                }
                 followed.insert(run_id.clone());
                 return Some((run_id.clone(), label.clone()));
             }
@@ -11300,7 +11319,7 @@ async fn fetch_jobs_overview(paths: &MiyuPaths) -> Result<JobsOverviewSnapshot> 
 /// 退出路径 5 秒宽限——主线程若卡死在 crossterm 对 HUP fd 的任何内部
 /// 自旋(事件 poll、CPR 应答等待,均为实测形态),由这里强制收尾,
 /// 保证关终端后绝不留下吃 CPU 的残留进程。
-fn spawn_hangup_watchdog() {
+pub(crate) fn spawn_hangup_watchdog() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         std::thread::spawn(|| loop {
@@ -11729,11 +11748,11 @@ async fn follow_wake_run(
     live.raw_mode_handoff = true;
     // Suppress the duplicate DB report for a turn that was rendered live.
     if let Some(turn_id) = turn_id {
-        jobs_shared
-            .rendered_turns
-            .lock()
-            .unwrap()
-            .insert(turn_id);
+        let mut rendered = jobs_shared.rendered_turns.lock().unwrap();
+        if rendered.len() >= JOBS_FEED_MARK_LIMIT {
+            rendered.clear();
+        }
+        rendered.insert(turn_id);
     }
     Ok(())
 }
@@ -13602,6 +13621,18 @@ mod repl_input_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 回归(PR#31):会话内历史无上限,常开 REPL 线性增长。
+    #[test]
+    fn repl_history_is_capped() {
+        let mut history = Vec::new();
+        for i in 0..(REPL_HISTORY_LIMIT + 100) {
+            push_history_capped(&mut history, &format!("entry-{i}"));
+        }
+        assert_eq!(history.len(), REPL_HISTORY_LIMIT);
+        assert_eq!(history.first().map(String::as_str), Some("entry-100"));
+        assert_eq!(history.last().map(String::as_str), Some("entry-599"));
+    }
 
     fn sample_pop_turn(status: TurnStatus) -> Turn {
         Turn {

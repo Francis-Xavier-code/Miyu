@@ -50,6 +50,9 @@ struct TerminalSession {
 impl TerminalSession {
     fn start() -> Result<Self> {
         terminal::enable_raw_mode()?;
+        // 独立 `miyu config` 没有 REPL 的挂断看门狗;不发 SIGHUP 的断开
+        // (tmux kill-pane、SSH 掉线)会让 crossterm 对 HUP fd 全速自旋。
+        crate::cli::spawn_hangup_watchdog();
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
         Ok(Self { stdout })

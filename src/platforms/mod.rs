@@ -116,6 +116,7 @@ const PLATFORM_TOOL_LOG_MAX_CHARS: usize = 2_400;
 const PLATFORM_REPLY_LOG_MAX_CHARS: usize = 1_200;
 const MESSAGE_ACTIVITY_SCOPE_SOFT_LIMIT: usize = 512;
 const MESSAGE_ACTIVITY_SEEN_LIMIT: usize = 4_096;
+const MESSAGE_ACTIVITY_SENDER_LIMIT: usize = 4_096;
 const MESSAGE_ACTIVITY_MAX_ID_BYTES: usize = 256;
 
 #[derive(Clone, Default)]
@@ -190,6 +191,13 @@ impl MessageActivityHandle {
         state.total_messages = state.total_messages.saturating_add(1);
         let total_messages = state.total_messages;
         let sender_messages = {
+            // 与 seen_messages 同款兜底:常驻 daemon 里陌生发送者只增不减。
+            // 清表的代价只是各发送者的"第 N 条"计数重新起算。
+            if state.sender_messages.len() >= MESSAGE_ACTIVITY_SENDER_LIMIT
+                && !state.sender_messages.contains_key(sender_id)
+            {
+                state.sender_messages.clear();
+            }
             let count = state
                 .sender_messages
                 .entry(sender_id.to_string())
@@ -2893,6 +2901,29 @@ mod tests {
         assert_eq!(sniff_image_mime(b"GIF89a"), "image/gif");
         assert_eq!(sniff_image_mime(b"RIFF\0\0\0\0WEBPVP8 "), "image/webp");
         assert_eq!(sniff_image_mime(b"????"), "image/png");
+    }
+
+    /// 回归(PR#31):sender_messages 每个唯一发送者一条、永不清,
+    /// 常驻 daemon 慢速泄漏;超限清表后计数重新起算、总数不受影响。
+    #[test]
+    fn message_activity_sender_counts_are_bounded() {
+        let registry = MessageActivityRegistry::default();
+        let now = Instant::now();
+        // 持有一个 handle 保住 scope 的 Arc,循环里的弱引用才升级得到。
+        let (_keep, _, _) = registry.observe("onebot:1:group:9", "m0", "sender-0", now);
+        for i in 1..MESSAGE_ACTIVITY_SENDER_LIMIT {
+            registry.observe("onebot:1:group:9", &format!("m{i}"), &format!("sender-{i}"), now);
+        }
+        // 表满;新面孔触发清表,计数从 1 起
+        let (_, newcomer, _) = registry.observe("onebot:1:group:9", "mx1", "newcomer", now);
+        assert_eq!(newcomer.sender_messages, 1);
+        // 老发送者被清,回到 1 而不是 2;总量计数不受清表影响
+        let (_, again, _) = registry.observe("onebot:1:group:9", "mx2", "sender-0", now);
+        assert_eq!(again.sender_messages, 1);
+        assert_eq!(
+            again.total_messages,
+            (MESSAGE_ACTIVITY_SENDER_LIMIT + 2) as u64
+        );
     }
 
     #[test]
