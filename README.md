@@ -14,7 +14,17 @@ Miyu 是从我曾经很喜欢的动画中的角色身上汲取灵感制作的虚
 
 ## 有什么功能？
 
-`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。除了 Coding，她还可以完成聊天日常、游戏娱乐、系统排障、天气查询、汇率换算、二手市场行情查询等日用场景。
+`miyu` 由大模型驱动，默认接入了 [opencode](https://github.com/anomalyco/opencode) 的公共模型服务，你也可以配置自己的大模型服务。
+
+`miyu` 拥有两个模式
+
+- Normal 普通模式
+  
+  拥有全部功能和工具，可以完成角色扮演、游戏娱乐、系统排障、天气查询、汇率换算、二手市场行情查询等日用场景。
+
+- Dev 开发模式
+
+  和普通模式隔离，移除所有和开发无关的功能和工具，通过极简设计最大限度发挥模型自身的能力。
 
 `miyu` 可以与 `fish`、`zsh`、`bash` 集成，终端打字直接无缝对话！
 
@@ -36,7 +46,7 @@ miyu config
 
 ![](./pics/webui.png)
 
-还可以通过 NapCat 接入 QQ，远程操作电脑；亦或是加入群聊，陪网友吹水，帮助你管理群聊。
+还可以接入 QQ，远程操作电脑；亦或是加入群聊，陪网友吹水，帮助你管理群聊。
 
 ![](./pics/qq私聊.png)
 
@@ -59,18 +69,15 @@ miyu config
   cargo build --release
   ```
 
+安装完成后可以运行 `miyu init` 初始化配置和状态文件；也可以直接运行 `miyu daemon start`，首次启动会自动初始化。查看完整帮助信息可以运行 `miyu -h`。
 
-安装完成后可以运行 `miyu init` 初始化配置和状态文件；也可以直接运行 `miyu daemon start`，首次启动会自动初始化。
-
-## 如何使用？
+## 三种触发
 
 > 与 `miyu` 运行最适配的是 `kitty`终端
 
-- REPL TUI 交互模式
+- REPL TUI
 
-  ```
-  miyu
-  ```
+  `miyu normal` 进入普通模式的 REPL； `miyu dev` 进入开发模式的 REPL。
 
 - webui 局域网网页
 
@@ -85,30 +92,21 @@ miyu config
   ```
   miyu fish-init
   ```
+  初始化后可以直接在终端打字对话。
 
-### 会话的三条车道
+## 重要配置调整
 
-`miyu` 把「对话落在哪」分成三条互不干扰的车道，不用手动切会话就能随口问问题：
+运行 `miyu config` 命令打开配置 TUI。
 
-| 入口                                                            | 落在哪                                               |
-| --------------------------------------------------------------- | ---------------------------------------------------- |
-| `miyu ask <消息>`、`miyu '<消息>'`、管道输入                    | **一次性对话**：临时会话，答完即删，不进任何上下文   |
-| shell hook（终端里直接说自然语言）、`miyu new` / `miyu session` | **终端会话**：一直沿用，直到你主动切换               |
-| `miyu` 进 REPL、REPL 内的 `/new` 和 `/session`                  | **REPL 会话**：REPL 自己记着上次在哪，重开就回到那里 |
+- 供应商和模型
 
-于是：shell hook 正在长篇回复时，另开一个终端 `miyu '顺手问一句'` 不会污染那条对话；REPL 里 `/new` 开的新会话，退出重开还在，而 shell hook 仍留在原来的终端会话上。
+  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的 API。
 
-一次性入口想例外地发进终端会话时加 `-c`：
+- 自定义提示词
 
-```
-miyu -c '记住我在写 Miyu 的会话模块'
-```
+  `miyu`的默认提示词是无法修改的。你可以在`自定义提示词`中新建属于自己的 AI 人格，还可以配置 `用户身份` 让对话更加沉浸。 
 
-`--session <名称|编号>` 则指定任意一个会话，同样只作用于本次命令。
-
-删除会话不必先切过去：`miyu session` 或 REPL 的 `/session` 弹出菜单后，在目标行按 `Ctrl+D` 确认即可，删完菜单会刷新并留在原处。
-
-### 搬到另一台机器
+## 搬到另一台机器
 
 `miyu export` 把当前安装打成一个 `.tar.gz`（权限 0600），`miyu import` 在新机器上还原：
 
@@ -124,25 +122,7 @@ miyu import miyu-export-*.tar.gz
 
 默认**不含**知识库向量索引（很大，且 `miyu kb embed` 可重建）、缓存、日志和其他一次性的本机状态。密钥默认带上并在导出时警告——归档是明文的，别随手发出去。
 
-目标目录已有配置或会话历史时导入会被拒绝；`--force` 会先把现有安装导出成 `miyu-backup-<时间>.tar.gz` 再覆盖。导入后按提示重装 shell 集成、跑 `miyu kb reindex`（知识库记的是旧机器的绝对路径），未带 `--index` 时再跑一次 `miyu kb embed`。
-
-### 重要配置调整
-
-运行 `miyu config` 命令打开配置 TUI。
-
-- 供应商和模型
-
-  `miyu` 默认使用 opencode 的公共 API，推荐配置自己的 API。
-
-- 自定义提示词
-
-  `miyu`的默认提示词是无法修改的。你可以在`自定义提示词`中新建属于自己的 AI 人格，还可以配置 `用户身份` 让对话更加沉浸。 
-
-### 用户资源与 Skill
-
-Miyu 将配置与用户资源分开保存：`~/.miyu/config` 存放 `config.jsonc`、主题和 shell 集成；`~/.miyu/data` 存放 prompts、identities、persona-avatars、scripts 和 skills；运行状态与 Skill 草稿位于 `~/.miyu/state`。
-
-### 内置插件
+## 内置插件
 
 <details><summary>[展开/收起] 具体介绍</summary>
 <br>
