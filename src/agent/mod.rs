@@ -3415,6 +3415,9 @@ impl Agent {
                 result.content.clone(),
                 result.reasoning.as_deref(),
                 result.thinking_signature.as_deref(),
+                // 参数的合法性由 ChatMessage::assistant 统一收口(见那里的
+                // 注释);执行侧仍拿原始参数,好让工具把 `EOF while parsing`
+                // 这类解析错误如实回给模型。
                 Some(result.tool_calls.clone()),
                 true,
             );
@@ -4048,7 +4051,7 @@ impl Agent {
                                 kind: "function".to_string(),
                                 function: ToolCallFunction {
                                     name: call.name.clone(),
-                                    arguments: replayable_tool_arguments(&call.arguments),
+                                    arguments: call.arguments.clone(),
                                 },
                             })
                             .collect(),
@@ -4937,27 +4940,10 @@ fn prune_tool_flow(flow: &mut [crate::state::ToolFlowRound], context: &crate::co
     }
 }
 
-/// 工具调用参数在写进历史、以及从历史回放之前，必须是合法 JSON。
-///
-/// 模型偶尔会把一次 native tool_call 只开个头，剩下的改用 `<tool_call>`
-/// `<function=…>` 那种文本形式写完（mimo-v2.5 实测），native 那一侧就留下
-/// 一串被截断的 JSON，例如 `{"action": "mute", "duration_seconds": `。工具
-/// 本身当场就报 `EOF while parsing a value` 失败了，但那串参数会被化石化
-/// 进 turn，从此每一轮都原样回放——OpenAI→Anthropic 的代理解析不了它，整
-/// 条请求回 HTTP 500，该会话永久不可用（08-17 实测 QQ 群 130515298 卡死）。
-///
-/// 落库和回放两侧都过一遍：落库保证新回合干净，回放让已经坏掉的会话自愈，
-/// 不必靠清库。参数换成 `{}` 不改变故事——那次调用本来就失败了，失败原因
-/// 已经写在同一轮的 tool 结果里。
-fn replayable_tool_arguments(arguments: &str) -> String {
-    // 必须是 JSON **对象**:`5` 或 `"x"` 也是合法 JSON,但工具参数在两家 wire
-    // 格式里都必须是对象,放行只是把同一个 500 换个形状。
-    let trimmed = arguments.trim();
-    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
-        return trimmed.to_string();
-    }
-    "{}".to_string()
-}
+/// 落库保留模型原样发来的参数——包括半截 JSON。发上线前的合法性由
+/// `ChatMessage::assistant` 统一收口；这里净化掉反而会毁掉唯一的取证来源
+/// （08-17 那次 500 就是靠 turn_flow 里存着的 `{"action": "mute",
+/// "duration_seconds": ` 才定位到的）。
 
 fn derive_tool_flow(
     messages: &[ChatMessage],
@@ -4978,7 +4964,7 @@ fn derive_tool_flow(
                         .map(|call| crate::state::ToolFlowCall {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
-                            arguments: replayable_tool_arguments(&call.function.arguments),
+                            arguments: call.function.arguments.clone(),
                             output: String::new(),
                         })
                         .collect(),
@@ -5104,7 +5090,7 @@ fn turn_context_tokens(turn: &crate::state::Turn) -> usize {
                         kind: "function".to_string(),
                         function: ToolCallFunction {
                             name: call.name.clone(),
-                            arguments: replayable_tool_arguments(&call.arguments),
+                            arguments: call.arguments.clone(),
                         },
                     })
                     .collect(),
@@ -5252,9 +5238,7 @@ fn interrupted_turn_replay_messages(agent: &Agent, turn: &crate::state::Turn) ->
                     kind: "function".to_string(),
                     function: ToolCallFunction {
                         name: replay_tool_function_name(name),
-                        arguments: replayable_tool_arguments(
-                            event.text_payload.as_deref().unwrap_or_default(),
-                        ),
+                        arguments: event.text_payload.clone().unwrap_or_default(),
                     },
                 });
             }
@@ -6871,32 +6855,6 @@ mod tests {
     /// `env`/`shell`/`terminal` 报的是 daemon 进程而非客户端(08-17 实测:
     /// daemon 的 stdin 恒为 /dev/null、TERM 是启动时冻结的),既错又占位;
     /// `note` 的身份守卫同样退场。
-    /// 半截 JSON 的工具参数不能进历史,也不能被回放出去。
-    ///
-    /// 08-17 实测:mimo-v2.5 把一次 qq_group_manage 调用只开了个 native 头
-    /// (`{"action": "mute", "duration_seconds": `)就改用文本形式写完,那串
-    /// 参数化石化进 turn 之后每轮回放,上游代理解析不了直接 HTTP 500,整个
-    /// QQ 群会话永久卡死。
-    #[test]
-    fn truncated_tool_arguments_never_reach_the_wire() {
-        for broken in [
-            "",
-            "   ",
-            r#"{"action": "mute", "user_id": "2276391153", "duration_seconds": "#,
-            "not json at all",
-            "{",
-        ] {
-            assert_eq!(replayable_tool_arguments(broken), "{}", "{broken:?}");
-        }
-        // 合法 JSON 但不是对象的同样挡下:两家 wire 格式都要求对象。
-        for scalar in ["5", r#""text""#, "null", "true", "[1,2]"] {
-            assert_eq!(replayable_tool_arguments(scalar), "{}", "{scalar:?}");
-        }
-        // 合法参数原样通过(只去首尾空白)。
-        assert_eq!(replayable_tool_arguments(r#"{"a":1}"#), r#"{"a":1}"#);
-        assert_eq!(replayable_tool_arguments("  {\"a\":1}  "), r#"{"a":1}"#);
-        assert_eq!(replayable_tool_arguments("{}"), "{}");
-    }
 
     /// 剪枝必须幂等:第二次扫过不能再改写,否则每次落库都掰一次前缀。
     #[test]

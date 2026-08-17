@@ -549,11 +549,12 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             return Err(self.unknown_tool_error(name));
         };
-        let args = if arguments.trim().is_empty() {
+        let mut args: Value = if arguments.trim().is_empty() {
             json!({})
         } else {
             serde_json::from_str(arguments)?
         };
+        coerce_declared_shapes(&tool.parameters, &mut args);
         if name == "load_tools" {
             return super::load_tools::execute(args, self);
         }
@@ -581,11 +582,12 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             return Err(self.unknown_tool_error(name));
         };
-        let args = if arguments.trim().is_empty() {
+        let mut args: Value = if arguments.trim().is_empty() {
             json!({})
         } else {
             serde_json::from_str(arguments)?
         };
+        coerce_declared_shapes(&tool.parameters, &mut args);
         if name == "load_tools" {
             let result = super::load_tools::execute(args, self);
             return Ok(Box::pin(async move { result }));
@@ -836,6 +838,55 @@ impl ToolRegistry {
             }
         }
         registry
+    }
+}
+
+/// 按工具自己的 schema 还原被写成「JSON 字符串」的数组/对象参数。
+///
+/// 模型经常把结构化参数序列化成字符串再传，实测同一天踩到三次：
+/// `reference_images` 传成 `"[\"/path.png\"]"`、`todos` 传成
+/// `"[{\"content\":…}]"`、`updates` 同理。stub 加载模式尤其容易——模型看到
+/// 的只有一句摘要和宽松参数壳，没取契约就调用时只能猜形状。
+///
+/// 逐个工具打补丁治标不治本，所以放在这里做一次：只动 schema 明确声明为
+/// array/object 的顶层参数，且只在给来的字符串确实能解析成那个形状时才换。
+/// 声明成 string 的参数一个字节都不碰——`run_command.command` 里恰好是一段
+/// JSON 的情况必须原样透传。
+fn coerce_declared_shapes(parameters: &Value, args: &mut Value) {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for (name, schema) in properties {
+        let Some(declared) = schema.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(declared, "array" | "object") {
+            continue;
+        }
+        let Some(Value::String(text)) = object.get(name) else {
+            continue;
+        };
+        let text = text.trim();
+        let looks_right = match declared {
+            "array" => text.starts_with('['),
+            _ => text.starts_with('{'),
+        };
+        if !looks_right {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let matches_declared = match declared {
+            "array" => parsed.is_array(),
+            _ => parsed.is_object(),
+        };
+        if matches_declared {
+            object.insert(name.clone(), parsed);
+        }
     }
 }
 
@@ -1144,6 +1195,52 @@ mod tests {
 
         // 只取第一行。
         assert_eq!(load_target_summary("首行摘要。\n第二行细节。"), "首行摘要。");
+    }
+
+    /// 模型把结构化参数序列化成字符串再传是常态,08-17 一天踩到三次:
+    /// `reference_images` 传成 `"[\"/p.png\"]"`、`todos` 传成
+    /// `"[{...}]"`、`updates` 同理。按 schema 还原,别让参数静默失效。
+    #[test]
+    fn stringified_arrays_and_objects_are_restored_by_schema() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "todos": { "type": "array" },
+                "config": { "type": "object" },
+                "command": { "type": "string" },
+                "count": { "type": "integer" }
+            }
+        });
+
+        // 线上实际踩到的两种形状。
+        let mut args = json!({
+            "todos": r#"[{"content":"a","status":"pending"}]"#,
+            "config": r#"{"a":1}"#
+        });
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args["todos"], json!([{"content":"a","status":"pending"}]));
+        assert_eq!(args["config"], json!({"a":1}));
+
+        // 声明成 string 的参数一个字节都不碰:命令里恰好是一段 JSON 的
+        // 情况必须原样透传。
+        let mut args = json!({ "command": r#"["not","an","array"]"#, "count": 3 });
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args["command"], json!(r#"["not","an","array"]"#));
+        assert_eq!(args["count"], json!(3));
+
+        // 本来就是正确类型的、解析不了的、形状对不上的,一律不动。
+        let mut args = json!({
+            "todos": [{"content": "a"}],
+            "config": "{ broken",
+        });
+        let before = args.clone();
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args, before);
+
+        let mut args = json!({ "todos": r#"{"not":"an array"}"# });
+        let before = args.clone();
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args, before);
     }
 
     #[test]
