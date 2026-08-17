@@ -106,8 +106,12 @@ fn silence_first_font_load() {
 }
 
 /// 渲染一个最小公式，只为触发字体加载；产物丢弃。
+///
+/// 必须带 CJK。会说话的是**Unicode 回退字体**，纯 ASCII 公式压根用不上它
+/// ——第一版预热写的是 `parse("x")`，缓存没填上，真正带中文的公式一来照样
+/// 打印两行。实测只有 `\text{中文}` 这条会触发（两张缓存各打一次）。
 fn warm_up_font_caches() -> Option<Vec<u8>> {
-    let ast = parse("x").ok()?;
+    let ast = parse(r"\text{中}").ok()?;
     let color = Color {
         r: MATH_COLOR.0,
         g: MATH_COLOR.1,
@@ -443,6 +447,24 @@ mod tests {
             assert!(!joined.contains("\u{1b}[?25l"), "混进了隐藏光标");
             assert!(!joined.contains("\u{1b}D"), "还有没换掉的 IND");
         }
+    }
+
+    /// 回归：带 CJK 的公式会让 RaTeX 加载 Unicode 回退字体，而那个 crate
+    /// 找到字体就无条件 `eprintln!`。预热必须用带 CJK 的公式——第一版写的
+    /// 是 `parse("x")`，纯 ASCII 用不上回退字体，缓存没填上，真正带中文的
+    /// 公式一来照样打印两行。
+    ///
+    /// 这里只断言预热本身能跑通；噪声有没有被吞掉要看 stderr，用
+    /// `cargo test --release tmp -- --ignored` 那类手工对照验（实测无抑制
+    /// 2 行、有抑制 0 行）。
+    #[test]
+    fn font_warm_up_uses_a_cjk_formula() {
+        assert!(
+            warm_up_font_caches().is_some(),
+            "预热公式渲染失败,字体缓存填不上"
+        );
+        // 预热之后再渲染带中文的公式不该再触发加载。
+        assert!(ratex_png(r"\text{中文}", MathMode::Block).is_some());
     }
 
     #[test]
