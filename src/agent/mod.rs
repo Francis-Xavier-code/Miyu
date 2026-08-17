@@ -28,7 +28,6 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -385,6 +384,9 @@ pub enum AgentEvent {
     },
     ToolPreparing {
         name: String,
+        /// 本轮里这不是第一个工具调用。渲染层据此在工具自己没有提示词时
+        /// 退到通用的「准备工具」。
+        batch: bool,
     },
     ToolResult {
         call_id: String,
@@ -411,6 +413,7 @@ pub enum AgentEvent {
         name: String,
         path: PathBuf,
         alt: String,
+        size: Option<String>,
     },
     Artifact {
         call_id: String,
@@ -564,10 +567,10 @@ impl TurnJournalSink {
                     arguments,
                 })
             }
-            AgentEvent::ToolPreparing { name } => {
+            AgentEvent::ToolPreparing { name, batch } => {
                 self.flush(on_event)?;
                 self.append("tool_preparing", None, Some(&name), Some(&name), None, None)?;
-                on_event(AgentEvent::ToolPreparing { name })
+                on_event(AgentEvent::ToolPreparing { name, batch })
             }
             AgentEvent::ToolResult {
                 call_id,
@@ -635,8 +638,11 @@ impl TurnJournalSink {
                 name,
                 path,
                 alt,
+                size,
             } => {
                 self.flush(on_event)?;
+                // size 刻意不落库:它是这一次的展示偏好,回放时终端可能已经
+                // 换了尺寸,按当时的配置百分比重算才对。
                 let payload = serde_json::json!({
                     "path": path.display().to_string(),
                     "alt": alt,
@@ -655,6 +661,7 @@ impl TurnJournalSink {
                     name,
                     path,
                     alt,
+                    size,
                 })
             }
             AgentEvent::Artifact {
@@ -864,11 +871,12 @@ where
         tools::ToolProgressEvent::PrepareForExternalOutput { ready } => {
             on_event(AgentEvent::PrepareForExternalOutput { ready })
         }
-        tools::ToolProgressEvent::Image { path, alt } => on_event(AgentEvent::Image {
+        tools::ToolProgressEvent::Image { path, alt, size } => on_event(AgentEvent::Image {
             call_id: call_id.to_string(),
             name: name.to_string(),
             path,
             alt,
+            size,
         }),
         tools::ToolProgressEvent::Artifact { path, title } => on_event(AgentEvent::Artifact {
             call_id: call_id.to_string(),
@@ -1021,11 +1029,14 @@ impl Agent {
             config
         };
         let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
-        let system_prompt = with_host_environment(
-            with_mode_reminder(base_system_prompt, mode),
-            prompt_audience,
-            paths,
-            mode,
+        let system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_mode_reminder(base_system_prompt, mode),
+                prompt_audience,
+                paths,
+                mode,
+            ),
+            config.memory_config().enabled,
         );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
@@ -1224,15 +1235,17 @@ impl Agent {
             self.state.recover_stale_turns()?;
             self.maybe_cold_resume_prune()?;
         }
-        self.system_prompt = with_host_environment(
-            with_runtime_system_context(
-                with_mode_reminder(effective_system_prompt, self.mode),
-                &self.runtime_system_context,
+        self.system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_runtime_system_context(
+                    with_mode_reminder(effective_system_prompt, self.mode),
+                    &self.runtime_system_context,
+                ),
+                self.prompt_audience,
+                &self.paths,
+                self.mode,
             ),
-            self.prompt_audience,
-            &self.paths,
-        
-            self.mode,
+            self.config.memory_config().enabled,
         );
         Ok(())
     }
@@ -1520,15 +1533,17 @@ impl Agent {
     fn refresh_system_prompt(&mut self) -> Result<()> {
         let base_system_prompt =
             mode_system_prompt(&self.config, &self.paths, self.mode, self.prompt_audience)?;
-        self.system_prompt = with_host_environment(
-            with_runtime_system_context(
-                with_mode_reminder(base_system_prompt, self.mode),
-                &self.runtime_system_context,
+        self.system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_runtime_system_context(
+                    with_mode_reminder(base_system_prompt, self.mode),
+                    &self.runtime_system_context,
+                ),
+                self.prompt_audience,
+                &self.paths,
+                self.mode,
             ),
-            self.prompt_audience,
-            &self.paths,
-        
-            self.mode,
+            self.config.memory_config().enabled,
         );
         Ok(())
     }
@@ -1992,7 +2007,8 @@ impl Agent {
         }
         // 无条件覆盖:redo 前的旧修订可能留有 tool_flow,新修订没有工具
         // 调用时空 flow 也必须写入,否则旧工具流会被冒名回放。
-        let tool_flow = derive_tool_flow(&messages, replay_start);
+        let mut tool_flow = derive_tool_flow(&messages, replay_start);
+        prune_tool_flow(&mut tool_flow, &self.config.context);
         self.state
             .set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         if self.memory.process_after_turn(
@@ -2236,7 +2252,8 @@ impl Agent {
         if let (Some(provider), Some(model)) = (&result.provider_id, &result.model) {
             self.last_request_endpoint = Some((provider.clone(), model.clone()));
         }
-        let tool_flow = derive_tool_flow(&messages, replay_start);
+        let mut tool_flow = derive_tool_flow(&messages, replay_start);
+        prune_tool_flow(&mut tool_flow, &self.config.context);
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
         }
@@ -2305,8 +2322,13 @@ impl Agent {
         // registration made the tools array appear/disappear between turns,
         // invalidating the provider prefix cache from token 0; an empty scope
         // simply rejects analysis requests with a clear message instead.
+        //
+        // 生图的参考图与看图共用同一份作用域,所以这一段不能只由 vision 插件
+        // 开关把门:vision 关、生图开时,平台回合的 generate_image 会留着不受
+        // 限的解析器,不可信用户一句话就能让它把宿主上任意文件当参考图上传。
         if self.tools_enabled
-            && self.config.plugins.vision.enabled
+            && (self.config.plugins.vision.enabled
+                || self.config.plugins.image_generation.enabled)
             && self.image_platform.is_some()
         {
             let mut tools = self.tools.lock().unwrap();
@@ -2411,8 +2433,11 @@ impl Agent {
                 .map(|image| image.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // 用法说明是常量,已随 <qq-context-images> 进 system 提示词
+            // (08-17;实测一条 780K token 的群聊请求里这句重复 579 次、
+            // 共 139,867 字符)。每轮只留真正会变的 ID 列表。
             hints.push(ChatMessage::turn_context(format!(
-                "此前群聊记录中有可按需查看的历史图片：{ids}。你尚未看到这些图片的实际内容；只有回答确实依赖图片时，才使用 vision_analyze，并把对应 ID 作为 image 参数。不得根据图片占位符猜测内容。"
+                "<context-images>{ids}</context-images>"
             )));
         }
 
@@ -3038,6 +3063,9 @@ impl Agent {
                 request_messages.splice(offset..offset, context_messages.clone());
             }
             let mut reasoning_filter = ReasoningTitleFilter::default();
+            // 与 reasoning_filter 同生命周期:一轮模型调用 = 一条 assistant
+            // 消息,批量提示要的正是"这条消息里的第几个工具调用"。
+            let mut tool_calls_seen = 0usize;
             if self.config.cache.write_grace_ms > 0 {
                 if let Some(previous) = last_round_completed_at {
                     let grace = std::time::Duration::from_millis(self.config.cache.write_grace_ms);
@@ -3091,6 +3119,7 @@ impl Agent {
                                 chunk,
                                 received_at,
                                 &mut reasoning_filter,
+                                &mut tool_calls_seen,
                                 on_event,
                             )?;
                         }
@@ -3260,7 +3289,13 @@ impl Agent {
                 continue;
             };
             while let Ok((chunk, received_at)) = chunk_rx.try_recv() {
-                emit_model_chunk_at(chunk, received_at, &mut reasoning_filter, on_event)?;
+                emit_model_chunk_at(
+                    chunk,
+                    received_at,
+                    &mut reasoning_filter,
+                    &mut tool_calls_seen,
+                    on_event,
+                )?;
             }
             let (title, text) = reasoning_filter.finish();
             if let Some(title) = title {
@@ -3399,6 +3434,9 @@ impl Agent {
                 result.content.clone(),
                 result.reasoning.as_deref(),
                 result.thinking_signature.as_deref(),
+                // 参数的合法性由 ChatMessage::assistant 统一收口(见那里的
+                // 注释);执行侧仍拿原始参数,好让工具把 `EOF while parsing`
+                // 这类解析错误如实回给模型。
                 Some(result.tool_calls.clone()),
                 true,
             );
@@ -4879,6 +4917,53 @@ fn spill_replacement(output: &str, cap: usize, locator: &str) -> Option<String> 
 /// tool_calls 即开一轮,其后按 call id 认领 role:"tool" 输出。被 length 截断
 /// 拒执行的调用照录——它们的错误文案同样是模型看到的字节。任何悬空调用
 /// (无输出)补占位,回放绝不发"无应答的 tool_calls"(provider 会 400)。
+/// 历史工具结果分级剪枝(08-17,抄 dsh-compaction-tool-result-pruner)。
+///
+/// 超预算的工具输出在**落库那一刻**改写成「头 + 省略标记 + 尾」,活体请求
+/// 仍然拿到完整输出(模型这一轮需要它)。选落库而不是回放:落库时这条结果
+/// 就在上下文末尾,前缀只在末尾分叉一次,代价是一个尾巴;放到回放侧改则
+/// 每次回放都可能在历史中段分叉。改写是幂等的——第二次扫过不会再变。
+fn prune_tool_output(output: &str, threshold: usize, head: usize, tail: usize) -> String {
+    // 预算不自洽(头+尾不比阈值小)时原样返回:否则下面的减法会下溢,而且
+    // "剪枝"结果可能比原文还长。调用方也拦一道,这里是第二道。
+    if threshold == 0 || head + tail >= threshold || output.chars().count() <= threshold {
+        return output.to_string();
+    }
+    let chars: Vec<char> = output.chars().collect();
+    let omitted = chars.len() - head - tail;
+    let marker = format!(
+        "\n…[{} {omitted} {}]\n",
+        crate::i18n::agent_text("omitted", "已省略"),
+        crate::i18n::agent_text("chars from the middle", "字符（中段）")
+    );
+    let mut pruned = String::new();
+    pruned.extend(&chars[..head]);
+    pruned.push_str(&marker);
+    pruned.extend(&chars[chars.len() - tail..]);
+    pruned
+}
+
+fn prune_tool_flow(flow: &mut [crate::state::ToolFlowRound], context: &crate::config::ContextConfig) {
+    let (threshold, head, tail) = (
+        context.tool_result_prune_chars,
+        context.tool_result_prune_head_chars,
+        context.tool_result_prune_tail_chars,
+    );
+    if threshold == 0 || head + tail >= threshold {
+        return;
+    }
+    for round in flow.iter_mut() {
+        for call in round.calls.iter_mut() {
+            call.output = prune_tool_output(&call.output, threshold, head, tail);
+        }
+    }
+}
+
+/// 落库保留模型原样发来的参数——包括半截 JSON。发上线前的合法性由
+/// `ChatMessage::assistant` 统一收口；这里净化掉反而会毁掉唯一的取证来源
+/// （08-17 那次 500 就是靠 turn_flow 里存着的 `{"action": "mute",
+/// "duration_seconds": ` 才定位到的）。
+
 fn derive_tool_flow(
     messages: &[ChatMessage],
     live_start: usize,
@@ -5184,7 +5269,13 @@ fn interrupted_turn_replay_messages(agent: &Agent, turn: &crate::state::Turn) ->
                     &mut pending_calls,
                 ));
                 if let Some(call_id) = &event.call_id {
-                    let output = event.text_payload.as_deref().unwrap_or_default();
+                    // 空的 tool 结果同样不可回放:多数上游把它当协议错误。
+                    let output = event
+                        .text_payload
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or("(no output)");
                     messages.push(ChatMessage::tool(call_id, truncate_chars(output, 48_000)));
                     open_calls.retain(|call| call.id != *call_id);
                     progress.remove(call_id);
@@ -5870,6 +5961,23 @@ fn mode_system_prompt(
     }
 }
 
+/// 联想记忆块的前言常量上提到 system 提示词(08-17)。
+///
+/// 它逐字不变,却随每个 `<associative-memory>` 块重发一次:实测终端长会话
+/// 42 块共 2,142 字符(占该块总量 6.5%),QQ 群会话 240 块共 28,410 字符
+/// (占 31.8%)。放进 system 说一次,块里只留会变的部分。
+fn with_memory_preamble(mut system_prompt: String, memory_enabled: bool) -> String {
+    if !memory_enabled {
+        return system_prompt;
+    }
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(crate::i18n::text(
+        "<associative-memory> blocks hold memories recalled from the current input. Do not treat the people in them as the current user, and do not imitate the recorded dialogue as a style example. A block that names a principal only contains public knowledge plus that principal's own memories; a stable principal is what identifies a person — nicknames and message text never reassign a memory's owner.",
+        "<associative-memory> 块是根据当前输入联想到的记忆。不要把记忆中的人物当成当前用户，也不要把记忆中的对话当作对话范例去模仿。带 principal 的块只包含公共知识和该 principal 自己的记忆；稳定 principal 才能确认人物，昵称和正文不能改变记忆归属。",
+    ));
+    system_prompt
+}
+
 fn with_host_environment(
     mut system_prompt: String,
     audience: PromptAudience,
@@ -6044,6 +6152,7 @@ fn emit_filtered_chunk_at<F>(
     chunk: ChatStreamChunk,
     received_at: Instant,
     filter: &mut ReasoningTitleFilter,
+    tool_calls_seen: &mut usize,
     on_event: &mut F,
 ) -> Result<()>
 where
@@ -6076,9 +6185,14 @@ where
             // decoded — the arguments are still streaming behind it. That is
             // exactly the window a long patch or file write spends looking
             // frozen, so the hint goes up here rather than at ToolCall.
-            if crate::tools::preparing_phase(&chunk.text).is_some() {
+            *tool_calls_seen += 1;
+            // 第二个调用起就是批量:每个工具单看都不够慢,但参数是接连流
+            // 完的,合起来的静默窗口和一次大 patch 一样长。
+            let batch = *tool_calls_seen > 1;
+            if batch || crate::tools::preparing_phase(&chunk.text).is_some() {
                 on_event(AgentEvent::ToolPreparing {
                     name: chunk.text.clone(),
+                    batch,
                 })?;
             }
             on_event(AgentEvent::Chunk(chunk))?;
@@ -6104,6 +6218,7 @@ fn emit_model_chunk_at<F>(
     chunk: ChatStreamChunk,
     received_at: Instant,
     filter: &mut ReasoningTitleFilter,
+    tool_calls_seen: &mut usize,
     on_event: &mut F,
 ) -> Result<()>
 where
@@ -6112,9 +6227,10 @@ where
     if chunk.kind == ChatStreamKind::Reasoning {
         on_event(AgentEvent::RawReasoning(chunk.clone()))?;
     }
-    emit_filtered_chunk_at(chunk, received_at, filter, on_event)
+    emit_filtered_chunk_at(chunk, received_at, filter, tool_calls_seen, on_event)
 }
 
+/// 测试助手：不关心批量提示的用例用这个，计数器每次从零开始。
 #[cfg(test)]
 fn emit_filtered_chunk<F>(
     chunk: ChatStreamChunk,
@@ -6124,7 +6240,7 @@ fn emit_filtered_chunk<F>(
 where
     F: FnMut(AgentEvent) -> Result<()>,
 {
-    emit_filtered_chunk_at(chunk, Instant::now(), filter, on_event)
+    emit_filtered_chunk_at(chunk, Instant::now(), filter, &mut 0, on_event)
 }
 
 #[cfg(test)]
@@ -6186,64 +6302,31 @@ fn turns_since_reminder_fossil(
     Ok(since)
 }
 
+/// 每轮瞬态尾巴里唯一的运行时事实：时间 + 工作目录。
+///
+/// 其余字段全部退场（08-17 实测）：`env`/`shell`/`terminal` 读的是 **daemon
+/// 进程**的 stdio 与环境变量，而回合跑在 daemon 里——stdin 恒为 /dev/null,
+/// 于是 `env` 永远报"非交互"; `TERM`/`SHELL` 是 daemon 启动那一刻冻结的值,
+/// 与真正的客户端终端无关(实测 daemon=xterm-kitty 而客户端=tmux-256color)。
+/// 三个字段既是错的又占 91 字符。`note` 那句身份守卫同样删除。
+///
+/// 时间格式:终端小时级、平台分钟级——同粒度内整块字节不变,配合"变了才
+/// 注入"的投影(见 `chat_messages`)。ISO 日期比中文日期短,星期用三字母。
 fn runtime_context(mode: AgentMode, platform: bool) -> String {
     if platform {
         return format!(
             "<runtime now=\"{}\"/>",
-            Local::now().format("%Y年%m月%d日 %A %H:%M")
+            Local::now().format("%Y-%m-%d %a %H:%M")
         );
     }
     let cwd = crate::tools::workspace::effective_workdir()
         .display()
         .to_string();
     let _ = mode;
-    let runtime = terminal_runtime_context();
-    // 小时级而非分钟级:同一小时内整块字节不变,配合投影跳注入
-    // (缓存调研 08-16);要精确时间,终端面有 date。
     format!(
-        "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
-        Local::now().format("%Y年%m月%d日 %A %H时"),
+        "<runtime now=\"{}\" cwd=\"{}\"/>",
+        Local::now().format("%Y-%m-%d %a %H时"),
         xml_attr_escape(&cwd),
-    )
-}
-
-fn terminal_runtime_context() -> String {
-    let stdin_tty = std::io::stdin().is_terminal();
-    let stdout_tty = std::io::stdout().is_terminal();
-    let stderr_tty = std::io::stderr().is_terminal();
-    let environment = if stdin_tty || stdout_tty || stderr_tty {
-        if crate::i18n::agent_is_zh() {
-            "终端会话"
-        } else {
-            "terminal session"
-        }
-    } else if crate::i18n::agent_is_zh() {
-        "非交互或管道环境"
-    } else {
-        "non-interactive or piped environment"
-    };
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let mut terminal_parts = Vec::new();
-    for key in ["TERM_PROGRAM", "TERM", "COLORTERM"] {
-        if let Ok(value) = std::env::var(key) {
-            if !value.trim().is_empty() {
-                terminal_parts.push(format!("{key}={value}"));
-            }
-        }
-    }
-    let terminal = if terminal_parts.is_empty() {
-        "unknown".to_string()
-    } else {
-        terminal_parts.join(", ")
-    };
-    format!(
-        "env=\"{}\" shell=\"{}\" terminal=\"{}\"",
-        xml_attr_escape(environment),
-        xml_attr_escape(&shell),
-        xml_attr_escape(&terminal)
     )
 }
 
@@ -6327,7 +6410,7 @@ mod tests {
         let mut streamed = Vec::new();
         let mut on_event = |event| {
             match event {
-                AgentEvent::ToolPreparing { name } => prepared.push(name),
+                AgentEvent::ToolPreparing { name, .. } => prepared.push(name),
                 AgentEvent::Chunk(chunk) if chunk.kind == ChatStreamKind::ToolCall => {
                     streamed.push(chunk.text)
                 }
@@ -6370,6 +6453,40 @@ mod tests {
             ]
         );
         assert_eq!(streamed, names);
+    }
+
+    /// 上一个用例每次调用都新起一个计数器，测的是「单个工具够不够慢」。
+    /// 这里共用一个计数器，模拟同一条 assistant 消息里连着来的多个调用。
+    #[test]
+    fn tool_call_stream_announces_preparation_for_later_calls_in_a_batch() {
+        let mut filter = ReasoningTitleFilter::default();
+        let mut seen = 0usize;
+        let mut prepared = Vec::new();
+        let mut on_event = |event| {
+            if let AgentEvent::ToolPreparing { name, batch } = event {
+                prepared.push((name, batch));
+            }
+            Ok(())
+        };
+        for name in ["read_file", "read_file", "glob"] {
+            emit_filtered_chunk_at(
+                ChatStreamChunk {
+                    kind: ChatStreamKind::ToolCall,
+                    text: name.to_string(),
+                },
+                Instant::now(),
+                &mut filter,
+                &mut seen,
+                &mut on_event,
+            )
+            .unwrap();
+        }
+        // 第一个调用照旧不提示——单看 read_file 的参数一个 chunk 就到了,
+        // 提示只会闪一下。后面两个才知道这是批量。
+        assert_eq!(
+            prepared,
+            [("read_file".to_string(), true), ("glob".to_string(), true)]
+        );
     }
 
     #[test]
@@ -6770,6 +6887,7 @@ mod tests {
             },
             started_at,
             &mut filter,
+            &mut 0,
             &mut on_event,
         )
         .unwrap();
@@ -6780,6 +6898,7 @@ mod tests {
             },
             ended_at,
             &mut filter,
+            &mut 0,
             &mut on_event,
         )
         .unwrap();
@@ -6795,12 +6914,37 @@ mod tests {
         );
     }
 
+    /// 终端瞬态尾巴只剩两件事:时间和工作目录。
+    /// `env`/`shell`/`terminal` 报的是 daemon 进程而非客户端(08-17 实测:
+    /// daemon 的 stdin 恒为 /dev/null、TERM 是启动时冻结的),既错又占位;
+    /// `note` 的身份守卫同样退场。
+
+    /// 剪枝必须幂等:第二次扫过不能再改写,否则每次落库都掰一次前缀。
+    #[test]
+    fn tool_result_pruning_is_bounded_and_idempotent() {
+        let output = "x".repeat(20_000);
+        let pruned = prune_tool_output(&output, 8192, 4096, 1024);
+        assert!(pruned.chars().count() < output.chars().count());
+        assert!(pruned.contains("14880") || pruned.contains("已省略"), "{pruned}");
+        assert_eq!(prune_tool_output(&pruned, 8192, 4096, 1024), pruned);
+        // 预算内的输出一个字节都不动。
+        let small = "short output";
+        assert_eq!(prune_tool_output(small, 8192, 4096, 1024), small);
+        // 预算不自洽时原样返回,不下溢。
+        assert_eq!(prune_tool_output(&output, 100, 80, 80), output);
+    }
+
     #[test]
     fn runtime_context_contains_dynamic_runtime_only() {
         let context = runtime_context(AgentMode::Normal, false);
         assert!(context.starts_with("<runtime "));
         assert!(context.contains("now=\""));
         assert!(context.contains("cwd=\""));
+        for noise in ["env=", "shell=", "terminal=", "note="] {
+            assert!(!context.contains(noise), "{noise} in {context}");
+        }
+        // ISO 日期 + 三字母星期,不是中文长日期。
+        assert!(!context.contains('年'), "{context}");
     }
 
     #[test]
@@ -6813,10 +6957,15 @@ mod tests {
         for noise in ["cwd=", "shell=", "terminal=", "env=", "note="] {
             assert!(!platform.contains(noise), "{noise} in {platform}");
         }
-        assert!(
-            platform.len() * 3 < runtime_context(AgentMode::Normal, false).len(),
-            "{platform}"
-        );
+        // 平台面到分钟,终端面到小时:同粒度内整块字节不变。
+        assert!(platform.contains(':'), "{platform}");
+        let terminal = runtime_context(AgentMode::Normal, false);
+        let stamp = terminal
+            .split("now=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap();
+        assert!(stamp.ends_with('时') && !stamp.contains(':'), "{stamp}");
     }
 
     #[test]

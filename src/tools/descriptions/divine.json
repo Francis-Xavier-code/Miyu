@@ -1,0 +1,41 @@
+{
+  "name": "divine",
+  "display_name": "占卜",
+  "description": "随机占卜：method 选 zhouyi 周易起卦、tarot 塔罗牌、fortune 吉凶占、dice 掷骰子。工具只摇结果，解释由你来做。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "method": {
+        "type": "string",
+        "enum": [
+          "zhouyi",
+          "tarot",
+          "fortune",
+          "dice"
+        ],
+        "description": "占卜方式。"
+      },
+      "count": {
+        "type": "integer",
+        "description": "仅 dice：骰子数量，默认 1，最多 100。"
+      },
+      "sides": {
+        "type": "integer",
+        "description": "仅 dice：每颗骰子面数，默认 6，最多 1000。"
+      },
+      "modifier": {
+        "type": "integer",
+        "description": "仅 dice：可选总和修正值。"
+      }
+    },
+    "required": [
+      "method"
+    ]
+  },
+  "permission": "readonly",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "divination"
+  ]
+}

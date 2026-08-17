@@ -4524,7 +4524,7 @@ impl ConversationDb {
             "SELECT seq, turn_id, display_content,
                     CASE WHEN status = 'completed' THEN assistant_content
                          WHEN length(trim(assistant_content)) > 0 THEN assistant_content
-                         ELSE '（自动跟进未能完成：模型请求失败或被中断，可用 job_status 查看任务输出）'
+                         ELSE '（自动跟进未能完成：模型请求失败或被中断，可用 job 工具查看任务输出）'
                     END
              FROM turns
              WHERE session_id = ?1 AND seq > ?2 AND status IN ('completed', 'failed', 'interrupted')

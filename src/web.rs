@@ -984,16 +984,20 @@ impl RunEventMapper {
             // be the readable one here alone, which is an easy way to wire a
             // consumer to the wrong field. `tool_name` stays as an alias for
             // browsers still running a cached asset.
-            AgentEvent::ToolPreparing { name } => self.publish(
+            AgentEvent::ToolPreparing { name, batch } => self.publish(
                 "tool.preparing",
                 json!({
                     "run_id": self.run_id,
                     "name": &name,
                     "tool_name": &name,
+                    // 同一条消息里的第 2+ 个工具调用。终端在自己那侧解析
+                    // 提示词（i18n 归渲染层），所以标志位也要过 IPC。
+                    "batch": batch,
                     "display_name": tools::readable_tool_name(&name),
                     // Sent so the WebUI label tracks the backend list instead
                     // of keeping its own copy in sync.
-                    "phase": tools::preparing_phase(&name),
+                    "phase": tools::preparing_phase(&name)
+                        .or_else(|| batch.then(tools::batch_preparing_phase)),
                 }),
             ),
             AgentEvent::ToolProgress {
@@ -1085,6 +1089,7 @@ impl RunEventMapper {
                 name,
                 path,
                 alt,
+                size,
             } => {
                 let (tool_id, tool_name) = self.tool_identity(&call_id, &name);
                 let hide_caption = tool_name == "show_meme";
@@ -1110,6 +1115,9 @@ impl RunEventMapper {
                             "run_id": self.run_id,
                             "tool_id": tool_id,
                             "name": tool_name,
+                            // 模型显式要的尺寸。缺省交给终端按配置百分比
+                            // 自己算——daemon 量到的不是用户的终端。
+                            "size": size,
                             "asset": SafeImageAsset::from_asset(asset, hide_caption),
                         }),
                     ),
@@ -11027,7 +11035,7 @@ mod tests {
             &state,
             IpcCommand::ToolCall {
                 session: Some(session.clone()),
-                name: "job_status".to_string(),
+                name: "job".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: 0,
@@ -11042,7 +11050,7 @@ mod tests {
             &state,
             IpcCommand::ToolCall {
                 session: Some(session),
-                name: "job_status".to_string(),
+                name: "job".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: crate::tools::workspace::MAX_BRIDGE_DEPTH,

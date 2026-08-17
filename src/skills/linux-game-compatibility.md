@@ -8,8 +8,7 @@ compatibility: Miyu built-in research workflow
 
 按本技能的完整流程亲自执行调查（你就是调查者，不要再派发子代理）。原流程第 1 步的"宿主预采集"由你用工具完成：
 
-- `protondb_query`：直接用游戏名查询 ProtonDB（评级、报告数、近期趋势、玩家报告细节）。
-- `query_caniplayonlinux`：查询 Can I Play on Linux 汇总。
+- `game_compat`：用游戏名或 Steam App ID 查兼容性。`source=protondb` 取 ProtonDB 的评级、报告数、近期趋势和玩家报告细节；`source=caniplayonlinux` 取 Can I Play on Linux 汇总；默认 `auto` 先查前者，查不到再退后者。
 - 需要 Steam AppID、AreWeAntiCheatYet 反作弊状态或上述来源不足时，用 `web_search` / `web_fetch` 补查。
 - 中文游戏名先转换为通用英文名再查询（例如"赛博朋克2077"→ Cyberpunk 2077，"原神"→ Genshin Impact）。
 
@@ -29,7 +28,7 @@ compatibility: Miyu built-in research workflow
    - Can I Play on Linux
    - AreWeAntiCheatYet
 2. 根据基础信号做第一轮判断后进行如下操作：
-   - 如果 ProtonDB 有该游戏记录，调用 `protondb_query` 工具获取最新的玩家评论和评级详情。评论通常包含：
+   - 如果 ProtonDB 有该游戏记录，调用 `game_compat`（`source=protondb`）获取最新的玩家评论和评级详情。评论通常包含：
      - 能不能启动
      - 用什么 Proton / GE-Proton
      - 是否需要启动参数

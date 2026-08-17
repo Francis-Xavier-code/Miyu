@@ -84,11 +84,14 @@ pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths
 pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
     registry.register(ToolSpec::new(
         "search_knowledge_base",
-        "Search the local knowledge base content. Returns file paths and original text snippets. Use read_knowledge_base_file if snippets are insufficient. Mention paths only when useful or when the user asks.",
+        // 内容检索与文件名检索合并(08-17):同一个知识库的两种检索口径,
+        // 拆成两个工具只是让 tools 数组多背一份外壳。by 缺省 content。
+        "Search the local knowledge base. by=content (default) searches file contents and returns paths plus original snippets; by=name finds files by file name, directory, extension, or path fragment and returns relative paths. Use read_knowledge_base_file if snippets are insufficient. Mention paths only when useful or when the user asks.",
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Search keywords or user question." },
+                "query": { "type": "string", "description": "Search keywords, user question, or (with by=name) a file name / directory / extension / path fragment." },
+                "by": { "type": "string", "enum": ["content", "name"], "description": "content searches text, name searches paths. Defaults to content." },
                 "max_results": { "type": "integer", "description": "Optional result limit." }
             },
             "required": ["query"],
@@ -100,29 +103,13 @@ pub fn register_readonly(registry: &mut ToolRegistry, config: AppConfig, paths: 
             move |args| {
                 let config = config.clone();
                 let paths = paths.clone();
-                async move { tool_search_readonly(args, config, paths).await }
-            }
-        },
-    ));
-    registry.register(ToolSpec::new(
-        "search_knowledge_base_by_name",
-        "Find knowledge base files by file name, directory, extension, or path fragment. Returns relative paths for read_knowledge_base_file. Mention paths only when useful or when the user asks.",
-        json!({
-            "type": "object",
-            "properties": {
-                "file_name_query": { "type": "string", "description": "File name, directory, extension, or path fragment." },
-                "max_results": { "type": "integer", "description": "Optional result limit." }
-            },
-            "required": ["file_name_query"],
-            "additionalProperties": false
-        }),
-        {
-            let config = config.clone();
-            let paths = paths.clone();
-            move |args| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move { tool_find_readonly(args, config, paths).await }
+                async move {
+                    match args.get("by").and_then(Value::as_str).unwrap_or("content") {
+                        "content" => tool_search_readonly(args, config, paths).await,
+                        "name" => tool_find_readonly(args, config, paths).await,
+                        other => bail!("unknown by: {other}; expected content or name"),
+                    }
+                }
             }
         },
     ));
@@ -1025,13 +1012,15 @@ async fn tool_search_readonly(args: Value, config: AppConfig, paths: MiyuPaths) 
 
 async fn tool_find_readonly(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
     ensure_enabled(&config)?;
+    // 合并后统一用 query;file_name_query 保留为兼容别名。
     let query = args
-        .get("file_name_query")
+        .get("query")
+        .or_else(|| args.get("file_name_query"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
     if query.is_empty() {
-        bail!("file_name_query is required")
+        bail!("query is required")
     }
     let max_results = args
         .get("max_results")

@@ -2820,6 +2820,15 @@ pub struct ContextConfig {
     /// its one-time prefix-cache reset.
     #[serde(default = "default_true")]
     pub prune_stale_tool_reports: bool,
+    /// 历史工具结果分级剪枝（字符）：落库时超过 chars 的输出改写成
+    /// 「头 head + 省略标记 + 尾 tail」。0 = 关闭。默认值抄 dsh 的
+    /// compaction-tool-result-pruner（8192 / 4096 / 1024）。
+    #[serde(default = "default_tool_result_prune_chars")]
+    pub tool_result_prune_chars: usize,
+    #[serde(default = "default_tool_result_prune_head_chars")]
+    pub tool_result_prune_head_chars: usize,
+    #[serde(default = "default_tool_result_prune_tail_chars")]
+    pub tool_result_prune_tail_chars: usize,
     /// Cold-resume prune: a session idle longer than this resumes against an
     /// expired provider cache, so rewriting history at that moment costs no
     /// extra misses — it only shrinks the full-price first request. Minutes;
@@ -2922,6 +2931,11 @@ pub struct MemoryConfig {
     pub association_episodes: usize,
     #[serde(default = "default_memory_association_max_chars")]
     pub association_max_chars: usize,
+    /// 单条联想记忆的正文上限（字符）。日记常把当时那条完整回复整段存进
+    /// 去，实测一条 400+ 字符；截断后带 id，模型可用 recall_memories(id=)
+    /// 取全文。0 = 不截断。
+    #[serde(default = "default_memory_association_entry_chars")]
+    pub association_entry_chars: usize,
     /// 同一条记忆若已在本会话早前回合注入过（化石仍在可见上下文中逐字回放），
     /// 本回合不再重复注入。内容或日期变化的记忆视为新条目照常注入。
     #[serde(default = "default_true")]
@@ -3672,6 +3686,7 @@ impl Default for MemoryConfig {
             association_facts: default_memory_association_facts(),
             association_episodes: default_memory_association_episodes(),
             association_max_chars: default_memory_association_max_chars(),
+            association_entry_chars: default_memory_association_entry_chars(),
             association_dedup: default_true(),
             snippet_chars: default_memory_snippet_chars(),
             forget_after_days: default_memory_forget_after_days(),
@@ -3698,6 +3713,9 @@ impl Default for ContextConfig {
             compact_soft_ratio: default_compact_soft_ratio(),
             compact_snip_ratio: default_compact_snip_ratio(),
             prune_stale_tool_reports: true,
+            tool_result_prune_chars: default_tool_result_prune_chars(),
+            tool_result_prune_head_chars: default_tool_result_prune_head_chars(),
+            tool_result_prune_tail_chars: default_tool_result_prune_tail_chars(),
             cold_prune_after_minutes: default_cold_prune_after_minutes(),
             compact_cache_reuse: true,
         }
@@ -5869,7 +5887,7 @@ fn default_mixed_model_endpoint_display() -> String {
 }
 
 fn default_memory_association_facts() -> usize {
-    5
+    2
 }
 
 fn default_memory_diary_batch_size() -> usize {
@@ -5889,11 +5907,27 @@ fn default_memory_organizer_timeout_seconds() -> u64 {
 }
 
 fn default_memory_association_episodes() -> usize {
-    3
+    1
 }
 
 fn default_memory_association_max_chars() -> usize {
     1800
+}
+
+fn default_memory_association_entry_chars() -> usize {
+    120
+}
+
+fn default_tool_result_prune_chars() -> usize {
+    8192
+}
+
+fn default_tool_result_prune_head_chars() -> usize {
+    4096
+}
+
+fn default_tool_result_prune_tail_chars() -> usize {
+    1024
 }
 
 fn default_memory_snippet_chars() -> usize {
@@ -5953,7 +5987,7 @@ fn default_memes_auto_send_probability() -> f32 {
 }
 
 fn default_web_search_max_results() -> usize {
-    2
+    4
 }
 
 fn default_web_images_max_results() -> usize {

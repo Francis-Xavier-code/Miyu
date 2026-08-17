@@ -1,0 +1,27 @@
+{
+  "name": "manage_meme",
+  "display_name": "管理表情包",
+  "description": "维护表情库：action=add 导入本地图片、update 改元数据、delete 删除或禁用。\nadd 未提供元数据时由配置的识图模型根据图片生成；delete 对用户表情是删除、对内置表情是禁用，hard_delete=true 才永久删文件。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": { "type": "string", "enum": ["add", "update", "delete"], "description": "add 导入，update 修改，delete 删除。" },
+      "image": { "type": "string", "description": "action=add：本地图片路径。" },
+      "id": { "type": "string", "description": "action=update/delete：完整 sha256 id 或唯一短 id。" },
+      "library": { "type": "string", "description": "可选表情库覆盖。" },
+      "name_zh": { "type": "string", "description": "中文显示名。" },
+      "name_en": { "type": "string", "description": "英文显示名。" },
+      "description": { "type": "string", "description": "图片可见内容描述。" },
+      "usage": { "type": "string", "description": "什么时候使用该表情。" },
+      "avoid": { "type": "string", "description": "什么场景不要使用。" },
+      "tags": { "type": "array", "items": { "type": "string" }, "description": "检索标签。" },
+      "enabled": { "type": "boolean", "description": "action=update：启用或禁用该表情。" },
+      "hard_delete": { "type": "boolean", "description": "action=delete：永久删除而不是移入回收站。" }
+    },
+    "required": ["action"]
+  },
+  "permission": "writes",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": ["memes"]
+}

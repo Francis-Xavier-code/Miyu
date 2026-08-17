@@ -36,7 +36,7 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
 pub fn register_run_command(registry: &mut ToolRegistry, allow_command_execution: bool) {
     registry.register(ToolSpec::new_with_progress(
         "run_command",
-        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job_status and stop with job_stop.", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job_status 查询、job_stop 停止。"),
+        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job(action=status) and stop with job(action=stop).", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job(action=status) 查询、job(action=stop) 停止。"),
         json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds (1-120, default 30). Ignored when background=true.", "可选超时时间，单位秒（1-120，默认 30）；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
         move |args, progress| async move {
             run_command(args, allow_command_execution, progress).await
@@ -75,11 +75,12 @@ pub fn register_readonly(registry: &mut ToolRegistry) {
 
 fn check_os_info() -> Result<String> {
     let mut env = BTreeMap::new();
+    // PATH 与 kernel_cmdline 一并退场(08-17):两者合计占单次返回的三成
+    // (实测 1,866 字符里 550+),而绝大多数问题用不上;真要看走 run_command。
     for key in [
         "SHELL",
         "TERM",
         "LANG",
-        "PATH",
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_TYPE",
         "DESKTOP_SESSION",
@@ -100,7 +101,6 @@ fn check_os_info() -> Result<String> {
     let debian_version = read_small_file("/etc/debian_version");
     let fedora_release = read_small_file("/etc/fedora-release");
     let proc_version = read_small_file("/proc/version");
-    let proc_cmdline = read_small_file("/proc/cmdline");
     let macos_system_version = crate::host_info::macos_system_version_text();
     let macos = parse_macos_system_version(macos_system_version.as_deref());
     let package_manager_guess = package_manager_guess(
@@ -119,7 +119,6 @@ fn check_os_info() -> Result<String> {
         "fedora_release": fedora_release,
         "macos": macos,
         "kernel_version": proc_version,
-        "kernel_cmdline": proc_cmdline,
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
         "family": std::env::consts::FAMILY,
@@ -673,24 +672,49 @@ async fn read_command_output(
 }
 
 
+/// dsh 式纯文本返回体(08-17)。此前每条结果都裹一层 pretty-print JSON,
+/// 里面 6 个字段在说"什么都没发生"(`stderr:""`、`*_truncated:false`、
+/// `*_omitted_chars:0`、`success:true`)——实测一次 `uname -r; pwd; ls`
+/// 407 字符里信封占 217(53%)。
+///
+/// 新形态:正文就是 stdout;有 stderr 才追加 `[stderr]` 段;完全没输出时
+/// 精确输出 `(no output)`;截断和非零退出码各自只在真发生时补一行标记。
+/// 退出码是通用 Unix 词汇,不额外解释。
+fn command_text(
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> String {
+    let stdout = clip_output_with_meta(&String::from_utf8_lossy(&stdout));
+    let stderr = clip_output_with_meta(&String::from_utf8_lossy(&stderr));
+    let mut body = stdout.text.trim_end().to_string();
+    if !stderr.text.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(stderr.text.trim_end());
+    }
+    if body.is_empty() {
+        body.push_str("(no output)");
+    }
+    if let Some(code) = status.code() {
+        if code != 0 {
+            body.push_str(&format!("\n[exit code: {code}]"));
+        }
+    } else {
+        // 没有退出码 = 被信号杀掉;不说一声模型会把它当成功。
+        body.push_str("\n[killed by signal]");
+    }
+    body
+}
+
 fn command_output(
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 ) -> Result<String> {
-    let stdout = clip_output_with_meta(&String::from_utf8_lossy(&stdout));
-    let stderr = clip_output_with_meta(&String::from_utf8_lossy(&stderr));
-    Ok(serde_json::to_string_pretty(&json!({
-        "success": status.success(),
-        "exit_code": status.code(),
-        "stdout": stdout.text,
-        "stderr": stderr.text,
-        "truncated": stdout.truncated || stderr.truncated,
-        "stdout_truncated": stdout.truncated,
-        "stderr_truncated": stderr.truncated,
-        "stdout_omitted_chars": stdout.omitted_chars,
-        "stderr_omitted_chars": stderr.omitted_chars,
-    }))?)
+    Ok(command_text(status, stdout, stderr))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -730,45 +754,36 @@ fn clip_output_with_meta(value: &str) -> ClippedOutput {
 
 fn command_output_limited(output: std::process::Output, max_lines: usize) -> Result<String> {
     let stdout_raw = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout_raw
+    let mut stdout = stdout_raw
         .lines()
         .take(max_lines)
         .collect::<Vec<_>>()
         .join("\n");
-    let stdout = clip_output_with_meta(&stdout);
-    let stderr = clip_output_with_meta(&String::from_utf8_lossy(&output.stderr));
-    let line_truncated = stdout_raw.lines().nth(max_lines).is_some();
-    Ok(serde_json::to_string_pretty(&json!({
-        "success": output.status.success(),
-        "exit_code": output.status.code(),
-        "stdout": stdout.text,
-        "stderr": stderr.text,
-        "truncated": line_truncated || stdout.truncated || stderr.truncated,
-        "stdout_truncated": line_truncated || stdout.truncated,
-        "stderr_truncated": stderr.truncated,
-        "stdout_omitted_chars": stdout.omitted_chars,
-        "stderr_omitted_chars": stderr.omitted_chars,
-        "max_results": max_lines
-    }))?)
+    if stdout_raw.lines().nth(max_lines).is_some() {
+        stdout.push_str(&format!(
+            "\n[{} {max_lines} {}]",
+            t("truncated to the first", "已截断到前"),
+            t("results", "条结果")
+        ));
+    }
+    Ok(command_text(
+        output.status,
+        stdout.into_bytes(),
+        output.stderr,
+    ))
 }
 
 fn search_output_limited(output: std::process::Output, max_lines: usize) -> Result<String> {
+    // rg 的 "无匹配" 是退出码 1 + 空 stdout。那不是失败,别让模型看到
+    // `[exit code: 1]` 后误以为搜索坏了。
     if output.status.code() == Some(1) && output.stdout.is_empty() {
-        let stderr = clip_output_with_meta(&String::from_utf8_lossy(&output.stderr));
-        return Ok(serde_json::to_string_pretty(&json!({
-            "success": true,
-            "exit_code": 0,
-            "stdout": "",
-            "stderr": stderr.text,
-            "truncated": stderr.truncated,
-            "stdout_truncated": false,
-            "stderr_truncated": stderr.truncated,
-            "stdout_omitted_chars": 0,
-            "stderr_omitted_chars": stderr.omitted_chars,
-            "max_results": max_lines,
-            "matches": 0,
-            "note": "no matches"
-        }))?);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Ok(if stderr.is_empty() {
+            t("no matches", "无匹配").to_string()
+        } else {
+            format!("{}\n[stderr]\n{stderr}", t("no matches", "无匹配"))
+        });
     }
     command_output_limited(output, max_lines)
 }
@@ -979,9 +994,9 @@ mod tests {
         let output = execute_command("printf 'out'; printf 'err' >&2", 5, ToolProgress::new(tx))
             .await
             .unwrap();
-        let output: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(output["stdout"], "out");
-        assert_eq!(output["stderr"], "err");
+        // dsh 式纯文本:正文是 stdout,有 stderr 才追加 [stderr] 段,
+        // 退出码为 0 时一个标记都不打。
+        assert_eq!(output, "out\n[stderr]\nerr");
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1113,9 +1128,8 @@ mod tests {
         }))
         .await
         .unwrap();
-        let data: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(data["success"], true);
-        assert!(data["stdout"].as_str().unwrap().contains("ai测试题.txt"));
+        assert!(result.contains("ai测试题.txt"), "{result}");
+        assert!(!result.contains("[exit code:"), "{result}");
     }
 
     #[tokio::test]
@@ -1129,11 +1143,8 @@ mod tests {
         }))
         .await
         .unwrap();
-        let data: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(data["success"], true);
-        assert_eq!(data["exit_code"], 0);
-        assert_eq!(data["stdout"], "");
-        assert_eq!(data["note"], "no matches");
+        // rg 的"无匹配"是退出码 1 + 空 stdout,不能渲染成失败。
+        assert_eq!(result, crate::i18n::text("no matches", "无匹配"));
     }
 
     #[test]

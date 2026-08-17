@@ -77,12 +77,72 @@ fn stable_catalog(config: &AppConfig, paths: &MiyuPaths) -> Result<(Vec<SkillEnt
     anyhow::bail!("skill catalog kept changing while it was being refreshed")
 }
 
+/// 五件 Skill 创作工具合并成 `manage_skill`(08-17):create/update/delete/
+/// publish/list_drafts 是同一条创作流水线上的五个动作。
 pub fn register_authoring(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
-    register_create_skill(registry, config.clone(), paths.clone());
-    register_update_skill(registry, config.clone(), paths.clone());
-    register_delete_skill(registry, config, paths.clone());
-    register_publish_skill(registry, paths.clone());
-    register_list_skill_drafts(registry, paths);
+    registry.register(
+        ToolSpec::new(
+            "manage_skill",
+            t(
+                "Author Miyu skills. action=create opens a hidden draft for a new skill; action=update copies an existing skill into an isolated draft; edit only the returned draft with apply_patch, then action=publish validates and atomically publishes it (create drafts never overwrite; update drafts fail if the live skill changed meanwhile). action=delete permanently removes a user skill; action=list_drafts lists retained drafts (drafts untouched for 30 days are pruned first). Scripts inside a skill stay resources and are never registered as tools.",
+                "创作 Miyu skill。action=create 为新 skill 开隐藏草稿；action=update 从已有 skill 复制隔离草稿；只编辑返回的草稿（用 apply_patch），随后 action=publish 校验并原子发布（创建草稿绝不覆盖，更新草稿在 live skill 同期变化时发布失败）。action=delete 永久删除用户 skill；action=list_drafts 列出保留的草稿（列出前清理 30 天未修改的）。skill 内的 scripts 仍是资源，不会注册为工具。",
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "update", "delete", "publish", "list_drafts"],
+                        "description": t("Which authoring step to run.", "要执行的创作步骤。")
+                    },
+                    "name": {
+                        "type": "string",
+                        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                        "description": t("Skill name, required for create/update/delete. Must follow the Agent Skills naming rules.", "Skill 名称，create/update/delete 必填，须符合 Agent Skills 命名规则。")
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": t("action=create: what the skill does and when it should be used.", "action=create：Skill 做什么以及何时应使用。")
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "persona"],
+                        "description": t("global is available to every persona; persona belongs to the current persona. Required for update/delete, defaults to global for create.", "global 对所有人格可用；persona 仅属于当前人格。update/delete 必填，create 默认 global。")
+                    },
+                    "draft_id": {
+                        "type": "string",
+                        "description": t("action=publish: draft ID returned by create or update.", "action=publish：create 或 update 返回的草稿 ID。")
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            move |args| {
+                let config = config.clone();
+                let paths = paths.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        match args.get("action").and_then(Value::as_str).unwrap_or_default() {
+                            "create" => create_skill(args, &config, &paths),
+                            "update" => update_skill(args, &config, &paths),
+                            "delete" => delete_skill(args, &config, &paths),
+                            "publish" => publish_skill(args, &paths),
+                            "list_drafts" => Ok(serde_json::to_string_pretty(&json!({
+                                "ok": true,
+                                "drafts": skills::list_drafts(&paths)?,
+                            }))?),
+                            other => anyhow::bail!(
+                                "unknown action: {other}; expected create, update, delete, publish or list_drafts"
+                            ),
+                        }
+                    })
+                    .await
+                    .context("skill authoring worker stopped")?
+                }
+            },
+        )
+        .writes(),
+    );
 }
 
 fn register_load_skill(
@@ -91,15 +151,18 @@ fn register_load_skill(
     paths: MiyuPaths,
     entries: &[SkillEntry],
 ) {
+    // 第一行必须自洽:stub 模式只保留它,原来那句"必须匹配下方列出的可用
+    // 技能之一"指向一份 stub 里根本不存在的清单(清单在完整契约里,要经
+    // load_tools 取)。清单相关的话统一放进第二段,它只随完整契约出现。
     let description = format!(
         "{}\n\n{}\n\n{}",
         t(
-            "Load a specialized skill's full instructions and resources into the conversation. The skill name must match one of the available skills listed below.",
-            "加载指定技能的完整指令和资源到当前对话。技能名称必须匹配下方列出的可用技能之一。",
+            "Load a specialized skill's full instructions and resources into the conversation.",
+            "加载指定技能的完整指令和资源到当前对话。",
         ),
         t(
-            "Use this tool before applying a skill or using any scripts/resources from that skill. Skill allowed-tools metadata never grants Miyu permissions.",
-            "应用 skill 或使用其中的脚本/资源前，必须先加载该 skill。Skill 的 allowed-tools 元数据不会授予 Miyu 权限。",
+            "The skill name must match one of the available skills listed below. Use this tool before applying a skill or using any scripts/resources from that skill. Skill allowed-tools metadata never grants Miyu permissions.",
+            "技能名称必须匹配下方列出的可用技能之一。应用 skill 或使用其中的脚本/资源前，必须先加载该 skill。Skill 的 allowed-tools 元数据不会授予 Miyu 权限。",
         ),
         available_skills_xml(entries),
     );
@@ -129,175 +192,10 @@ fn register_load_skill(
     ));
 }
 
-fn register_create_skill(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
-    registry.register(
-        ToolSpec::new(
-            "create_skill",
-            t(
-                "Create a hidden draft for a new Miyu skill. Use the returned absolute skill_dir and skill_file with apply_patch, then call publish_skill. This never overwrites an existing skill.",
-                "为新的 Miyu skill 创建隐藏草稿。使用返回的绝对 skill_dir 和 skill_file 配合 apply_patch 编辑，随后调用 publish_skill。此操作不会覆盖已有 skill。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
-                        "description": t("Skill name, which must follow the Agent Skills naming rules.", "Skill 名称，必须符合 Agent Skills 命名规则。")
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": t("What the skill does and when it should be used.", "Skill 做什么以及何时应使用。")
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["global", "persona"],
-                        "default": "global",
-                        "description": t("global is available to every persona; persona belongs to the current persona.", "global 对所有人格可用；persona 仅属于当前人格。")
-                    }
-                },
-                "required": ["name", "description"],
-                "additionalProperties": false
-            }),
-            move |args| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || create_skill(args, &config, &paths))
-                        .await
-                        .context("skill draft worker stopped")?
-                }
-            },
-        )
-        .writes(),
-    );
-}
 
-fn register_update_skill(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
-    registry.register(
-        ToolSpec::new(
-            "update_skill",
-            t(
-                "Create an isolated update draft copied from an existing skill. Edit only the returned draft, then call publish_skill. Publishing fails if the live skill changed meanwhile.",
-                "从已有 skill 复制一个隔离的更新草稿。只编辑返回的草稿，然后调用 publish_skill；若 live skill 同期发生变化，发布会失败。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": t("Existing skill name.", "已有 skill 名称。") },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["global", "persona"],
-                        "description": t("Exact scope containing the skill.", "包含该 skill 的准确作用域。")
-                    }
-                },
-                "required": ["name", "scope"],
-                "additionalProperties": false
-            }),
-            move |args| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || update_skill(args, &config, &paths))
-                        .await
-                        .context("skill update worker stopped")?
-                }
-            },
-        )
-        .writes(),
-    );
-}
 
-fn register_delete_skill(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
-    registry.register(
-        ToolSpec::new(
-            "delete_skill",
-            t(
-                "Permanently delete an existing user skill from the exact global or current-persona scope.",
-                "从准确的 global 或当前 persona 作用域永久删除已有用户 Skill。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": t("Existing skill name.", "已有 Skill 名称。") },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["global", "persona"],
-                        "description": t("Exact scope containing the skill.", "包含该 Skill 的准确作用域。")
-                    }
-                },
-                "required": ["name", "scope"],
-                "additionalProperties": false
-            }),
-            move |args| {
-                let config = config.clone();
-                let paths = paths.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || delete_skill(args, &config, &paths))
-                        .await
-                        .context("skill deletion worker stopped")?
-                }
-            },
-        )
-        .writes(),
-    );
-}
 
-fn register_publish_skill(registry: &mut ToolRegistry, paths: MiyuPaths) {
-    registry.register(
-        ToolSpec::new(
-            "publish_skill",
-            t(
-                "Validate and atomically publish a Miyu skill draft. Create drafts never overwrite; update drafts use revision checks. Scripts remain resources and are not registered as tools.",
-                "校验并原子发布 Miyu skill 草稿。创建草稿绝不覆盖；更新草稿执行版本检查。scripts 仍是资源，不会注册为工具。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "draft_id": { "type": "string", "description": t("Draft ID returned by create_skill or update_skill.", "create_skill 或 update_skill 返回的草稿 ID。") }
-                },
-                "required": ["draft_id"],
-                "additionalProperties": false
-            }),
-            move |args| {
-                let paths = paths.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || publish_skill(args, &paths))
-                        .await
-                        .context("skill publish worker stopped")?
-                }
-            },
-        )
-        .writes(),
-    );
-}
 
-fn register_list_skill_drafts(registry: &mut ToolRegistry, paths: MiyuPaths) {
-    registry.register(
-        ToolSpec::new(
-            "list_skill_drafts",
-            t(
-                "List retained Miyu skill drafts. Drafts with no changes for 30 days are removed before listing.",
-                "列出保留的 Miyu skill 草稿。列出前会清理 30 天未修改的草稿。",
-            ),
-            json!({"type":"object","properties":{},"additionalProperties":false}),
-            move |_| {
-                let paths = paths.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        Ok(serde_json::to_string_pretty(&json!({
-                            "ok": true,
-                            "drafts": skills::list_drafts(&paths)?,
-                        }))?)
-                    })
-                    .await
-                    .context("skill draft listing worker stopped")?
-                }
-            },
-        )
-        .writes(),
-    );
-}
 
 fn load_skill(args: Value, config: &AppConfig, paths: &MiyuPaths) -> Result<String> {
     let name = required_string(&args, "name")?;
@@ -514,19 +412,8 @@ mod tests {
         let paths = test_paths(temp.path());
         let mut registry = ToolRegistry::new();
         register_authoring(&mut registry, AppConfig::default(), paths);
-        for name in [
-            "create_skill",
-            "update_skill",
-            "delete_skill",
-            "publish_skill",
-        ] {
-            assert_eq!(
-                registry.permission(name).unwrap(),
-                super::super::ToolPermission::Writes
-            );
-        }
         assert_eq!(
-            registry.permission("list_skill_drafts").unwrap(),
+            registry.permission("manage_skill").unwrap(),
             super::super::ToolPermission::Writes
         );
     }

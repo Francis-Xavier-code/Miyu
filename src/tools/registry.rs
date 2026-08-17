@@ -41,6 +41,9 @@ pub enum ToolProgressEvent {
     Image {
         path: PathBuf,
         alt: String,
+        /// 模型显式要的终端渲染尺寸。百分比默认值不走这里——那个只能在
+        /// 终端那一侧算。
+        size: Option<String>,
     },
     Artifact {
         path: PathBuf,
@@ -77,10 +80,21 @@ impl ToolProgress {
     }
 
     pub fn report_image(&self, path: impl Into<PathBuf>, alt: impl Into<String>) {
+        self.report_sized_image(path, alt, None)
+    }
+
+    /// 带上模型显式要的尺寸；`None` 表示由终端按配置百分比自己定。
+    pub fn report_sized_image(
+        &self,
+        path: impl Into<PathBuf>,
+        alt: impl Into<String>,
+        size: Option<String>,
+    ) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(ToolProgressEvent::Image {
                 path: path.into(),
                 alt: alt.into(),
+                size,
             });
         }
     }
@@ -549,11 +563,12 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             return Err(self.unknown_tool_error(name));
         };
-        let args = if arguments.trim().is_empty() {
+        let mut args: Value = if arguments.trim().is_empty() {
             json!({})
         } else {
             serde_json::from_str(arguments)?
         };
+        coerce_declared_shapes(&tool.parameters, &mut args);
         if name == "load_tools" {
             return super::load_tools::execute(args, self);
         }
@@ -581,11 +596,12 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             return Err(self.unknown_tool_error(name));
         };
-        let args = if arguments.trim().is_empty() {
+        let mut args: Value = if arguments.trim().is_empty() {
             json!({})
         } else {
             serde_json::from_str(arguments)?
         };
+        coerce_declared_shapes(&tool.parameters, &mut args);
         if name == "load_tools" {
             let result = super::load_tools::execute(args, self);
             return Ok(Box::pin(async move { result }));
@@ -839,6 +855,58 @@ impl ToolRegistry {
     }
 }
 
+/// 按工具自己的 schema 还原被写成「JSON 字符串」的数组/对象参数。
+///
+/// 模型经常把结构化参数序列化成字符串再传，实测同一天踩到三次：
+/// `reference_images` 传成 `"[\"/path.png\"]"`、`todos` 传成
+/// `"[{\"content\":…}]"`、`updates` 同理。stub 加载模式尤其容易——模型看到
+/// 的只有一句摘要和宽松参数壳，没取契约就调用时只能猜形状。
+///
+/// 逐个工具打补丁治标不治本，所以放在这里做一次：只动 schema 明确声明为
+/// array/object 的顶层参数，且只在给来的字符串确实能解析成那个形状时才换。
+/// 声明成 string 的参数一个字节都不碰——`run_command.command` 里恰好是一段
+/// JSON 的情况必须原样透传。
+fn coerce_declared_shapes(parameters: &Value, args: &mut Value) {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for (name, schema) in properties {
+        let Some(declared) = schema.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(Value::String(text)) = object.get(name) else {
+            continue;
+        };
+        let text = text.trim();
+        let restored = match declared {
+            "array" if text.starts_with('[') => {
+                serde_json::from_str::<Value>(text).ok().filter(Value::is_array)
+            }
+            "object" if text.starts_with('{') => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object),
+            // 数字/布尔被写成字符串同样常见:实测
+            // `"start_line": "1"` 让 edit_knowledge_base_file 一直报
+            // "start_line is required"。
+            "integer" => text.parse::<i64>().ok().map(Value::from),
+            "number" => text.parse::<f64>().ok().map(Value::from),
+            // 大小写都收:实测模型发过 Python 风格的 "False"。
+            "boolean" => match text.to_ascii_lowercase().as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(restored) = restored {
+            object.insert(name.clone(), restored);
+        }
+    }
+}
+
 pub fn empty_parameters() -> Value {
     json!({
         "type": "object",
@@ -874,14 +942,22 @@ fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
             // Permissive shell: real parameters go at the top level exactly as
             // in a normal call, so execution needs no unwrapping; the actual
             // contract arrives via the load_tools result.
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
-            }),
+            //
+            // 裸 {"type":"object"} 与 {"type":"object","properties":{},
+            // "additionalProperties":true} 在 JSON Schema 下完全等价——后者
+            // 只是把两个默认值显式写了一遍,每条 stub 白占 48 字符
+            // (08-17 实测:57 条 stub 共 2,464 字符)。
+            parameters: serde_json::json!({ "type": "object" }),
         },
     }
 }
+
+/// Upper bound for a stub / catalog one-line summary, in characters.
+///
+/// 摘要是模型判断「要不要 load 这个工具」的唯一依据,不是契约——真正的约束
+/// (参数、前置条件、互斥规则)都在完整契约里,而模型必须先取契约才能调用。
+/// 所以摘要只需回答"这是不是我要的那个工具"。
+const SUMMARY_MAX_CHARS: usize = 60;
 
 /// Catalog entries carry a bounded one-line summary instead of the full tool
 /// description. This keeps the loader catalog small and byte-stable: without
@@ -894,10 +970,31 @@ fn load_target_summary(description: &str) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
-    let mut summary: String = first_line.chars().take(200).collect();
-    if first_line.chars().count() > 200 {
-        summary.push('…');
+    if first_line.chars().count() <= SUMMARY_MAX_CHARS {
+        return first_line.to_string();
     }
+    // 优先在预算内的句末断开,断不出来才硬截。半句话比整句更容易让模型
+    // 误判用途,而句末断开读起来仍是一句完整的摘要。
+    let window: Vec<char> = first_line.chars().take(SUMMARY_MAX_CHARS).collect();
+    let sentence_end = window
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, ch)| {
+            matches!(ch, '。' | '；' | '！' | '？')
+                // 英文句点只在后面跟空格时算句末,免得切断 "0.5" 或 "e.g."。
+                || (**ch == '.' && window.get(index + 1) == Some(&' '))
+        })
+        .map(|(index, _)| index);
+    if let Some(index) = sentence_end {
+        // 句末太靠前就别snap:一句"好。"当摘要还不如半句话。四分之一预算
+        // 是经验下限,足以放下"按文字提示生成图片，返回本地路径。"这种。
+        if index + 1 >= SUMMARY_MAX_CHARS / 4 {
+            return window[..=index].iter().collect();
+        }
+    }
+    let mut summary: String = window.iter().collect();
+    summary.push('…');
     summary
 }
 
@@ -1089,6 +1186,112 @@ mod tests {
         registry.register(sleeping_tool("slow_tool", 60));
         let filtered = registry.clone_filtered(&["slow_tool"]);
         assert!(filtered.call("slow_tool", "{}").await.is_err());
+    }
+
+    /// 摘要在预算内的句末断开,断不出来才硬截;短摘要原样通过。
+    #[test]
+    fn stub_summary_prefers_a_sentence_boundary() {
+        assert_eq!(load_target_summary("很短的一句摘要。"), "很短的一句摘要。");
+
+        // 超预算时在预算内的最后一个句末断开,读起来仍是完整一句。
+        // 超预算时在预算内的最后一个句末断开,读起来仍是完整一句。
+        let long = "按文字提示生成图片，返回本地路径。平台会自动投递已发布的图片，所以不要再用别的工具重发同一张图。另外，除非用户明确要求展示，否则不要调用任何打印图片的工具。";
+        assert!(long.chars().count() > SUMMARY_MAX_CHARS);
+        let summary = load_target_summary(long);
+        assert_eq!(
+            summary,
+            "按文字提示生成图片，返回本地路径。平台会自动投递已发布的图片，所以不要再用别的工具重发同一张图。"
+        );
+        assert!(!summary.ends_with('…'));
+
+        // 一句话就超预算 ⇒ 硬截并加省略号。
+        let run_on = "a".repeat(200);
+        let summary = load_target_summary(&run_on);
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), SUMMARY_MAX_CHARS + 1);
+
+        // 只取第一行。
+        assert_eq!(load_target_summary("首行摘要。\n第二行细节。"), "首行摘要。");
+    }
+
+    /// 模型把结构化参数序列化成字符串再传是常态,08-17 一天踩到三次:
+    /// `reference_images` 传成 `"[\"/p.png\"]"`、`todos` 传成
+    /// `"[{...}]"`、`updates` 同理。按 schema 还原,别让参数静默失效。
+    #[test]
+    fn stringified_arrays_and_objects_are_restored_by_schema() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "todos": { "type": "array" },
+                "config": { "type": "object" },
+                "command": { "type": "string" },
+                "count": { "type": "integer" }
+            }
+        });
+
+        // 线上实际踩到的两种形状。
+        let mut args = json!({
+            "todos": r#"[{"content":"a","status":"pending"}]"#,
+            "config": r#"{"a":1}"#
+        });
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args["todos"], json!([{"content":"a","status":"pending"}]));
+        assert_eq!(args["config"], json!({"a":1}));
+
+        // 数字/布尔被写成字符串:实测 `"start_line": "1"` 让
+        // edit_knowledge_base_file 一直报 "start_line is required"。
+        let scalars = json!({
+            "type": "object",
+            "properties": {
+                "start_line": { "type": "integer" },
+                "ratio": { "type": "number" },
+                "background": { "type": "boolean" },
+                "command": { "type": "string" }
+            }
+        });
+        let mut args = json!({
+            "start_line": "1",
+            "ratio": "0.5",
+            "background": "true",
+            "command": "42"
+        });
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args["start_line"], json!(1));
+        assert_eq!(args["ratio"], json!(0.5));
+        assert_eq!(args["background"], json!(true));
+        // 声明成 string 的参数一个字节都不碰,哪怕它看起来像数字。
+        assert_eq!(args["command"], json!("42"));
+
+        // 解析不出来就别硬转。
+        let mut args = json!({ "background": "False" });
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args["background"], json!(false));
+
+        let mut args = json!({ "start_line": "第一行", "background": "yes" });
+        let before = args.clone();
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args, before);
+
+        // 声明成 string 的参数一个字节都不碰:命令里恰好是一段 JSON 的
+        // 情况必须原样透传。
+        let mut args = json!({ "command": r#"["not","an","array"]"#, "count": 3 });
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args["command"], json!(r#"["not","an","array"]"#));
+        assert_eq!(args["count"], json!(3));
+
+        // 本来就是正确类型的、解析不了的、形状对不上的,一律不动。
+        let mut args = json!({
+            "todos": [{"content": "a"}],
+            "config": "{ broken",
+        });
+        let before = args.clone();
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args, before);
+
+        let mut args = json!({ "todos": r#"{"not":"an array"}"# });
+        let before = args.clone();
+        coerce_declared_shapes(&parameters, &mut args);
+        assert_eq!(args, before);
     }
 
     #[test]

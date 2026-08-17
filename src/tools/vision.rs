@@ -145,6 +145,23 @@ fn register_scoped(
         fetches: AtomicUsize::new(0),
         total_bytes: AtomicUsize::new(0),
     });
+    // 生图的参考图与看图共用同一份作用域:两者都会把图片原样送到第三方,
+    // 信任面必须一致(08-17)。只在插件启用时接管,否则保持工具不存在。
+    if config.plugins.image_generation.enabled {
+        super::image_generation::register_scoped(
+            registry,
+            config.clone(),
+            ReferenceResolver {
+                config: config.clone(),
+                paths: paths.clone(),
+                state: Some(state.clone()),
+            },
+        );
+    }
+    if !config.plugins.vision.enabled {
+        // 只为生图的参考图建作用域:看图插件关着就不注册 vision_analyze。
+        return;
+    }
     registry.register(ToolSpec::new(
         "vision_analyze",
         "分析图片。image 可以是本轮提示中的图片路径或 context_image_N；历史上下文图片会按需获取。",
@@ -227,11 +244,14 @@ async fn print_image(
             path.display()
         )
     }
-    progress.report_image(
+    // 模型显式要的尺寸要随事件带走:daemon 模式下真正画图的是终端那一侧,
+    // 这里 print_image_file 的参数它看不见。
+    progress.report_sized_image(
         path.clone(),
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("image"),
+        requested_print_size(&args),
     );
     if progress.prepare_for_external_output().await {
         print_image_file(&path, print_size(&args, print_config)).await?;
@@ -286,7 +306,13 @@ pub fn configured_print_size(print_config: &PrintImagePluginConfig) -> Option<St
     Some(format!("{}x{}", width.min(300), height.min(200)))
 }
 
-fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<String> {
+/// 模型显式要的尺寸，没要就是 None。
+///
+/// 和 `configured_print_size` 分开是因为两者只能在不同的地方解析：百分比
+/// 依赖 `crossterm::terminal::size()`，daemon 量到的不是用户的终端，只能
+/// 在 CLI 那侧算；而显式值只有 daemon 手里的工具参数才知道，必须随事件带
+/// 过去，否则模型写了 width 也会被无声吃掉。
+pub fn requested_print_size(args: &Value) -> Option<String> {
     let width = args
         .get("width")
         .and_then(Value::as_u64)
@@ -303,12 +329,15 @@ fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<Str
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| configured_print_size(print_config)),
+            .map(str::to_string),
         (width, 0) => Some(format!("{width}x")),
         (0, height) => Some(format!("x{height}")),
         (width, height) => Some(format!("{width}x{height}")),
     }
+}
+
+fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<String> {
+    requested_print_size(args).or_else(|| configured_print_size(print_config))
 }
 
 async fn analyze_image(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
@@ -395,6 +424,104 @@ async fn analyze_scoped_image(
         bail!("image is not attached to the current platform turn")
     }
     analyze_local_image_with_prompt(&config, &paths, &image, prompt).await
+}
+
+/// 生图参考图的引用解析器:把一个引用(本轮图片路径 / context_image_N /
+/// 可信头像 URL / 普通本地路径或 URL)解析成图片字节与 MIME。
+///
+/// 作用域直接沿用 `vision_analyze` 的那一套:平台面只认本轮附带的图片、群
+/// 聊记录里明确列出的 context_image_N、以及群查询工具返回的可信头像 URL;
+/// 终端面(state=None)照旧接受任意本地路径与 http(s) URL。生图会把图片原样
+/// 发到第三方 API,信任面必须和看图工具一致(08-17 决定)。
+pub(crate) type ReferenceImage = (Vec<u8>, String);
+
+pub(crate) struct ReferenceResolver {
+    config: AppConfig,
+    paths: MiyuPaths,
+    state: Option<Arc<ScopedVisionState>>,
+}
+
+impl ReferenceResolver {
+    pub(crate) fn unscoped(config: AppConfig, paths: MiyuPaths) -> Self {
+        Self {
+            config,
+            paths,
+            state: None,
+        }
+    }
+
+    pub(crate) async fn resolve(&self, reference: &str) -> Result<ReferenceImage> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            bail!("reference image must not be empty")
+        }
+        if let Some(state) = &self.state {
+            if state.context_images.contains_key(reference) {
+                let resolved = resolve_context_image(&self.paths, state, reference).await?;
+                return Ok((resolved.image.data.to_vec(), resolved.image.mime.clone()));
+            }
+            if !state.allow_general_access {
+                if reference.starts_with("http://") || reference.starts_with("https://") {
+                    if crate::platforms::avatar::is_trusted_avatar_url(reference) {
+                        return download_reference_image(reference).await;
+                    }
+                    bail!("only images attached to the current platform turn can be used as a reference")
+                }
+                let path = expand_path(reference)
+                    .canonicalize()
+                    .context("failed to resolve the requested reference image")?;
+                if !state.allowed_paths.iter().any(|allowed| allowed == &path) {
+                    bail!("reference image is not attached to the current platform turn")
+                }
+                return read_reference_file(&path);
+            }
+        }
+        let _ = &self.config;
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            return download_reference_image(reference).await;
+        }
+        read_reference_file(&expand_path(reference))
+    }
+}
+
+fn read_reference_file(path: &Path) -> Result<ReferenceImage> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat reference image {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("reference image is not a file: {}", path.display())
+    }
+    if metadata.len() as usize > MAX_IMAGE_BYTES {
+        bail!("reference image too large: {} bytes", metadata.len())
+    }
+    let mime = mime_from_path(path)?;
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read reference image {}", path.display()))?;
+    Ok((data, mime.to_string()))
+}
+
+async fn download_reference_image(url: &str) -> Result<ReferenceImage> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("failed to download reference image ({status})")
+    }
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or_else(|| "image/png".to_string());
+    let data = response.bytes().await?.to_vec();
+    if data.len() > MAX_IMAGE_BYTES {
+        bail!("reference image too large: {} bytes", data.len())
+    }
+    Ok((data, mime))
 }
 
 async fn resolve_context_image(
@@ -571,11 +698,36 @@ where
     })?
 }
 
+/// 当前文本模型池自己就能看图时,`vision_analyze` 直接用它。
+///
+/// `prefer_current_multimodal_model` 此前只管一件事:粘贴进来的图片要不要
+/// 内联发给聊天模型。`vision_analyze` 完全没看这个开关——哪怕当前文本模型
+/// 自带眼睛,工具照旧把图发给另配的多模态池,既多一次跨模型往返,答案也来
+/// 自一个没有对话上下文的模型(08-17 用户报的问题)。
+///
+/// 要求整池都支持图片输入:池是负载均衡的,只要有一个端点不认图片,这一路
+/// 就可能随机落到它头上。
+fn active_text_pool_for_vision(config: &AppConfig) -> Option<Vec<crate::config::ProviderModelChoice>> {
+    if !config.plugins.vision.prefer_current_multimodal_model {
+        return None;
+    }
+    let pool = config.active_provider_model_choices();
+    let usable = !pool.is_empty()
+        && pool.iter().all(|choice| {
+            config.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+        });
+    usable.then_some(pool)
+}
+
 fn vision_client(config: &AppConfig, paths: &MiyuPaths) -> Result<OpenAiCompatibleClient> {
     // An explicit global vision provider preserves its existing precedence.
     // Platform turns with a conversation override clear that single-provider
     // field in their private config clone, exposing the full routed pool here.
     if config.plugins.vision.vision_provider_id.trim().is_empty() {
+        if let Some(text_pool) = active_text_pool_for_vision(config) {
+            return OpenAiCompatibleClient::from_choices(config, paths, &text_pool)
+                .map(|client| client.with_request_scope("vision"));
+        }
         let choices = config
             .active_multimodal_provider_model_choices()
             .into_iter()
@@ -654,6 +806,7 @@ fn mime_from_path(path: &Path) -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ActiveProviderModelConfig;
     use crate::platforms::{
         ConversationKind, OutboundMessage, PlatformAdapter, PlatformConversation, SendReceipt,
     };
@@ -704,6 +857,72 @@ mod tests {
             scripts_dir: root.join("scripts"),
             system_scripts_dir: root.join("system-scripts"),
         }
+    }
+
+    /// 平台回合的作用域不能只由看图插件把门:生图的参考图共用同一份作用域,
+    /// vision 关、生图开时若不建作用域,generate_image 会留着不受限的解析器。
+    #[test]
+    fn scoped_registration_binds_image_generation_even_without_vision() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
+            config_dir: temp.path().join("config"),
+            config_file: temp.path().join("config/config.jsonc"),
+            skills_dir: temp.path().join("config/skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish"),
+            bash_hook_file: temp.path().join("bash"),
+            zsh_hook_file: temp.path().join("zsh"),
+            scripts_dir: temp.path().join("config/scripts"),
+            system_scripts_dir: temp.path().join("system-scripts"),
+        };
+        let mut config = AppConfig::default();
+        config.plugins.vision.enabled = false;
+        config.plugins.image_generation.enabled = true;
+
+        let mut registry = ToolRegistry::new();
+        register_scoped_local(&mut registry, config, paths, Vec::new());
+        // 看图插件关着 ⇒ 不注册 vision_analyze,但生图必须换成带作用域的版本。
+        assert!(!registry.contains("vision_analyze"));
+        assert!(registry.contains("generate_image"));
+    }
+
+    /// 当前文本模型自己能看图时就用它,不再绕道另配的多模态池。
+    #[test]
+    fn vision_uses_the_active_text_pool_when_it_can_see() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        let provider_id = provider.id.clone();
+        provider.model_modalities.insert(
+            provider.default_model.clone(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        provider
+            .model_modalities
+            .insert("blind-model".to_string(), vec!["text".to_string()]);
+        provider.models.push("blind-model".to_string());
+        assert!(active_text_pool_for_vision(&config).is_some());
+
+        // 开关关掉就走原路。
+        config.plugins.vision.prefer_current_multimodal_model = false;
+        assert!(active_text_pool_for_vision(&config).is_none());
+        config.plugins.vision.prefer_current_multimodal_model = true;
+
+        // 池里只要混进一个不认图片的端点就不能用:负载均衡会随机落到它。
+        config.active_provider_models = Some(vec![
+            ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: config.providers[0].default_model.clone(),
+            },
+            ActiveProviderModelConfig {
+                provider_id,
+                model: "blind-model".to_string(),
+            },
+        ]);
+        assert!(active_text_pool_for_vision(&config).is_none());
     }
 
     #[tokio::test]

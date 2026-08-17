@@ -1,0 +1,52 @@
+{
+  "name": "manage_skill",
+  "display_name": "管理技能",
+  "description": "创作 Skill：action=create/update 开草稿、publish 发布、delete 删除、list_drafts 列草稿。\n只编辑返回的草稿（用 apply_patch），随后 publish 校验并原子发布。创建草稿绝不覆盖已有 skill；更新草稿在 live skill 同期变化时发布失败。list_drafts 前会清理 30 天未修改的草稿。skill 内的 scripts 仍是资源，不会注册为工具。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "create",
+          "update",
+          "delete",
+          "publish",
+          "list_drafts"
+        ],
+        "description": "要执行的创作步骤。"
+      },
+      "name": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+        "description": "Skill 名称，create/update/delete 必填。"
+      },
+      "description": {
+        "type": "string",
+        "description": "action=create：Skill 做什么以及何时应使用。"
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "global",
+          "persona"
+        ],
+        "description": "global 对所有人格可用；persona 仅当前人格。update/delete 必填，create 默认 global。",
+        "default": "global"
+      },
+      "draft_id": {
+        "type": "string",
+        "description": "action=publish：create 或 update 返回的草稿 ID。"
+      }
+    },
+    "required": [
+      "action"
+    ]
+  },
+  "permission": "writes",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "skills"
+  ]
+}

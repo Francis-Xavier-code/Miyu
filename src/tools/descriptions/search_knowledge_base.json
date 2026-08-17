@@ -1,17 +1,25 @@
 {
   "name": "search_knowledge_base",
   "display_name": "搜索知识库",
-  "description": "Search the local knowledge base content. Returns file paths and original text snippets. Use read_knowledge_base_file if snippets are insufficient. ",
+  "description": "搜索本地知识库：by=content 搜内容（默认），by=name 按文件名/目录/扩展名/路径片段找文件。\n内容检索返回路径和原文片段，片段不够时用 read_knowledge_base_file 读全文；名称检索返回相对路径。只在有用或用户问起时才提路径。",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "Search keywords or user question."
+        "description": "搜索词、用户问题，或 by=name 时的文件名/目录/扩展名/路径片段。"
+      },
+      "by": {
+        "type": "string",
+        "enum": [
+          "content",
+          "name"
+        ],
+        "description": "content 搜内容，name 搜路径。默认 content。"
       },
       "max_results": {
         "type": "integer",
-        "description": "Optional result limit."
+        "description": "可选结果数量限制。"
       }
     },
     "required": [

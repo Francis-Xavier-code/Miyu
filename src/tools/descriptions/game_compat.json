@@ -1,0 +1,40 @@
+{
+  "name": "game_compat",
+  "display_name": "游戏兼容性",
+  "description": "查询游戏在 Linux 上的兼容性。\n汇总 ProtonDB 的评级与用户评论、caniplayonlinux 的实时结论（Proton 推荐版本、Steam Deck 状态、已知问题与修复）。支持 Steam App ID（数字）或游戏名称。返回内容来自第三方站点实时解析，未返回的字段视为未知，不要编造。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Steam App ID 或游戏名称。"
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "protondb",
+          "caniplayonlinux"
+        ],
+        "description": "数据源。默认 auto：先查 ProtonDB，无结果再查 caniplayonlinux。"
+      },
+      "max_reports": {
+        "type": "integer",
+        "description": "仅 protondb：最多返回的评论数，默认 20。"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "仅 caniplayonlinux：最多返回的匹配结果数，默认 5，最大 10。"
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "permission": "readonly",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": [
+    "gaming"
+  ]
+}

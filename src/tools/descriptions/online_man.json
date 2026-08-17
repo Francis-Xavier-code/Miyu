@@ -1,0 +1,23 @@
+{
+  "name": "online_man",
+  "display_name": "在线手册",
+  "description": "在线 Linux 手册：action=search 搜索，action=read 取具体手册页。\n搜索走 Arch manual pages；取页可选 Arch man pages 或 man7.org。read 正常阅读时 max_chars 至少给 8000，只要摘录才调小。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": { "type": "string", "enum": ["search", "read"], "description": "search 搜索，read 取页。" },
+      "query": { "type": "string", "description": "action=search 必填：搜索词。" },
+      "name": { "type": "string", "description": "action=read 必填：手册页名称。" },
+      "section": { "type": "string", "description": "可选手册章节号。" },
+      "language": { "type": "string", "description": "可选语言，默认 en。" },
+      "limit": { "type": "integer", "description": "仅 search：最多结果数，默认 10。" },
+      "source": { "type": "string", "enum": ["auto", "arch", "man7"], "description": "仅 read：来源站点，默认 auto。" },
+      "max_chars": { "type": "integer", "description": "仅 read：最多返回字符数。" }
+    },
+    "required": ["action"]
+  },
+  "permission": "readonly",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": ["linux-docs"]
+}

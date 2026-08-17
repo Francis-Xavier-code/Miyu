@@ -6,36 +6,50 @@ use std::time::Duration;
 const PROTONDB_BASE: &str = "https://www.protondb.com";
 const ALGOLIA_URL: &str = "https://94he6yatei-dsn.algolia.net/1/indexes/steamdb/query";
 
-const TOOL_NAME: &str = "protondb_query";
-const TOOL_DESC: &str = "查询 ProtonDB 游戏兼容性评级和用户评论。在需要查询 Linux 游戏兼容性信息等场景时使用。支持 Steam App ID（数字）或游戏名称（文本搜索）。";
+const TOOL_DESC: &str = "查询某个游戏在 Linux 上的兼容性。汇总 ProtonDB 的评级与用户评论、caniplayonlinux 的实时结论（Proton 推荐版本、Steam Deck 状态、已知问题与修复）。支持 Steam App ID（数字）或游戏名称。返回内容来自第三方站点实时解析，未返回的字段视为未知，不要编造。";
 
+/// 两个 Linux 游戏兼容性数据源合并成一件 `game_compat`(08-17):模型问的
+/// 始终是同一个问题("这游戏在 Linux 上能不能跑"),分成两个工具只是逼它
+/// 先挑数据源。source 缺省 auto = 先 ProtonDB(有 Steam App ID 时最准),
+/// 查不到再退 caniplayonlinux。
 pub fn register(registry: &mut ToolRegistry) {
-    registry.register(create_toolspec());
-}
-
-pub fn create_toolspec() -> ToolSpec {
-    ToolSpec::new(
-        TOOL_NAME,
+    registry.register(ToolSpec::new(
+        "game_compat",
         TOOL_DESC,
         json!({
             "type": "object",
             "properties": {
-                "query": {
+                "query": { "type": "string", "description": "Steam App ID 或游戏名称。" },
+                "source": {
                     "type": "string",
-                    "description": "Steam App ID 或游戏名称。"
+                    "enum": ["auto", "protondb", "caniplayonlinux"],
+                    "description": "数据源。默认 auto：先查 ProtonDB，无结果再查 caniplayonlinux。"
                 },
-                "max_reports": {
-                    "type": "integer",
-                    "description": "最多返回的评论数，默认 20。"
-                }
+                "max_reports": { "type": "integer", "description": "仅 protondb：最多返回的评论数，默认 20。" },
+                "limit": { "type": "integer", "description": "仅 caniplayonlinux：最多返回的匹配结果数，默认 5，最大 10。" }
             },
             "required": ["query"],
             "additionalProperties": false
         }),
-        |args| async move { protondb_query(args).await },
-    )
+        |args| async move { game_compat(args).await },
+    ));
 }
 
+async fn game_compat(args: Value) -> Result<String> {
+    match args.get("source").and_then(Value::as_str).unwrap_or("auto") {
+        "protondb" => protondb_query(args).await,
+        "caniplayonlinux" => super::caniplayonlinux_query::query(args).await,
+        "auto" => match protondb_query(args.clone()).await {
+            Ok(output) => Ok(output),
+            // ProtonDB 查不到就退到 caniplayonlinux;两边都失败时报前者的
+            // 错(它是首选源,错误信息对调用方更有指导性)。
+            Err(protondb_error) => super::caniplayonlinux_query::query(args)
+                .await
+                .map_err(|_| protondb_error),
+        },
+        other => bail!("unknown source: {other}; expected auto, protondb or caniplayonlinux"),
+    }
+}
 async fn protondb_query(args: Value) -> Result<String> {
     let query = args
         .get("query")

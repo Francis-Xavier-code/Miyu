@@ -1,7 +1,7 @@
 {
   "name": "deep_research",
   "display_name": "深度研究",
-  "description": "Run a dual-role deep research task and write the final Markdown report to the configured output directory.",
+  "description": "执行深度研究任务并写出 Markdown 报告。\nRun a dual-role deep research task and write the final Markdown report to the configured output directory.",
   "parameters": {
     "type": "object",
     "properties": {

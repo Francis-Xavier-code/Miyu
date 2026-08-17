@@ -973,18 +973,16 @@ impl RealContextPlugin {
         input.content = if formatted.text.is_empty() {
             current_block
         } else {
-            let identity_note = if context.config.platforms.qq.user_identification {
-                "每条记录的格式为「[时间] 昵称(QQ:号码) [msg=消息ID]: 内容」，可能带缩进的 \"回复引用:\" 和 \"@对象:\" 附加行；QQ 号是稳定标识，昵称可由用户随时修改，标记为 [你] 的记录是你自己发送的。"
-            } else {
-                "每条记录的格式为「[时间] 昵称 [msg=消息ID]: 内容」，可能带缩进的 \"回复引用:\" 和 \"@对象:\" 附加行；本会话未提供稳定标识，昵称可由用户随时修改，标记为 [你] 的记录是你自己发送的。"
-            };
+            // 格式说明是会话级常量,08-17 起随 <qq-history-format> 进 system
+            // 提示词说一次(实测一条 780K token 的群聊请求里它出现 558 次、
+            // 共 60,264 字符)。这里只保留会变的缺口提示。
             let gap_note = if truncated_backlog {
                 "\n（这段时间的消息较多，此处只包含其中最近的一部分；更早的记录可用 search_real_chat_history 取得。）"
             } else {
                 ""
             };
             format!(
-                "[此前群聊记录]\n{identity_note}{gap_note}\n{}\n\n{current_block}",
+                "[此前群聊记录]{gap_note}\n{}\n\n{current_block}",
                 formatted.text
             )
         };

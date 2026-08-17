@@ -950,6 +950,13 @@ pub struct StreamRenderer {
     /// so a phase merely pushed into the spinner is overwritten before it can
     /// be drawn.
     tool_preparing: Option<(&'static str, std::time::Instant)>,
+    /// 整个准备窗口的起点，跨 write_tool_call 存活。
+    ///
+    /// `tool_preparing` 每次工具调用完成就被清掉，计时锚点跟着它走的话，
+    /// 批量调用里第二个工具一到就归零——屏幕上的秒数来回横跳，反映不出
+    /// 已经等了多久。窗口真正结束（新一轮思考／外部输出／工具跑完／回合
+    /// 结束）才清这个。
+    tool_preparing_since: Option<std::time::Instant>,
     subagent_mode: Option<ChatStreamKind>,
     sent_meme_filter: SentMemeStreamFilter,
     /// 模型正文/思维链的流式转义过滤状态:与命令输出同一套状态机,
@@ -992,6 +999,7 @@ impl StreamRenderer {
             last_tick: None,
             preparing_question_started_at: None,
             tool_preparing: None,
+            tool_preparing_since: None,
             subagent_mode: None,
             sent_meme_filter: SentMemeStreamFilter::default(),
             stream_control: TerminalControlState::default(),
@@ -1032,6 +1040,7 @@ impl StreamRenderer {
     pub fn start_reasoning_phase(&mut self, received_at: std::time::Instant) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         if self.reasoning_mode == ReasoningDisplayMode::Summary {
             self.reasoning_started_at = Some(received_at);
             self.reasoning_elapsed = None;
@@ -1299,11 +1308,15 @@ impl StreamRenderer {
         Ok(())
     }
 
-    pub fn write_tool_preparing(&mut self, name: &str) -> Result<()> {
+    pub fn write_tool_preparing(&mut self, name: &str, batch: bool) -> Result<()> {
         if self.plain {
             return Ok(());
         }
-        let Some(phase) = crate::tools::preparing_phase(name) else {
+        // 工具自己的提示优先——它说得更具体；没有的话，批量场景退到通用
+        // 提示，总比整段空白强。
+        let phase = crate::tools::preparing_phase(name)
+            .or_else(|| batch.then(crate::tools::batch_preparing_phase));
+        let Some(phase) = phase else {
             return Ok(());
         };
         self.release_transient_output()?;
@@ -1311,7 +1324,10 @@ impl StreamRenderer {
         // immediately, and that tick re-derives the phase from renderer state.
         // Without the sticky field the tool summary or the reasoning timer wins
         // there and the hint never reaches the screen.
-        self.tool_preparing = Some((phase, std::time::Instant::now()));
+        let since = *self
+            .tool_preparing_since
+            .get_or_insert_with(std::time::Instant::now);
+        self.tool_preparing = Some((phase, since));
         // Braille + the dim tool palette: this is a tool starting up, not the
         // model thinking, and the scanner/green pair reads as the latter.
         self.ensure_waiting_phase(self.waiting_phase_text(), SpinnerStyle::Braille)
@@ -1325,6 +1341,7 @@ impl StreamRenderer {
             return Ok(());
         }
         self.stop_waiting()?;
+        self.tool_preparing_since = None;
         self.end_subagent_stream_line()?;
         let status = if ok { "ok" } else { "err" };
         let elapsed = self.finish_subagent_timer(name);
@@ -1347,7 +1364,7 @@ impl StreamRenderer {
             }
             return Ok(());
         }
-        if matches!(name, "todowrite" | "todoupdate") && ok {
+        if name == "todowrite" && ok {
             self.release_transient_output()?;
             let stdout = &mut self.output;
             if write_todo_table(stdout, output)? {
@@ -1596,6 +1613,7 @@ impl StreamRenderer {
     pub fn prepare_for_external_output(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         self.release_transient_output()?;
         self.finalize_tools_summary()?;
         self.show_cursor()?;
@@ -1636,6 +1654,7 @@ impl StreamRenderer {
     pub fn finish(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         self.stop_waiting()?;
         if let Some(mut display) = self.command_display.take() {
             display.commit(
@@ -2458,14 +2477,11 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         | "search_knowledge_base"
         | "search_evicted_context"
         | "recall_memories"
-        | "recall_past_events"
-        | "aur_search_packages"
-        | "online_man_search"
-        | "protondb_query"
-        | "query_caniplayonlinux"
+        | "aur"
+        | "online_man"
+        | "game_compat"
         | "fcitx5_input_method_wiki_qurey" => string_arg(&args, &["query", "topic"]),
         "archwiki_query" | "query_moegirl" => string_arg(&args, &["title", "query"]),
-        "search_knowledge_base_by_name" => string_arg(&args, &["file_name_query"]),
         "read_file" => {
             let path = string_arg(&args, &["path"])?;
             Some(match read_page_label(&args) {
@@ -2473,7 +2489,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
                 None => path,
             })
         }
-        "write_file" | "edit_file" | "edit_string" | "register_script" => {
+        "write_file" | "edit_file" | "edit_string" | "manage_script" => {
             string_arg(&args, &["path"])
         }
         "trash_path" => {
@@ -2510,8 +2526,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         }
         "web_fetch" => string_arg(&args, &["url"]).and_then(|url| safe_url_subject(&url)),
         "load_skill" => string_arg(&args, &["name"]),
-        "create_skill" | "update_skill" | "delete_skill" => string_arg(&args, &["name"]),
-        "publish_skill" => string_arg(&args, &["draft_id"]),
+        "manage_skill" => string_arg(&args, &["name", "draft_id"]),
         "load_tools" => args.get("names").and_then(Value::as_array).map(|names| {
             names
                 .iter()
@@ -2541,18 +2556,11 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
             ))
         }
         "scientific_calculator" => string_arg(&args, &["expression", "operation"]),
-        "set_alarm" => string_arg(&args, &["label", "time"]),
-        "cancel_alarm" => string_arg(&args, &["id"]),
-        "aur_get_package_info"
-        | "archlinux_official_package_query"
+        "alarm" => string_arg(&args, &["label", "time", "id"]),
+        "archlinux_official_package_query"
         | "review_aur_package"
         | "install_aur_package" => string_arg(&args, &["package_name", "package"]),
-        "online_man_get_page" => {
-            let page = string_arg(&args, &["name"])?;
-            let section = string_arg(&args, &["section"]);
-            Some(section.map_or(page.clone(), |section| format!("{page}({section})")))
-        }
-        "vision_analyze" | "print_image" | "add_meme" => {
+        "vision_analyze" | "print_image" | "manage_meme" => {
             string_arg(&args, &["image"]).map(|image| image_basename(&image))
         }
         "generate_image" => string_arg(&args, &["prompt"]),
@@ -2560,7 +2568,6 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         "register_deep_research_topic_title" => string_arg(&args, &["topic_title"]),
         "register_deep_research_reference" => string_arg(&args, &["title"]),
         "remove_deep_research_reference" => string_arg(&args, &["ref"]),
-        "unregister_script" => string_arg(&args, &["id"]),
         _ => None,
     }?;
     safe_inline_subject(&value)
@@ -2970,11 +2977,14 @@ impl MarkdownLineRenderer {
 /// 块级公式:kitty 家族终端走图形协议(高清,复用 print_image 管线),
 /// 其余终端半块画;渲染失败原样回放(青色+定界符)。
 fn render_display_math(tex: &str, closer: &str) -> String {
-    let max_cols = terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(100)
+    let (terminal_cols, terminal_rows) = terminal::size().unwrap_or((100, 24));
+    let max_cols = (terminal_cols as usize)
         .saturating_sub(6)
         .clamp(24, 110);
+    // 垂直方向此前没有任何上限——只约束宽度，行数由调用方写死为 9。
+    // 上限取 8 与 kitty 那条路对齐，再按终端高度收一道，矮窗口里一条公式
+    // 不该占掉半屏。
+    let max_rows = (terminal_rows as usize / 4).clamp(2, 8);
     if math::kitty_graphics_supported() {
         if let Some(kitty) = math::render_math_kitty(tex, max_cols) {
             // 占位行自带换行,逐行加两格缩进(图形转义段无换行,不受影响);
@@ -2988,7 +2998,21 @@ fn render_display_math(tex: &str, closer: &str) -> String {
             return output;
         }
     }
-    if let Some(art) = math::render_math(tex, math::MathMode::Block, 9, max_cols) {
+    // 非 kitty 终端交给 chafa:它认得 Konsole/WezTerm/foot/iTerm2 之流,能
+    // 出真图。图片工具一直走这条路,公式此前却只有半块——同一个终端里图片
+    // 是图、公式是像素块,就是这么来的。chafa 缺失或失败才退半块。
+    if let Some(art) = math::render_math_chafa(tex, max_cols, max_rows) {
+        let mut output = String::from("\n");
+        for line in &art.lines {
+            output.push_str("  ");
+            output.push_str(line);
+            output.push('\n');
+        }
+        // 与半块分支一致:首尾各留一个空行,和正文拉开呼吸感。
+        output.push('\n');
+        return output;
+    }
+    if let Some(art) = math::render_block_math(tex, max_cols, max_rows) {
         let mut output = String::from("\n");
         for line in art.lines {
             output.push_str("  ");
@@ -4099,21 +4123,64 @@ struct CommandResult {
     stderr: String,
 }
 
+/// 解析 dsh 式纯文本命令结果(08-17 起 run_command/grep/glob 的形态):
+/// 正文是 stdout,可选 `[stderr]` 段,末尾可选 `[exit code: N]` /
+/// `[killed by signal]` 标记。老的 JSON 形态仍然认——历史回合里还躺着
+/// 一批,渲染层不能因为换了形态就把它们变成裸 JSON。
 fn parse_command_result(output: &str) -> Option<CommandResult> {
-    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    let text = output.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(success) = value.get("success").and_then(Value::as_bool) {
+            return Some(CommandResult {
+                success,
+                exit_code: value.get("exit_code").and_then(Value::as_i64),
+                stdout: value
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                stderr: value
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        return None;
+    }
+
+    let mut body = text;
+    let mut exit_code = Some(0);
+    let mut success = true;
+    if let Some(rest) = body.strip_suffix("]") {
+        if let Some((head, marker)) = rest.rsplit_once("\n[") {
+            if let Some(code) = marker.strip_prefix("exit code: ") {
+                if let Ok(code) = code.trim().parse::<i64>() {
+                    body = head;
+                    exit_code = Some(code);
+                    success = code == 0;
+                }
+            } else if marker == "killed by signal" {
+                body = head;
+                exit_code = None;
+                success = false;
+            }
+        }
+    }
+    let (stdout, stderr) = match body.split_once("[stderr]\n") {
+        Some((out, err)) => (out.trim_end(), err),
+        None => (body, ""),
+    };
+    let stdout = if stdout.trim() == "(no output)" {
+        ""
+    } else {
+        stdout
+    };
     Some(CommandResult {
-        success: value.get("success")?.as_bool()?,
-        exit_code: value.get("exit_code").and_then(Value::as_i64),
-        stdout: value
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        stderr: value
-            .get("stderr")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        success,
+        exit_code,
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
     })
 }
 
@@ -5757,13 +5824,10 @@ mod tests {
             ("check_os_info", "System information", "查看系统信息"),
             ("get_weather", "Weather", "天气查询"),
             ("get_exchange_rate", "Exchange rates", "汇率查询"),
-            ("draw_zhouyi_hexagram", "Draw I Ching hexagram", "周易起卦"),
-            ("draw_tarot_card", "Draw tarot card", "抽塔罗牌"),
-            ("draw_fortune_lot", "Draw fortune", "吉凶占"),
             ("vision_analyze", "Analyze image", "分析图片"),
             ("search_meme", "Search memes", "搜索表情包"),
             ("show_meme", "Send meme", "发送表情"),
-            ("add_meme", "Add meme", "添加表情包"),
+            ("manage_meme", "Manage memes", "管理表情包"),
             ("task", "Subagent", "子代理"),
             (
                 "upload_text_to_knowledge_base",
@@ -5775,21 +5839,16 @@ mod tests {
                 "Search old context",
                 "搜索旧上下文",
             ),
-            ("recall_past_events", "Recall past events", "回忆往事"),
-            ("aur_check_status", "Check AUR status", "查询 AUR 状态"),
-            ("online_man_search", "Search online manuals", "搜索在线手册"),
-            ("online_man_get_page", "Read online manual", "读取在线手册"),
+            ("aur", "AUR query", "AUR 查询"),
+            ("online_man", "Online manual", "在线手册"),
             (
                 "fcitx5_input_method_wiki_qurey",
                 "Query Fcitx5 Wiki",
                 "查询 Fcitx5 Wiki",
             ),
             ("install_aur_package", "Install AUR package", "安装 AUR 包"),
-            (
-                "search_knowledge_base_by_name",
-                "Search knowledge base by name",
-                "按名称搜索知识库",
-            ),
+            ("divine", "Divination", "占卜"),
+            ("manage_skill", "Manage skills", "管理技能"),
             ("recall_memories", "Recall memories", "召回记忆"),
         ] {
             assert_eq!(readable_tool_name(name), t(english, chinese), "{name}");
@@ -6117,7 +6176,7 @@ mod tests {
 
     #[test]
     fn tool_preparing_announces_every_slow_argument_tool() {
-        let phase_for = |name: &str| {
+        let phase_for_batch = |name: &str, batch: bool| {
             let mut renderer = StreamRenderer::new(
                 ReasoningDisplayMode::Summary,
                 ToolCallDisplayMode::Summary,
@@ -6130,9 +6189,10 @@ mod tests {
             // No TTY under test, so the spinner degrades to a summary line —
             // which is gated on the same flag a real terminal would set.
             renderer.live_summary = true;
-            renderer.write_tool_preparing(name).unwrap();
+            renderer.write_tool_preparing(name, batch).unwrap();
             String::from_utf8_lossy(&renderer.take_output_frame()).into_owned()
         };
+        let phase_for = |name: &str| phase_for_batch(name, false);
 
         // apply_artifact_patch used to fall through the label match and render
         // nothing even though the backend announced it.
@@ -6149,7 +6209,55 @@ mod tests {
         }
         assert!(phase_for("run_command").contains(t("~ Preparing command", "~ 准备执行")));
         assert!(phase_for("trash_path").contains(t("~ Preparing delete", "~ 准备删除")));
+        assert!(phase_for("todowrite").contains(t("~ Preparing list", "~ 准备清单")));
         assert!(phase_for("read_file").is_empty());
+
+        // 同一条消息里的第 2+ 个调用:每个工具单看都不够慢,但参数接连流完
+        // 的静默窗口和一次大 patch 一样长,所以退到通用提示而不是空白。
+        assert!(phase_for_batch("read_file", true)
+            .contains(t("~ Preparing tools", "~ 准备工具")));
+        // 工具自己的提示更具体,批量时也不该被通用的顶掉。
+        assert!(phase_for_batch("run_command", true)
+            .contains(t("~ Preparing command", "~ 准备执行")));
+    }
+
+    /// 批量里的计时是整个准备窗口的，不是每个工具各算各的。
+    ///
+    /// `write_tool_call` 会清掉 `tool_preparing`，锚点若跟着它走，第二个
+    /// 工具一到秒数就归零，屏幕上来回横跳。
+    #[test]
+    fn batch_preparation_timer_spans_the_whole_window() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            false,
+            true,
+            10,
+        );
+        renderer.use_external_cursor_control();
+        renderer.use_buffered_output();
+        renderer.live_summary = true;
+
+        renderer.write_tool_preparing("apply_patch", false).unwrap();
+        let first = renderer.tool_preparing.expect("准备状态已建立").1;
+        // 参数流完 → 这个工具的准备结束，但整批还没完。
+        renderer.write_tool_call("apply_patch", "{}").unwrap();
+        assert!(renderer.tool_preparing.is_none());
+        renderer.write_tool_preparing("write_file", false).unwrap();
+        assert_eq!(
+            renderer.tool_preparing.expect("第二个工具的准备状态").1,
+            first,
+            "同一批里的计时起点必须复用"
+        );
+
+        // 工具真跑起来了 = 窗口结束，下一批重新计时。
+        renderer.write_tool_result("write_file", true, "ok").unwrap();
+        renderer.write_tool_preparing("apply_patch", false).unwrap();
+        assert_ne!(
+            renderer.tool_preparing.expect("新一批的准备状态").1,
+            first,
+            "工具跑完之后应该重新起算"
+        );
     }
 
     /// Regression: the hint above is announced mid-turn, when a reasoning
@@ -6176,7 +6284,7 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
         renderer.tool_stats_entry("read_file").calls += 1;
 
-        renderer.write_tool_preparing("run_command").unwrap();
+        renderer.write_tool_preparing("run_command", false).unwrap();
         assert!(renderer
             .waiting_phase_text()
             .starts_with(t("~ Preparing command · ", "~ 准备执行 · ")));

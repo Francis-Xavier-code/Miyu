@@ -76,13 +76,14 @@ fn run_scoped(
     Ok(output)
 }
 
+/// todowrite + todoupdate 合并(08-17):同一份清单的整表替换与增量修改。
+/// 给了 updates 就走增量,给了 todos 就整表替换。
 pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
-    let update_paths = paths.clone();
     registry.register(ToolSpec::new(
         "todowrite",
         t(
-            "Create or replace the full structured task list for the current coding session. Use this when initializing or rebuilding the whole list. For changing one existing item, use todoupdate instead.",
-            "创建或替换当前编码会话的完整结构化任务列表。用于初始化或重建整个列表；如果只是修改单个已有任务，请使用 todoupdate。",
+            "Maintain the structured task list for the current session. Pass todos to create or replace the whole list; pass updates to apply small atomic changes (add, update, remove, clear) without resending everything. Exactly one of the two.",
+            "维护当前会话的结构化任务列表。传 todos 创建或替换整个列表；传 updates 做小范围原子变更（新增、修改、删除、清空），不必重传完整列表。二者必须且只能给一个。",
         ),
         json!({
             "type": "object",
@@ -93,10 +94,7 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": t("Brief description of the task.", "任务简述。")
-                            },
+                            "content": { "type": "string", "description": t("Brief description of the task.", "任务简述。") },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
@@ -110,25 +108,7 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
                         },
                         "required": ["content", "status", "priority"]
                     }
-                }
-            },
-            "required": ["todos"],
-            "additionalProperties": false
-        }),
-        move |args| {
-            let paths = paths.clone();
-            async move { run_scoped(&paths, args, todo_write) }
-        },
-    ).writes());
-    registry.register(ToolSpec::new(
-        "todoupdate",
-        t(
-            "Atomically update the existing todo list. Use this for small changes: add, update, remove, or clear items without resending the full list.",
-            "原子更新现有任务列表。用于小范围变更：新增、修改、删除或清空任务，不需要重传完整列表。",
-        ),
-        json!({
-            "type": "object",
-            "properties": {
+                },
                 "updates": {
                     "type": "array",
                     "description": t("Sequential todo mutations to apply atomically.", "按顺序原子应用的任务变更。"),
@@ -148,10 +128,7 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
                                 "type": "string",
                                 "description": t("Exact content used to find the target when index is omitted.", "省略 index 时，用于定位目标任务的完整内容。")
                             },
-                            "content": {
-                                "type": "string",
-                                "description": t("New task content for add or update.", "新增或修改后的任务内容。")
-                            },
+                            "content": { "type": "string", "description": t("New task content for add or update.", "新增或修改后的任务内容。") },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
@@ -168,12 +145,17 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
                     }
                 }
             },
-            "required": ["updates"],
             "additionalProperties": false
         }),
         move |args| {
-            let paths = update_paths.clone();
-            async move { run_scoped(&paths, args, todo_update) }
+            let paths = paths.clone();
+            async move {
+                if args.get("updates").is_some() {
+                    run_scoped(&paths, args, todo_update)
+                } else {
+                    run_scoped(&paths, args, todo_write)
+                }
+            }
         },
     ).writes());
 }

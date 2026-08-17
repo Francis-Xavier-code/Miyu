@@ -667,17 +667,22 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 注册与注销合并成 `manage_script`(08-17):同一份脚本索引的两种写操作。
 fn register_script_tools(registry: &mut ToolRegistry, scripts_dir: PathBuf) {
-    let scripts_dir_2 = scripts_dir.clone();
     registry.register(ToolSpec::new(
-        "register_script",
+        "manage_script",
         t(
-            "Register or update a user script as a tool. The script must exist in the scripts directory. This updates index.json, sets executable permission, and makes the script immediately available as a tool in subsequent tool rounds.",
-            "注册或更新用户脚本为工具。脚本必须存在于 scripts 目录中。此操作更新 index.json、设置可执行权限，并使脚本在后续工具调用轮次中立即可用。"
+            "Manage user scripts as tools. action=register adds or updates one (the script must already exist in the scripts directory; this updates index.json, sets the executable bit, and the script becomes callable in later tool rounds). action=unregister removes it from the index, optionally deleting the file.",
+            "把用户脚本管理为工具。action=register 注册或更新（脚本必须已存在于 scripts 目录；会更新 index.json、设置可执行权限，脚本在后续工具轮次中立即可用）。action=unregister 从索引移除，可选同时删除文件。",
         ),
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["register", "unregister"],
+                    "description": t("register adds or updates, unregister removes.", "register 注册/更新，unregister 注销。")
+                },
                 "id": {
                     "type": "string",
                     "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$",
@@ -693,7 +698,7 @@ fn register_script_tools(registry: &mut ToolRegistry, scripts_dir: PathBuf) {
                 },
                 "path": {
                     "type": "string",
-                    "description": t("Script file name or path within the user scripts directory.", "用户 scripts 目录内的脚本文件名或路径。")
+                    "description": t("register only: script file name or path within the user scripts directory.", "仅 register：用户 scripts 目录内的脚本文件名或路径。")
                 },
                 "parameters": {
                     "type": "object",
@@ -716,41 +721,24 @@ fn register_script_tools(registry: &mut ToolRegistry, scripts_dir: PathBuf) {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": t("Optional hybrid catalog groups, e.g. gaming or systeminfo.", "可选 Hybrid 目录分组，例如 gaming 或 systeminfo。")
+                },
+                "delete_file": {
+                    "type": "boolean",
+                    "description": t("unregister only: also delete the script file from disk. Only affects files within the scripts directory.", "仅 unregister：同时从磁盘删除脚本文件。仅影响 scripts 目录内的文件。")
                 }
             },
-            "required": ["id", "path"],
+            "required": ["action", "id"],
             "additionalProperties": false
         }),
         move |args| {
             let scripts_dir = scripts_dir.clone();
-            async move { register_script_handler(args, &scripts_dir).await }
-        },
-    ).writes());
-
-    registry.register(ToolSpec::new(
-        "unregister_script",
-        t(
-            "Remove a registered script from the tool index. Optionally delete the script file if it resides within the scripts directory.",
-            "从工具索引中移除已注册的脚本。如果脚本文件位于 scripts 目录内，可选删除文件。"
-        ),
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": t("The script id to unregister.", "要注销的脚本 id。")
-                },
-                "delete_file": {
-                    "type": "boolean",
-                    "description": t("If true, delete the script file from disk. Only affects files within the scripts directory.", "若为 true，同时从磁盘删除脚本文件。仅影响 scripts 目录内的文件。")
+            async move {
+                match args.get("action").and_then(Value::as_str).unwrap_or_default() {
+                    "register" => register_script_handler(args, &scripts_dir).await,
+                    "unregister" => unregister_script_handler(args, &scripts_dir).await,
+                    other => bail!("unknown action: {other}; expected register or unregister"),
                 }
-            },
-            "required": ["id"],
-            "additionalProperties": false
-        }),
-        move |args| {
-            let scripts_dir = scripts_dir_2.clone();
-            async move { unregister_script_handler(args, &scripts_dir).await }
+            }
         },
     ).writes());
 }
@@ -822,19 +810,7 @@ async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<Stri
         .map(parse_load_policy)
         .transpose()?
         .unwrap_or_default();
-    let groups = args
-        .get("groups")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let groups = super::string_list(args.get("groups"));
     let stored_path = relative_script_path(&script_path, scripts_dir);
 
     let entry = ScriptEntry {

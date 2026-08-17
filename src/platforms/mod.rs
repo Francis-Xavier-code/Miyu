@@ -1068,6 +1068,16 @@ impl PlatformTurnContext {
         Ok(receipt)
     }
 
+    /// 直发，不过 `before_send`/`after_send`（历史仍经
+    /// `record_external_bot_message` 记一份）。
+    ///
+    /// 只留给**故障路径上的短通知**：限流提示、会话解析失败、回合异常。
+    /// 这些消息恰恰在插件可能不可用或正是问题来源的时候要发出去，多一层
+    /// 依赖就多一次发不出的机会；而且都短到不触发任何插件的阈值，绕过与
+    /// 否看不出差别。
+    ///
+    /// 命令输出**不属于**这一类——它和模型回复一样是正常产物，走 `send()`
+    /// 过回复处理插件（长清单转图片等）。
     pub(crate) async fn send_bypass_plugins(
         &self,
         message: OutboundMessage,

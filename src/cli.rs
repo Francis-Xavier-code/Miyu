@@ -225,6 +225,70 @@ fn short_model_name(model: &str, provider: &str) -> String {
 /// down with "The cursor position could not be read within a normal duration".
 /// The answer is only ever used to re-anchor a redraw, so a stale one costs a
 /// single imperfect frame — losing the session costs the session.
+/// 活动区重绘轨迹（`MIYU_TAIL_TRACE=1` 打开，落
+/// `~/.miyu/cache/logs/tail-trace.log`）。
+///
+/// 这段重绘靠绝对屏幕行号 + DECSTBM 受限滚动区 + 插入/删除行来搬动活动
+/// 区。受限区里滚出去的行是直接丢弃、不进 scrollback 的，而 kitty 的图
+/// 片锚在文本行上——所以只有「用户滚过历史 + 新输出推动」这个组合才暴
+/// 露。要定位就得看出错那一刻实际发了哪些序列。
+#[allow(clippy::too_many_arguments)]
+fn trace_tail_redraw(
+    tail_start: u16,
+    next_tail: u16,
+    shift: i32,
+    tail_rows: u16,
+    output_cursor: (u16, u16),
+    output_bottom: Option<u16>,
+    leading_scroll: u16,
+    terminal_rows: u16,
+    transaction: &[u8],
+) {
+    use std::io::Write as _;
+    // 只记会搬动屏幕内容的序列,纯重绘噪声太大。
+    let escapes = String::from_utf8_lossy(transaction);
+    let mut moves = Vec::new();
+    for (marker, label) in [
+        ("L", "IL 插入行"),
+        ("M", "DL 删除行"),
+        ("r", "DECSTBM 滚动区"),
+    ] {
+        let pattern = format!("\x1b[");
+        let mut rest = escapes.as_ref();
+        while let Some(index) = rest.find(&pattern) {
+            rest = &rest[index + pattern.len()..];
+            if let Some(end) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+                if &rest[end..end + 1] == marker {
+                    moves.push(format!("{label}({})", &rest[..end]));
+                }
+            }
+        }
+    }
+    let line = format!(
+        "tail {tail_start}→{next_tail} shift={shift} rows={tail_rows} \
+         cursor={output_cursor:?} bottom={output_bottom:?} \
+         leading_scroll={leading_scroll} term_rows={terminal_rows} \
+         | {}\n",
+        if moves.is_empty() {
+            "无搬动".to_string()
+        } else {
+            moves.join(" ")
+        }
+    );
+    let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+        .join(".miyu/cache/logs/tail-trace.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn cursor_position_or(fallback: (u16, u16)) -> (u16, u16) {
     // 终端已挂断时 ESC[6n 永远等不到应答,而 crossterm 的应答等待对
     // HUP fd 会无限自旋(超时失效)——直接用回退值,让退出路径走完。
@@ -491,7 +555,7 @@ fn root_help_template() -> String {
   bash-init          Integrate with bash
   zsh-init           Integrate with zsh
   remove-shell-hook  Safely remove installed Miyu shell hooks
-  models             Switch the terminal-integration session's model
+  models             Switch the terminal session's model (-g edits the global pool)
   variant            Switch the terminal session model's thinking level
   history            Show conversation history
   reset              Clear the terminal-integration session context
@@ -501,7 +565,7 @@ fn root_help_template() -> String {
   bash-init          集成到 bash
   zsh-init           集成到 zsh
   remove-shell-hook  安全删除已安装的 Miyu shell hook
-  models             修改终端集成会话的模型
+  models             修改终端集成会话的模型（-g 改全局模型池）
   variant            切换终端集成会话模型的思考档位
   history            显示会话历史
   reset              清除终端集成会话上下文
@@ -1285,6 +1349,11 @@ pub struct ModelsArgs {
     /// 1-based list index, `provider/model`, a bare model name, or
     /// `default` to follow the global active pool again.
     pub target: Option<String>,
+
+    /// 改的是全局激活模型池，而不是当前终端集成会话的覆盖。
+    /// 全局池是所有没有单独覆盖的会话（含 WebUI 与通讯平台）的默认来源。
+    #[arg(short = 'g', long = "global")]
+    pub global: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3565,6 +3634,134 @@ async fn run_models(paths: &MiyuPaths, args: ModelsArgs) -> Result<()> {
     run_models_for_session(paths, args, None).await
 }
 
+/// REPL 的 `/models` 收的是一整串自由文本,这里把 `--global` / `-g` 从中
+/// 摘出来,让两个入口的写法一致(`/models --global`、`/models -g gpt-5`)。
+fn parse_models_argument(argument: &str) -> ModelsArgs {
+    let mut global = false;
+    let mut rest = argument.trim();
+    loop {
+        let stripped = rest
+            .strip_prefix("--global")
+            .or_else(|| rest.strip_prefix("-g"))
+            .filter(|remainder| remainder.is_empty() || remainder.starts_with(char::is_whitespace));
+        match stripped {
+            Some(remainder) => {
+                global = true;
+                rest = remainder.trim_start();
+            }
+            None => break,
+        }
+    }
+    ModelsArgs {
+        target: (!rest.is_empty()).then(|| rest.to_string()),
+        global,
+    }
+}
+
+/// `miyu models --global`:直接编辑全局激活模型池。
+///
+/// 不带 --global 时这条命令改的只是终端集成会话的覆盖,全局池此前只能进
+/// `miyu config` 的 TUI 里翻。全局池是所有没有单独覆盖的会话(WebUI、通讯
+/// 平台、新开的终端会话)共同的默认来源,值得有一条一行就能改完的路。
+///
+/// 与会话覆盖的两点不同:池不能清空(至少留一个端点,`set_active_provider_models`
+/// 自己会拦),以及 `default` 没有意义——全局池本身就是那个"默认"。
+async fn run_models_global(paths: &MiyuPaths, target: Option<&str>) -> Result<()> {
+    let mut config = AppConfig::load(paths)?;
+    let choices = config.text_provider_model_choices();
+    if choices.is_empty() {
+        bail!(
+            "{}",
+            t(
+                "no configured provider models; configure a model first",
+                "没有已配置的 provider 模型；请先配置模型",
+            )
+        );
+    }
+    let selected = if let Some(target) = target.map(str::trim) {
+        if target.eq_ignore_ascii_case("default") || target.eq_ignore_ascii_case("global") {
+            bail!(
+                "{}",
+                t(
+                    "the global pool is the default; pick a concrete model instead",
+                    "全局池本身就是默认来源，请直接指定具体模型",
+                )
+            );
+        }
+        let choice = crate::config::resolve_provider_model_argument(&choices, target)
+            .map_err(anyhow::Error::msg)?;
+        vec![ActiveProviderModelConfig {
+            provider_id: choice.provider_id.clone(),
+            model: choice.model.clone(),
+        }]
+    } else {
+        if !(io::stdout().is_terminal() && io::stdin().is_terminal()) {
+            print_model_choices(&config, &choices, None);
+            return Ok(());
+        }
+        let initial = choices
+            .iter()
+            .map(|choice| config.is_active_provider_model(&choice.provider_id, &choice.model))
+            .collect::<Vec<_>>();
+        let Some(active) = inline_fuzzy_select(
+            &choices
+                .iter()
+                .map(|choice| choice.label())
+                .collect::<Vec<_>>(),
+            initial.clone(),
+        )?
+        else {
+            return Ok(());
+        };
+        if active == initial {
+            println!(
+                "{}",
+                t(
+                    "no changes (Enter picks the highlighted model; Tab multi-selects)",
+                    "未做修改（回车=选定高亮模型,Tab=多选勾选）"
+                )
+            );
+            return Ok(());
+        }
+        choices
+            .iter()
+            .zip(active)
+            .filter_map(|(choice, active)| {
+                active.then(|| ActiveProviderModelConfig {
+                    provider_id: choice.provider_id.clone(),
+                    model: choice.model.clone(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if selected.is_empty() {
+        bail!(
+            "{}",
+            t(
+                "at least one model must stay active in the global pool",
+                "全局池至少要保留一个激活模型",
+            )
+        );
+    }
+    config.set_active_provider_models(&selected)?;
+    config.save(paths)?;
+    let labels = selected
+        .iter()
+        .map(|model| format!("{}/{}", model.provider_id, model.model))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{}: {labels}", t("global model pool", "全局激活模型池"));
+    // daemon 在跑就让它立刻吃到新池,否则要等下次重启。已绑定覆盖的会话
+    // 不受影响——它们本来就不看全局池。
+    if ipc::daemon_info(paths).await.is_some() {
+        retry_config_reload(RELOAD_MAX_ATTEMPTS, RELOAD_RETRY_INTERVAL, || {
+            request_config_reload(paths)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 /// Switches the model pool of one session (the current session when
 /// `session_id` is None). The override persists on the session, so reopening
 /// it restores the model; the global pool is managed in `miyu config`.
@@ -3573,6 +3770,9 @@ async fn run_models_for_session(
     args: ModelsArgs,
     session_id: Option<&str>,
 ) -> Result<()> {
+    if args.global {
+        return run_models_global(paths, args.target.as_deref()).await;
+    }
     let config = AppConfig::load(paths)?;
     let choices = config.text_provider_model_choices();
     if choices.is_empty() {
@@ -3610,22 +3810,35 @@ async fn run_models_for_session(
     }
     if io::stdout().is_terminal() && io::stdin().is_terminal() {
         let override_pool = session_model_override_snapshot(paths, session_id)?;
-        let initial = choices
-            .iter()
-            .map(|choice| match override_pool.as_deref() {
-                Some(pool) => pool.iter().any(|model| {
-                    model.provider_id == choice.provider_id && model.model == choice.model
-                }),
-                None => config.is_active_provider_model(&choice.provider_id, &choice.model),
-            })
-            .collect::<Vec<_>>();
-        if let Some(active) = inline_fuzzy_select(
-            &choices
-                .iter()
-                .map(|choice| choice.label())
-                .collect::<Vec<_>>(),
-            initial.clone(),
-        )? {
+        // 第一项是「继承全局模型池」,与 config TUI 的会话/QQ 模型菜单同款:
+        // 会话没有自己的覆盖时它就是当前状态。此前想恢复继承只能记住
+        // `miyu models default` 这个隐藏写法,菜单里根本看不到这条路。
+        let inherit_label = t("Inherit global model pool", "继承全局模型池").to_string();
+        let mut labels = vec![inherit_label];
+        labels.extend(choices.iter().map(|choice| choice.label()));
+        let mut initial = vec![override_pool.is_none()];
+        initial.extend(choices.iter().map(|choice| match override_pool.as_deref() {
+            Some(pool) => pool.iter().any(|model| {
+                model.provider_id == choice.provider_id && model.model == choice.model
+            }),
+            None => config.is_active_provider_model(&choice.provider_id, &choice.model),
+        }));
+        if let Some(active) = inline_fuzzy_select(&labels, initial.clone())? {
+            // 勾了「继承」就是继承:继承与覆盖天然互斥,同时勾选时以继承为准
+            // (标签本身也这么说)。
+            if active.first().copied().unwrap_or(false) && !initial[0] {
+                set_session_models(paths, session_id, Vec::new()).await?;
+                println!(
+                    "{}",
+                    t(
+                        "this session now follows the global active pool",
+                        "当前会话已恢复跟随全局激活模型池"
+                    )
+                );
+                return Ok(());
+            }
+            let active = active.into_iter().skip(1).collect::<Vec<_>>();
+            let initial = initial.into_iter().skip(1).collect::<Vec<_>>();
             if active == initial {
                 println!(
                     "{}",
@@ -5862,6 +6075,21 @@ async fn try_run_remote_chat(
                 },
                 frame = &mut recv => break frame?,
                 _ = spinner_tick.tick() => {
+                    // 外部输出期间活动区是挂起的(rendered=false),这时
+                    // apply_output_frame 会把帧直接写在光标当下的位置——
+                    // 也就是工具刚打完的图片中间。文本只盖住左边一截,右
+                    // 边残留的 Kitty 占位字符继续渲染对应那行的图片切片,
+                    // 屏幕上就是一条条横带。
+                    //
+                    // 进程内那条路(handle_live_agent_event)早就把外部输
+                    // 出期间的 SpinnerTick 整个丢掉了,远端这条漏了。丢掉
+                    // 不会少画:tool.finished 会先 resume_at 再统一出帧。
+                    if live
+                        .as_deref()
+                        .is_some_and(|live| live.external_output_active)
+                    {
+                        continue;
+                    }
                     renderer.tick_spinner()?;
                     if let Some(live) = live.as_deref_mut() {
                         live.apply_renderer_frame(&mut renderer)?;
@@ -5977,6 +6205,10 @@ async fn try_run_remote_chat(
                 &mut renderer,
                 AgentEvent::ToolPreparing {
                     name: ipc_text(&data, "name").to_string(),
+                    batch: data
+                        .get("batch")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 },
             )?,
             "tool.started" => handle_agent_event(
@@ -6040,14 +6272,21 @@ async fn try_run_remote_chat(
                 let state = queue_state
                     .as_ref()
                     .expect("queue state exists for a remote turn");
-                let size = (ipc_text(&data, "name") == "show_meme")
-                    .then(|| tools::memes::configured_meme_size(&config.plugins.memes))
-                    .flatten();
+                let size = remote_tool_image_size(
+                    ipc_text(&data, "name"),
+                    ipc_text(&data, "size"),
+                    &config,
+                );
                 if let Err(error) = render_remote_tool_image(state, &data, size).await {
                     renderer.write_system_message(&format!(
                         "{}: {error}",
                         t("Could not display tool image", "工具图片显示失败")
                     ))?;
+                }
+                // 图片打完就得抬进正文页内,否则之后每次受限区滚动它都不
+                // 动(kitty 只搬完全落在页内的图),残影会一路堆下去。
+                if let Some(live) = live.as_deref_mut() {
+                    live.lift_external_output_into_page()?;
                 }
             }
             "question.requested" => {
@@ -6184,6 +6423,27 @@ async fn try_run_remote_chat(
                     text: ipc_text(&data, "text").to_string(),
                 },
             )?,
+            // daemon 每完成一次模型请求就发这个,可这里没有对应分支,于是
+            // 逐请求的计量在 IPC 这一段掉地上——回合跑在 daemon 里,CLI 拿
+            // 不到就只能等 run.completed 的权威数字,footer 因此整轮不动。
+            // WebUI 没这问题:它自己解 SSE。
+            "chat.round_usage" => {
+                if let Some(live) = live.as_deref_mut() {
+                    let usage = data.get("usage").cloned().unwrap_or_default();
+                    // prompt+completion 即该请求结束时的上下文实际占用,
+                    // 与进程内那条路同一个口径。
+                    let context_tokens = ipc_u64(&usage, "prompt_tokens")
+                        .saturating_add(ipc_u64(&usage, "completion_tokens"));
+                    live.refresh_round_usage(
+                        context_tokens,
+                        TurnTokens {
+                            total: ipc_u64(&data, "turn_total"),
+                            prompt: ipc_u64(&data, "turn_prompt"),
+                            cache_read: ipc_u64(&data, "turn_cache_read"),
+                        },
+                    )?;
+                }
+            }
             "run.completed" => break data,
             "run.failed" => {
                 renderer.finish()?;
@@ -6909,6 +7169,33 @@ fn ipc_text<'a>(data: &'a serde_json::Value, key: &str) -> &'a str {
     data.get(key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
+}
+
+fn ipc_u64(data: &serde_json::Value, key: &str) -> u64 {
+    data.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+}
+
+/// daemon 模式下真正画图的是终端这一侧，尺寸也只能在这里定。
+///
+/// 此前只有 show_meme 算尺寸，别的工具一律传 None，而 `parse_size(None)`
+/// 的语义是「铺满整个终端」——生图、print_image、搜图预览于是全都印成满
+/// 屏。百分比默认值依赖 `crossterm::terminal::size()`，daemon 量到的不是
+/// 用户的终端，所以必须在这里算；模型显式要的尺寸则随事件带过来。
+fn remote_tool_image_size(
+    tool_name: &str,
+    requested: &str,
+    config: &crate::config::AppConfig,
+) -> Option<String> {
+    let requested = requested.trim();
+    if !requested.is_empty() {
+        return Some(requested.to_string());
+    }
+    if tool_name == "show_meme" {
+        return tools::memes::configured_meme_size(&config.plugins.memes);
+    }
+    tools::vision::configured_print_size(&config.plugins.print_image)
 }
 
 async fn render_remote_tool_image(
@@ -7746,9 +8033,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     let argument = command_args.trim();
                     let result = run_models_for_session(
                         paths,
-                        ModelsArgs {
-                            target: (!argument.is_empty()).then(|| argument.to_string()),
-                        },
+                        parse_models_argument(argument),
                         Some(&active_session_id),
                     )
                     .await;
@@ -8062,19 +8347,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::ResetMemory => {
-                    if !confirm_inline(
-                        &mut live_repl,
-                        t(
-                            "erase this mode's long-term memory (facts, diary, episodes)?",
-                            "确认清空当前模式的长期记忆（事实/日记/经历）？",
-                        ),
-                    )? {
-                        repl_note(
-                            &mut live_repl,
-                            &format!("\x1b[2m{}\x1b[0m\n", t("cancelled", "已取消")),
-                        )?;
-                        continue;
-                    }
+                    // 不二次确认:只清长期记忆,会话历史/技能/知识库都不动。
                     let Some((_, _)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
@@ -8441,9 +8714,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             let repl_session_id = state.session_id();
             run_models_for_session(
                 paths,
-                ModelsArgs {
-                    target: (!argument.is_empty()).then(|| argument.to_string()),
-                },
+                parse_models_argument(argument),
                 Some(&repl_session_id),
             )
             .await?;
@@ -8613,13 +8884,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             continue;
         }
         if command.eq_ignore_ascii_case("/reset-memory") {
-            if !confirm_stdin(t(
-                "erase this mode's long-term memory (facts, diary, episodes)?",
-                "确认清空当前模式的长期记忆（事实/日记/经历）？",
-            ))? {
-                println!("{}", t("cancelled", "已取消"));
-                continue;
-            }
+            // 不二次确认:只清长期记忆,会话历史/技能/知识库都不动。
             agent.wipe_memory()?;
             println!(
                 "{}",
@@ -10395,6 +10660,52 @@ impl LiveReplTail {
         Ok(())
     }
 
+    /// 把刚打完的外部输出整屏上滚，直到它完全落进正文页内。
+    ///
+    /// kitty 图形协议原文：设了页边距之后，只有「完全落在页内」的图片才
+    /// 跟着滚动，越界的会被裁剪并留在原地。图片是顺着光标往下打的，底部
+    /// 常常正压在活动区上——恰好越界。此后每一次受限区滚动它都不动，文字
+    /// 走了图不走，一次留一条残影；一次会话滚几百次，屏幕上就堆成一叠重
+    /// 复的切片。
+    ///
+    /// 原本是个死锁：那个本该把图抬出活动区的滚动，正是 kitty 拒绝对图生
+    /// 效的滚动。所以要趁这一刻整屏滚一次——整屏滚没有页边距，图片一定跟
+    /// 着走。这里也正是唯一能这么做的时机：活动区已经 suspend、那几行是
+    /// 空的，被一起带上去不会留下痕迹（在别处整屏滚会把画着 ┃ 的输入框推
+    /// 进正文）。
+    fn lift_external_output_into_page(&mut self) -> Result<()> {
+        let (_, terminal_rows) = terminal::size().unwrap_or((80, 24));
+        let terminal_rows = terminal_rows.max(1);
+        let page_bottom = self.tail_start.saturating_sub(1);
+        let cursor_row = cursor_row_or(self.output_cursor.1);
+        let overflow = cursor_row.saturating_sub(page_bottom);
+        if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
+            use std::io::Write as _;
+            let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                .join(".miyu/cache/logs/tail-trace.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    file,
+                    "lift: 光标行={cursor_row} 页底={page_bottom} 需抬升={overflow}                      tail_start={} 屏高={terminal_rows}",
+                    self.tail_start
+                );
+            }
+        }
+        if overflow == 0 {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        queue!(stdout, MoveTo(0, terminal_rows.saturating_sub(1)))?;
+        for _ in 0..overflow {
+            queue!(stdout, Print("\n"))?;
+        }
+        // 停在滚完后内容真正的末尾:调用方随后会重新查询光标来定位活动区。
+        queue!(stdout, MoveTo(0, page_bottom))?;
+        stdout.flush()?;
+        self.output_cursor = (0, page_bottom);
+        Ok(())
+    }
+
     fn suspend(&mut self) -> Result<()> {
         if !self.rendered {
             return Ok(());
@@ -10612,6 +10923,19 @@ impl LiveReplTail {
         let input_row = (i32::from(self.input_cursor.1) + shift)
             .clamp(0, i32::from(terminal_rows.saturating_sub(1))) as u16;
         queue!(transaction, MoveTo(self.input_cursor.0, input_row))?;
+        if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
+            trace_tail_redraw(
+                self.tail_start,
+                next_tail,
+                shift,
+                self.tail_rows,
+                self.output_cursor,
+                output_bottom,
+                leading_scroll,
+                terminal_rows,
+                &transaction,
+            );
+        }
         let mut stdout = io::stdout();
         stdout.write_all(&transaction)?;
         stdout.flush()?;
@@ -11759,6 +12083,10 @@ async fn follow_wake_run(
                 &mut renderer,
                 AgentEvent::ToolPreparing {
                     name: ipc_text(&data, "name").to_string(),
+                    batch: data
+                        .get("batch")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 },
             )?,
             "tool.started" => handle_live_agent_event(
@@ -11827,6 +12155,25 @@ async fn follow_wake_run(
                     live.suspend()?;
                     live.consume_queued(&prompt_ids, consumed_mode)
                 })?;
+            }
+            // daemon 一直在发这个事件,可这里没有对应分支,于是逐请求的
+            // 计量在 IPC 这一段就掉地上了——WebUI 有(它自己解 SSE),终端
+            // 直连模式也有(走本地事件),唯独日常的「终端连 daemon」要等整
+            // 个回合结束才动。
+            "chat.round_usage" => {
+                let usage = data.get("usage").cloned().unwrap_or_default();
+                // prompt+completion 即该请求结束时的上下文实际占用,与
+                // 本地事件那条路取同一个口径。
+                let context_tokens = ipc_u64(&usage, "prompt_tokens")
+                    .saturating_add(ipc_u64(&usage, "completion_tokens"));
+                live.refresh_round_usage(
+                    context_tokens,
+                    TurnTokens {
+                        total: ipc_u64(&data, "turn_total"),
+                        prompt: ipc_u64(&data, "turn_prompt"),
+                        cache_read: ipc_u64(&data, "turn_cache_read"),
+                    },
+                )?;
             }
             "generation.superseded" => handle_live_agent_event(
                 live,
@@ -13725,6 +14072,38 @@ mod repl_input_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// 回归：daemon 模式下终端图片印成满屏。
+    ///
+    /// 真正画图的是终端这一侧，而尺寸此前只给 show_meme 算，别的工具一律
+    /// 传 None——`parse_size(None)` 的语义正是「铺满整个终端」。
+    #[test]
+    fn every_tool_image_gets_a_size_not_just_memes() {
+        let config = crate::config::AppConfig::default();
+        // 没有一个工具可以拿着 None 去调 print_image_file。
+        for name in [
+            "generate_image",
+            "print_image",
+            "search_web_images",
+            "show_meme",
+            "",
+        ] {
+            assert!(
+                remote_tool_image_size(name, "", &config).is_some(),
+                "{name} 没拿到尺寸，会印成满屏"
+            );
+        }
+        // 模型显式要的尺寸优先，且不被百分比覆盖。
+        assert_eq!(
+            remote_tool_image_size("print_image", "40x12", &config),
+            Some("40x12".to_string())
+        );
+        // 空白不算「要了」，仍走配置百分比。
+        assert_ne!(
+            remote_tool_image_size("print_image", "   ", &config),
+            Some("   ".to_string())
+        );
+    }
+
     /// 回归(PR#31):会话内历史无上限,常开 REPL 线性增长。
     #[test]
     fn repl_history_is_capped() {
@@ -13835,6 +14214,32 @@ mod repl_input_tests {
         assert_eq!(bounded.occupied_bottom, Some(5));
     }
 
+    /// REPL 的 `/models` 收一整串自由文本,`--global` / `-g` 要能从里面摘
+    /// 出来,并且不能把 `-g` 开头的模型名(如 `-gpt`)误当成开关。
+    #[test]
+    fn models_argument_parses_the_global_switch() {
+        let plain = parse_models_argument("  gpt-5  ");
+        assert!(!plain.global);
+        assert_eq!(plain.target.as_deref(), Some("gpt-5"));
+
+        let bare = parse_models_argument("--global");
+        assert!(bare.global);
+        assert!(bare.target.is_none());
+
+        for input in ["-g gpt-5", "--global gpt-5", "-g --global gpt-5"] {
+            let parsed = parse_models_argument(input);
+            assert!(parsed.global, "{input}");
+            assert_eq!(parsed.target.as_deref(), Some("gpt-5"), "{input}");
+        }
+
+        // `-gpt` 是模型名,不是开关。
+        let lookalike = parse_models_argument("-gpt-image");
+        assert!(!lookalike.global);
+        assert_eq!(lookalike.target.as_deref(), Some("-gpt-image"));
+
+        assert!(parse_models_argument("").target.is_none());
+    }
+
     #[test]
     fn models_is_the_cli_model_selector() {
         let matches = localized_command()
@@ -13844,7 +14249,7 @@ mod repl_input_tests {
 
         assert!(matches!(
             cli.command,
-            Some(Command::Models(ModelsArgs { target: Some(ref target) })) if target == "1"
+            Some(Command::Models(ModelsArgs { target: Some(ref target), global: false })) if target == "1"
         ));
         let old_matches = localized_command()
             .try_get_matches_from(["miyu", "providers"])
@@ -16215,24 +16620,12 @@ async fn run_reset(paths: &MiyuPaths) -> Result<()> {
 }
 
 /// `miyu reset-memory`:清空当前人格的长期记忆。daemon 在跑走 IPC,
-/// 否则本地直清;终端确认后执行。
+/// 否则本地直清。
+///
+/// 不再二次确认:清的只是长期记忆(事实/日记/经历),会话历史、技能和知识库
+/// 都不动,和 `/wipe` 那种不可逆的整体抹除不是一个量级。确认弹窗还顺带把
+/// 这条命令钉死在终端上——非交互调用只能拿到"需要在终端确认"的报错。
 async fn run_reset_memory_command(paths: &MiyuPaths) -> Result<()> {
-    if !io::stdin().is_terminal() {
-        bail!(
-            "{}",
-            t(
-                "reset-memory needs a terminal to confirm",
-                "reset-memory 需要在终端确认"
-            )
-        );
-    }
-    if !confirm_stdin(t(
-        "erase this persona's long-term memory (facts, diary, episodes)?",
-        "确认清空长期记忆（事实/日记/经历）？",
-    ))? {
-        println!("{}", t("cancelled", "已取消"));
-        return Ok(());
-    }
     if ipc::daemon_info(paths).await.is_some() {
         send_ipc_admin(paths, IpcCommand::ResetMemory { mode: None }).await?;
     } else {
@@ -16361,8 +16754,8 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             renderer.write_tool_call(&name, &arguments)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ToolPreparing { name } => {
-            renderer.write_tool_preparing(&name)?;
+        AgentEvent::ToolPreparing { name, batch } => {
+            renderer.write_tool_preparing(&name, batch)?;
             renderer.tick_spinner()
         }
         AgentEvent::ToolResult {
