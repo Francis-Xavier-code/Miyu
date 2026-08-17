@@ -138,9 +138,42 @@ fn sample(raster: &Raster, x: usize, y: usize, target_width: usize, target_heigh
     [(r / count) as u8, (g / count) as u8, (b / count) as u8, (a / count) as u8]
 }
 
+/// 块级公式:行数随内容自然分配，`max_rows` 只是上限。
+///
+/// 此前这里和表格单元格共用 `render_math`，行数由调用方写死为 9，于是
+/// `E=mc^2` 这种两行就够的式子也被撑到 9 行——报的「大小限制好像消失了」
+/// 就是这个。而且 `halfblock_art` 只约束宽度，垂直方向没有任何上限。
+///
+/// 用和 kitty 那条路同一套 retina 语义：RaTeX 以 2x 密度出图，显示尺寸取
+/// 内容的一半，所以简单式子 1~2 行、积分矩阵自然更高。
+pub(crate) fn render_block_math(
+    tex: &str,
+    max_cols: usize,
+    max_rows: usize,
+) -> Option<MathArt> {
+    let png = ratex_png(tex, MathMode::Block)?;
+    let raster = decode_and_trim(&png)?;
+    let (_, cell_h) = crate::tools::kitty_image::cell_pixel_size();
+    let cell_h = usize::from(cell_h.max(1));
+    let rows = raster
+        .height
+        .div_ceil(2)
+        .div_ceil(cell_h)
+        .clamp(1, max_rows.max(1));
+    halfblock_from_raster(&raster, rows, max_cols)
+}
+
 /// 半块化:目标高 `target_rows` 字符行(=2×像素行),宽等比、封顶 `max_cols`。
 fn halfblock_art(png: &[u8], target_rows: usize, max_cols: usize) -> Option<MathArt> {
     let raster = decode_and_trim(png)?;
+    halfblock_from_raster(&raster, target_rows, max_cols)
+}
+
+fn halfblock_from_raster(
+    raster: &Raster,
+    target_rows: usize,
+    max_cols: usize,
+) -> Option<MathArt> {
     let target_rows = target_rows.max(1);
     let mut height_px = target_rows * 2;
     let mut width_px = (raster.width * height_px).div_ceil(raster.height).max(1);
@@ -155,8 +188,8 @@ fn halfblock_art(png: &[u8], target_rows: usize, max_cols: usize) -> Option<Math
     for row in 0..rows {
         let mut line = String::with_capacity(width_px * 24);
         for x in 0..width_px {
-            let top = sample(&raster, x, row * 2, width_px, height_px);
-            let bottom = sample(&raster, x, row * 2 + 1, width_px, height_px);
+            let top = sample(raster, x, row * 2, width_px, height_px);
+            let bottom = sample(raster, x, row * 2 + 1, width_px, height_px);
             line.push_str(&halfblock_cell(top, bottom));
         }
         line.push_str("\x1b[0m");
@@ -196,6 +229,43 @@ mod tests {
         assert!(art.cols > 10 && art.cols <= 100);
         assert!(art.lines[0].contains("\u{1b}[")); // 真彩 ANSI
         assert!(art.lines.iter().any(|line| line.contains('▀') || line.contains('▄')));
+    }
+
+    /// 回归：块级公式此前行数写死为 9，简单式子也被撑满，而且垂直方向
+    /// 没有任何上限。现在随内容自然分配，`max_rows` 只是天花板。
+    #[test]
+    fn block_math_rows_follow_content_and_respect_the_cap() {
+        let simple = render_block_math(r"E=mc^2", 100, 8).expect("renders");
+        let tall = render_block_math(
+            r"\int_{0}^{\infty} \frac{x^{2}}{\sqrt{1+x^{4}}}\,dx",
+            100,
+            8,
+        )
+        .expect("renders");
+        println!(
+            "  E=mc^2 → {} 行 / {} 列；积分 → {} 行 / {} 列",
+            simple.lines.len(),
+            simple.cols,
+            tall.lines.len(),
+            tall.cols
+        );
+        // 简单式子远比写死的 9 行矮。
+        assert!(
+            simple.lines.len() < 5,
+            "E=mc^2 占了 {} 行",
+            simple.lines.len()
+        );
+        // 复杂式子该更高，但不越过上限。
+        assert!(tall.lines.len() >= simple.lines.len());
+        assert!(tall.lines.len() <= 8);
+        // 上限确实是上限。
+        let capped = render_block_math(
+            r"\int_{0}^{\infty} \frac{x^{2}}{\sqrt{1+x^{4}}}\,dx",
+            100,
+            2,
+        )
+        .expect("renders");
+        assert!(capped.lines.len() <= 2);
     }
 
     #[test]

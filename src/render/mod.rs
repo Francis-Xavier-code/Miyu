@@ -2977,11 +2977,14 @@ impl MarkdownLineRenderer {
 /// 块级公式:kitty 家族终端走图形协议(高清,复用 print_image 管线),
 /// 其余终端半块画;渲染失败原样回放(青色+定界符)。
 fn render_display_math(tex: &str, closer: &str) -> String {
-    let max_cols = terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(100)
+    let (terminal_cols, terminal_rows) = terminal::size().unwrap_or((100, 24));
+    let max_cols = (terminal_cols as usize)
         .saturating_sub(6)
         .clamp(24, 110);
+    // 垂直方向此前没有任何上限——只约束宽度，行数由调用方写死为 9。
+    // 上限取 8 与 kitty 那条路对齐，再按终端高度收一道，矮窗口里一条公式
+    // 不该占掉半屏。
+    let max_rows = (terminal_rows as usize / 4).clamp(2, 8);
     if math::kitty_graphics_supported() {
         if let Some(kitty) = math::render_math_kitty(tex, max_cols) {
             // 占位行自带换行,逐行加两格缩进(图形转义段无换行,不受影响);
@@ -2995,7 +2998,7 @@ fn render_display_math(tex: &str, closer: &str) -> String {
             return output;
         }
     }
-    if let Some(art) = math::render_math(tex, math::MathMode::Block, 9, max_cols) {
+    if let Some(art) = math::render_block_math(tex, max_cols, max_rows) {
         let mut output = String::from("\n");
         for line in art.lines {
             output.push_str("  ");
