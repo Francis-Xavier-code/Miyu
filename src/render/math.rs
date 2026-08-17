@@ -47,6 +47,7 @@ fn ratex_png(tex: &str, mode: MathMode) -> Option<Vec<u8>> {
     if normalized.is_empty() {
         return None;
     }
+    silence_first_font_load();
     let ast = parse(&normalized).ok()?;
     let (math_style, font_size, padding) = match mode {
         MathMode::Block => (MathStyle::Display, 28.0, 4.0),
@@ -64,6 +65,72 @@ fn ratex_png(tex: &str, mode: MathMode) -> Option<Vec<u8>> {
     let layout_box = layout(&ast, &layout_opts);
     let display_list = to_display_list(&layout_box);
     render_to_png(&display_list, &render_opts).ok()
+}
+
+/// 吞掉 RaTeX 首次加载字体时的噪声。
+///
+/// `ratex-unicode-font` 0.1.14 找到字体就无条件 `eprintln!`，没有 env 开关
+/// 也没有 feature 门——连读 `RATEX_UNICODE_FONT` 那条分支也照打。字体是
+/// `OnceLock` 缓存的、每进程只加载一次，于是进 REPL 回放带公式的历史时，
+/// 屏幕上就会冒出两行 `[ratex-unicode-font] found via system-fonts: …`
+/// （daemon 与 CLI 各一次，两个进程共用同一个终端）。
+///
+/// 做法是趁第一次渲染，把 fd 2 临时指向 /dev/null 让它把话说完，之后缓存
+/// 已经填上，再也不会响。重定向 fd 是进程级副作用，所以只在这一次、且只
+/// 在这一小段窗口里做；后续每一次渲染都不再碰 fd 2。
+fn silence_first_font_load() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        #[cfg(unix)]
+        unsafe {
+            let saved = libc::dup(libc::STDERR_FILENO);
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            if null >= 0 {
+                libc::dup2(null, libc::STDERR_FILENO);
+            }
+            // 一个最小公式足以把三张字体缓存都填上。
+            let _ = warm_up_font_caches();
+            if saved >= 0 {
+                libc::dup2(saved, libc::STDERR_FILENO);
+                libc::close(saved);
+            }
+            if null >= 0 {
+                libc::close(null);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = warm_up_font_caches();
+        }
+    });
+}
+
+/// 渲染一个最小公式，只为触发字体加载；产物丢弃。
+fn warm_up_font_caches() -> Option<Vec<u8>> {
+    let ast = parse("x").ok()?;
+    let color = Color {
+        r: MATH_COLOR.0,
+        g: MATH_COLOR.1,
+        b: MATH_COLOR.2,
+        a: 1.0,
+    };
+    let layout_opts = LayoutOptions::default()
+        .with_style(MathStyle::Text)
+        .with_color(color);
+    let render_opts = RenderOptions {
+        font_size: 12.0,
+        padding: 0.0,
+        background_color: Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        },
+        font_dir: String::new(),
+        device_pixel_ratio: 1.0,
+    };
+    let layout_box = layout(&ast, &layout_opts);
+    render_to_png(&to_display_list(&layout_box), &render_opts).ok()
 }
 
 struct Raster {
@@ -138,6 +205,96 @@ fn sample(raster: &Raster, x: usize, y: usize, target_width: usize, target_heigh
     [(r / count) as u8, (g / count) as u8, (b / count) as u8, (a / count) as u8]
 }
 
+/// 非 kitty 终端交给 chafa 渲染公式。
+///
+/// 半块渲染只有 `▀ ▄ 空格` 三个字形、每格两个垂直采样，把高清 PNG 压进去
+/// 必然碎成像素块。而 chafa 认得的终端多得多——Konsole、WezTerm、foot、
+/// iTerm2 之流都能出真图，图片工具一直走的就是这条路（「Konsole 明明能显
+/// 示图片」正是这么来的），公式却一直没走。
+///
+/// 关键是 `--probe-mode ctty`：chafa 经**控制终端**探测能力，所以这里把它
+/// 的 stdout 捕获下来也不影响判断——原先以为「一捕获就探测不到」是错的。
+///
+/// `--polite on` 去掉隐藏/显示光标的转义（要嵌进流里，不能乱动光标）；
+/// 图形格式下 chafa 用 IND(`ESC D`) 推行而不是换行，渲染层按行记账会少算
+/// N-1 行，所以换回换行——两者都是「下移一行」，IND 前面那个 `ESC[nD` 回
+/// 到行首的动作留着也无害。
+pub(crate) fn render_math_chafa(tex: &str, max_cols: usize, max_rows: usize) -> Option<MathArt> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    // 输出不是终端就别起进程:管道、重定向、测试都走不到真终端,chafa 探测
+    // 不到能力只会退回符号画,还白付一次进程开销。
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return None;
+    }
+    let png = ratex_png(tex, MathMode::Block)?;
+    let rows = natural_block_rows(&decode_and_trim(&png)?, max_rows);
+    let mut child = Command::new("chafa")
+        .args([
+            "--relative",
+            "off",
+            "--polite",
+            "on",
+            "--probe-mode",
+            "ctty",
+            // RaTeX 出的是透明底,阈值放高让背景真正透出去,别被合成成一块
+            // 底板。代价是抗锯齿边缘会硬一点,公式笔画本身影响很小。
+            "-t",
+            "0.9",
+            "--size",
+            &format!("{max_cols}x{rows}"),
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&png).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).replace("\u{1b}D", "\n");
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    // 末尾那个换行切出来的空段不算一行。
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    // 行推进随格式而变，必须补齐到实际占用的行数：
+    //
+    //   kitty    IND×(N-1) + 换行×1 = N   够了
+    //   sixel    0                        整图一个 blob，一行都不推
+    //   iterm    换行×1                   同上
+    //   symbols  换行×N                   够了
+    //
+    // 不补的话渲染层以为公式只占一行，后续文字就直接写到图上——Konsole 里
+    // 高的公式压住下一行标题正是这么来的。补空行让终端和渲染层的行数一致。
+    while lines.len() < rows {
+        lines.push(String::new());
+    }
+    Some(MathArt {
+        lines,
+        cols: max_cols,
+    })
+}
+
+/// 块级公式的自然行数：与 kitty 那条路同一套 retina 语义（RaTeX 以 2x 密度
+/// 出图，显示尺寸取内容的一半），`max_rows` 只是天花板。
+fn natural_block_rows(raster: &Raster, max_rows: usize) -> usize {
+    let (_, cell_h) = crate::tools::kitty_image::cell_pixel_size();
+    let cell_h = usize::from(cell_h.max(1));
+    raster
+        .height
+        .div_ceil(2)
+        .div_ceil(cell_h)
+        .clamp(1, max_rows.max(1))
+}
+
 /// 块级公式:行数随内容自然分配，`max_rows` 只是上限。
 ///
 /// 此前这里和表格单元格共用 `render_math`，行数由调用方写死为 9，于是
@@ -153,13 +310,7 @@ pub(crate) fn render_block_math(
 ) -> Option<MathArt> {
     let png = ratex_png(tex, MathMode::Block)?;
     let raster = decode_and_trim(&png)?;
-    let (_, cell_h) = crate::tools::kitty_image::cell_pixel_size();
-    let cell_h = usize::from(cell_h.max(1));
-    let rows = raster
-        .height
-        .div_ceil(2)
-        .div_ceil(cell_h)
-        .clamp(1, max_rows.max(1));
+    let rows = natural_block_rows(&raster, max_rows);
     halfblock_from_raster(&raster, rows, max_cols)
 }
 
@@ -266,6 +417,32 @@ mod tests {
         )
         .expect("renders");
         assert!(capped.lines.len() <= 2);
+    }
+
+    /// chafa 出的行数必须精确等于请求行数——渲染层按行记账，少算一行整段
+    /// 布局就错位。图形格式下 chafa 用 IND(`ESC D`) 推行而不是换行，靠换回
+    /// 换行才对得上。
+    ///
+    /// 需要真终端 + chafa，默认 ignore：
+    /// `cargo test --release chafa -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a real terminal and chafa"]
+    fn chafa_math_row_count_matches_the_request() {
+        for max_rows in [2usize, 4, 8] {
+            let art = render_math_chafa(r"\int_{0}^{\infty} e^{-x^2}\,dx", 60, max_rows)
+                .expect("chafa 应当渲染成功");
+            println!("  上限 {max_rows} → {} 行 / {} 列", art.lines.len(), art.cols);
+            assert!(
+                art.lines.len() <= max_rows,
+                "上限 {max_rows} 却出了 {} 行",
+                art.lines.len()
+            );
+            assert!(!art.lines.is_empty());
+            // 光标不该被乱动:polite 模式已经掐掉隐藏/显示光标的转义。
+            let joined = art.lines.join("\n");
+            assert!(!joined.contains("\u{1b}[?25l"), "混进了隐藏光标");
+            assert!(!joined.contains("\u{1b}D"), "还有没换掉的 IND");
+        }
     }
 
     #[test]

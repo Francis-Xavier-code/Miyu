@@ -2998,6 +2998,20 @@ fn render_display_math(tex: &str, closer: &str) -> String {
             return output;
         }
     }
+    // 非 kitty 终端交给 chafa:它认得 Konsole/WezTerm/foot/iTerm2 之流,能
+    // 出真图。图片工具一直走这条路,公式此前却只有半块——同一个终端里图片
+    // 是图、公式是像素块,就是这么来的。chafa 缺失或失败才退半块。
+    if let Some(art) = math::render_math_chafa(tex, max_cols, max_rows) {
+        let mut output = String::from("\n");
+        for line in &art.lines {
+            output.push_str("  ");
+            output.push_str(line);
+            output.push('\n');
+        }
+        // 与半块分支一致:首尾各留一个空行,和正文拉开呼吸感。
+        output.push('\n');
+        return output;
+    }
     if let Some(art) = math::render_block_math(tex, max_cols, max_rows) {
         let mut output = String::from("\n");
         for line in art.lines {
