@@ -413,6 +413,7 @@ pub enum AgentEvent {
         name: String,
         path: PathBuf,
         alt: String,
+        size: Option<String>,
     },
     Artifact {
         call_id: String,
@@ -637,8 +638,11 @@ impl TurnJournalSink {
                 name,
                 path,
                 alt,
+                size,
             } => {
                 self.flush(on_event)?;
+                // size 刻意不落库:它是这一次的展示偏好,回放时终端可能已经
+                // 换了尺寸,按当时的配置百分比重算才对。
                 let payload = serde_json::json!({
                     "path": path.display().to_string(),
                     "alt": alt,
@@ -657,6 +661,7 @@ impl TurnJournalSink {
                     name,
                     path,
                     alt,
+                    size,
                 })
             }
             AgentEvent::Artifact {
@@ -866,11 +871,12 @@ where
         tools::ToolProgressEvent::PrepareForExternalOutput { ready } => {
             on_event(AgentEvent::PrepareForExternalOutput { ready })
         }
-        tools::ToolProgressEvent::Image { path, alt } => on_event(AgentEvent::Image {
+        tools::ToolProgressEvent::Image { path, alt, size } => on_event(AgentEvent::Image {
             call_id: call_id.to_string(),
             name: name.to_string(),
             path,
             alt,
+            size,
         }),
         tools::ToolProgressEvent::Artifact { path, title } => on_event(AgentEvent::Artifact {
             call_id: call_id.to_string(),

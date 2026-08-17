@@ -1089,6 +1089,7 @@ impl RunEventMapper {
                 name,
                 path,
                 alt,
+                size,
             } => {
                 let (tool_id, tool_name) = self.tool_identity(&call_id, &name);
                 let hide_caption = tool_name == "show_meme";
@@ -1114,6 +1115,9 @@ impl RunEventMapper {
                             "run_id": self.run_id,
                             "tool_id": tool_id,
                             "name": tool_name,
+                            // 模型显式要的尺寸。缺省交给终端按配置百分比
+                            // 自己算——daemon 量到的不是用户的终端。
+                            "size": size,
                             "asset": SafeImageAsset::from_asset(asset, hide_caption),
                         }),
                     ),

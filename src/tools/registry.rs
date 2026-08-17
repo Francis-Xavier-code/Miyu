@@ -41,6 +41,9 @@ pub enum ToolProgressEvent {
     Image {
         path: PathBuf,
         alt: String,
+        /// 模型显式要的终端渲染尺寸。百分比默认值不走这里——那个只能在
+        /// 终端那一侧算。
+        size: Option<String>,
     },
     Artifact {
         path: PathBuf,
@@ -77,10 +80,21 @@ impl ToolProgress {
     }
 
     pub fn report_image(&self, path: impl Into<PathBuf>, alt: impl Into<String>) {
+        self.report_sized_image(path, alt, None)
+    }
+
+    /// 带上模型显式要的尺寸；`None` 表示由终端按配置百分比自己定。
+    pub fn report_sized_image(
+        &self,
+        path: impl Into<PathBuf>,
+        alt: impl Into<String>,
+        size: Option<String>,
+    ) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(ToolProgressEvent::Image {
                 path: path.into(),
                 alt: alt.into(),
+                size,
             });
         }
     }

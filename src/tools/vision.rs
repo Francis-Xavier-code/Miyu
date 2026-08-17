@@ -244,11 +244,14 @@ async fn print_image(
             path.display()
         )
     }
-    progress.report_image(
+    // 模型显式要的尺寸要随事件带走:daemon 模式下真正画图的是终端那一侧,
+    // 这里 print_image_file 的参数它看不见。
+    progress.report_sized_image(
         path.clone(),
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("image"),
+        requested_print_size(&args),
     );
     if progress.prepare_for_external_output().await {
         print_image_file(&path, print_size(&args, print_config)).await?;
@@ -303,7 +306,13 @@ pub fn configured_print_size(print_config: &PrintImagePluginConfig) -> Option<St
     Some(format!("{}x{}", width.min(300), height.min(200)))
 }
 
-fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<String> {
+/// 模型显式要的尺寸，没要就是 None。
+///
+/// 和 `configured_print_size` 分开是因为两者只能在不同的地方解析：百分比
+/// 依赖 `crossterm::terminal::size()`，daemon 量到的不是用户的终端，只能
+/// 在 CLI 那侧算；而显式值只有 daemon 手里的工具参数才知道，必须随事件带
+/// 过去，否则模型写了 width 也会被无声吃掉。
+pub fn requested_print_size(args: &Value) -> Option<String> {
     let width = args
         .get("width")
         .and_then(Value::as_u64)
@@ -320,12 +329,15 @@ fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<Str
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| configured_print_size(print_config)),
+            .map(str::to_string),
         (width, 0) => Some(format!("{width}x")),
         (0, height) => Some(format!("x{height}")),
         (width, height) => Some(format!("{width}x{height}")),
     }
+}
+
+fn print_size(args: &Value, print_config: &PrintImagePluginConfig) -> Option<String> {
+    requested_print_size(args).or_else(|| configured_print_size(print_config))
 }
 
 async fn analyze_image(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {

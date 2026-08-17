@@ -6193,9 +6193,11 @@ async fn try_run_remote_chat(
                 let state = queue_state
                     .as_ref()
                     .expect("queue state exists for a remote turn");
-                let size = (ipc_text(&data, "name") == "show_meme")
-                    .then(|| tools::memes::configured_meme_size(&config.plugins.memes))
-                    .flatten();
+                let size = remote_tool_image_size(
+                    ipc_text(&data, "name"),
+                    ipc_text(&data, "size"),
+                    &config,
+                );
                 if let Err(error) = render_remote_tool_image(state, &data, size).await {
                     renderer.write_system_message(&format!(
                         "{}: {error}",
@@ -7089,6 +7091,27 @@ fn ipc_u64(data: &serde_json::Value, key: &str) -> u64 {
     data.get(key)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default()
+}
+
+/// daemon 模式下真正画图的是终端这一侧，尺寸也只能在这里定。
+///
+/// 此前只有 show_meme 算尺寸，别的工具一律传 None，而 `parse_size(None)`
+/// 的语义是「铺满整个终端」——生图、print_image、搜图预览于是全都印成满
+/// 屏。百分比默认值依赖 `crossterm::terminal::size()`，daemon 量到的不是
+/// 用户的终端，所以必须在这里算；模型显式要的尺寸则随事件带过来。
+fn remote_tool_image_size(
+    tool_name: &str,
+    requested: &str,
+    config: &crate::config::AppConfig,
+) -> Option<String> {
+    let requested = requested.trim();
+    if !requested.is_empty() {
+        return Some(requested.to_string());
+    }
+    if tool_name == "show_meme" {
+        return tools::memes::configured_meme_size(&config.plugins.memes);
+    }
+    tools::vision::configured_print_size(&config.plugins.print_image)
 }
 
 async fn render_remote_tool_image(
@@ -13905,6 +13928,38 @@ mod repl_input_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 回归：daemon 模式下终端图片印成满屏。
+    ///
+    /// 真正画图的是终端这一侧，而尺寸此前只给 show_meme 算，别的工具一律
+    /// 传 None——`parse_size(None)` 的语义正是「铺满整个终端」。
+    #[test]
+    fn every_tool_image_gets_a_size_not_just_memes() {
+        let config = crate::config::AppConfig::default();
+        // 没有一个工具可以拿着 None 去调 print_image_file。
+        for name in [
+            "generate_image",
+            "print_image",
+            "search_web_images",
+            "show_meme",
+            "",
+        ] {
+            assert!(
+                remote_tool_image_size(name, "", &config).is_some(),
+                "{name} 没拿到尺寸，会印成满屏"
+            );
+        }
+        // 模型显式要的尺寸优先，且不被百分比覆盖。
+        assert_eq!(
+            remote_tool_image_size("print_image", "40x12", &config),
+            Some("40x12".to_string())
+        );
+        // 空白不算「要了」，仍走配置百分比。
+        assert_ne!(
+            remote_tool_image_size("print_image", "   ", &config),
+            Some("   ".to_string())
+        );
+    }
 
     /// 回归(PR#31):会话内历史无上限,常开 REPL 线性增长。
     #[test]
