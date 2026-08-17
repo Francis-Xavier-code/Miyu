@@ -571,11 +571,36 @@ where
     })?
 }
 
+/// 当前文本模型池自己就能看图时,`vision_analyze` 直接用它。
+///
+/// `prefer_current_multimodal_model` 此前只管一件事:粘贴进来的图片要不要
+/// 内联发给聊天模型。`vision_analyze` 完全没看这个开关——哪怕当前文本模型
+/// 自带眼睛,工具照旧把图发给另配的多模态池,既多一次跨模型往返,答案也来
+/// 自一个没有对话上下文的模型(08-17 用户报的问题)。
+///
+/// 要求整池都支持图片输入:池是负载均衡的,只要有一个端点不认图片,这一路
+/// 就可能随机落到它头上。
+fn active_text_pool_for_vision(config: &AppConfig) -> Option<Vec<crate::config::ProviderModelChoice>> {
+    if !config.plugins.vision.prefer_current_multimodal_model {
+        return None;
+    }
+    let pool = config.active_provider_model_choices();
+    let usable = !pool.is_empty()
+        && pool.iter().all(|choice| {
+            config.model_supports_any_input(&choice.provider_id, &choice.model, &["image"])
+        });
+    usable.then_some(pool)
+}
+
 fn vision_client(config: &AppConfig, paths: &MiyuPaths) -> Result<OpenAiCompatibleClient> {
     // An explicit global vision provider preserves its existing precedence.
     // Platform turns with a conversation override clear that single-provider
     // field in their private config clone, exposing the full routed pool here.
     if config.plugins.vision.vision_provider_id.trim().is_empty() {
+        if let Some(text_pool) = active_text_pool_for_vision(config) {
+            return OpenAiCompatibleClient::from_choices(config, paths, &text_pool)
+                .map(|client| client.with_request_scope("vision"));
+        }
         let choices = config
             .active_multimodal_provider_model_choices()
             .into_iter()
@@ -654,6 +679,7 @@ fn mime_from_path(path: &Path) -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ActiveProviderModelConfig;
     use crate::platforms::{
         ConversationKind, OutboundMessage, PlatformAdapter, PlatformConversation, SendReceipt,
     };
@@ -704,6 +730,41 @@ mod tests {
             scripts_dir: root.join("scripts"),
             system_scripts_dir: root.join("system-scripts"),
         }
+    }
+
+    /// 当前文本模型自己能看图时就用它,不再绕道另配的多模态池。
+    #[test]
+    fn vision_uses_the_active_text_pool_when_it_can_see() {
+        let mut config = AppConfig::default();
+        let provider = config.providers.first_mut().unwrap();
+        let provider_id = provider.id.clone();
+        provider.model_modalities.insert(
+            provider.default_model.clone(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        provider
+            .model_modalities
+            .insert("blind-model".to_string(), vec!["text".to_string()]);
+        provider.models.push("blind-model".to_string());
+        assert!(active_text_pool_for_vision(&config).is_some());
+
+        // 开关关掉就走原路。
+        config.plugins.vision.prefer_current_multimodal_model = false;
+        assert!(active_text_pool_for_vision(&config).is_none());
+        config.plugins.vision.prefer_current_multimodal_model = true;
+
+        // 池里只要混进一个不认图片的端点就不能用:负载均衡会随机落到它。
+        config.active_provider_models = Some(vec![
+            ActiveProviderModelConfig {
+                provider_id: provider_id.clone(),
+                model: config.providers[0].default_model.clone(),
+            },
+            ActiveProviderModelConfig {
+                provider_id,
+                model: "blind-model".to_string(),
+            },
+        ]);
+        assert!(active_text_pool_for_vision(&config).is_none());
     }
 
     #[tokio::test]
