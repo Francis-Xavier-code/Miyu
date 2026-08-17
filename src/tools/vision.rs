@@ -145,6 +145,19 @@ fn register_scoped(
         fetches: AtomicUsize::new(0),
         total_bytes: AtomicUsize::new(0),
     });
+    // 生图的参考图与看图共用同一份作用域:两者都会把图片原样送到第三方,
+    // 信任面必须一致(08-17)。只在插件启用时接管,否则保持工具不存在。
+    if config.plugins.image_generation.enabled {
+        super::image_generation::register_scoped(
+            registry,
+            config.clone(),
+            ReferenceResolver {
+                config: config.clone(),
+                paths: paths.clone(),
+                state: Some(state.clone()),
+            },
+        );
+    }
     registry.register(ToolSpec::new(
         "vision_analyze",
         "分析图片。image 可以是本轮提示中的图片路径或 context_image_N；历史上下文图片会按需获取。",
@@ -395,6 +408,104 @@ async fn analyze_scoped_image(
         bail!("image is not attached to the current platform turn")
     }
     analyze_local_image_with_prompt(&config, &paths, &image, prompt).await
+}
+
+/// 生图参考图的引用解析器:把一个引用(本轮图片路径 / context_image_N /
+/// 可信头像 URL / 普通本地路径或 URL)解析成图片字节与 MIME。
+///
+/// 作用域直接沿用 `vision_analyze` 的那一套:平台面只认本轮附带的图片、群
+/// 聊记录里明确列出的 context_image_N、以及群查询工具返回的可信头像 URL;
+/// 终端面(state=None)照旧接受任意本地路径与 http(s) URL。生图会把图片原样
+/// 发到第三方 API,信任面必须和看图工具一致(08-17 决定)。
+pub(crate) type ReferenceImage = (Vec<u8>, String);
+
+pub(crate) struct ReferenceResolver {
+    config: AppConfig,
+    paths: MiyuPaths,
+    state: Option<Arc<ScopedVisionState>>,
+}
+
+impl ReferenceResolver {
+    pub(crate) fn unscoped(config: AppConfig, paths: MiyuPaths) -> Self {
+        Self {
+            config,
+            paths,
+            state: None,
+        }
+    }
+
+    pub(crate) async fn resolve(&self, reference: &str) -> Result<ReferenceImage> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            bail!("reference image must not be empty")
+        }
+        if let Some(state) = &self.state {
+            if state.context_images.contains_key(reference) {
+                let resolved = resolve_context_image(&self.paths, state, reference).await?;
+                return Ok((resolved.image.data.to_vec(), resolved.image.mime.clone()));
+            }
+            if !state.allow_general_access {
+                if reference.starts_with("http://") || reference.starts_with("https://") {
+                    if crate::platforms::avatar::is_trusted_avatar_url(reference) {
+                        return download_reference_image(reference).await;
+                    }
+                    bail!("only images attached to the current platform turn can be used as a reference")
+                }
+                let path = expand_path(reference)
+                    .canonicalize()
+                    .context("failed to resolve the requested reference image")?;
+                if !state.allowed_paths.iter().any(|allowed| allowed == &path) {
+                    bail!("reference image is not attached to the current platform turn")
+                }
+                return read_reference_file(&path);
+            }
+        }
+        let _ = &self.config;
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            return download_reference_image(reference).await;
+        }
+        read_reference_file(&expand_path(reference))
+    }
+}
+
+fn read_reference_file(path: &Path) -> Result<ReferenceImage> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat reference image {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("reference image is not a file: {}", path.display())
+    }
+    if metadata.len() as usize > MAX_IMAGE_BYTES {
+        bail!("reference image too large: {} bytes", metadata.len())
+    }
+    let mime = mime_from_path(path)?;
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read reference image {}", path.display()))?;
+    Ok((data, mime.to_string()))
+}
+
+async fn download_reference_image(url: &str) -> Result<ReferenceImage> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("failed to download reference image ({status})")
+    }
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or_else(|| "image/png".to_string());
+    let data = response.bytes().await?.to_vec();
+    if data.len() > MAX_IMAGE_BYTES {
+        bail!("reference image too large: {} bytes", data.len())
+    }
+    Ok((data, mime))
 }
 
 async fn resolve_context_image(

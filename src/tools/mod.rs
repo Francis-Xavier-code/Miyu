@@ -366,7 +366,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
         vision::register(&mut registry, config.clone(), paths.clone(), true);
     }
     if config.plugins.image_generation.enabled {
-        image_generation::register(&mut registry, config.clone());
+        image_generation::register(&mut registry, config.clone(), paths.clone());
     }
     if config.plugins.knowledge_base.enabled {
         knowledge_base::register(&mut registry, config.clone(), paths.clone());
@@ -540,7 +540,7 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
         memes::register_chat(&mut registry, config.clone(), paths.clone());
     }
     if config.plugins.image_generation.enabled {
-        image_generation::register(&mut registry, config.clone());
+        image_generation::register(&mut registry, config.clone(), paths.clone());
     }
     if config.skills.enabled {
         if let Err(error) = skills::register_skills(&mut registry, config, paths) {
