@@ -8062,19 +8062,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::ResetMemory => {
-                    if !confirm_inline(
-                        &mut live_repl,
-                        t(
-                            "erase this mode's long-term memory (facts, diary, episodes)?",
-                            "确认清空当前模式的长期记忆（事实/日记/经历）？",
-                        ),
-                    )? {
-                        repl_note(
-                            &mut live_repl,
-                            &format!("\x1b[2m{}\x1b[0m\n", t("cancelled", "已取消")),
-                        )?;
-                        continue;
-                    }
+                    // 不二次确认:只清长期记忆,会话历史/技能/知识库都不动。
                     let Some((_, _)) = repl_ipc_admin(
                         paths,
                         &mut live_repl,
@@ -8613,13 +8601,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             continue;
         }
         if command.eq_ignore_ascii_case("/reset-memory") {
-            if !confirm_stdin(t(
-                "erase this mode's long-term memory (facts, diary, episodes)?",
-                "确认清空当前模式的长期记忆（事实/日记/经历）？",
-            ))? {
-                println!("{}", t("cancelled", "已取消"));
-                continue;
-            }
+            // 不二次确认:只清长期记忆,会话历史/技能/知识库都不动。
             agent.wipe_memory()?;
             println!(
                 "{}",
@@ -16215,24 +16197,12 @@ async fn run_reset(paths: &MiyuPaths) -> Result<()> {
 }
 
 /// `miyu reset-memory`:清空当前人格的长期记忆。daemon 在跑走 IPC,
-/// 否则本地直清;终端确认后执行。
+/// 否则本地直清。
+///
+/// 不再二次确认:清的只是长期记忆(事实/日记/经历),会话历史、技能和知识库
+/// 都不动,和 `/wipe` 那种不可逆的整体抹除不是一个量级。确认弹窗还顺带把
+/// 这条命令钉死在终端上——非交互调用只能拿到"需要在终端确认"的报错。
 async fn run_reset_memory_command(paths: &MiyuPaths) -> Result<()> {
-    if !io::stdin().is_terminal() {
-        bail!(
-            "{}",
-            t(
-                "reset-memory needs a terminal to confirm",
-                "reset-memory 需要在终端确认"
-            )
-        );
-    }
-    if !confirm_stdin(t(
-        "erase this persona's long-term memory (facts, diary, episodes)?",
-        "确认清空长期记忆（事实/日记/经历）？",
-    ))? {
-        println!("{}", t("cancelled", "已取消"));
-        return Ok(());
-    }
     if ipc::daemon_info(paths).await.is_some() {
         send_ipc_admin(paths, IpcCommand::ResetMemory { mode: None }).await?;
     } else {
