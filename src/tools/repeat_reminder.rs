@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 const THRESHOLDS: [u32; 3] = [3, 5, 8];
 
 /// 对链透明的工具:记录类调用不参与也不打断计数。
-const TRANSPARENT: [&str; 2] = ["todowrite", "todoupdate"];
+const TRANSPARENT: [&str; 1] = ["todowrite"];
 
 /// 详细提醒里引用的参数预览上限(检测始终用全量串,只截提醒文本)。
 const ARGUMENTS_PREVIEW_CHARS: usize = 500;

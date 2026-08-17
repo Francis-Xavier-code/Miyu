@@ -32,10 +32,6 @@
       "algorithms": {
         "type": "string",
         "description": "仅 op=hash：算法名，逗号或空格分隔；all/mainstream 表示全算。默认 sha256。"
-      },
-      "text_encoding": {
-        "type": "string",
-        "description": "仅 op=decode：解码结果按此字符编码还原为文本。"
       }
     },
     "required": [

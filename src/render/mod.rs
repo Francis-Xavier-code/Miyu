@@ -2507,8 +2507,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         }
         "web_fetch" => string_arg(&args, &["url"]).and_then(|url| safe_url_subject(&url)),
         "load_skill" => string_arg(&args, &["name"]),
-        "create_skill" | "update_skill" | "delete_skill" => string_arg(&args, &["name"]),
-        "publish_skill" => string_arg(&args, &["draft_id"]),
+        "manage_skill" => string_arg(&args, &["name", "draft_id"]),
         "load_tools" => args.get("names").and_then(Value::as_array).map(|names| {
             names
                 .iter()

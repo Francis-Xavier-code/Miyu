@@ -5,7 +5,6 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 const BASE_URL: &str = "https://caniplayonlinux.com";
-const TOOL_NAME: &str = "query_caniplayonlinux";
 const TOOL_DISPLAY_NAME: &str = "查询是否能在Linux上玩";
 const PAGE_SIZE: usize = 24;
 const MAX_LIMIT: usize = 10;

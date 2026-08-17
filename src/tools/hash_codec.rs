@@ -17,8 +17,7 @@ pub fn register(registry: &mut ToolRegistry) {
                 "op": { "type": "string", "enum": ["hash", "decode"], "description": "hash 计算哈希，decode 解码。" },
                 "input_text": { "type": "string", "description": "输入文本字节。匹配 echo 这类 shell 命令时要带 \\n。" },
                 "input_format": { "type": "string", "enum": ["text", "hex", "base64", "url", "html", "rot13"], "description": "输入编码。op=hash 时可选 text/hex/base64（默认 text）；op=decode 时必填，指明待解码的编码。" },
-                "algorithms": { "type": "string", "description": "仅 op=hash：算法名，逗号或空格分隔；all/mainstream 表示全算。默认 sha256。" },
-                "text_encoding": { "type": "string", "description": "仅 op=decode：解码结果按此字符编码还原为文本。" }
+                "algorithms": { "type": "string", "description": "仅 op=hash：算法名，逗号或空格分隔；all/mainstream 表示全算。默认 sha256。" }
             },
             "required": ["op", "input_text"],
             "additionalProperties": false

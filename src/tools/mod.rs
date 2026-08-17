@@ -414,12 +414,7 @@ pub(crate) fn rescope_platform_memory_tools(
     if !config.tools.enabled || !config.memory_config().enabled {
         return;
     }
-    for name in [
-        "remember_fact",
-        "search_evicted_context",
-        "recall_past_events",
-        "recall_memories",
-    ] {
+    for name in ["remember_fact", "search_evicted_context", "recall_memories"] {
         registry.unregister(name);
     }
     let principal = context.principal().stable_key();
