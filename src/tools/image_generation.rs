@@ -93,11 +93,9 @@ async fn generate_image(
         .unwrap_or(&plugin.default_resolution)
         .trim();
     let mut references = Vec::new();
-    if let Some(items) = args.get("reference_images").and_then(Value::as_array) {
-        for item in items.iter().filter_map(Value::as_str) {
-            if item.trim().is_empty() {
-                continue;
-            }
+    if let Some(value) = args.get("reference_images") {
+        let wanted = reference_list(value)?;
+        for item in &wanted {
             references.push(resolver.resolve(item).await?);
         }
     }
@@ -139,6 +137,55 @@ async fn generate_image(
 const PRINTED_INSTRUCTION: &str = "The generated image has already been emitted to the host and printed in the terminal. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it. Do not put the local file path in your reply.";
 
 const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply.";
+
+/// 把 `reference_images` 收成一串引用。
+///
+/// 在 stub 加载模式下模型看到的只有一句摘要和宽松参数壳，没取契约就调用时
+/// 很容易把数组写成"数组的 JSON 字符串"——实测 mimo-v2.5 传的就是
+/// `"[\"/home/shorin/Pictures/3.png\"]"`。此前这里只认真数组，其余一律
+/// `as_array()` 拿到 None 后**静默**退回纯文生图：用户连传了三次才从返回体
+/// 的 `reference_images: 0` 看出没生效。
+///
+/// 现在把常见的几种写法都收下（真数组、单个字符串、字符串里装的 JSON 数组），
+/// 收不出任何一条时明确报错——传了参考图却当文生图跑，比直接失败更难查。
+fn reference_list(value: &Value) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    // 空数组/空串是"明确不给",不报错;给了内容却一条都取不出才报错。
+    let had_content = match value {
+        Value::Null => false,
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(text) if !text.trim().is_empty() => {
+                        out.push(text.trim().to_string())
+                    }
+                    Value::String(_) => {}
+                    other => bail!("reference_images entries must be strings, got {other}"),
+                }
+            }
+            !items.is_empty()
+        }
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(out);
+            }
+            // 字符串里装着 JSON 数组时先解开，否则整串当成一条路径。
+            if text.starts_with('[') {
+                let parsed: Value = serde_json::from_str(text)
+                    .with_context(|| format!("reference_images is not valid JSON: {text}"))?;
+                return reference_list(&parsed);
+            }
+            out.push(text.to_string());
+            true
+        }
+        other => bail!("reference_images must be a string or an array of strings, got {other}"),
+    };
+    if had_content && out.is_empty() {
+        bail!("reference_images was given but contained no usable image reference")
+    }
+    Ok(out)
+}
 
 /// 参考图的两条传法。两条都不支持时静默忽略参考图,退回纯文生图——多传了
 /// 一个参数不该让整次调用失败(与 AstrBot 生图插件同款取舍)。
@@ -425,6 +472,42 @@ mod tests {
         plugin.provider_type = provider_type.to_string();
         plugin.model = model.to_string();
         plugin
+    }
+
+    /// 模型在 stub 模式下没取契约就调用，会把数组写成各种形状。实测
+    /// mimo-v2.5 传的是 `"[\"/path.png\"]"`，此前被静默丢弃。
+    #[test]
+    fn reference_images_accepts_the_shapes_models_actually_send() {
+        let one = vec!["/home/shorin/Pictures/3.png".to_string()];
+        // 真数组。
+        assert_eq!(
+            reference_list(&json!(["/home/shorin/Pictures/3.png"])).unwrap(),
+            one
+        );
+        // 单个字符串。
+        assert_eq!(
+            reference_list(&json!("/home/shorin/Pictures/3.png")).unwrap(),
+            one
+        );
+        // 字符串里装着 JSON 数组——线上实际踩到的那种。
+        assert_eq!(
+            reference_list(&json!(r#"["/home/shorin/Pictures/3.png"]"#)).unwrap(),
+            one
+        );
+        assert_eq!(
+            reference_list(&json!(["/a.png", "/b.png"])).unwrap(),
+            vec!["/a.png".to_string(), "/b.png".to_string()]
+        );
+        // 没给就是没给,不报错。
+        assert!(reference_list(&Value::Null).unwrap().is_empty());
+        assert!(reference_list(&json!([])).unwrap().is_empty());
+        assert!(reference_list(&json!("")).unwrap().is_empty());
+
+        // 给了却一条都取不出 ⇒ 明确报错,不静默退回文生图。
+        assert!(reference_list(&json!(["", "  "])).is_err());
+        assert!(reference_list(&json!("[not json")).is_err());
+        assert!(reference_list(&json!([1, 2])).is_err());
+        assert!(reference_list(&json!(42)).is_err());
     }
 
     /// 参考图的两条线路各自认哪个后端;都不认时退回纯文生图而不是报错。
