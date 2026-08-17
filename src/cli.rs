@@ -6337,6 +6337,27 @@ async fn try_run_remote_chat(
                     text: ipc_text(&data, "text").to_string(),
                 },
             )?,
+            // daemon 每完成一次模型请求就发这个,可这里没有对应分支,于是
+            // 逐请求的计量在 IPC 这一段掉地上——回合跑在 daemon 里,CLI 拿
+            // 不到就只能等 run.completed 的权威数字,footer 因此整轮不动。
+            // WebUI 没这问题:它自己解 SSE。
+            "chat.round_usage" => {
+                if let Some(live) = live.as_deref_mut() {
+                    let usage = data.get("usage").cloned().unwrap_or_default();
+                    // prompt+completion 即该请求结束时的上下文实际占用,
+                    // 与进程内那条路同一个口径。
+                    let context_tokens = ipc_u64(&usage, "prompt_tokens")
+                        .saturating_add(ipc_u64(&usage, "completion_tokens"));
+                    live.refresh_round_usage(
+                        context_tokens,
+                        TurnTokens {
+                            total: ipc_u64(&data, "turn_total"),
+                            prompt: ipc_u64(&data, "turn_prompt"),
+                            cache_read: ipc_u64(&data, "turn_cache_read"),
+                        },
+                    )?;
+                }
+            }
             "run.completed" => break data,
             "run.failed" => {
                 renderer.finish()?;
@@ -7061,6 +7082,12 @@ async fn send_ipc_admin(
 fn ipc_text<'a>(data: &'a serde_json::Value, key: &str) -> &'a str {
     data.get(key)
         .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn ipc_u64(data: &serde_json::Value, key: &str) -> u64 {
+    data.get(key)
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or_default()
 }
 
@@ -11962,6 +11989,25 @@ async fn follow_wake_run(
                     live.suspend()?;
                     live.consume_queued(&prompt_ids, consumed_mode)
                 })?;
+            }
+            // daemon 一直在发这个事件,可这里没有对应分支,于是逐请求的
+            // 计量在 IPC 这一段就掉地上了——WebUI 有(它自己解 SSE),终端
+            // 直连模式也有(走本地事件),唯独日常的「终端连 daemon」要等整
+            // 个回合结束才动。
+            "chat.round_usage" => {
+                let usage = data.get("usage").cloned().unwrap_or_default();
+                // prompt+completion 即该请求结束时的上下文实际占用,与
+                // 本地事件那条路取同一个口径。
+                let context_tokens = ipc_u64(&usage, "prompt_tokens")
+                    .saturating_add(ipc_u64(&usage, "completion_tokens"));
+                live.refresh_round_usage(
+                    context_tokens,
+                    TurnTokens {
+                        total: ipc_u64(&data, "turn_total"),
+                        prompt: ipc_u64(&data, "turn_prompt"),
+                        cache_read: ipc_u64(&data, "turn_cache_read"),
+                    },
+                )?;
             }
             "generation.superseded" => handle_live_agent_event(
                 live,
