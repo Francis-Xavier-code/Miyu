@@ -491,7 +491,7 @@ fn root_help_template() -> String {
   bash-init          Integrate with bash
   zsh-init           Integrate with zsh
   remove-shell-hook  Safely remove installed Miyu shell hooks
-  models             Switch the terminal-integration session's model
+  models             Switch the terminal session's model (-g edits the global pool)
   variant            Switch the terminal session model's thinking level
   history            Show conversation history
   reset              Clear the terminal-integration session context
@@ -501,7 +501,7 @@ fn root_help_template() -> String {
   bash-init          集成到 bash
   zsh-init           集成到 zsh
   remove-shell-hook  安全删除已安装的 Miyu shell hook
-  models             修改终端集成会话的模型
+  models             修改终端集成会话的模型（-g 改全局模型池）
   variant            切换终端集成会话模型的思考档位
   history            显示会话历史
   reset              清除终端集成会话上下文
@@ -1285,6 +1285,11 @@ pub struct ModelsArgs {
     /// 1-based list index, `provider/model`, a bare model name, or
     /// `default` to follow the global active pool again.
     pub target: Option<String>,
+
+    /// 改的是全局激活模型池，而不是当前终端集成会话的覆盖。
+    /// 全局池是所有没有单独覆盖的会话（含 WebUI 与通讯平台）的默认来源。
+    #[arg(short = 'g', long = "global")]
+    pub global: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3565,6 +3570,134 @@ async fn run_models(paths: &MiyuPaths, args: ModelsArgs) -> Result<()> {
     run_models_for_session(paths, args, None).await
 }
 
+/// REPL 的 `/models` 收的是一整串自由文本,这里把 `--global` / `-g` 从中
+/// 摘出来,让两个入口的写法一致(`/models --global`、`/models -g gpt-5`)。
+fn parse_models_argument(argument: &str) -> ModelsArgs {
+    let mut global = false;
+    let mut rest = argument.trim();
+    loop {
+        let stripped = rest
+            .strip_prefix("--global")
+            .or_else(|| rest.strip_prefix("-g"))
+            .filter(|remainder| remainder.is_empty() || remainder.starts_with(char::is_whitespace));
+        match stripped {
+            Some(remainder) => {
+                global = true;
+                rest = remainder.trim_start();
+            }
+            None => break,
+        }
+    }
+    ModelsArgs {
+        target: (!rest.is_empty()).then(|| rest.to_string()),
+        global,
+    }
+}
+
+/// `miyu models --global`:直接编辑全局激活模型池。
+///
+/// 不带 --global 时这条命令改的只是终端集成会话的覆盖,全局池此前只能进
+/// `miyu config` 的 TUI 里翻。全局池是所有没有单独覆盖的会话(WebUI、通讯
+/// 平台、新开的终端会话)共同的默认来源,值得有一条一行就能改完的路。
+///
+/// 与会话覆盖的两点不同:池不能清空(至少留一个端点,`set_active_provider_models`
+/// 自己会拦),以及 `default` 没有意义——全局池本身就是那个"默认"。
+async fn run_models_global(paths: &MiyuPaths, target: Option<&str>) -> Result<()> {
+    let mut config = AppConfig::load(paths)?;
+    let choices = config.text_provider_model_choices();
+    if choices.is_empty() {
+        bail!(
+            "{}",
+            t(
+                "no configured provider models; configure a model first",
+                "没有已配置的 provider 模型；请先配置模型",
+            )
+        );
+    }
+    let selected = if let Some(target) = target.map(str::trim) {
+        if target.eq_ignore_ascii_case("default") || target.eq_ignore_ascii_case("global") {
+            bail!(
+                "{}",
+                t(
+                    "the global pool is the default; pick a concrete model instead",
+                    "全局池本身就是默认来源，请直接指定具体模型",
+                )
+            );
+        }
+        let choice = crate::config::resolve_provider_model_argument(&choices, target)
+            .map_err(anyhow::Error::msg)?;
+        vec![ActiveProviderModelConfig {
+            provider_id: choice.provider_id.clone(),
+            model: choice.model.clone(),
+        }]
+    } else {
+        if !(io::stdout().is_terminal() && io::stdin().is_terminal()) {
+            print_model_choices(&config, &choices, None);
+            return Ok(());
+        }
+        let initial = choices
+            .iter()
+            .map(|choice| config.is_active_provider_model(&choice.provider_id, &choice.model))
+            .collect::<Vec<_>>();
+        let Some(active) = inline_fuzzy_select(
+            &choices
+                .iter()
+                .map(|choice| choice.label())
+                .collect::<Vec<_>>(),
+            initial.clone(),
+        )?
+        else {
+            return Ok(());
+        };
+        if active == initial {
+            println!(
+                "{}",
+                t(
+                    "no changes (Enter picks the highlighted model; Tab multi-selects)",
+                    "未做修改（回车=选定高亮模型,Tab=多选勾选）"
+                )
+            );
+            return Ok(());
+        }
+        choices
+            .iter()
+            .zip(active)
+            .filter_map(|(choice, active)| {
+                active.then(|| ActiveProviderModelConfig {
+                    provider_id: choice.provider_id.clone(),
+                    model: choice.model.clone(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if selected.is_empty() {
+        bail!(
+            "{}",
+            t(
+                "at least one model must stay active in the global pool",
+                "全局池至少要保留一个激活模型",
+            )
+        );
+    }
+    config.set_active_provider_models(&selected)?;
+    config.save(paths)?;
+    let labels = selected
+        .iter()
+        .map(|model| format!("{}/{}", model.provider_id, model.model))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{}: {labels}", t("global model pool", "全局激活模型池"));
+    // daemon 在跑就让它立刻吃到新池,否则要等下次重启。已绑定覆盖的会话
+    // 不受影响——它们本来就不看全局池。
+    if ipc::daemon_info(paths).await.is_some() {
+        retry_config_reload(RELOAD_MAX_ATTEMPTS, RELOAD_RETRY_INTERVAL, || {
+            request_config_reload(paths)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 /// Switches the model pool of one session (the current session when
 /// `session_id` is None). The override persists on the session, so reopening
 /// it restores the model; the global pool is managed in `miyu config`.
@@ -3573,6 +3706,9 @@ async fn run_models_for_session(
     args: ModelsArgs,
     session_id: Option<&str>,
 ) -> Result<()> {
+    if args.global {
+        return run_models_global(paths, args.target.as_deref()).await;
+    }
     let config = AppConfig::load(paths)?;
     let choices = config.text_provider_model_choices();
     if choices.is_empty() {
@@ -7746,9 +7882,7 @@ async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMode) -> Result<()> {
                     let argument = command_args.trim();
                     let result = run_models_for_session(
                         paths,
-                        ModelsArgs {
-                            target: (!argument.is_empty()).then(|| argument.to_string()),
-                        },
+                        parse_models_argument(argument),
                         Some(&active_session_id),
                     )
                     .await;
@@ -8429,9 +8563,7 @@ async fn run_direct_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<(
             let repl_session_id = state.session_id();
             run_models_for_session(
                 paths,
-                ModelsArgs {
-                    target: (!argument.is_empty()).then(|| argument.to_string()),
-                },
+                parse_models_argument(argument),
                 Some(&repl_session_id),
             )
             .await?;
@@ -13817,6 +13949,32 @@ mod repl_input_tests {
         assert_eq!(bounded.occupied_bottom, Some(5));
     }
 
+    /// REPL 的 `/models` 收一整串自由文本,`--global` / `-g` 要能从里面摘
+    /// 出来,并且不能把 `-g` 开头的模型名(如 `-gpt`)误当成开关。
+    #[test]
+    fn models_argument_parses_the_global_switch() {
+        let plain = parse_models_argument("  gpt-5  ");
+        assert!(!plain.global);
+        assert_eq!(plain.target.as_deref(), Some("gpt-5"));
+
+        let bare = parse_models_argument("--global");
+        assert!(bare.global);
+        assert!(bare.target.is_none());
+
+        for input in ["-g gpt-5", "--global gpt-5", "-g --global gpt-5"] {
+            let parsed = parse_models_argument(input);
+            assert!(parsed.global, "{input}");
+            assert_eq!(parsed.target.as_deref(), Some("gpt-5"), "{input}");
+        }
+
+        // `-gpt` 是模型名,不是开关。
+        let lookalike = parse_models_argument("-gpt-image");
+        assert!(!lookalike.global);
+        assert_eq!(lookalike.target.as_deref(), Some("-gpt-image"));
+
+        assert!(parse_models_argument("").target.is_none());
+    }
+
     #[test]
     fn models_is_the_cli_model_selector() {
         let matches = localized_command()
@@ -13826,7 +13984,7 @@ mod repl_input_tests {
 
         assert!(matches!(
             cli.command,
-            Some(Command::Models(ModelsArgs { target: Some(ref target) })) if target == "1"
+            Some(Command::Models(ModelsArgs { target: Some(ref target), global: false })) if target == "1"
         ));
         let old_matches = localized_command()
             .try_get_matches_from(["miyu", "providers"])
