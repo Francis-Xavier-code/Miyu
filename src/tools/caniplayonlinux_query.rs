@@ -1,4 +1,4 @@
-use super::{html_conversion, http_response, ToolRegistry, ToolSpec};
+use super::{html_conversion, http_response};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -25,35 +25,7 @@ struct ScoredGame {
     reason: String,
 }
 
-pub fn register(registry: &mut ToolRegistry) {
-    registry.register(create_toolspec());
-}
-
-pub fn create_toolspec() -> ToolSpec {
-    ToolSpec::new(
-        TOOL_NAME,
-        TOOL_DESC,
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "要查询的游戏名称或部分标题。"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "最多返回的匹配结果数，默认 5，最大 10。"
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        }),
-        |args| async move { query_caniplayonlinux(args).await },
-    )
-    .with_display_name(TOOL_DISPLAY_NAME)
-}
-
-async fn query_caniplayonlinux(args: Value) -> Result<String> {
+pub(super) async fn query(args: Value) -> Result<String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)

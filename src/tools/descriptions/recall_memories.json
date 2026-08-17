@@ -1,13 +1,25 @@
 {
   "name": "recall_memories",
   "display_name": "召回记忆",
-  "description": "搜索长期知识点、近期日记和长期日记。",
+  "description": "搜索已记住的知识点和过往事件；scope=episode 只搜日记式的过往事件。\n联想记忆里被截断的条目会带 id，用 recall_memories id=<id> 取全文。需要时可用 include_forgotten 包含已遗忘记忆。只读，不改变记忆状态。",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "搜索关键词或问题。"
+        "description": "搜索关键词或问题。只有用 id 直取时才可省略。"
+      },
+      "id": {
+        "type": "integer",
+        "description": "按 id 直接取一条记忆的全文。"
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "all",
+          "episode"
+        ],
+        "description": "all 搜知识点和事件（默认）；episode 只搜过往事件。"
       },
       "max_results": {
         "type": "integer",
@@ -17,10 +29,7 @@
         "type": "boolean",
         "description": "是否包含已遗忘记忆。"
       }
-    },
-    "required": [
-      "query"
-    ]
+    }
   },
   "permission": "readonly",
   "always_loaded": false,

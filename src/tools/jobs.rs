@@ -1035,65 +1035,71 @@ fn truncate_command(command: &str) -> String {
     truncated
 }
 
-/// job_status + job_stop, for registries that can run commands.
+/// 后台任务查询与停止合并成一件 `job`(08-17):同一个对象的两种操作。
+/// 只读面(聊天/平台)只拿到 action=status 的契约,可写面才多出 stop——
+/// 权限挂在 ToolSpec 上,两个面各自自洽。
 pub fn register_management(registry: &mut ToolRegistry) {
-    register_status(registry);
-    registry.register(
-        ToolSpec::new(
-            "job_stop",
-            t(
-                "Stop this session's background tasks (commands or subagents). Commands get SIGTERM then SIGKILL; subagents are aborted. Accepts job_ids for batch stops. Pass all=true to stop other sessions' jobs.",
-                "停止本会话的后台任务（后台命令或后台子代理）。命令向进程组发送 SIGTERM，宽限期后升级 SIGKILL；子代理直接中止。支持 job_ids 批量。停止其他会话的任务需传 all=true。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "job_id": { "type": "string", "description": "要停止的任务 id（单个）。" },
-                    "job_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "要停止的任务 id 列表（批量）。"
-                    },
-                    "all": { "type": "boolean", "description": "true 时允许停止其他会话的后台任务。" }
-                },
-                "additionalProperties": false
-            }),
-            |args| async move { job_stop(args).await },
-        )
-        .writes()
-        .with_display_name(t("Stop background task", "停止后台任务"))
-        .with_always_loaded(false),
-    );
+    registry.register(job_spec(true).writes().with_always_loaded(false));
 }
 
-/// job_status only, for registries that must stay read-only (chat / platform).
+/// status only, for registries that must stay read-only (chat / platform).
 pub fn register_status(registry: &mut ToolRegistry) {
-    registry.register(
-        ToolSpec::new(
-            "job_status",
-            t(
-                "Call it with no arguments to list every background job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.",
-                "不带参数直接调用，就会列出本会话全部后台任务——每条都带 recent_output（该任务日志的尾部片段）和 log_size，想知道「都跑成什么样了」一次调用就够。要某个任务的增量输出，带 job_id 加 offset；要同时看多个，带 job_ids（日志额度在它们之间均分）。想完整翻阅或从头读某份日志，用 read_file 读它的 log_path（支持按行分页）。跨会话加 all=true。立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "all": { "type": "boolean", "description": "true 时不限本会话，列出/查询全部会话的后台任务。" },
-                    "job_id": { "type": "string", "description": "只看某一个任务时用。省略它和 job_ids 就是列出全部任务（含每条的日志尾部）。" },
-                    "job_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "一次查询多个任务的明细，日志额度在它们之间均分。"
-                    },
-                    "offset": { "type": "integer", "minimum": 0, "description": "日志读取起始字节偏移，配合 job_id 增量追新输出；用上次返回的 next_offset。列表模式的 recent_output 是尾部片段，不能当作续读起点。" }
-                },
-                "additionalProperties": false
-            }),
-            |args| async move { job_status(args).await },
+    registry.register(job_spec(false).with_always_loaded(false));
+}
+
+fn job_spec(allow_stop: bool) -> ToolSpec {
+    let actions = if allow_stop {
+        json!(["status", "stop"])
+    } else {
+        json!(["status"])
+    };
+    let action_hint = if allow_stop {
+        t(
+            "status inspects, stop terminates. Defaults to status.",
+            "status 查询，stop 停止。默认 status。",
         )
-        .with_display_name(t("Check background tasks", "查询后台任务"))
-        .with_always_loaded(false),
-    );
+    } else {
+        t("Only status is available here.", "本会话只支持 status。")
+    };
+    let description = if allow_stop {
+        t(
+            "Background jobs. action=status with no other argument lists every job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. action=stop terminates jobs (commands get SIGTERM then SIGKILL; subagents are aborted), single or by job_ids. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.",
+            "后台任务。action=status 不带其它参数就列出本会话全部任务——每条都带 recent_output（日志尾部片段）和 log_size，想知道「都跑成什么样了」一次调用就够。要某个任务的增量输出，带 job_id 加 offset；要同时看多个，带 job_ids（日志额度在它们之间均分）。想完整翻阅或从头读某份日志，用 read_file 读它的 log_path（支持按行分页）。action=stop 停止任务（命令先 SIGTERM 后 SIGKILL，子代理直接中止），支持 job_ids 批量。跨会话加 all=true。立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。",
+        )
+    } else {
+        t(
+            "Background jobs. action=status with no other argument lists every job of this session with recent_output and log_size; pass job_id plus offset for incremental output, or job_ids for several at once. Returns immediately — you are woken automatically when a job finishes.",
+            "后台任务。action=status 不带其它参数就列出本会话全部任务，每条带 recent_output 和 log_size；要增量输出带 job_id 加 offset，要看多个带 job_ids。立即返回——任务完成会自动唤起你。",
+        )
+    };
+    ToolSpec::new(
+        "job",
+        description,
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": actions, "description": action_hint },
+                "all": { "type": "boolean", "description": t("true reaches other sessions' jobs.", "true 时不限本会话。") },
+                "job_id": { "type": "string", "description": t("A single job id.", "单个任务 id。") },
+                "job_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": t("Several job ids at once; for status the log budget is split between them.", "一次多个任务 id；status 时日志额度在它们之间均分。")
+                },
+                "offset": { "type": "integer", "minimum": 0, "description": t("status only: byte offset into the log, from the previous next_offset. The list mode's recent_output is a tail snippet, not a resume point.", "仅 status：日志读取起始字节偏移，用上次返回的 next_offset。列表模式的 recent_output 是尾部片段，不能当续读起点。") }
+            },
+            "additionalProperties": false
+        }),
+        move |args| async move {
+            match args.get("action").and_then(Value::as_str).unwrap_or("status") {
+                "status" => job_status(args).await,
+                "stop" if allow_stop => job_stop(args).await,
+                "stop" => bail!("stop is not available in this session"),
+                other => bail!("unknown action: {other}; expected status or stop"),
+            }
+        },
+    )
+    .with_display_name(t("Background jobs", "后台任务"))
 }
 
 #[cfg(test)]

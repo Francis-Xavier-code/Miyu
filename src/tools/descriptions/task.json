@@ -1,7 +1,7 @@
 {
   "name": "task",
   "display_name": "子代理",
-  "description": "启动子代理独立处理复杂任务。 长任务可用 background=true 后台运行，完成后自动唤起。",
+  "description": "启动子代理独立处理复杂任务，工具集与你相同。长任务可用 background=true 后台运行，完成后自动唤起。",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,20 +11,11 @@
       },
       "prompt": {
         "type": "string",
-        "description": "详细任务提示。必须包含完整的上下文、目标和输出要求，因为子代理无法访问主 agent 的对话历史。"
-      },
-      "subagent_type": {
-        "type": "string",
-        "enum": [
-          "explore",
-          "general"
-        ],
-        "description": "子代理类型。explore 只有这 7 个工具：read_file、glob、grep、web_search、web_fetch、check_os_info、read_clipboard——适合读代码、查资料，别的一律没有。需要其它任何工具（天气、知识库、生图、运行命令等）就必须用 general，它继承你当前的全部工具。默认 general。",
-        "default": "general"
+        "description": "详细任务提示。必须包含完整上下文、目标和输出要求，子代理看不到你的对话历史。"
       },
       "max_steps": {
         "type": "integer",
-        "description": "可选的工具调用步数预算。默认不限，子代理完成任务即自然结束；仅在需要硬性约束时设置。"
+        "description": "可选工具调用步数上限。默认不限，任务完成即结束。"
       },
       "tier": {
         "type": "string",
@@ -33,15 +24,15 @@
           "balanced",
           "strong"
         ],
-        "description": "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 explore→cheap、general→balanced。未配置的档位回退主模型。"
+        "description": "可选模型档位：cheap 简单查询，balanced 常规多步，strong 高难推理。默认 balanced，未配置的档位回退主模型。"
       },
       "background": {
         "type": "boolean",
-        "description": "后台分离运行子代理：立即返回 job_id，用 job_status 查询进度（日志即实时进度），完成后系统自动唤起你跟进。适合不应阻塞对话的长研究/长任务。"
+        "description": "后台分离运行，立即返回 job_id，用 job(action=status) 查进度，完成后自动唤起你。"
       },
       "resume_id": {
         "type": "string",
-        "description": "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。"
+        "description": "可选。上一次 task 因连接中断失败并在错误里给出 resume_id 时携带它，可从最后一个已完成的工具轮继续（仅本进程有效）。"
       }
     },
     "required": [

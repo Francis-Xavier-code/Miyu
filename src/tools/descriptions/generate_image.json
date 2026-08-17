@@ -1,7 +1,7 @@
 {
   "name": "generate_image",
   "display_name": "生成图片",
-  "description": "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Emits an image event and returns a local path. Messaging platforms deliver emitted images automatically, so do not pass the same image to send_message_to_user. Do not call print_image unless the user explicitly asks to display it.",
+  "description": "按文字提示生成图片，返回本地路径。\nGenerate an image from a text prompt using the configured OpenAI or RightCode image API. Emits an image event and returns a local path. Messaging platforms deliver emitted images automatically, so do not pass the same image to send_message_to_user. Do not call print_image unless the user explicitly asks to display it.",
   "parameters": {
     "type": "object",
     "properties": {

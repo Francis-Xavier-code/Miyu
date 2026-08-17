@@ -444,7 +444,7 @@ async fn search_tavily(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        match format_search_results(query, "Tavily", results) {
+        match format_search_results(query, "Tavily", results, max_results) {
             Ok(output) => {
                 mark_key_success("tavily", index);
                 return Ok(output);
@@ -520,7 +520,7 @@ async fn search_firecrawl(
             }
         };
         let raw = firecrawl_results(&data, max_results);
-        match format_search_results(query, "Firecrawl", raw) {
+        match format_search_results(query, "Firecrawl", raw, max_results) {
             Ok(output) => {
                 mark_key_success("firecrawl", index);
                 return Ok(output);
@@ -596,7 +596,7 @@ async fn search_anysearch(
             }
         };
         let raw = anysearch_results(&data, max_results);
-        match format_search_results(query, "AnySearch", raw) {
+        match format_search_results(query, "AnySearch", raw, max_results) {
             Ok(output) => {
                 mark_key_success("anysearch", index);
                 return Ok(output);
@@ -684,7 +684,7 @@ async fn search_exa(
             .into_iter()
             .take(max_results)
             .collect::<Vec<_>>();
-        match format_search_results(query, "Exa", raw) {
+        match format_search_results(query, "Exa", raw, max_results) {
             Ok(output) => {
                 mark_key_success("exa", index);
                 return Ok(output);
@@ -815,12 +815,12 @@ async fn search_exa_public(
             .take(max_results)
             .collect::<Vec<_>>();
         if !results.is_empty() {
-            return format_search_results(query, "Exa (free quota)", results);
+            return format_search_results(query, "Exa (free quota)", results, max_results);
         }
     }
     let results = exa_public_results(&text, max_results);
     if !results.is_empty() {
-        return format_search_results(query, "Exa (free quota)", results);
+        return format_search_results(query, "Exa (free quota)", results, max_results);
     }
     Ok(format!(
         "## Search results for: {query}\n**Provider**: Exa (free quota)\n\n{}",
@@ -962,7 +962,7 @@ async fn search_searxng(
     if results.is_empty() {
         bail!("SearXNG returned no results")
     }
-    format_search_results(query, "SearXNG", results)
+    format_search_results(query, "SearXNG", results, max_results)
 }
 
 // ── Crawler helper functions ───────────────────────────────────
@@ -1101,8 +1101,9 @@ fn format_crawler_results(query: &str, provider: &str, results: Vec<CrawlerResul
         lines.push(format!("### {}. {}", index + 1, r.title));
         lines.push(format!("**URL**: {}", r.url));
         lines.push(format!("**Source**: {}", r.source));
-        if !r.snippet.is_empty() {
-            lines.push(format!("**Snippet**: {}", clip(&r.snippet, 400)));
+        let snippet = strip_nav_link_runs(&r.snippet);
+        if !snippet.trim().is_empty() {
+            lines.push(format!("**Snippet**: {}", clip(snippet.trim(), 400)));
         }
         lines.push(String::new());
     }
@@ -1738,7 +1739,76 @@ fn anysearch_results(data: &Value, max_results: usize) -> Vec<Value> {
         .collect()
 }
 
-fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> Result<String> {
+/// 去掉片段里成串的 markdown 链接。网页正文抽取常把导航栏/页脚整条带进
+/// snippet(实测某条结果整段是"[网易首页](…) [应用](…) [网易公开课](…)…"),
+/// 那是零信息量的样板。只删连续 2 条以上的链接串,孤立的正文链接保留。
+fn strip_nav_link_runs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    // 先扫出所有 [text](url) 的字符区间。
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '[' {
+            index += 1;
+            continue;
+        }
+        let Some(close) = (index + 1..chars.len()).find(|i| chars[*i] == ']') else {
+            break;
+        };
+        if chars.get(close + 1) != Some(&'(') {
+            index = close + 1;
+            continue;
+        }
+        let Some(end) = (close + 2..chars.len()).find(|i| chars[*i] == ')') else {
+            break;
+        };
+        spans.push((index, end + 1));
+        index = end + 1;
+    }
+    if spans.len() < 2 {
+        return text.to_string();
+    }
+    // 相邻(中间只隔空白或轻标点)的链接归为一串;串长 >= 2 才删。
+    let separator_only = |from: usize, to: usize| {
+        chars[from..to]
+            .iter()
+            .all(|ch| ch.is_whitespace() || matches!(ch, '|' | '·' | '-' | '*' | ',' | '、'))
+    };
+    let mut drop = vec![false; spans.len()];
+    let mut run_start = 0usize;
+    for i in 1..=spans.len() {
+        let joins = i < spans.len() && separator_only(spans[i - 1].1, spans[i].0);
+        if !joins {
+            if i - run_start >= 2 {
+                for item in drop.iter_mut().take(i).skip(run_start) {
+                    *item = true;
+                }
+            }
+            run_start = i;
+        }
+    }
+    if !drop.iter().any(|dropped| *dropped) {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (span, dropped) in spans.iter().zip(&drop) {
+        if !dropped {
+            continue;
+        }
+        out.extend(&chars[cursor..span.0]);
+        cursor = span.1;
+    }
+    out.extend(&chars[cursor..]);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_search_results(
+    query: &str,
+    provider: &str,
+    results: Vec<Value>,
+    max_results: usize,
+) -> Result<String> {
     let mut lines = vec![
         format!("## Search results for: {query}"),
         format!("**Provider**: {provider}\n"),
@@ -1773,13 +1843,21 @@ fn format_search_results(query: &str, provider: &str, results: Vec<Value>) -> Re
         if title == "Untitled" && url.is_empty() && snippet.is_empty() && raw.is_empty() {
             continue;
         }
+        if rendered >= max_results {
+            // 上限由这里兜底:provider 常常多返(实测 max_results=10 时回过
+            // 11 条),之前没人再收一次口。
+            break;
+        }
         rendered += 1;
         lines.push(format!("### {}. {title}", rendered));
         if !url.is_empty() {
             lines.push(format!("**URL**: {url}"));
         }
         if !snippet.is_empty() {
-            lines.push(format!("**Snippet**: {}", clip(snippet, 500)));
+            let snippet = strip_nav_link_runs(snippet);
+            if !snippet.trim().is_empty() {
+                lines.push(format!("**Snippet**: {}", clip(snippet.trim(), 500)));
+            }
         }
         if !raw.is_empty() {
             lines.push(format!("**Content**: {}", clip(raw, 800)));
@@ -1905,7 +1983,7 @@ mod tests {
         // N/A 作者不进 snippet
         assert!(!results[1]["snippet"].as_str().unwrap().contains("N/A"));
 
-        let formatted = format_search_results("测试", "Exa (free quota)", results).unwrap();
+        let formatted = format_search_results("测试", "Exa (free quota)", results, 10).unwrap();
         assert!(formatted.contains("### 1. 第一条结果"));
         assert!(formatted.contains("**URL**: https://example.com/b"));
     }

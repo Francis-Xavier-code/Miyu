@@ -157,8 +157,7 @@ pub fn preparing_phase(name: &str) -> Option<&'static str> {
 fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "run_command" => t("Run command", "运行命令"),
-        "job_status" => t("Check background tasks", "查询后台任务"),
-        "job_stop" => t("Stop background task", "停止后台任务"),
+        "job" => t("Background jobs", "后台任务"),
         "apply_patch" => t("Edit files", "编辑文件"),
         "apply_artifact_patch" => t("Edit preview file", "修改预览文件"),
         "create_artifact" => t("Create preview file", "创建预览文件"),
@@ -189,66 +188,44 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "generate_image" => t("Generate image", "生成图片"),
         "search_meme" => t("Search memes", "搜索表情包"),
         "show_meme" => t("Send meme", "发送表情"),
-        "add_meme" => t("Add meme", "添加表情包"),
-        "update_meme" => t("Update meme", "更新表情包"),
-        "delete_meme" => t("Delete meme", "删除表情包"),
+        "manage_meme" => t("Manage memes", "管理表情包"),
         "deep_research" => t("Deep research", "深度研究"),
         "upload_knowledge_base_file" | "upload_text_to_knowledge_base" => {
             t("Import knowledge base", "导入知识库")
         }
         "read_knowledge_base_file" => t("Read knowledge base", "读取知识库"),
         "search_knowledge_base" => t("Search knowledge base", "搜索知识库"),
-        "search_knowledge_base_by_name" => t("Search knowledge base by name", "按名称搜索知识库"),
         "edit_knowledge_base_file" => t("Edit knowledge base", "编辑知识库"),
         "remove_knowledge_base_file" => t("Remove from knowledge base", "移除知识库"),
         "list_knowledge_base_files" => t("List knowledge base", "列出知识库"),
-        "set_alarm" => t("Set alarm", "设置闹钟"),
-        "list_alarms" => t("List alarms", "列出闹钟"),
-        "cancel_alarm" => t("Cancel alarm", "取消闹钟"),
+        "alarm" => t("Alarms", "闹钟"),
         "remember_fact" => t("Remember fact", "记录记忆"),
         "search_evicted_context" => t("Search old context", "搜索旧上下文"),
-        "recall_past_events" => t("Recall past events", "回忆往事"),
         "recall_memory" | "recall_memories" => t("Recall memories", "召回记忆"),
         "forget_memory" | "forget_memories" => t("Forget memories", "删除记忆"),
         "list_memory" | "list_memories" => t("List memories", "列出记忆"),
-        "aur_search_packages" => t("Search AUR", "搜索 AUR"),
-        "aur_get_package_info" => t("View AUR package", "查看 AUR 包"),
-        "aur_check_status" => t("Check AUR status", "查询 AUR 状态"),
+        "aur" => t("AUR query", "AUR 查询"),
         "archlinux_official_package_query" => t("Query Arch package", "查询 Arch 官方包"),
         "query_deepseek_status" => t("Check DeepSeek status", "查询 DeepSeek 状态"),
         "query_api_quota" => t("Query API quota", "查询大模型 API 额度"),
         "pacman_search" => t("Search packages", "搜索软件包"),
         "archwiki_query" => t("Query ArchWiki", "查询 ArchWiki"),
         "archlinux_news" => t("Arch news", "Arch 新闻"),
-        "online_man_search" | "man_search" => t("Search online manuals", "搜索在线手册"),
-        "online_man_get_page" | "man_read" => t("Read online manual", "读取在线手册"),
+        "online_man" => t("Online manual", "在线手册"),
         "moegirl_query" | "query_moegirl" => t("Query Moegirlpedia", "查询萌娘百科"),
         "calculate" | "calculator" | "scientific_calculator" => {
             t("Scientific calculation", "科学计算")
         }
-        "calculate_hash" => t("Calculate hash", "计算哈希"),
-        "decode_encoded_text" => t("Decode text", "解码文本"),
+        "codec" => t("Encode/decode", "编解码"),
         "exchange_rate" | "get_exchange_rate" => t("Exchange rates", "汇率查询"),
         "weather" | "get_weather" => t("Weather", "天气查询"),
-        "query_caniplayonlinux" => t("Check Linux compatibility", "查询是否能在Linux上玩"),
-        "protondb_query" => t("Query ProtonDB", "查询 ProtonDB"),
-        "xuanxue_pick" => t("Divination choice", "玄学选择"),
-        "xuanxue_divine" => t("Divination", "玄学占卜"),
-        "draw_zhouyi_hexagram" => t("Draw I Ching hexagram", "周易起卦"),
-        "draw_tarot_card" => t("Draw tarot card", "抽塔罗牌"),
-        "draw_fortune_lot" => t("Draw fortune", "吉凶占"),
-        "roll_dice" => t("Roll dice", "掷骰子"),
+        "game_compat" => t("Game compatibility", "游戏兼容性"),
+        "divine" => t("Divination", "占卜"),
         "load_skill" => t("Load skill", "加载技能"),
-        "create_skill" => t("Create skill draft", "创建技能草稿"),
-        "update_skill" => t("Update skill draft", "更新技能草稿"),
-        "delete_skill" => t("Delete skill", "删除技能"),
-        "publish_skill" => t("Publish skill", "发布技能"),
-        "list_skill_drafts" => t("Skill drafts", "技能草稿"),
+        "manage_skill" => t("Manage skills", "管理技能"),
         "load_tools" => t("Load", "加载"),
-        "register_script" => t("Register script", "注册脚本"),
-        "unregister_script" => t("Unregister script", "注销脚本"),
+        "manage_script" => t("Manage scripts", "管理脚本"),
         "todowrite" => t("Todo list", "任务列表"),
-        "todoupdate" => t("Update todos", "更新任务"),
         "review_aur_package" => t("Review AUR package", "审查 AUR 包"),
         "install_aur_package" => t("Install AUR package", "安装 AUR 包"),
         "review_pkgbuild_directory" => t("Review PKGBUILD directory", "审查 PKGBUILD 目录"),
@@ -351,9 +328,12 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     web::register_fetch(&mut registry);
     fcitx_wiki::register(&mut registry);
     weather::register(&mut registry);
-    caniplayonlinux_query::register(&mut registry);
     protondb_query::register(&mut registry);
-    exchange_rate::register(&mut registry, config.plugins.exchange_rate.clone());
+    // 插件关就不注册:关掉的插件仍然常驻一份完整契约,是三个面都白背的
+    // 纯浪费(08-17 实测 get_exchange_rate 311 字符)。
+    if config.plugins.exchange_rate.enabled {
+        exchange_rate::register(&mut registry, config.plugins.exchange_rate.clone());
+    }
     xuanxue::register(&mut registry);
     if config.plugins.archlinux.enabled {
         archlinux::register(&mut registry, paths);
@@ -542,9 +522,12 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     web::register_fetch(&mut registry);
     weather::register(&mut registry);
-    caniplayonlinux_query::register(&mut registry);
     protondb_query::register(&mut registry);
-    exchange_rate::register(&mut registry, config.plugins.exchange_rate.clone());
+    // 插件关就不注册:关掉的插件仍然常驻一份完整契约,是三个面都白背的
+    // 纯浪费(08-17 实测 get_exchange_rate 311 字符)。
+    if config.plugins.exchange_rate.enabled {
+        exchange_rate::register(&mut registry, config.plugins.exchange_rate.clone());
+    }
     xuanxue::register(&mut registry);
     moegirl::register(&mut registry);
     hash_codec::register(&mut registry);
@@ -732,7 +715,7 @@ mod tests {
             .any(|definition| definition.function.name == "load_tools"));
         assert!(!visible
             .iter()
-            .any(|definition| definition.function.name == "draw_zhouyi_hexagram"));
+            .any(|definition| definition.function.name == "divine"));
     }
 
     #[test]
@@ -751,16 +734,8 @@ mod tests {
             crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false)
                 .unwrap();
 
-        for name in [
-            "create_skill",
-            "update_skill",
-            "delete_skill",
-            "publish_skill",
-            "list_skill_drafts",
-        ] {
-            assert!(normal.contains(name), "{name}");
-            assert!(!dev.contains(name), "{name}");
-        }
+        assert!(normal.contains("manage_skill"));
+        assert!(!dev.contains("manage_skill"));
         assert!(normal.contains("load_skill"));
         assert!(dev.contains("load_skill"));
     }
@@ -808,9 +783,7 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         let loaded = value["loaded_tools"].as_array().unwrap();
-        assert!(loaded.iter().any(|name| name == "draw_zhouyi_hexagram"));
-        assert!(loaded.iter().any(|name| name == "draw_tarot_card"));
-        assert!(loaded.iter().any(|name| name == "draw_fortune_lot"));
+        assert!(loaded.iter().any(|name| name == "divine"));
     }
 }
 

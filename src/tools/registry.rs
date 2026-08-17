@@ -874,14 +874,22 @@ fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
             // Permissive shell: real parameters go at the top level exactly as
             // in a normal call, so execution needs no unwrapping; the actual
             // contract arrives via the load_tools result.
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
-            }),
+            //
+            // 裸 {"type":"object"} 与 {"type":"object","properties":{},
+            // "additionalProperties":true} 在 JSON Schema 下完全等价——后者
+            // 只是把两个默认值显式写了一遍,每条 stub 白占 48 字符
+            // (08-17 实测:57 条 stub 共 2,464 字符)。
+            parameters: serde_json::json!({ "type": "object" }),
         },
     }
 }
+
+/// Upper bound for a stub / catalog one-line summary, in characters.
+///
+/// 摘要是模型判断「要不要 load 这个工具」的唯一依据,不是契约——真正的约束
+/// (参数、前置条件、互斥规则)都在完整契约里,而模型必须先取契约才能调用。
+/// 所以摘要只需回答"这是不是我要的那个工具"。
+const SUMMARY_MAX_CHARS: usize = 60;
 
 /// Catalog entries carry a bounded one-line summary instead of the full tool
 /// description. This keeps the loader catalog small and byte-stable: without
@@ -894,10 +902,31 @@ fn load_target_summary(description: &str) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
-    let mut summary: String = first_line.chars().take(200).collect();
-    if first_line.chars().count() > 200 {
-        summary.push('…');
+    if first_line.chars().count() <= SUMMARY_MAX_CHARS {
+        return first_line.to_string();
     }
+    // 优先在预算内的句末断开,断不出来才硬截。半句话比整句更容易让模型
+    // 误判用途,而句末断开读起来仍是一句完整的摘要。
+    let window: Vec<char> = first_line.chars().take(SUMMARY_MAX_CHARS).collect();
+    let sentence_end = window
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, ch)| {
+            matches!(ch, '。' | '；' | '！' | '？')
+                // 英文句点只在后面跟空格时算句末,免得切断 "0.5" 或 "e.g."。
+                || (**ch == '.' && window.get(index + 1) == Some(&' '))
+        })
+        .map(|(index, _)| index);
+    if let Some(index) = sentence_end {
+        // 句末太靠前就别snap:一句"好。"当摘要还不如半句话。四分之一预算
+        // 是经验下限,足以放下"按文字提示生成图片，返回本地路径。"这种。
+        if index + 1 >= SUMMARY_MAX_CHARS / 4 {
+            return window[..=index].iter().collect();
+        }
+    }
+    let mut summary: String = window.iter().collect();
+    summary.push('…');
     summary
 }
 
@@ -1089,6 +1118,32 @@ mod tests {
         registry.register(sleeping_tool("slow_tool", 60));
         let filtered = registry.clone_filtered(&["slow_tool"]);
         assert!(filtered.call("slow_tool", "{}").await.is_err());
+    }
+
+    /// 摘要在预算内的句末断开,断不出来才硬截;短摘要原样通过。
+    #[test]
+    fn stub_summary_prefers_a_sentence_boundary() {
+        assert_eq!(load_target_summary("很短的一句摘要。"), "很短的一句摘要。");
+
+        // 超预算时在预算内的最后一个句末断开,读起来仍是完整一句。
+        // 超预算时在预算内的最后一个句末断开,读起来仍是完整一句。
+        let long = "按文字提示生成图片，返回本地路径。平台会自动投递已发布的图片，所以不要再用别的工具重发同一张图。另外，除非用户明确要求展示，否则不要调用任何打印图片的工具。";
+        assert!(long.chars().count() > SUMMARY_MAX_CHARS);
+        let summary = load_target_summary(long);
+        assert_eq!(
+            summary,
+            "按文字提示生成图片，返回本地路径。平台会自动投递已发布的图片，所以不要再用别的工具重发同一张图。"
+        );
+        assert!(!summary.ends_with('…'));
+
+        // 一句话就超预算 ⇒ 硬截并加省略号。
+        let run_on = "a".repeat(200);
+        let summary = load_target_summary(&run_on);
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), SUMMARY_MAX_CHARS + 1);
+
+        // 只取第一行。
+        assert_eq!(load_target_summary("首行摘要。\n第二行细节。"), "首行摘要。");
     }
 
     #[test]

@@ -1347,7 +1347,7 @@ impl StreamRenderer {
             }
             return Ok(());
         }
-        if matches!(name, "todowrite" | "todoupdate") && ok {
+        if name == "todowrite" && ok {
             self.release_transient_output()?;
             let stdout = &mut self.output;
             if write_todo_table(stdout, output)? {
@@ -2458,14 +2458,11 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         | "search_knowledge_base"
         | "search_evicted_context"
         | "recall_memories"
-        | "recall_past_events"
-        | "aur_search_packages"
-        | "online_man_search"
-        | "protondb_query"
-        | "query_caniplayonlinux"
+        | "aur"
+        | "online_man"
+        | "game_compat"
         | "fcitx5_input_method_wiki_qurey" => string_arg(&args, &["query", "topic"]),
         "archwiki_query" | "query_moegirl" => string_arg(&args, &["title", "query"]),
-        "search_knowledge_base_by_name" => string_arg(&args, &["file_name_query"]),
         "read_file" => {
             let path = string_arg(&args, &["path"])?;
             Some(match read_page_label(&args) {
@@ -2473,7 +2470,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
                 None => path,
             })
         }
-        "write_file" | "edit_file" | "edit_string" | "register_script" => {
+        "write_file" | "edit_file" | "edit_string" | "manage_script" => {
             string_arg(&args, &["path"])
         }
         "trash_path" => {
@@ -2541,18 +2538,11 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
             ))
         }
         "scientific_calculator" => string_arg(&args, &["expression", "operation"]),
-        "set_alarm" => string_arg(&args, &["label", "time"]),
-        "cancel_alarm" => string_arg(&args, &["id"]),
-        "aur_get_package_info"
-        | "archlinux_official_package_query"
+        "alarm" => string_arg(&args, &["label", "time", "id"]),
+        "archlinux_official_package_query"
         | "review_aur_package"
         | "install_aur_package" => string_arg(&args, &["package_name", "package"]),
-        "online_man_get_page" => {
-            let page = string_arg(&args, &["name"])?;
-            let section = string_arg(&args, &["section"]);
-            Some(section.map_or(page.clone(), |section| format!("{page}({section})")))
-        }
-        "vision_analyze" | "print_image" | "add_meme" => {
+        "vision_analyze" | "print_image" | "manage_meme" => {
             string_arg(&args, &["image"]).map(|image| image_basename(&image))
         }
         "generate_image" => string_arg(&args, &["prompt"]),
@@ -2560,7 +2550,6 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         "register_deep_research_topic_title" => string_arg(&args, &["topic_title"]),
         "register_deep_research_reference" => string_arg(&args, &["title"]),
         "remove_deep_research_reference" => string_arg(&args, &["ref"]),
-        "unregister_script" => string_arg(&args, &["id"]),
         _ => None,
     }?;
     safe_inline_subject(&value)
@@ -4099,21 +4088,64 @@ struct CommandResult {
     stderr: String,
 }
 
+/// 解析 dsh 式纯文本命令结果(08-17 起 run_command/grep/glob 的形态):
+/// 正文是 stdout,可选 `[stderr]` 段,末尾可选 `[exit code: N]` /
+/// `[killed by signal]` 标记。老的 JSON 形态仍然认——历史回合里还躺着
+/// 一批,渲染层不能因为换了形态就把它们变成裸 JSON。
 fn parse_command_result(output: &str) -> Option<CommandResult> {
-    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    let text = output.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(success) = value.get("success").and_then(Value::as_bool) {
+            return Some(CommandResult {
+                success,
+                exit_code: value.get("exit_code").and_then(Value::as_i64),
+                stdout: value
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                stderr: value
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        return None;
+    }
+
+    let mut body = text;
+    let mut exit_code = Some(0);
+    let mut success = true;
+    if let Some(rest) = body.strip_suffix("]") {
+        if let Some((head, marker)) = rest.rsplit_once("\n[") {
+            if let Some(code) = marker.strip_prefix("exit code: ") {
+                if let Ok(code) = code.trim().parse::<i64>() {
+                    body = head;
+                    exit_code = Some(code);
+                    success = code == 0;
+                }
+            } else if marker == "killed by signal" {
+                body = head;
+                exit_code = None;
+                success = false;
+            }
+        }
+    }
+    let (stdout, stderr) = match body.split_once("[stderr]\n") {
+        Some((out, err)) => (out.trim_end(), err),
+        None => (body, ""),
+    };
+    let stdout = if stdout.trim() == "(no output)" {
+        ""
+    } else {
+        stdout
+    };
     Some(CommandResult {
-        success: value.get("success")?.as_bool()?,
-        exit_code: value.get("exit_code").and_then(Value::as_i64),
-        stdout: value
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        stderr: value
-            .get("stderr")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        success,
+        exit_code,
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
     })
 }
 
@@ -5757,13 +5789,10 @@ mod tests {
             ("check_os_info", "System information", "查看系统信息"),
             ("get_weather", "Weather", "天气查询"),
             ("get_exchange_rate", "Exchange rates", "汇率查询"),
-            ("draw_zhouyi_hexagram", "Draw I Ching hexagram", "周易起卦"),
-            ("draw_tarot_card", "Draw tarot card", "抽塔罗牌"),
-            ("draw_fortune_lot", "Draw fortune", "吉凶占"),
             ("vision_analyze", "Analyze image", "分析图片"),
             ("search_meme", "Search memes", "搜索表情包"),
             ("show_meme", "Send meme", "发送表情"),
-            ("add_meme", "Add meme", "添加表情包"),
+            ("manage_meme", "Manage memes", "管理表情包"),
             ("task", "Subagent", "子代理"),
             (
                 "upload_text_to_knowledge_base",
@@ -5775,21 +5804,16 @@ mod tests {
                 "Search old context",
                 "搜索旧上下文",
             ),
-            ("recall_past_events", "Recall past events", "回忆往事"),
-            ("aur_check_status", "Check AUR status", "查询 AUR 状态"),
-            ("online_man_search", "Search online manuals", "搜索在线手册"),
-            ("online_man_get_page", "Read online manual", "读取在线手册"),
+            ("aur", "AUR query", "AUR 查询"),
+            ("online_man", "Online manual", "在线手册"),
             (
                 "fcitx5_input_method_wiki_qurey",
                 "Query Fcitx5 Wiki",
                 "查询 Fcitx5 Wiki",
             ),
             ("install_aur_package", "Install AUR package", "安装 AUR 包"),
-            (
-                "search_knowledge_base_by_name",
-                "Search knowledge base by name",
-                "按名称搜索知识库",
-            ),
+            ("divine", "Divination", "占卜"),
+            ("manage_skill", "Manage skills", "管理技能"),
             ("recall_memories", "Recall memories", "召回记忆"),
         ] {
             assert_eq!(readable_tool_name(name), t(english, chinese), "{name}");

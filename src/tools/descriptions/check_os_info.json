@@ -7,7 +7,7 @@
     "properties": {}
   },
   "permission": "readonly",
-  "always_loaded": true,
+  "always_loaded": false,
   "load_policy": "group",
   "groups": [
     "diagnostics"

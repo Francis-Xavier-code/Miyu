@@ -147,115 +147,123 @@ impl GroupManagementPlugin {
             }
             return Ok(());
         }
-        if settings.enable_tool {
-            self.register_ban(registry, context.clone());
-        }
-        if settings.enable_kick_tool {
-            self.register_kick(registry, context.clone());
+        // 禁言/踢人/头衔合并成一件 `qq_group_manage`(08-17):同一个群的三种
+        // 管理动作。action 枚举按开关裁剪,关掉的动作根本不出现在契约里。
+        if settings.enable_tool || settings.enable_kick_tool || settings.enable_special_title_tool {
+            self.register_manage(
+                registry,
+                context.clone(),
+                settings.enable_tool,
+                settings.enable_kick_tool,
+                settings.enable_special_title_tool,
+            );
         }
         if query_enabled {
             self.register_history_query(registry, context.clone());
         }
-        if settings.enable_special_title_tool {
-            self.register_title(registry, context);
-        }
         Ok(())
     }
 
-    fn register_ban(
+    fn register_manage(
         self: &Arc<Self>,
         registry: &mut ToolRegistry,
         context: Arc<PlatformTurnContext>,
+        allow_ban: bool,
+        allow_kick: bool,
+        allow_title: bool,
     ) {
         let plugin = self.clone();
+        let mut actions = Vec::new();
+        if allow_ban {
+            actions.push("mute");
+        }
+        if allow_kick {
+            actions.push("kick");
+        }
+        if allow_title {
+            actions.push("title");
+        }
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "action".to_string(),
+            json!({
+                "type": "string",
+                "enum": actions,
+                "description": "mute 禁言/解禁，kick 踢人，title 设置群头衔。"
+            }),
+        );
+        properties.insert(
+            "user_id".to_string(),
+            json!({ "type": "string", "description": "QQ 号；可用空格或逗号分隔多个。省略时回落到 @ 或引用对象。" }),
+        );
+        properties.insert("reason".to_string(), json!({ "type": "string" }));
+        properties.insert("confirmation_token".to_string(), json!({ "type": "string" }));
+        if allow_ban {
+            properties.insert(
+                "duration_seconds".to_string(),
+                json!({
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": MAX_BAN_SECONDS,
+                    "description": "仅 action=mute。禁言秒数，不是分钟也不是小时：10 分钟=600，1 小时=3600，24 小时=86400，最长 30 天=2592000；0 表示解禁。"
+                }),
+            );
+        }
+        if allow_kick {
+            properties.insert(
+                "user_ids".to_string(),
+                json!({
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "pattern": "^[1-9][0-9]{4,11}$" },
+                    "description": "仅 action=kick。要踢的 QQ 号列表，优于逐个调用。"
+                }),
+            );
+            properties.insert(
+                "blacklist".to_string(),
+                json!({ "type": "boolean", "default": false, "description": "仅 action=kick。true 时踢出并拒绝其后续加群请求（踢黑）。" }),
+            );
+        }
+        if allow_title {
+            properties.insert(
+                "special_title".to_string(),
+                json!({ "type": "string", "description": "仅 action=title。要设置的群头衔；空串表示清除。" }),
+            );
+            properties.insert(
+                "duration".to_string(),
+                json!({ "type": "integer", "default": -1, "description": "仅 action=title。头衔有效期秒数；-1 表示永久。" }),
+            );
+        }
         registry.register(
             ToolSpec::new(
-                "qq_group_manage_with_log",
-                "Mute or unmute one or more members in the current QQ group and record the action. duration_seconds is in SECONDS (1 hour = 3600, 24 hours = 86400); 0 un-mutes.",
+                "qq_group_manage",
+                "Manage members of the current QQ group and record the action. action=mute mutes or unmutes (duration_seconds is in SECONDS: 1 hour = 3600, 24 hours = 86400; 0 un-mutes); action=kick removes members (blacklist=true also rejects their future join requests); action=title sets or clears one member's special title. Pass every target in a single call; the result reports each target separately.",
                 json!({
                     "type": "object",
-                    "properties": {
-                        "user_id": { "type": "string", "description": "Optional QQ id or multiple QQ ids separated by spaces/commas. Falls back to mentions/reply." },
-                        "duration_seconds": {
-                            "type": ["integer", "null"],
-                            "minimum": 0,
-                            "maximum": MAX_BAN_SECONDS,
-                            "description": "禁言秒数，不是分钟也不是小时：10 分钟=600，1 小时=3600，24 小时=86400，最长 30 天=2592000；0 表示解禁。"
-                        },
-                        "duration": {
-                            "type": ["integer", "null"],
-                            "minimum": 0,
-                            "maximum": MAX_BAN_SECONDS,
-                            "description": "Deprecated alias of duration_seconds (also seconds)."
-                        },
-                        "reason": { "type": "string" },
-                        "confirmation_token": { "type": "string" }
-                    },
+                    "properties": properties,
+                    "required": ["action"],
                     "additionalProperties": false
                 }),
                 move |args| {
                     let plugin = plugin.clone();
                     let context = context.clone();
-                    async move { plugin.ban(args, context).await }
+                    async move {
+                        match args.get("action").and_then(Value::as_str).unwrap_or_default() {
+                            "mute" if allow_ban => plugin.ban(args, context).await,
+                            "kick" if allow_kick => plugin.kick(args, context).await,
+                            "title" if allow_title => plugin.title(args, context).await,
+                            "mute" | "kick" | "title" => {
+                                anyhow::bail!("this action is disabled for this group")
+                            }
+                            other => anyhow::bail!(
+                                "unknown action: {other}; expected mute, kick or title"
+                            ),
+                        }
+                    }
                 },
             )
             .writes()
-            .with_display_name("QQ群禁言/解禁"),
-        );
-    }
-
-    fn register_kick(
-        self: &Arc<Self>,
-        registry: &mut ToolRegistry,
-        context: Arc<PlatformTurnContext>,
-    ) {
-        let plugin = self.clone();
-        registry.register(
-            ToolSpec::new(
-                "qq_group_manage_kick_with_log",
-                "Kick one or more members from the current QQ group and record the action. Set blacklist=true to also reject their future join requests. Pass every target in a single call; the result reports each target separately.",
-                kick_schema(),
-                move |args| {
-                    let plugin = plugin.clone();
-                    let context = context.clone();
-                    async move { plugin.kick(args, context).await }
-                },
-            )
-            .writes()
-            .with_display_name("QQ群踢人"),
-        );
-    }
-
-    fn register_title(
-        self: &Arc<Self>,
-        registry: &mut ToolRegistry,
-        context: Arc<PlatformTurnContext>,
-    ) {
-        let plugin = self.clone();
-        registry.register(
-            ToolSpec::new(
-                "qq_group_set_special_title_with_log",
-                "Set or clear one member's QQ group special title and record the action.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "special_title": { "type": "string" },
-                        "user_id": { "type": "string" },
-                        "duration": { "type": "integer", "default": -1, "description": "头衔有效期秒数；-1 表示永久。" },
-                        "reason": { "type": "string" },
-                        "confirmation_token": { "type": "string" }
-                    },
-                    "required": ["special_title"],
-                    "additionalProperties": false
-                }),
-                move |args| {
-                    let plugin = plugin.clone();
-                    let context = context.clone();
-                    async move { plugin.title(args, context).await }
-                },
-            )
-            .writes()
-            .with_display_name("设置QQ群头衔"),
+            .with_display_name("QQ群管理"),
         );
     }
 

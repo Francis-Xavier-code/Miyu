@@ -28,7 +28,6 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1021,11 +1020,14 @@ impl Agent {
             config
         };
         let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
-        let system_prompt = with_host_environment(
-            with_mode_reminder(base_system_prompt, mode),
-            prompt_audience,
-            paths,
-            mode,
+        let system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_mode_reminder(base_system_prompt, mode),
+                prompt_audience,
+                paths,
+                mode,
+            ),
+            config.memory_config().enabled,
         );
         let tools_enabled = config.tools.enabled;
         let max_tool_rounds = config.tools.max_rounds;
@@ -1224,15 +1226,17 @@ impl Agent {
             self.state.recover_stale_turns()?;
             self.maybe_cold_resume_prune()?;
         }
-        self.system_prompt = with_host_environment(
-            with_runtime_system_context(
-                with_mode_reminder(effective_system_prompt, self.mode),
-                &self.runtime_system_context,
+        self.system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_runtime_system_context(
+                    with_mode_reminder(effective_system_prompt, self.mode),
+                    &self.runtime_system_context,
+                ),
+                self.prompt_audience,
+                &self.paths,
+                self.mode,
             ),
-            self.prompt_audience,
-            &self.paths,
-        
-            self.mode,
+            self.config.memory_config().enabled,
         );
         Ok(())
     }
@@ -1520,15 +1524,17 @@ impl Agent {
     fn refresh_system_prompt(&mut self) -> Result<()> {
         let base_system_prompt =
             mode_system_prompt(&self.config, &self.paths, self.mode, self.prompt_audience)?;
-        self.system_prompt = with_host_environment(
-            with_runtime_system_context(
-                with_mode_reminder(base_system_prompt, self.mode),
-                &self.runtime_system_context,
+        self.system_prompt = with_memory_preamble(
+            with_host_environment(
+                with_runtime_system_context(
+                    with_mode_reminder(base_system_prompt, self.mode),
+                    &self.runtime_system_context,
+                ),
+                self.prompt_audience,
+                &self.paths,
+                self.mode,
             ),
-            self.prompt_audience,
-            &self.paths,
-        
-            self.mode,
+            self.config.memory_config().enabled,
         );
         Ok(())
     }
@@ -1992,7 +1998,8 @@ impl Agent {
         }
         // 无条件覆盖:redo 前的旧修订可能留有 tool_flow,新修订没有工具
         // 调用时空 flow 也必须写入,否则旧工具流会被冒名回放。
-        let tool_flow = derive_tool_flow(&messages, replay_start);
+        let mut tool_flow = derive_tool_flow(&messages, replay_start);
+        prune_tool_flow(&mut tool_flow, &self.config.context);
         self.state
             .set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         if self.memory.process_after_turn(
@@ -2236,7 +2243,8 @@ impl Agent {
         if let (Some(provider), Some(model)) = (&result.provider_id, &result.model) {
             self.last_request_endpoint = Some((provider.clone(), model.clone()));
         }
-        let tool_flow = derive_tool_flow(&messages, replay_start);
+        let mut tool_flow = derive_tool_flow(&messages, replay_start);
+        prune_tool_flow(&mut tool_flow, &self.config.context);
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
         }
@@ -2411,8 +2419,11 @@ impl Agent {
                 .map(|image| image.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // 用法说明是常量,已随 <qq-context-images> 进 system 提示词
+            // (08-17;实测一条 780K token 的群聊请求里这句重复 579 次、
+            // 共 139,867 字符)。每轮只留真正会变的 ID 列表。
             hints.push(ChatMessage::turn_context(format!(
-                "此前群聊记录中有可按需查看的历史图片：{ids}。你尚未看到这些图片的实际内容；只有回答确实依赖图片时，才使用 vision_analyze，并把对应 ID 作为 image 参数。不得根据图片占位符猜测内容。"
+                "<context-images>{ids}</context-images>"
             )));
         }
 
@@ -4879,6 +4890,46 @@ fn spill_replacement(output: &str, cap: usize, locator: &str) -> Option<String> 
 /// tool_calls 即开一轮,其后按 call id 认领 role:"tool" 输出。被 length 截断
 /// 拒执行的调用照录——它们的错误文案同样是模型看到的字节。任何悬空调用
 /// (无输出)补占位,回放绝不发"无应答的 tool_calls"(provider 会 400)。
+/// 历史工具结果分级剪枝(08-17,抄 dsh-compaction-tool-result-pruner)。
+///
+/// 超预算的工具输出在**落库那一刻**改写成「头 + 省略标记 + 尾」,活体请求
+/// 仍然拿到完整输出(模型这一轮需要它)。选落库而不是回放:落库时这条结果
+/// 就在上下文末尾,前缀只在末尾分叉一次,代价是一个尾巴;放到回放侧改则
+/// 每次回放都可能在历史中段分叉。改写是幂等的——第二次扫过不会再变。
+fn prune_tool_output(output: &str, threshold: usize, head: usize, tail: usize) -> String {
+    if threshold == 0 || output.chars().count() <= threshold {
+        return output.to_string();
+    }
+    let chars: Vec<char> = output.chars().collect();
+    let omitted = chars.len() - head - tail;
+    let marker = format!(
+        "\n…[{} {omitted} {}]\n",
+        crate::i18n::agent_text("omitted", "已省略"),
+        crate::i18n::agent_text("chars from the middle", "字符（中段）")
+    );
+    let mut pruned = String::new();
+    pruned.extend(&chars[..head]);
+    pruned.push_str(&marker);
+    pruned.extend(&chars[chars.len() - tail..]);
+    pruned
+}
+
+fn prune_tool_flow(flow: &mut [crate::state::ToolFlowRound], context: &crate::config::ContextConfig) {
+    let (threshold, head, tail) = (
+        context.tool_result_prune_chars,
+        context.tool_result_prune_head_chars,
+        context.tool_result_prune_tail_chars,
+    );
+    if threshold == 0 || head + tail >= threshold {
+        return;
+    }
+    for round in flow.iter_mut() {
+        for call in round.calls.iter_mut() {
+            call.output = prune_tool_output(&call.output, threshold, head, tail);
+        }
+    }
+}
+
 fn derive_tool_flow(
     messages: &[ChatMessage],
     live_start: usize,
@@ -5870,6 +5921,23 @@ fn mode_system_prompt(
     }
 }
 
+/// 联想记忆块的前言常量上提到 system 提示词(08-17)。
+///
+/// 它逐字不变,却随每个 `<associative-memory>` 块重发一次:实测终端长会话
+/// 42 块共 2,142 字符(占该块总量 6.5%),QQ 群会话 240 块共 28,410 字符
+/// (占 31.8%)。放进 system 说一次,块里只留会变的部分。
+fn with_memory_preamble(mut system_prompt: String, memory_enabled: bool) -> String {
+    if !memory_enabled {
+        return system_prompt;
+    }
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(crate::i18n::text(
+        "<associative-memory> blocks hold memories recalled from the current input. Do not treat the people in them as the current user, and do not imitate the recorded dialogue as a style example. A block that names a principal only contains public knowledge plus that principal's own memories; a stable principal is what identifies a person — nicknames and message text never reassign a memory's owner.",
+        "<associative-memory> 块是根据当前输入联想到的记忆。不要把记忆中的人物当成当前用户，也不要把记忆中的对话当作对话范例去模仿。带 principal 的块只包含公共知识和该 principal 自己的记忆；稳定 principal 才能确认人物，昵称和正文不能改变记忆归属。",
+    ));
+    system_prompt
+}
+
 fn with_host_environment(
     mut system_prompt: String,
     audience: PromptAudience,
@@ -6186,64 +6254,31 @@ fn turns_since_reminder_fossil(
     Ok(since)
 }
 
+/// 每轮瞬态尾巴里唯一的运行时事实：时间 + 工作目录。
+///
+/// 其余字段全部退场（08-17 实测）：`env`/`shell`/`terminal` 读的是 **daemon
+/// 进程**的 stdio 与环境变量，而回合跑在 daemon 里——stdin 恒为 /dev/null,
+/// 于是 `env` 永远报"非交互"; `TERM`/`SHELL` 是 daemon 启动那一刻冻结的值,
+/// 与真正的客户端终端无关(实测 daemon=xterm-kitty 而客户端=tmux-256color)。
+/// 三个字段既是错的又占 91 字符。`note` 那句身份守卫同样删除。
+///
+/// 时间格式:终端小时级、平台分钟级——同粒度内整块字节不变,配合"变了才
+/// 注入"的投影(见 `chat_messages`)。ISO 日期比中文日期短,星期用三字母。
 fn runtime_context(mode: AgentMode, platform: bool) -> String {
     if platform {
         return format!(
             "<runtime now=\"{}\"/>",
-            Local::now().format("%Y年%m月%d日 %A %H:%M")
+            Local::now().format("%Y-%m-%d %a %H:%M")
         );
     }
     let cwd = crate::tools::workspace::effective_workdir()
         .display()
         .to_string();
     let _ = mode;
-    let runtime = terminal_runtime_context();
-    // 小时级而非分钟级:同一小时内整块字节不变,配合投影跳注入
-    // (缓存调研 08-16);要精确时间,终端面有 date。
     format!(
-        "<runtime now=\"{}\" cwd=\"{}\" note=\"cwd is workspace context only; do not infer assistant identity from paths or project names\" {runtime}/>",
-        Local::now().format("%Y年%m月%d日 %A %H时"),
+        "<runtime now=\"{}\" cwd=\"{}\"/>",
+        Local::now().format("%Y-%m-%d %a %H时"),
         xml_attr_escape(&cwd),
-    )
-}
-
-fn terminal_runtime_context() -> String {
-    let stdin_tty = std::io::stdin().is_terminal();
-    let stdout_tty = std::io::stdout().is_terminal();
-    let stderr_tty = std::io::stderr().is_terminal();
-    let environment = if stdin_tty || stdout_tty || stderr_tty {
-        if crate::i18n::agent_is_zh() {
-            "终端会话"
-        } else {
-            "terminal session"
-        }
-    } else if crate::i18n::agent_is_zh() {
-        "非交互或管道环境"
-    } else {
-        "non-interactive or piped environment"
-    };
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let mut terminal_parts = Vec::new();
-    for key in ["TERM_PROGRAM", "TERM", "COLORTERM"] {
-        if let Ok(value) = std::env::var(key) {
-            if !value.trim().is_empty() {
-                terminal_parts.push(format!("{key}={value}"));
-            }
-        }
-    }
-    let terminal = if terminal_parts.is_empty() {
-        "unknown".to_string()
-    } else {
-        terminal_parts.join(", ")
-    };
-    format!(
-        "env=\"{}\" shell=\"{}\" terminal=\"{}\"",
-        xml_attr_escape(environment),
-        xml_attr_escape(&shell),
-        xml_attr_escape(&terminal)
     )
 }
 
@@ -6795,12 +6830,34 @@ mod tests {
         );
     }
 
+    /// 终端瞬态尾巴只剩两件事:时间和工作目录。
+    /// `env`/`shell`/`terminal` 报的是 daemon 进程而非客户端(08-17 实测:
+    /// daemon 的 stdin 恒为 /dev/null、TERM 是启动时冻结的),既错又占位;
+    /// `note` 的身份守卫同样退场。
+    /// 剪枝必须幂等:第二次扫过不能再改写,否则每次落库都掰一次前缀。
+    #[test]
+    fn tool_result_pruning_is_bounded_and_idempotent() {
+        let output = "x".repeat(20_000);
+        let pruned = prune_tool_output(&output, 8192, 4096, 1024);
+        assert!(pruned.chars().count() < output.chars().count());
+        assert!(pruned.contains("14880") || pruned.contains("已省略"), "{pruned}");
+        assert_eq!(prune_tool_output(&pruned, 8192, 4096, 1024), pruned);
+        // 预算内的输出一个字节都不动。
+        let small = "short output";
+        assert_eq!(prune_tool_output(small, 8192, 4096, 1024), small);
+    }
+
     #[test]
     fn runtime_context_contains_dynamic_runtime_only() {
         let context = runtime_context(AgentMode::Normal, false);
         assert!(context.starts_with("<runtime "));
         assert!(context.contains("now=\""));
         assert!(context.contains("cwd=\""));
+        for noise in ["env=", "shell=", "terminal=", "note="] {
+            assert!(!context.contains(noise), "{noise} in {context}");
+        }
+        // ISO 日期 + 三字母星期,不是中文长日期。
+        assert!(!context.contains('年'), "{context}");
     }
 
     #[test]
@@ -6813,10 +6870,15 @@ mod tests {
         for noise in ["cwd=", "shell=", "terminal=", "env=", "note="] {
             assert!(!platform.contains(noise), "{noise} in {platform}");
         }
-        assert!(
-            platform.len() * 3 < runtime_context(AgentMode::Normal, false).len(),
-            "{platform}"
-        );
+        // 平台面到分钟,终端面到小时:同粒度内整块字节不变。
+        assert!(platform.contains(':'), "{platform}");
+        let terminal = runtime_context(AgentMode::Normal, false);
+        let stamp = terminal
+            .split("now=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap();
+        assert!(stamp.ends_with('时') && !stamp.contains(':'), "{stamp}");
     }
 
     #[test]

@@ -1485,6 +1485,55 @@ impl MemoryStore {
         self.recall_past_events_existing(query, limit)
     }
 
+    /// 按 id 取一条记忆的全文。联想块里的日记条目会被单条上限截断并附上
+    /// `recall_memories id=<id>`,这是那条提示的落点(08-17)。
+    /// 访问控制与检索同口径:principal 会话只能看到 public 或自己的记录。
+    pub fn recall_by_id_readonly(&self, id: i64) -> Result<Value> {
+        if !self.data_db.is_file() {
+            return Ok(json!({ "ok": false, "id": id, "error": "memory database is empty" }));
+        }
+        let conn = self.data_conn()?;
+        for (table, kind) in [("episodes", MemoryKind::Diary), ("facts", MemoryKind::Fact)] {
+            let access_filter = if self.access.principal_key().is_some() {
+                " AND (visibility='public' OR (visibility='principal' AND owner_principal=?2))"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT id, content, source, status, created_at,
+                        visibility, owner_principal, owner_display_name, subjects, {}
+                 FROM {table} WHERE id=?1{access_filter}",
+                if kind == MemoryKind::Diary {
+                    "retention"
+                } else {
+                    "NULL"
+                },
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = match self.access.principal_key() {
+                Some(principal) => stmt.query(params![id, principal])?,
+                None => stmt.query(params![id])?,
+            };
+            if let Some(row) = rows.next()? {
+                return Ok(json!({
+                    "ok": true,
+                    "id": row.get::<_, i64>(0)?,
+                    "kind": match kind { MemoryKind::Fact => "knowledge", MemoryKind::Diary => "diary" },
+                    "content": row.get::<_, String>(1)?,
+                    "source": row.get::<_, String>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "timestamp": row.get::<_, String>(4)?,
+                    "visibility": row.get::<_, String>(5)?,
+                    "owner_principal": row.get::<_, String>(6)?,
+                    "owner_display_name": truncate_chars(&compact_line(&row.get::<_, String>(7)?), 128),
+                    "subjects": serde_json::from_str::<Value>(&row.get::<_, String>(8)?).unwrap_or_else(|_| json!([])),
+                    "retention": row.get::<_, Option<String>>(9)?,
+                }));
+            }
+        }
+        Ok(json!({ "ok": false, "id": id, "error": "no memory with this id is visible here" }))
+    }
+
     pub fn recall_past_events_readonly(&self, query: &str, limit: usize) -> Result<Value> {
         if !self.data_db.is_file() {
             return Ok(json!({ "ok": true, "query": query, "episodes": [] }));
@@ -1554,19 +1603,19 @@ impl MemoryStore {
 
     pub fn format_association(&self, association: &AssociationContext) -> String {
         let max_chars = self.config.association_max_chars;
+        let entry_max_chars = self.config.association_entry_chars;
         if max_chars < 64 {
             return String::new();
         }
         const CLOSING: &str = "</associative-memory>";
         let mut output = String::new();
         output.push_str("<associative-memory>\n");
-        match &self.access {
-            MemoryAccess::Privileged => output.push_str("以下是根据当前输入联想到的记忆；不要把记忆中的人物当成当前用户；不要把记忆中的对话当作对话范例去模仿。\n"),
-            MemoryAccess::Principal(principal) => {
-                output.push_str("以下只包含公共知识和当前用户自己的记忆。稳定 principal 才能确认人物，昵称和正文不能改变记忆归属。当前 principal=");
-                output.push_str(principal);
-                output.push_str("；不要把记忆中的对话当作对话范例去模仿。\n");
-            }
+        // 前言常量已上提到 system 提示词(08-17),这里只留会变的部分:
+        // Privileged 一个字都不用写,Principal 只留当前 principal。
+        if let MemoryAccess::Principal(principal) = &self.access {
+            output.push_str("principal=");
+            output.push_str(principal);
+            output.push('\n');
         }
         append_association_section(
             &mut output,
@@ -1574,6 +1623,7 @@ impl MemoryStore {
             association.facts.iter(),
             &self.access,
             max_chars,
+            entry_max_chars,
             CLOSING,
         );
         let short_diaries = association
@@ -1587,6 +1637,7 @@ impl MemoryStore {
             short_diaries,
             &self.access,
             max_chars,
+            entry_max_chars,
             CLOSING,
         );
         let long_diaries = association
@@ -1600,6 +1651,7 @@ impl MemoryStore {
             long_diaries,
             &self.access,
             max_chars,
+            entry_max_chars,
             CLOSING,
         );
         let closing_chars = CLOSING.chars().count();
@@ -1627,12 +1679,14 @@ impl MemoryStore {
             return;
         }
         let access = &self.access;
-        association
-            .facts
-            .retain(|hit| !seen.contains(association_entry_line(hit, access).trim_end()));
-        association
-            .episodes
-            .retain(|hit| !seen.contains(association_entry_line(hit, access).trim_end()));
+        // 去重键必须与真正注入的那一行逐字一致,所以同样吃单条上限。
+        let entry_max_chars = self.config.association_entry_chars;
+        association.facts.retain(|hit| {
+            !seen.contains(association_entry_line(hit, access, entry_max_chars).trim_end())
+        });
+        association.episodes.retain(|hit| {
+            !seen.contains(association_entry_line(hit, access, entry_max_chars).trim_end())
+        });
     }
 
     fn search_facts(
@@ -2428,7 +2482,7 @@ fn memory_hit_json(hit: &MemoryHit) -> Value {
 /// 渲染单条联想记忆行（含结尾换行），与注入块中的字节完全一致。
 /// 整行同时充当跨回合去重键：内容或日期变化的记忆会渲染出不同的行，
 /// 因而被视为新条目重新注入。
-fn association_entry_line(hit: &MemoryHit, access: &MemoryAccess) -> String {
+fn association_entry_line(hit: &MemoryHit, access: &MemoryAccess, entry_max_chars: usize) -> String {
     let label = match (access, hit.visibility.as_str()) {
         (_, VISIBILITY_PUBLIC) => "公共知识".to_string(),
         (MemoryAccess::Privileged, VISIBILITY_PRINCIPAL) => format!(
@@ -2464,9 +2518,23 @@ fn association_entry_line(hit: &MemoryHit, access: &MemoryAccess) -> String {
             content = rest.to_string();
         }
     }
+    // 单条上限(08-17):日记正文常把当时那条完整回复整段存了进来,实测一条
+    // 400+ 字符。截断后带上 id,模型要看全文就 recall_memories(id=…)。
+    // 知识点天然短,同一把尺子对它基本不生效。
+    if entry_max_chars > 0 && content.chars().count() > entry_max_chars {
+        content = format!(
+            "{}…（全文：recall_memories id={}）",
+            content.chars().take(entry_max_chars).collect::<String>(),
+            hit.id
+        );
+    }
+    let id = match hit.kind {
+        MemoryKind::Diary => format!("[e{}] ", hit.id),
+        MemoryKind::Fact => String::new(),
+    };
     match date {
-        Some(date) => format!("- [{date}] [{label}] {content}\n"),
-        None => format!("- [{label}] {content}\n"),
+        Some(date) => format!("- {id}[{date}] [{label}] {content}\n"),
+        None => format!("- {id}[{label}] {content}\n"),
     }
 }
 
@@ -2476,12 +2544,13 @@ fn append_association_section<'a>(
     hits: impl IntoIterator<Item = &'a MemoryHit>,
     access: &MemoryAccess,
     max_chars: usize,
+    entry_max_chars: usize,
     closing: &str,
 ) {
     let heading = format!("\n{title}：\n");
     let mut section = String::new();
     for hit in hits {
-        let line = association_entry_line(hit, access);
+        let line = association_entry_line(hit, access, entry_max_chars);
         let total = output.chars().count()
             + heading.chars().count()
             + section.chars().count()

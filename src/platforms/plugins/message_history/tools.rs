@@ -154,9 +154,9 @@ pub(super) fn register(
     if context.conversation.kind == ConversationKind::Group {
         register_activity_ranking(registry, context.clone(), store.clone());
     }
+    // 三件历史查询合并成 `search_real_chat_history`(08-17):关键词检索、
+    // 近期回放、按发送者过滤本来就是同一次查询的三种参数组合。
     register_search(registry, context.clone(), store.clone(), settings.clone());
-    register_recent(registry, context.clone(), store.clone(), settings.clone());
-    register_user_history(registry, context.clone(), store.clone(), settings.clone());
     if !effective_admin(&context) {
         return;
     }
@@ -340,14 +340,15 @@ fn register_search(
         ToolSpec::new(
             "search_real_chat_history",
             t(
-                "Search persisted QQ text history. It defaults to the current conversation. Administrators may select another group/private QQ conversation or all conversations.",
-                "搜索持久化的 QQ 纯文字历史。默认当前会话；管理员可指定其他群聊/私聊 QQ 会话或全部会话。",
+                "Read persisted QQ text history. Give query to search by keyword, or omit it to replay recent messages; sender_id narrows either to one sender. Defaults to the current conversation; administrators may select another group/private QQ conversation or all conversations.",
+                "读取持久化的 QQ 纯文字历史。给 query 就按关键词检索，不给就回放近期消息；sender_id 可把两者都限定到某个发送者。默认当前会话；管理员可指定其他群聊/私聊 QQ 会话或全部会话。",
             ),
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "minLength": 1 },
-                    "sender_id": { "type": "string" },
+                    "query": { "type": "string", "minLength": 1, "description": "关键词；省略则回放近期消息。" },
+                    "sender_id": { "type": "string", "description": "只看这个 QQ 号发的消息。" },
+                    "user_id": { "type": "string", "description": "sender_id 的旧别名。" },
                     "conversation_kind": { "type": "string", "enum": ["group", "private"] },
                     "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
                     "group_id": { "type": "string" },
@@ -358,14 +359,25 @@ fn register_search(
                     "end_time": { "type": "string", "description": "格式同 start_time；仅日期时包含当天" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
                 },
-                "required": ["query"],
                 "additionalProperties": false
             }),
             move |arguments| {
                 let context = context.clone();
                 let store = store.clone();
                 let settings = settings.clone();
-                async move { search(arguments, context, store, settings).await }
+                async move {
+                    // 无关键词 = 近期回放;user_id 是 get_user_real_chat_history
+                    // 时代的参数名,继续当 sender_id 的别名收下。
+                    if required_string(&arguments, "query").is_ok() {
+                        search(arguments, context, store, settings).await
+                    } else if optional_id(&arguments, "sender_id")?.is_some()
+                        || optional_id(&arguments, "user_id")?.is_some()
+                    {
+                        user_history(arguments, context, store, settings).await
+                    } else {
+                        recent(arguments, context, store, settings).await
+                    }
+                }
             },
         )
         .with_display_name(t("Search real chat history", "搜索真实聊天历史")),
@@ -403,87 +415,7 @@ async fn search(
     .to_string())
 }
 
-fn register_recent(
-    registry: &mut ToolRegistry,
-    context: Arc<PlatformTurnContext>,
-    store: HistoryStore,
-    settings: Arc<QqMessageHistoryPluginSettings>,
-) {
-    let maximum = history_limit_ceiling(&settings);
-    registry.register(
-        ToolSpec::new(
-            "get_recent_real_chat_history",
-            t(
-                "Read recent persisted QQ text messages without a keyword. It defaults to the current conversation; administrators may choose another conversation.",
-                "读取无需关键词的近期 QQ 纯文字历史。默认当前会话；管理员可选择其他会话。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
-                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
-                    "group_id": { "type": "string" },
-                    "all_conversations": { "type": "boolean", "default": false },
-                    "all_groups": { "type": "boolean", "default": false },
-                    "days": { "type": "integer", "minimum": 1 },
-                    "start_time": { "type": "string" },
-                    "end_time": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
-                },
-                "additionalProperties": false
-            }),
-            move |arguments| {
-                let context = context.clone();
-                let store = store.clone();
-                let settings = settings.clone();
-                async move { recent(arguments, context, store, settings).await }
-            },
-        )
-        .with_display_name(t("Read recent real chat history", "读取近期真实聊天历史")),
-    );
-}
 
-fn register_user_history(
-    registry: &mut ToolRegistry,
-    context: Arc<PlatformTurnContext>,
-    store: HistoryStore,
-    settings: Arc<QqMessageHistoryPluginSettings>,
-) {
-    let maximum = history_limit_ceiling(&settings);
-    registry.register(
-        ToolSpec::new(
-            "get_user_real_chat_history",
-            t(
-                "Read persisted QQ text messages from a specific sender. It defaults to the current conversation; administrators may choose another conversation.",
-                "读取指定发送者的 QQ 纯文字历史。默认当前会话；管理员可选择其他会话。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "user_id": { "type": "string", "description": "要查询的 QQ 号" },
-                    "conversation_kind": { "type": "string", "enum": ["group", "private"] },
-                    "conversation_id": { "type": "string", "description": "群号或私聊对方 QQ 号" },
-                    "group_id": { "type": "string" },
-                    "all_conversations": { "type": "boolean", "default": false },
-                    "all_groups": { "type": "boolean", "default": false },
-                    "days": { "type": "integer", "minimum": 1 },
-                    "start_time": { "type": "string" },
-                    "end_time": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": maximum }
-                },
-                "required": ["user_id"],
-                "additionalProperties": false
-            }),
-            move |arguments| {
-                let context = context.clone();
-                let store = store.clone();
-                let settings = settings.clone();
-                async move { user_history(arguments, context, store, settings).await }
-            },
-        )
-        .with_display_name(t("Read user chat history", "读取用户聊天历史")),
-    );
-}
 
 async fn user_history(
     arguments: Value,
@@ -491,7 +423,12 @@ async fn user_history(
     store: HistoryStore,
     settings: Arc<QqMessageHistoryPluginSettings>,
 ) -> Result<String> {
-    let user_id = required_id(&arguments, "user_id")?;
+    // sender_id 是合并后的首选名;user_id 是 get_user_real_chat_history
+    // 时代的旧参数名,继续兼容。
+    let user_id = match optional_id(&arguments, "sender_id")? {
+        Some(id) => id,
+        None => required_id(&arguments, "user_id")?,
+    };
     let scope = history_scope(
         &arguments,
         &context,
@@ -825,51 +762,16 @@ pub(super) fn register_group_members(
     );
 }
 
-pub(super) fn register_group_avatar(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
-    registry.register(
-        ToolSpec::new(
-            "get_group_avatar",
-            t(
-                "Get the avatar URL of the current QQ group. Feed the returned avatar_url to vision_analyze to see the avatar. Member avatars are returned by get_group_members_info as avatar_url.",
-                "获取当前 QQ 群的群头像 URL。把返回的 avatar_url 交给 vision_analyze 即可查看头像内容。群成员的头像请使用 get_group_members_info 返回的 avatar_url。",
-            ),
-            json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            move |_arguments| {
-                let context = context.clone();
-                async move {
-                    let group_id = context.conversation.conversation_id.clone();
-                    let avatar_url = crate::platforms::avatar::group_avatar_url(
-                        &group_id,
-                        crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
-                    )
-                    .context("当前会话不是数字群号，无法构造群头像 URL")?;
-                    Ok(json!({
-                        "ok": true,
-                        "group_id": group_id,
-                        "avatar_url": avatar_url
-                    })
-                    .to_string())
-                }
-            },
-        )
-        .with_display_name(t("Query group avatar", "查询群头像")),
-    );
-}
-
-pub(super) fn register_avatar_download(
-    registry: &mut ToolRegistry,
-    context: Arc<PlatformTurnContext>,
-) {
+/// 群头像 URL 与头像下载合并成 `get_avatar`(08-17):同一个头像的两种取法。
+/// download=false(默认)只回 URL,交给 vision_analyze 看图即可;download=true
+/// 才真下载并发布为图片。
+pub(super) fn register_avatar(registry: &mut ToolRegistry, context: Arc<PlatformTurnContext>) {
     registry.register(
         ToolSpec::new_with_progress(
-            "download_avatar",
+            "get_avatar",
             t(
-                "Download the avatar of the current QQ group or one of its members and emit it as an image. The host delivers emitted images automatically with your reply; do not resend the same image with send_message_to_user.",
-                "下载当前 QQ 群或指定群成员的 QQ 头像并发布为图片。宿主会随回复自动投递已发布的图片，不要再用 send_message_to_user 重发同一张图。",
+                "Get a QQ avatar. Omit user_id for the current group's avatar, or pass a member's QQ id. By default it returns avatar_url only — feed that to vision_analyze to see the image. Set download=true to fetch it and emit it as an image; the host delivers emitted images automatically with your reply, so do not resend the same image with send_message_to_user.",
+                "获取 QQ 头像。省略 user_id 取当前群头像，传成员 QQ 号取该成员头像。默认只返回 avatar_url，交给 vision_analyze 即可查看内容。download=true 才会下载并发布为图片；宿主会随回复自动投递已发布的图片，不要再用 send_message_to_user 重发。",
             ),
             json!({
                 "type": "object",
@@ -877,17 +779,62 @@ pub(super) fn register_avatar_download(
                     "user_id": {
                         "type": "string",
                         "pattern": "^[0-9]{5,20}$",
-                        "description": "群成员的 QQ 号；省略时下载当前群的群头像。只知道名字时先调用 get_group_members_info。"
+                        "description": "群成员的 QQ 号；省略时取当前群的群头像。只知道名字时先调用 get_group_members_info。"
+                    },
+                    "download": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true 时下载头像并发布为图片；默认只返回 URL。"
                     }
                 },
                 "additionalProperties": false
             }),
             move |arguments, progress| {
                 let context = context.clone();
-                async move { download_avatar(arguments, context, progress).await }
+                async move {
+                    if arguments
+                        .get("download")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        return download_avatar(arguments, context, progress).await;
+                    }
+                    match optional_string(&arguments, "user_id")? {
+                        Some(user_id) => {
+                            let member = context.group_member(&user_id).await?.with_context(|| {
+                                format!("群里没有 QQ 号为 {user_id} 的成员，只能查询当前群成员的头像")
+                            })?;
+                            let avatar_url = crate::platforms::avatar::user_avatar_url(
+                                &member.user_id,
+                                crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+                            )
+                            .context("成员 QQ 号不是纯数字，无法构造头像 URL")?;
+                            Ok(json!({
+                                "ok": true,
+                                "user_id": member.user_id,
+                                "avatar_url": avatar_url
+                            })
+                            .to_string())
+                        }
+                        None => {
+                            let group_id = context.conversation.conversation_id.clone();
+                            let avatar_url = crate::platforms::avatar::group_avatar_url(
+                                &group_id,
+                                crate::platforms::avatar::DEFAULT_AVATAR_SIZE,
+                            )
+                            .context("当前会话不是数字群号，无法构造群头像 URL")?;
+                            Ok(json!({
+                                "ok": true,
+                                "group_id": group_id,
+                                "avatar_url": avatar_url
+                            })
+                            .to_string())
+                        }
+                    }
+                }
             },
         )
-        .with_display_name(t("Download avatar", "下载头像")),
+        .with_display_name(t("QQ avatar", "QQ 头像")),
     );
 }
 

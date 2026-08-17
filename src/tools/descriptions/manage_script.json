@@ -1,0 +1,26 @@
+{
+  "name": "manage_script",
+  "display_name": "管理脚本",
+  "description": "把用户脚本管理为工具：action=register 注册/更新，action=unregister 注销。\nregister 时脚本必须已存在于 scripts 目录，会更新 index.json、设置可执行权限，脚本在后续工具轮次中立即可用。unregister 可选同时删除文件（仅限 scripts 目录内）。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": { "type": "string", "enum": ["register", "unregister"], "description": "register 注册/更新，unregister 注销。" },
+      "id": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$", "description": "唯一工具标识符（ASCII，字母开头），即 AI 调用的函数名。" },
+      "display_name": { "type": "string", "description": "可读显示名称，可含中文。" },
+      "description": { "type": "string", "description": "可选描述覆盖。省略时读取脚本头部的 Description:/描述：。" },
+      "path": { "type": "string", "description": "仅 register：scripts 目录内的脚本文件名或路径。" },
+      "parameters": { "type": "object", "description": "工具参数的 JSON schema。省略时用带 stdin 的通用 schema。" },
+      "timeout_seconds": { "type": "integer", "description": "可选超时秒数，最大 300。" },
+      "always_loaded": { "type": "boolean", "description": "可选加载策略覆盖。" },
+      "load_policy": { "type": "string", "enum": ["summary", "group", "hidden"], "description": "Hybrid 目录策略。" },
+      "groups": { "type": "array", "items": { "type": "string" }, "description": "可选 Hybrid 目录分组。" },
+      "delete_file": { "type": "boolean", "description": "仅 unregister：同时删除脚本文件。" }
+    },
+    "required": ["action", "id"]
+  },
+  "permission": "writes",
+  "always_loaded": false,
+  "load_policy": "group",
+  "groups": ["scripting"]
+}

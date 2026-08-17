@@ -11027,7 +11027,7 @@ mod tests {
             &state,
             IpcCommand::ToolCall {
                 session: Some(session.clone()),
-                name: "job_status".to_string(),
+                name: "job".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: 0,
@@ -11042,7 +11042,7 @@ mod tests {
             &state,
             IpcCommand::ToolCall {
                 session: Some(session),
-                name: "job_status".to_string(),
+                name: "job".to_string(),
                 arguments: "{}".to_string(),
                 origin: None,
                 depth: crate::tools::workspace::MAX_BRIDGE_DEPTH,

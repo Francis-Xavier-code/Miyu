@@ -31,12 +31,16 @@ pub fn register(registry: &mut ToolRegistry) {
 }
 
 pub(super) fn dynamic_description(registry: &ToolRegistry, loaded: &BTreeSet<String>) -> String {
-    format!(
-        "{BASE_DESCRIPTION}\n\n{}\n{}\n{}",
+    let mut description = format!(
+        "{BASE_DESCRIPTION}\n\n{}\n{}",
         registry.script_summary_xml(),
         registry.load_targets_xml(loaded),
-        unregistered_scripts_xml(registry),
-    )
+    );
+    if let Some(xml) = unregistered_scripts_xml(registry) {
+        description.push('\n');
+        description.push_str(&xml);
+    }
+    description
 }
 
 /// Stub loading mode: the catalog is already visible as permanently
@@ -44,10 +48,15 @@ pub(super) fn dynamic_description(registry: &ToolRegistry, loaded: &BTreeSet<Str
 /// fetch flow (plus unregistered script files, which are not in the tools
 /// array at all).
 pub(super) fn stub_mode_description(registry: &ToolRegistry) -> String {
-    format!(
-        "获取工具或脚本的完整参数契约。本会话的全部工具已以精简条目常驻 tools 列表（标注「精简条目」的工具只有一句摘要和宽松参数壳）。用 {{\"names\":[\"工具名\"]}} 请求后，结果的 contracts 字段会给出每个工具的完整 description 与参数 JSON Schema；随后按契约把实际参数直接填在该工具的顶层参数对象里调用即可。group:名称 可一次获取整组契约。<unregistered_scripts> 中的文件尚未注册，需先读取对应路径并用 register_script 注册。\n\n{}",
-        unregistered_scripts_xml(registry),
-    )
+    // 没有未注册脚本时一个字都不追加。此前恒定输出一份空的
+    // <unregistered_scripts></unregistered_scripts>:既白占 53 字符,又是
+    // 一个静默的缓存杀手——往 scripts 目录扔一个未注册文件,tools 数组的
+    // 字节就变,所有会话的前缀缓存从 token 0 掰断(08-17 实测)。
+    let base = "获取工具或脚本的完整参数契约。本会话的全部工具已以精简条目常驻 tools 列表（标注「精简条目」的工具只有一句摘要和宽松参数壳）。用 {\"names\":[\"工具名\"]} 请求后，结果的 contracts 字段会给出每个工具的完整 description 与参数 JSON Schema；随后按契约把实际参数直接填在该工具的顶层参数对象里调用即可。group:名称 可一次获取整组契约。";
+    match unregistered_scripts_xml(registry) {
+        Some(xml) => format!("{base}<unregistered_scripts> 中的文件尚未注册，需先读取对应路径并用 register_script 注册。\n\n{xml}"),
+        None => base.to_string(),
+    }
 }
 
 pub(super) fn execute(args: Value, registry: &ToolRegistry) -> Result<String> {
@@ -119,9 +128,13 @@ pub(super) fn execute(args: Value, registry: &ToolRegistry) -> Result<String> {
     }))?)
 }
 
-fn unregistered_scripts_xml(registry: &ToolRegistry) -> String {
-    let items = registry
-        .unregistered_scripts()
+/// `None` = 没有未注册脚本(常态)。调用方据此整段跳过,不发空壳。
+fn unregistered_scripts_xml(registry: &ToolRegistry) -> Option<String> {
+    let scripts = registry.unregistered_scripts();
+    if scripts.is_empty() {
+        return None;
+    }
+    let items = scripts
         .iter()
         .map(|script| {
             format!(
@@ -132,7 +145,9 @@ fn unregistered_scripts_xml(registry: &ToolRegistry) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("<unregistered_scripts>\n{items}\n</unregistered_scripts>")
+    Some(format!(
+        "<unregistered_scripts>\n{items}\n</unregistered_scripts>"
+    ))
 }
 
 pub(super) fn xml_escape(text: &str) -> String {
@@ -321,7 +336,9 @@ mod tests {
         assert!(lazy.function.description.contains("多行描述的第一行摘要"));
         assert!(lazy.function.description.contains("精简条目"));
         assert!(!lazy.function.description.contains("第二行细节"));
-        assert_eq!(lazy.function.parameters["additionalProperties"], true);
+        // 裸 {"type":"object"}:JSON Schema 里等价于显式写 properties:{} +
+        // additionalProperties:true,少 48 字符/条。
+        assert_eq!(lazy.function.parameters, serde_json::json!({"type":"object"}));
         let always = definitions
             .iter()
             .find(|def| def.function.name == "always_tool")
