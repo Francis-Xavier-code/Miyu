@@ -225,6 +225,70 @@ fn short_model_name(model: &str, provider: &str) -> String {
 /// down with "The cursor position could not be read within a normal duration".
 /// The answer is only ever used to re-anchor a redraw, so a stale one costs a
 /// single imperfect frame — losing the session costs the session.
+/// 活动区重绘轨迹（`MIYU_TAIL_TRACE=1` 打开，落
+/// `~/.miyu/cache/logs/tail-trace.log`）。
+///
+/// 这段重绘靠绝对屏幕行号 + DECSTBM 受限滚动区 + 插入/删除行来搬动活动
+/// 区。受限区里滚出去的行是直接丢弃、不进 scrollback 的，而 kitty 的图
+/// 片锚在文本行上——所以只有「用户滚过历史 + 新输出推动」这个组合才暴
+/// 露。要定位就得看出错那一刻实际发了哪些序列。
+#[allow(clippy::too_many_arguments)]
+fn trace_tail_redraw(
+    tail_start: u16,
+    next_tail: u16,
+    shift: i32,
+    tail_rows: u16,
+    output_cursor: (u16, u16),
+    output_bottom: Option<u16>,
+    leading_scroll: u16,
+    terminal_rows: u16,
+    transaction: &[u8],
+) {
+    use std::io::Write as _;
+    // 只记会搬动屏幕内容的序列,纯重绘噪声太大。
+    let escapes = String::from_utf8_lossy(transaction);
+    let mut moves = Vec::new();
+    for (marker, label) in [
+        ("L", "IL 插入行"),
+        ("M", "DL 删除行"),
+        ("r", "DECSTBM 滚动区"),
+    ] {
+        let pattern = format!("\x1b[");
+        let mut rest = escapes.as_ref();
+        while let Some(index) = rest.find(&pattern) {
+            rest = &rest[index + pattern.len()..];
+            if let Some(end) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+                if &rest[end..end + 1] == marker {
+                    moves.push(format!("{label}({})", &rest[..end]));
+                }
+            }
+        }
+    }
+    let line = format!(
+        "tail {tail_start}→{next_tail} shift={shift} rows={tail_rows} \
+         cursor={output_cursor:?} bottom={output_bottom:?} \
+         leading_scroll={leading_scroll} term_rows={terminal_rows} \
+         | {}\n",
+        if moves.is_empty() {
+            "无搬动".to_string()
+        } else {
+            moves.join(" ")
+        }
+    );
+    let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+        .join(".miyu/cache/logs/tail-trace.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn cursor_position_or(fallback: (u16, u16)) -> (u16, u16) {
     // 终端已挂断时 ESC[6n 永远等不到应答,而 crossterm 的应答等待对
     // HUP fd 会无限自旋(超时失效)——直接用回退值,让退出路径走完。
@@ -10793,6 +10857,19 @@ impl LiveReplTail {
         let input_row = (i32::from(self.input_cursor.1) + shift)
             .clamp(0, i32::from(terminal_rows.saturating_sub(1))) as u16;
         queue!(transaction, MoveTo(self.input_cursor.0, input_row))?;
+        if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
+            trace_tail_redraw(
+                self.tail_start,
+                next_tail,
+                shift,
+                self.tail_rows,
+                self.output_cursor,
+                output_bottom,
+                leading_scroll,
+                terminal_rows,
+                &transaction,
+            );
+        }
         let mut stdout = io::stdout();
         stdout.write_all(&transaction)?;
         stdout.flush()?;

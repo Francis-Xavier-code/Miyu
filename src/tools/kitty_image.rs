@@ -36,6 +36,43 @@ pub fn print(path: &Path, requested_size: Option<&str>) -> Result<()> {
         .with_context(|| format!("failed to decode image {}", path.display()))?;
     let (terminal_cols, terminal_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let (max_cols, max_rows) = parse_size(requested_size, terminal_cols, terminal_rows)?;
+    if std::env::var_os("MIYU_IMAGE_TRACE").is_some() {
+        let (cell_w, cell_h) = cell_pixel_size();
+        let (cols, rows) = fit_cells(
+            image.width(),
+            image.height(),
+            max_cols,
+            max_rows,
+            cell_w,
+            cell_h,
+        );
+        let resized = resize_for_transfer(image.clone(), cols, rows, cell_w, cell_h);
+        let line = format!(
+            "终端 {terminal_cols}x{terminal_rows}  单元格 {cell_w}x{cell_h}  \
+             请求 {requested_size:?}  框 {max_cols}x{max_rows}  \
+             原图 {}x{}  →  网格 {cols}x{rows} = {}x{} px  \
+             传输画布 {}x{}\n",
+            image.width(),
+            image.height(),
+            u32::from(cols) * u32::from(cell_w),
+            u32::from(rows) * u32::from(cell_h),
+            resized.width(),
+            resized.height(),
+        );
+        // 落文件而不是 stderr:live REPL 里 stderr 会直接糊在画面上。
+        let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".miyu/cache/logs/image-trace.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
     let sequence = kitty_sequence(&image, max_cols, max_rows)?;
     io::stdout().write_all(sequence.as_bytes())?;
     io::stdout().flush()?;
