@@ -239,7 +239,6 @@ fn trace_tail_redraw(
     shift: i32,
     tail_rows: u16,
     output_cursor: (u16, u16),
-    actual_cursor: (u16, u16),
     output_bottom: Option<u16>,
     leading_scroll: u16,
     terminal_rows: u16,
@@ -265,19 +264,9 @@ fn trace_tail_redraw(
             }
         }
     }
-    let drift = if actual_cursor.1 == u16::MAX {
-        " 实测=查询失败".to_string()
-    } else if actual_cursor == output_cursor {
-        String::new()
-    } else {
-        format!(
-            " ⚠分叉 实测={actual_cursor:?} 差={}",
-            i32::from(actual_cursor.1) - i32::from(output_cursor.1)
-        )
-    };
     let line = format!(
         "tail {tail_start}→{next_tail} shift={shift} rows={tail_rows} \
-         cursor={output_cursor:?}{drift} bottom={output_bottom:?} \
+         cursor={output_cursor:?} bottom={output_bottom:?} \
          leading_scroll={leading_scroll} term_rows={terminal_rows} \
          | {}\n",
         if moves.is_empty() {
@@ -6086,6 +6075,21 @@ async fn try_run_remote_chat(
                 },
                 frame = &mut recv => break frame?,
                 _ = spinner_tick.tick() => {
+                    // 外部输出期间活动区是挂起的(rendered=false),这时
+                    // apply_output_frame 会把帧直接写在光标当下的位置——
+                    // 也就是工具刚打完的图片中间。文本只盖住左边一截,右
+                    // 边残留的 Kitty 占位字符继续渲染对应那行的图片切片,
+                    // 屏幕上就是一条条横带。
+                    //
+                    // 进程内那条路(handle_live_agent_event)早就把外部输
+                    // 出期间的 SpinnerTick 整个丢掉了,远端这条漏了。丢掉
+                    // 不会少画:tool.finished 会先 resume_at 再统一出帧。
+                    if live
+                        .as_deref()
+                        .is_some_and(|live| live.external_output_active)
+                    {
+                        continue;
+                    }
                     renderer.tick_spinner()?;
                     if let Some(live) = live.as_deref_mut() {
                         live.apply_renderer_frame(&mut renderer)?;
@@ -6278,6 +6282,11 @@ async fn try_run_remote_chat(
                         "{}: {error}",
                         t("Could not display tool image", "工具图片显示失败")
                     ))?;
+                }
+                // 图片打完就得抬进正文页内,否则之后每次受限区滚动它都不
+                // 动(kitty 只搬完全落在页内的图),残影会一路堆下去。
+                if let Some(live) = live.as_deref_mut() {
+                    live.lift_external_output_into_page()?;
                 }
             }
             "question.requested" => {
@@ -10651,6 +10660,52 @@ impl LiveReplTail {
         Ok(())
     }
 
+    /// 把刚打完的外部输出整屏上滚，直到它完全落进正文页内。
+    ///
+    /// kitty 图形协议原文：设了页边距之后，只有「完全落在页内」的图片才
+    /// 跟着滚动，越界的会被裁剪并留在原地。图片是顺着光标往下打的，底部
+    /// 常常正压在活动区上——恰好越界。此后每一次受限区滚动它都不动，文字
+    /// 走了图不走，一次留一条残影；一次会话滚几百次，屏幕上就堆成一叠重
+    /// 复的切片。
+    ///
+    /// 原本是个死锁：那个本该把图抬出活动区的滚动，正是 kitty 拒绝对图生
+    /// 效的滚动。所以要趁这一刻整屏滚一次——整屏滚没有页边距，图片一定跟
+    /// 着走。这里也正是唯一能这么做的时机：活动区已经 suspend、那几行是
+    /// 空的，被一起带上去不会留下痕迹（在别处整屏滚会把画着 ┃ 的输入框推
+    /// 进正文）。
+    fn lift_external_output_into_page(&mut self) -> Result<()> {
+        let (_, terminal_rows) = terminal::size().unwrap_or((80, 24));
+        let terminal_rows = terminal_rows.max(1);
+        let page_bottom = self.tail_start.saturating_sub(1);
+        let cursor_row = cursor_row_or(self.output_cursor.1);
+        let overflow = cursor_row.saturating_sub(page_bottom);
+        if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
+            use std::io::Write as _;
+            let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                .join(".miyu/cache/logs/tail-trace.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    file,
+                    "lift: 光标行={cursor_row} 页底={page_bottom} 需抬升={overflow}                      tail_start={} 屏高={terminal_rows}",
+                    self.tail_start
+                );
+            }
+        }
+        if overflow == 0 {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        queue!(stdout, MoveTo(0, terminal_rows.saturating_sub(1)))?;
+        for _ in 0..overflow {
+            queue!(stdout, Print("\n"))?;
+        }
+        // 停在滚完后内容真正的末尾:调用方随后会重新查询光标来定位活动区。
+        queue!(stdout, MoveTo(0, page_bottom))?;
+        stdout.flush()?;
+        self.output_cursor = (0, page_bottom);
+        Ok(())
+    }
+
     fn suspend(&mut self) -> Result<()> {
         if !self.rendered {
             return Ok(());
@@ -10869,16 +10924,12 @@ impl LiveReplTail {
             .clamp(0, i32::from(terminal_rows.saturating_sub(1))) as u16;
         queue!(transaction, MoveTo(self.input_cursor.0, input_row))?;
         if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
-            // 关键对比:存着的绝对行号 vs 终端此刻实际报的位置。
-            // 「滚上去看历史后才错位」如果是记账失效，这两个数必然分叉。
-            let actual = cursor_position_or((u16::MAX, u16::MAX));
             trace_tail_redraw(
                 self.tail_start,
                 next_tail,
                 shift,
                 self.tail_rows,
                 self.output_cursor,
-                actual,
                 output_bottom,
                 leading_scroll,
                 terminal_rows,

@@ -134,7 +134,8 @@ fn parse_size(
     };
     let width = parse_dimension(width, "width")?.unwrap_or(terminal_cols.max(1));
     let height = parse_dimension(height, "height")?.unwrap_or(available_rows);
-    Ok((width.clamp(1, 300), height.clamp(1, 200)))
+    // 上限跟着记号表走:每一格都要写行号+列号,超出表长就没有记号可用了。
+    Ok((width.clamp(1, max_cells()), height.clamp(1, max_cells())))
 }
 
 fn parse_dimension(value: &str, name: &str) -> Result<Option<u16>> {
@@ -220,13 +221,18 @@ fn write_image(
     let [_, red, green, blue] = image_id.to_be_bytes();
     for row in 0..rows {
         let row_mark = row_diacritic(row).context("image is too tall for Kitty placeholders")?;
-        write!(
-            output,
-            "\x1b[38;2;{red};{green};{blue}m{PLACEHOLDER}{row_mark}{}",
-            ROW_DIACRITICS[0]
-        )?;
-        for _ in 1..cols {
-            write!(output, "{PLACEHOLDER}")?;
+        write!(output, "\x1b[38;2;{red};{green};{blue}m")?;
+        // 每一格都写全行号+列号，不靠 kitty 的连续性推断。
+        //
+        // 省略后续格子的记号本来是合法写法（kitty 会按前一格递推），但只
+        // 在整行完好时成立。这一行被别的输出盖掉左边一截之后，带记号的
+        // 首格没了，右边残存的裸占位符失去参照，kitty 拿错行号去渲染——
+        // 屏幕上就是同一条切片在下方反复出现。写全了最坏也只是少半行。
+        // chafa 就是每格都写全的。
+        for col in 0..cols {
+            let col_mark =
+                row_diacritic(col).context("image is too wide for Kitty placeholders")?;
+            write!(output, "{PLACEHOLDER}{row_mark}{col_mark}")?;
         }
         writeln!(output, "\x1b[39m")?;
     }
@@ -235,6 +241,11 @@ fn write_image(
 
 fn row_diacritic(row: u16) -> Option<char> {
     ROW_DIACRITICS.get(usize::from(row)).copied()
+}
+
+/// 一张图最多能占多少行/列:占位符的行列号都取自同一张记号表。
+fn max_cells() -> u16 {
+    u16::try_from(ROW_DIACRITICS.len()).unwrap_or(u16::MAX)
 }
 
 #[cfg(unix)]
@@ -329,6 +340,36 @@ mod tests {
         assert!(output.contains("\x1b[38;2;1;2;3m"));
         assert_eq!(output.matches(PLACEHOLDER).count(), 4);
         assert_eq!(output.matches('\n').count(), 2);
+    }
+
+    /// 回归：占位行只有首格带记号时，被别的输出盖掉左边一截，右边残存
+    /// 的裸占位符就失去参照，kitty 拿错行号渲染——同一条切片在下方反复
+    /// 出现。每格写全就最坏只是少半行。
+    #[test]
+    fn every_placeholder_cell_carries_its_own_row_and_column() {
+        let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(4, 4, Rgba([1, 2, 3, 255])));
+        let mut output = Vec::new();
+        write_image(&mut output, &image, 0x010203, 3, 2).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let cells = output.matches(PLACEHOLDER).count();
+        assert_eq!(cells, 6);
+        // 每个占位符后面都跟着两个记号,一个都不能省。
+        for (row, row_mark) in ROW_DIACRITICS.iter().take(2).enumerate() {
+            for (col, col_mark) in ROW_DIACRITICS.iter().take(3).enumerate() {
+                let cell = format!("{PLACEHOLDER}{row_mark}{col_mark}");
+                assert!(output.contains(&cell), "缺第 {row} 行第 {col} 列的记号");
+            }
+        }
+    }
+
+    /// 每格都要写列号之后，宽度就不能超过记号表长度了。
+    #[test]
+    fn requested_size_is_capped_to_the_diacritic_table() {
+        let limit = max_cells();
+        assert!(limit >= 200, "记号表太短:{limit}");
+        let (cols, rows) = parse_size(Some("400x400"), 120, 40).unwrap();
+        assert_eq!((cols, rows), (limit, limit));
+        assert!(row_diacritic(cols.saturating_sub(1)).is_some());
     }
 
     #[test]
