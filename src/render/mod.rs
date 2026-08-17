@@ -1299,11 +1299,15 @@ impl StreamRenderer {
         Ok(())
     }
 
-    pub fn write_tool_preparing(&mut self, name: &str) -> Result<()> {
+    pub fn write_tool_preparing(&mut self, name: &str, batch: bool) -> Result<()> {
         if self.plain {
             return Ok(());
         }
-        let Some(phase) = crate::tools::preparing_phase(name) else {
+        // 工具自己的提示优先——它说得更具体；没有的话，批量场景退到通用
+        // 提示，总比整段空白强。
+        let phase = crate::tools::preparing_phase(name)
+            .or_else(|| batch.then(crate::tools::batch_preparing_phase));
+        let Some(phase) = phase else {
             return Ok(());
         };
         self.release_transient_output()?;
@@ -6140,7 +6144,7 @@ mod tests {
 
     #[test]
     fn tool_preparing_announces_every_slow_argument_tool() {
-        let phase_for = |name: &str| {
+        let phase_for_batch = |name: &str, batch: bool| {
             let mut renderer = StreamRenderer::new(
                 ReasoningDisplayMode::Summary,
                 ToolCallDisplayMode::Summary,
@@ -6153,9 +6157,10 @@ mod tests {
             // No TTY under test, so the spinner degrades to a summary line —
             // which is gated on the same flag a real terminal would set.
             renderer.live_summary = true;
-            renderer.write_tool_preparing(name).unwrap();
+            renderer.write_tool_preparing(name, batch).unwrap();
             String::from_utf8_lossy(&renderer.take_output_frame()).into_owned()
         };
+        let phase_for = |name: &str| phase_for_batch(name, false);
 
         // apply_artifact_patch used to fall through the label match and render
         // nothing even though the backend announced it.
@@ -6172,7 +6177,16 @@ mod tests {
         }
         assert!(phase_for("run_command").contains(t("~ Preparing command", "~ 准备执行")));
         assert!(phase_for("trash_path").contains(t("~ Preparing delete", "~ 准备删除")));
+        assert!(phase_for("todowrite").contains(t("~ Preparing list", "~ 准备清单")));
         assert!(phase_for("read_file").is_empty());
+
+        // 同一条消息里的第 2+ 个调用:每个工具单看都不够慢,但参数接连流完
+        // 的静默窗口和一次大 patch 一样长,所以退到通用提示而不是空白。
+        assert!(phase_for_batch("read_file", true)
+            .contains(t("~ Preparing tools", "~ 准备工具")));
+        // 工具自己的提示更具体,批量时也不该被通用的顶掉。
+        assert!(phase_for_batch("run_command", true)
+            .contains(t("~ Preparing command", "~ 准备执行")));
     }
 
     /// Regression: the hint above is announced mid-turn, when a reasoning
@@ -6199,7 +6213,7 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
         renderer.tool_stats_entry("read_file").calls += 1;
 
-        renderer.write_tool_preparing("run_command").unwrap();
+        renderer.write_tool_preparing("run_command", false).unwrap();
         assert!(renderer
             .waiting_phase_text()
             .starts_with(t("~ Preparing command · ", "~ 准备执行 · ")));

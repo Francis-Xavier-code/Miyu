@@ -6126,6 +6126,10 @@ async fn try_run_remote_chat(
                 &mut renderer,
                 AgentEvent::ToolPreparing {
                     name: ipc_text(&data, "name").to_string(),
+                    batch: data
+                        .get("batch")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 },
             )?,
             "tool.started" => handle_agent_event(
@@ -11886,6 +11890,10 @@ async fn follow_wake_run(
                 &mut renderer,
                 AgentEvent::ToolPreparing {
                     name: ipc_text(&data, "name").to_string(),
+                    batch: data
+                        .get("batch")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 },
             )?,
             "tool.started" => handle_live_agent_event(
@@ -16502,8 +16510,8 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
             renderer.write_tool_call(&name, &arguments)?;
             renderer.tick_spinner()
         }
-        AgentEvent::ToolPreparing { name } => {
-            renderer.write_tool_preparing(&name)?;
+        AgentEvent::ToolPreparing { name, batch } => {
+            renderer.write_tool_preparing(&name, batch)?;
             renderer.tick_spinner()
         }
         AgentEvent::ToolResult {

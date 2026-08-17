@@ -384,6 +384,9 @@ pub enum AgentEvent {
     },
     ToolPreparing {
         name: String,
+        /// 本轮里这不是第一个工具调用。渲染层据此在工具自己没有提示词时
+        /// 退到通用的「准备工具」。
+        batch: bool,
     },
     ToolResult {
         call_id: String,
@@ -563,10 +566,10 @@ impl TurnJournalSink {
                     arguments,
                 })
             }
-            AgentEvent::ToolPreparing { name } => {
+            AgentEvent::ToolPreparing { name, batch } => {
                 self.flush(on_event)?;
                 self.append("tool_preparing", None, Some(&name), Some(&name), None, None)?;
-                on_event(AgentEvent::ToolPreparing { name })
+                on_event(AgentEvent::ToolPreparing { name, batch })
             }
             AgentEvent::ToolResult {
                 call_id,
@@ -3054,6 +3057,9 @@ impl Agent {
                 request_messages.splice(offset..offset, context_messages.clone());
             }
             let mut reasoning_filter = ReasoningTitleFilter::default();
+            // 与 reasoning_filter 同生命周期:一轮模型调用 = 一条 assistant
+            // 消息,批量提示要的正是"这条消息里的第几个工具调用"。
+            let mut tool_calls_seen = 0usize;
             if self.config.cache.write_grace_ms > 0 {
                 if let Some(previous) = last_round_completed_at {
                     let grace = std::time::Duration::from_millis(self.config.cache.write_grace_ms);
@@ -3107,6 +3113,7 @@ impl Agent {
                                 chunk,
                                 received_at,
                                 &mut reasoning_filter,
+                                &mut tool_calls_seen,
                                 on_event,
                             )?;
                         }
@@ -3276,7 +3283,13 @@ impl Agent {
                 continue;
             };
             while let Ok((chunk, received_at)) = chunk_rx.try_recv() {
-                emit_model_chunk_at(chunk, received_at, &mut reasoning_filter, on_event)?;
+                emit_model_chunk_at(
+                    chunk,
+                    received_at,
+                    &mut reasoning_filter,
+                    &mut tool_calls_seen,
+                    on_event,
+                )?;
             }
             let (title, text) = reasoning_filter.finish();
             if let Some(title) = title {
@@ -6133,6 +6146,7 @@ fn emit_filtered_chunk_at<F>(
     chunk: ChatStreamChunk,
     received_at: Instant,
     filter: &mut ReasoningTitleFilter,
+    tool_calls_seen: &mut usize,
     on_event: &mut F,
 ) -> Result<()>
 where
@@ -6165,9 +6179,14 @@ where
             // decoded — the arguments are still streaming behind it. That is
             // exactly the window a long patch or file write spends looking
             // frozen, so the hint goes up here rather than at ToolCall.
-            if crate::tools::preparing_phase(&chunk.text).is_some() {
+            *tool_calls_seen += 1;
+            // 第二个调用起就是批量:每个工具单看都不够慢,但参数是接连流
+            // 完的,合起来的静默窗口和一次大 patch 一样长。
+            let batch = *tool_calls_seen > 1;
+            if batch || crate::tools::preparing_phase(&chunk.text).is_some() {
                 on_event(AgentEvent::ToolPreparing {
                     name: chunk.text.clone(),
+                    batch,
                 })?;
             }
             on_event(AgentEvent::Chunk(chunk))?;
@@ -6193,6 +6212,7 @@ fn emit_model_chunk_at<F>(
     chunk: ChatStreamChunk,
     received_at: Instant,
     filter: &mut ReasoningTitleFilter,
+    tool_calls_seen: &mut usize,
     on_event: &mut F,
 ) -> Result<()>
 where
@@ -6201,9 +6221,10 @@ where
     if chunk.kind == ChatStreamKind::Reasoning {
         on_event(AgentEvent::RawReasoning(chunk.clone()))?;
     }
-    emit_filtered_chunk_at(chunk, received_at, filter, on_event)
+    emit_filtered_chunk_at(chunk, received_at, filter, tool_calls_seen, on_event)
 }
 
+/// 测试助手：不关心批量提示的用例用这个，计数器每次从零开始。
 #[cfg(test)]
 fn emit_filtered_chunk<F>(
     chunk: ChatStreamChunk,
@@ -6213,7 +6234,7 @@ fn emit_filtered_chunk<F>(
 where
     F: FnMut(AgentEvent) -> Result<()>,
 {
-    emit_filtered_chunk_at(chunk, Instant::now(), filter, on_event)
+    emit_filtered_chunk_at(chunk, Instant::now(), filter, &mut 0, on_event)
 }
 
 #[cfg(test)]
@@ -6383,7 +6404,7 @@ mod tests {
         let mut streamed = Vec::new();
         let mut on_event = |event| {
             match event {
-                AgentEvent::ToolPreparing { name } => prepared.push(name),
+                AgentEvent::ToolPreparing { name, .. } => prepared.push(name),
                 AgentEvent::Chunk(chunk) if chunk.kind == ChatStreamKind::ToolCall => {
                     streamed.push(chunk.text)
                 }
@@ -6426,6 +6447,40 @@ mod tests {
             ]
         );
         assert_eq!(streamed, names);
+    }
+
+    /// 上一个用例每次调用都新起一个计数器，测的是「单个工具够不够慢」。
+    /// 这里共用一个计数器，模拟同一条 assistant 消息里连着来的多个调用。
+    #[test]
+    fn tool_call_stream_announces_preparation_for_later_calls_in_a_batch() {
+        let mut filter = ReasoningTitleFilter::default();
+        let mut seen = 0usize;
+        let mut prepared = Vec::new();
+        let mut on_event = |event| {
+            if let AgentEvent::ToolPreparing { name, batch } = event {
+                prepared.push((name, batch));
+            }
+            Ok(())
+        };
+        for name in ["read_file", "read_file", "glob"] {
+            emit_filtered_chunk_at(
+                ChatStreamChunk {
+                    kind: ChatStreamKind::ToolCall,
+                    text: name.to_string(),
+                },
+                Instant::now(),
+                &mut filter,
+                &mut seen,
+                &mut on_event,
+            )
+            .unwrap();
+        }
+        // 第一个调用照旧不提示——单看 read_file 的参数一个 chunk 就到了,
+        // 提示只会闪一下。后面两个才知道这是批量。
+        assert_eq!(
+            prepared,
+            [("read_file".to_string(), true), ("glob".to_string(), true)]
+        );
     }
 
     #[test]
@@ -6826,6 +6881,7 @@ mod tests {
             },
             started_at,
             &mut filter,
+            &mut 0,
             &mut on_event,
         )
         .unwrap();
@@ -6836,6 +6892,7 @@ mod tests {
             },
             ended_at,
             &mut filter,
+            &mut 0,
             &mut on_event,
         )
         .unwrap();

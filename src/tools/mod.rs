@@ -187,8 +187,19 @@ pub fn preparing_phase(name: &str) -> Option<&'static str> {
         // the arguments have all arrived.
         "task" | "deep_research" => t("Preparing task", "准备任务"),
         "ask_question" => t("Preparing question", "准备问题"),
+        // 整张清单都在参数里,条目一多就是几百字节,和批量删是同一个窗口。
+        "todowrite" => t("Preparing list", "准备清单"),
         _ => return None,
     })
+}
+
+/// 同一条消息里第二个及以后的工具调用用的提示。
+///
+/// 单看每个工具都不够"慢"到值得提示，但 N 个调用的参数是接连流完的，
+/// 合起来的静默窗口和一次大 patch 一样长。此时具体是哪个工具已经不重要
+/// 了——重要的是让用户知道后面还有。
+pub fn batch_preparing_phase() -> &'static str {
+    t("Preparing tools", "准备工具")
 }
 
 fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
