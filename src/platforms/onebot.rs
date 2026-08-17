@@ -3636,28 +3636,23 @@ async fn execute_builtin_command(
                 }
             }
         }
-        commands::ParsedPlatformCommand::ResetMemory { confirmed } => {
+        commands::ParsedPlatformCommand::ResetMemory => {
             let descriptor = commands::descriptor(commands::RESET_MEMORY_COMMAND_ID)
                 .expect("the reset-memory command descriptor is registered");
             if !commands::is_allowed(&context.config.platforms, descriptor, context.is_admin) {
                 return None;
             }
-            if !confirmed {
-                commands::reset_memory_confirm_message(&context.config.platforms)
-            } else {
-                // context.config 已按平台人格覆盖作用域化:清的就是这个
-                // 会话所属人格的记忆命名空间;会话历史与技能不动。
-                match crate::memory::MemoryStore::new(&context.config, &state.paths).reset_all(false)
-                {
-                    Ok(()) => t("Long-term memory erased.", "长期记忆已清空。").to_string(),
-                    Err(error) => {
-                        tracing::warn!(target: "miyu::qq", %error, "{}", t("resetting platform memory failed", "平台记忆清空失败"));
-                        t(
-                            "The memory reset could not be completed. Check the daemon logs for details.",
-                            "记忆清空未能完成，请查看 daemon 日志。",
-                        )
-                        .to_string()
-                    }
+            // context.config 已按平台人格覆盖作用域化:清的就是这个会话所属
+            // 人格的记忆命名空间;会话历史与技能不动。
+            match crate::memory::MemoryStore::new(&context.config, &state.paths).reset_all(false) {
+                Ok(()) => t("Long-term memory erased.", "长期记忆已清空。").to_string(),
+                Err(error) => {
+                    tracing::warn!(target: "miyu::qq", %error, "{}", t("resetting platform memory failed", "平台记忆清空失败"));
+                    t(
+                        "The memory reset could not be completed. Check the daemon logs for details.",
+                        "记忆清空未能完成，请查看 daemon 日志。",
+                    )
+                    .to_string()
                 }
             }
         }
