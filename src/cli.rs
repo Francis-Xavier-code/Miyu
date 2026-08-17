@@ -239,6 +239,7 @@ fn trace_tail_redraw(
     shift: i32,
     tail_rows: u16,
     output_cursor: (u16, u16),
+    actual_cursor: (u16, u16),
     output_bottom: Option<u16>,
     leading_scroll: u16,
     terminal_rows: u16,
@@ -264,9 +265,19 @@ fn trace_tail_redraw(
             }
         }
     }
+    let drift = if actual_cursor.1 == u16::MAX {
+        " 实测=查询失败".to_string()
+    } else if actual_cursor == output_cursor {
+        String::new()
+    } else {
+        format!(
+            " ⚠分叉 实测={actual_cursor:?} 差={}",
+            i32::from(actual_cursor.1) - i32::from(output_cursor.1)
+        )
+    };
     let line = format!(
         "tail {tail_start}→{next_tail} shift={shift} rows={tail_rows} \
-         cursor={output_cursor:?} bottom={output_bottom:?} \
+         cursor={output_cursor:?}{drift} bottom={output_bottom:?} \
          leading_scroll={leading_scroll} term_rows={terminal_rows} \
          | {}\n",
         if moves.is_empty() {
@@ -10858,12 +10869,16 @@ impl LiveReplTail {
             .clamp(0, i32::from(terminal_rows.saturating_sub(1))) as u16;
         queue!(transaction, MoveTo(self.input_cursor.0, input_row))?;
         if std::env::var_os("MIYU_TAIL_TRACE").is_some() {
+            // 关键对比:存着的绝对行号 vs 终端此刻实际报的位置。
+            // 「滚上去看历史后才错位」如果是记账失效，这两个数必然分叉。
+            let actual = cursor_position_or((u16::MAX, u16::MAX));
             trace_tail_redraw(
                 self.tail_start,
                 next_tail,
                 shift,
                 self.tail_rows,
                 self.output_cursor,
+                actual,
                 output_bottom,
                 leading_scroll,
                 terminal_rows,
