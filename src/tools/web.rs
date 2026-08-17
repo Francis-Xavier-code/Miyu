@@ -1741,7 +1741,10 @@ fn anysearch_results(data: &Value, max_results: usize) -> Vec<Value> {
 
 /// 去掉片段里成串的 markdown 链接。网页正文抽取常把导航栏/页脚整条带进
 /// snippet(实测某条结果整段是"[网易首页](…) [应用](…) [网易公开课](…)…"),
-/// 那是零信息量的样板。只删连续 2 条以上的链接串,孤立的正文链接保留。
+/// 那是零信息量的样板。
+///
+/// 门槛定在连续 3 条:正文里"参见 [文档](u), [示例](u)"这种两条并排很常见,
+/// 按 2 条删会误伤真内容;导航条实测都是 5 条以上。
 fn strip_nav_link_runs(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     // 先扫出所有 [text](url) 的字符区间。
@@ -1765,7 +1768,7 @@ fn strip_nav_link_runs(text: &str) -> String {
         spans.push((index, end + 1));
         index = end + 1;
     }
-    if spans.len() < 2 {
+    if spans.len() < 3 {
         return text.to_string();
     }
     // 相邻(中间只隔空白或轻标点)的链接归为一串;串长 >= 2 才删。
@@ -1779,7 +1782,7 @@ fn strip_nav_link_runs(text: &str) -> String {
     for i in 1..=spans.len() {
         let joins = i < spans.len() && separator_only(spans[i - 1].1, spans[i].0);
         if !joins {
-            if i - run_start >= 2 {
+            if i - run_start >= 3 {
                 for item in drop.iter_mut().take(i).skip(run_start) {
                     *item = true;
                 }

@@ -1036,42 +1036,24 @@ fn truncate_command(command: &str) -> String {
 }
 
 /// 后台任务查询与停止合并成一件 `job`(08-17):同一个对象的两种操作。
-/// 只读面(聊天/平台)只拿到 action=status 的契约,可写面才多出 stop——
-/// 权限挂在 ToolSpec 上,两个面各自自洽。
+///
+/// 曾经还有一个只注册 status 的只读变体,注释说是给聊天/平台面用的——但从
+/// 来没有任何地方调用它,受限平台注册表压根不含任何后台任务工具。一并删掉,
+/// 别留着一段撒谎的死代码。
 pub fn register_management(registry: &mut ToolRegistry) {
-    registry.register(job_spec(true).writes().with_always_loaded(false));
+    registry.register(job_spec().writes().with_always_loaded(false));
 }
 
-/// status only, for registries that must stay read-only (chat / platform).
-pub fn register_status(registry: &mut ToolRegistry) {
-    registry.register(job_spec(false).with_always_loaded(false));
-}
-
-fn job_spec(allow_stop: bool) -> ToolSpec {
-    let actions = if allow_stop {
-        json!(["status", "stop"])
-    } else {
-        json!(["status"])
-    };
-    let action_hint = if allow_stop {
-        t(
-            "status inspects, stop terminates. Defaults to status.",
-            "status 查询，stop 停止。默认 status。",
-        )
-    } else {
-        t("Only status is available here.", "本会话只支持 status。")
-    };
-    let description = if allow_stop {
-        t(
+fn job_spec() -> ToolSpec {
+    let actions = json!(["status", "stop"]);
+    let action_hint = t(
+        "status inspects, stop terminates. Defaults to status.",
+        "status 查询，stop 停止。默认 status。",
+    );
+    let description = t(
             "Background jobs. action=status with no other argument lists every job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. action=stop terminates jobs (commands get SIGTERM then SIGKILL; subagents are aborted), single or by job_ids. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.",
             "后台任务。action=status 不带其它参数就列出本会话全部任务——每条都带 recent_output（日志尾部片段）和 log_size，想知道「都跑成什么样了」一次调用就够。要某个任务的增量输出，带 job_id 加 offset；要同时看多个，带 job_ids（日志额度在它们之间均分）。想完整翻阅或从头读某份日志，用 read_file 读它的 log_path（支持按行分页）。action=stop 停止任务（命令先 SIGTERM 后 SIGKILL，子代理直接中止），支持 job_ids 批量。跨会话加 all=true。立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。",
-        )
-    } else {
-        t(
-            "Background jobs. action=status with no other argument lists every job of this session with recent_output and log_size; pass job_id plus offset for incremental output, or job_ids for several at once. Returns immediately — you are woken automatically when a job finishes.",
-            "后台任务。action=status 不带其它参数就列出本会话全部任务，每条带 recent_output 和 log_size；要增量输出带 job_id 加 offset，要看多个带 job_ids。立即返回——任务完成会自动唤起你。",
-        )
-    };
+    );
     ToolSpec::new(
         "job",
         description,
@@ -1093,8 +1075,7 @@ fn job_spec(allow_stop: bool) -> ToolSpec {
         move |args| async move {
             match args.get("action").and_then(Value::as_str).unwrap_or("status") {
                 "status" => job_status(args).await,
-                "stop" if allow_stop => job_stop(args).await,
-                "stop" => bail!("stop is not available in this session"),
+                "stop" => job_stop(args).await,
                 other => bail!("unknown action: {other}; expected status or stop"),
             }
         },

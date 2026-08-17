@@ -3746,22 +3746,35 @@ async fn run_models_for_session(
     }
     if io::stdout().is_terminal() && io::stdin().is_terminal() {
         let override_pool = session_model_override_snapshot(paths, session_id)?;
-        let initial = choices
-            .iter()
-            .map(|choice| match override_pool.as_deref() {
-                Some(pool) => pool.iter().any(|model| {
-                    model.provider_id == choice.provider_id && model.model == choice.model
-                }),
-                None => config.is_active_provider_model(&choice.provider_id, &choice.model),
-            })
-            .collect::<Vec<_>>();
-        if let Some(active) = inline_fuzzy_select(
-            &choices
-                .iter()
-                .map(|choice| choice.label())
-                .collect::<Vec<_>>(),
-            initial.clone(),
-        )? {
+        // 第一项是「继承全局模型池」,与 config TUI 的会话/QQ 模型菜单同款:
+        // 会话没有自己的覆盖时它就是当前状态。此前想恢复继承只能记住
+        // `miyu models default` 这个隐藏写法,菜单里根本看不到这条路。
+        let inherit_label = t("Inherit global model pool", "继承全局模型池").to_string();
+        let mut labels = vec![inherit_label];
+        labels.extend(choices.iter().map(|choice| choice.label()));
+        let mut initial = vec![override_pool.is_none()];
+        initial.extend(choices.iter().map(|choice| match override_pool.as_deref() {
+            Some(pool) => pool.iter().any(|model| {
+                model.provider_id == choice.provider_id && model.model == choice.model
+            }),
+            None => config.is_active_provider_model(&choice.provider_id, &choice.model),
+        }));
+        if let Some(active) = inline_fuzzy_select(&labels, initial.clone())? {
+            // 勾了「继承」就是继承:继承与覆盖天然互斥,同时勾选时以继承为准
+            // (标签本身也这么说)。
+            if active.first().copied().unwrap_or(false) && !initial[0] {
+                set_session_models(paths, session_id, Vec::new()).await?;
+                println!(
+                    "{}",
+                    t(
+                        "this session now follows the global active pool",
+                        "当前会话已恢复跟随全局激活模型池"
+                    )
+                );
+                return Ok(());
+            }
+            let active = active.into_iter().skip(1).collect::<Vec<_>>();
+            let initial = initial.into_iter().skip(1).collect::<Vec<_>>();
             if active == initial {
                 println!(
                     "{}",

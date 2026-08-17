@@ -4902,7 +4902,9 @@ fn spill_replacement(output: &str, cap: usize, locator: &str) -> Option<String> 
 /// 就在上下文末尾,前缀只在末尾分叉一次,代价是一个尾巴;放到回放侧改则
 /// 每次回放都可能在历史中段分叉。改写是幂等的——第二次扫过不会再变。
 fn prune_tool_output(output: &str, threshold: usize, head: usize, tail: usize) -> String {
-    if threshold == 0 || output.chars().count() <= threshold {
+    // 预算不自洽(头+尾不比阈值小)时原样返回:否则下面的减法会下溢,而且
+    // "剪枝"结果可能比原文还长。调用方也拦一道,这里是第二道。
+    if threshold == 0 || head + tail >= threshold || output.chars().count() <= threshold {
         return output.to_string();
     }
     let chars: Vec<char> = output.chars().collect();
@@ -4948,8 +4950,10 @@ fn prune_tool_flow(flow: &mut [crate::state::ToolFlowRound], context: &crate::co
 /// 不必靠清库。参数换成 `{}` 不改变故事——那次调用本来就失败了，失败原因
 /// 已经写在同一轮的 tool 结果里。
 fn replayable_tool_arguments(arguments: &str) -> String {
+    // 必须是 JSON **对象**:`5` 或 `"x"` 也是合法 JSON,但工具参数在两家 wire
+    // 格式里都必须是对象,放行只是把同一个 500 换个形状。
     let trimmed = arguments.trim();
-    if !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_ok() {
+    if serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object()) {
         return trimmed.to_string();
     }
     "{}".to_string()
@@ -6884,6 +6888,10 @@ mod tests {
         ] {
             assert_eq!(replayable_tool_arguments(broken), "{}", "{broken:?}");
         }
+        // 合法 JSON 但不是对象的同样挡下:两家 wire 格式都要求对象。
+        for scalar in ["5", r#""text""#, "null", "true", "[1,2]"] {
+            assert_eq!(replayable_tool_arguments(scalar), "{}", "{scalar:?}");
+        }
         // 合法参数原样通过(只去首尾空白)。
         assert_eq!(replayable_tool_arguments(r#"{"a":1}"#), r#"{"a":1}"#);
         assert_eq!(replayable_tool_arguments("  {\"a\":1}  "), r#"{"a":1}"#);
@@ -6901,6 +6909,8 @@ mod tests {
         // 预算内的输出一个字节都不动。
         let small = "short output";
         assert_eq!(prune_tool_output(small, 8192, 4096, 1024), small);
+        // 预算不自洽时原样返回,不下溢。
+        assert_eq!(prune_tool_output(&output, 100, 80, 80), output);
     }
 
     #[test]
