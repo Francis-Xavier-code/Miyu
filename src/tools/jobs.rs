@@ -766,19 +766,7 @@ fn tail_lines_for(job_count: usize) -> usize {
 /// `job_status` and `job_stop` — a plain `dedup()` only drops *adjacent*
 /// repeats, so `["a","b","a"]` used to slip two `a`s through.
 fn requested_job_ids(args: &Value) -> Vec<String> {
-    let mut ids: Vec<String> = args
-        .get("job_ids")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ids: Vec<String> = super::string_list(args.get("job_ids"));
     if let Some(single) = args
         .get("job_id")
         .and_then(Value::as_str)

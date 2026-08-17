@@ -810,19 +810,7 @@ async fn register_script_handler(args: Value, scripts_dir: &Path) -> Result<Stri
         .map(parse_load_policy)
         .transpose()?
         .unwrap_or_default();
-    let groups = args
-        .get("groups")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let groups = super::string_list(args.get("groups"));
     let stored_path = relative_script_path(&script_path, scripts_dir);
 
     let entry = ScriptEntry {

@@ -155,14 +155,11 @@ fn reference_list(value: &Value) -> Result<Vec<String>> {
         Value::Null => false,
         Value::Array(items) => {
             for item in items {
-                match item {
-                    Value::String(text) if !text.trim().is_empty() => {
-                        out.push(text.trim().to_string())
-                    }
-                    Value::String(_) => {}
-                    other => bail!("reference_images entries must be strings, got {other}"),
+                if !matches!(item, Value::String(_)) {
+                    bail!("reference_images entries must be strings, got {item}");
                 }
             }
+            out = super::string_list(Some(value));
             !items.is_empty()
         }
         Value::String(text) => {
@@ -170,13 +167,10 @@ fn reference_list(value: &Value) -> Result<Vec<String>> {
             if text.is_empty() {
                 return Ok(out);
             }
-            // 字符串里装着 JSON 数组时先解开，否则整串当成一条路径。
-            if text.starts_with('[') {
-                let parsed: Value = serde_json::from_str(text)
-                    .with_context(|| format!("reference_images is not valid JSON: {text}"))?;
-                return reference_list(&parsed);
+            if text.starts_with('[') && serde_json::from_str::<Value>(text).is_err() {
+                bail!("reference_images is not valid JSON: {text}");
             }
-            out.push(text.to_string());
+            out = super::string_list(Some(value));
             true
         }
         other => bail!("reference_images must be a string or an array of strings, got {other}"),

@@ -809,14 +809,15 @@ async fn validate_target(
 
 fn resolve_targets(args: &Value, context: &PlatformTurnContext) -> Result<Vec<String>> {
     let mut values = Vec::new();
-    if let Some(list) = args.get("user_ids").and_then(Value::as_array) {
-        values.extend(
-            list.iter()
-                .filter_map(Value::as_str)
-                .flat_map(split_ids)
-                .collect::<Vec<_>>(),
-        );
-    }
+    // 经 string_list 收，容忍模型把数组写成「数组的 JSON 字符串」。踢人是
+    // 有后果的操作，静默取不到目标比报错更糟。
+    values.extend(
+        crate::tools::string_list(args.get("user_ids"))
+            .iter()
+            .map(String::as_str)
+            .flat_map(split_ids)
+            .collect::<Vec<_>>(),
+    );
     if let Some(explicit) = args
         .get("user_id")
         .and_then(Value::as_str)

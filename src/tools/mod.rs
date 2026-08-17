@@ -63,6 +63,43 @@ pub(crate) use scripts::rescan_scripts;
 pub(crate) use skills::{apply_skill_refresh, prepare_skill_refresh};
 pub use skills::{register_authoring as register_skill_authoring, register_skills};
 
+/// 把「一串字符串」参数收成 Vec，容忍模型真会传的几种形状。
+///
+/// stub 加载模式下模型看到的只有一句摘要和宽松参数壳，没取契约就调用时很容
+/// 易把数组写成「数组的 JSON 字符串」——实测 mimo-v2.5 在 `reference_images`
+/// 上传的就是 `"[\"/path.png\"]"`。只认真数组会让这类调用**静默**失效：参数
+/// 明明传了，行为却像没传，排查时要靠返回体里的计数才能发现。
+///
+/// 收下：真数组、单个字符串、字符串里装的 JSON 数组。空白项一律丢弃。
+pub(crate) fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    use serde_json::Value;
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            if text.starts_with('[') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    return string_list(Some(&parsed));
+                }
+            }
+            vec![text.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub fn register_ask_question(registry: &mut ToolRegistry) {
     ask_question::register(registry);
 }
@@ -551,6 +588,29 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 数组参数要容忍模型真会传的形状。线上实测:mimo-v2.5 把
+    /// `reference_images` 传成了 `"[\"/path.png\"]"`——一个被 JSON 编码成
+    /// 字符串的数组。只认真数组会让 job_ids / user_ids / tags / groups 这类
+    /// 参数一起静默失效,踢人工具取不到目标尤其危险。
+    #[test]
+    fn string_list_accepts_the_shapes_models_actually_send() {
+        use serde_json::json;
+        let one = vec!["a".to_string()];
+        assert_eq!(string_list(Some(&json!(["a"]))), one);
+        assert_eq!(string_list(Some(&json!("a"))), one);
+        assert_eq!(string_list(Some(&json!(r#"["a"]"#))), one);
+        assert_eq!(
+            string_list(Some(&json!(["a", " b ", "", "  "]))),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(string_list(None).is_empty());
+        assert!(string_list(Some(&json!([]))).is_empty());
+        assert!(string_list(Some(&json!(""))).is_empty());
+        assert!(string_list(Some(&json!(null))).is_empty());
+        // 解不开的字符串按单条路径收下,不当成数组硬猜。
+        assert_eq!(string_list(Some(&json!("[not json"))), vec!["[not json".to_string()]);
+    }
 
     /// 回归:dev 模式要有看图(vision_analyze),且随 vision 插件开关走。
     #[test]

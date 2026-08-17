@@ -1108,18 +1108,7 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    super::string_list(value)
 }
 
 fn score_meme(item: &MemeItem, query: &str, tags: &[String]) -> f32 {
