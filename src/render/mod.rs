@@ -950,6 +950,13 @@ pub struct StreamRenderer {
     /// so a phase merely pushed into the spinner is overwritten before it can
     /// be drawn.
     tool_preparing: Option<(&'static str, std::time::Instant)>,
+    /// 整个准备窗口的起点，跨 write_tool_call 存活。
+    ///
+    /// `tool_preparing` 每次工具调用完成就被清掉，计时锚点跟着它走的话，
+    /// 批量调用里第二个工具一到就归零——屏幕上的秒数来回横跳，反映不出
+    /// 已经等了多久。窗口真正结束（新一轮思考／外部输出／工具跑完／回合
+    /// 结束）才清这个。
+    tool_preparing_since: Option<std::time::Instant>,
     subagent_mode: Option<ChatStreamKind>,
     sent_meme_filter: SentMemeStreamFilter,
     /// 模型正文/思维链的流式转义过滤状态:与命令输出同一套状态机,
@@ -992,6 +999,7 @@ impl StreamRenderer {
             last_tick: None,
             preparing_question_started_at: None,
             tool_preparing: None,
+            tool_preparing_since: None,
             subagent_mode: None,
             sent_meme_filter: SentMemeStreamFilter::default(),
             stream_control: TerminalControlState::default(),
@@ -1032,6 +1040,7 @@ impl StreamRenderer {
     pub fn start_reasoning_phase(&mut self, received_at: std::time::Instant) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         if self.reasoning_mode == ReasoningDisplayMode::Summary {
             self.reasoning_started_at = Some(received_at);
             self.reasoning_elapsed = None;
@@ -1315,7 +1324,10 @@ impl StreamRenderer {
         // immediately, and that tick re-derives the phase from renderer state.
         // Without the sticky field the tool summary or the reasoning timer wins
         // there and the hint never reaches the screen.
-        self.tool_preparing = Some((phase, std::time::Instant::now()));
+        let since = *self
+            .tool_preparing_since
+            .get_or_insert_with(std::time::Instant::now);
+        self.tool_preparing = Some((phase, since));
         // Braille + the dim tool palette: this is a tool starting up, not the
         // model thinking, and the scanner/green pair reads as the latter.
         self.ensure_waiting_phase(self.waiting_phase_text(), SpinnerStyle::Braille)
@@ -1329,6 +1341,7 @@ impl StreamRenderer {
             return Ok(());
         }
         self.stop_waiting()?;
+        self.tool_preparing_since = None;
         self.end_subagent_stream_line()?;
         let status = if ok { "ok" } else { "err" };
         let elapsed = self.finish_subagent_timer(name);
@@ -1600,6 +1613,7 @@ impl StreamRenderer {
     pub fn prepare_for_external_output(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         self.release_transient_output()?;
         self.finalize_tools_summary()?;
         self.show_cursor()?;
@@ -1640,6 +1654,7 @@ impl StreamRenderer {
     pub fn finish(&mut self) -> Result<()> {
         self.preparing_question_started_at = None;
         self.tool_preparing = None;
+        self.tool_preparing_since = None;
         self.stop_waiting()?;
         if let Some(mut display) = self.command_display.take() {
             display.commit(
@@ -6187,6 +6202,45 @@ mod tests {
         // 工具自己的提示更具体,批量时也不该被通用的顶掉。
         assert!(phase_for_batch("run_command", true)
             .contains(t("~ Preparing command", "~ 准备执行")));
+    }
+
+    /// 批量里的计时是整个准备窗口的，不是每个工具各算各的。
+    ///
+    /// `write_tool_call` 会清掉 `tool_preparing`，锚点若跟着它走，第二个
+    /// 工具一到秒数就归零，屏幕上来回横跳。
+    #[test]
+    fn batch_preparation_timer_spans_the_whole_window() {
+        let mut renderer = StreamRenderer::new(
+            ReasoningDisplayMode::Summary,
+            ToolCallDisplayMode::Summary,
+            false,
+            true,
+            10,
+        );
+        renderer.use_external_cursor_control();
+        renderer.use_buffered_output();
+        renderer.live_summary = true;
+
+        renderer.write_tool_preparing("apply_patch", false).unwrap();
+        let first = renderer.tool_preparing.expect("准备状态已建立").1;
+        // 参数流完 → 这个工具的准备结束，但整批还没完。
+        renderer.write_tool_call("apply_patch", "{}").unwrap();
+        assert!(renderer.tool_preparing.is_none());
+        renderer.write_tool_preparing("write_file", false).unwrap();
+        assert_eq!(
+            renderer.tool_preparing.expect("第二个工具的准备状态").1,
+            first,
+            "同一批里的计时起点必须复用"
+        );
+
+        // 工具真跑起来了 = 窗口结束，下一批重新计时。
+        renderer.write_tool_result("write_file", true, "ok").unwrap();
+        renderer.write_tool_preparing("apply_patch", false).unwrap();
+        assert_ne!(
+            renderer.tool_preparing.expect("新一批的准备状态").1,
+            first,
+            "工具跑完之后应该重新起算"
+        );
     }
 
     /// Regression: the hint above is announced mid-turn, when a reasoning
