@@ -2313,8 +2313,13 @@ impl Agent {
         // registration made the tools array appear/disappear between turns,
         // invalidating the provider prefix cache from token 0; an empty scope
         // simply rejects analysis requests with a clear message instead.
+        //
+        // 生图的参考图与看图共用同一份作用域,所以这一段不能只由 vision 插件
+        // 开关把门:vision 关、生图开时,平台回合的 generate_image 会留着不受
+        // 限的解析器,不可信用户一句话就能让它把宿主上任意文件当参考图上传。
         if self.tools_enabled
-            && self.config.plugins.vision.enabled
+            && (self.config.plugins.vision.enabled
+                || self.config.plugins.image_generation.enabled)
             && self.image_platform.is_some()
         {
             let mut tools = self.tools.lock().unwrap();

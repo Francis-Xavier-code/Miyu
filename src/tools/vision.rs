@@ -158,6 +158,10 @@ fn register_scoped(
             },
         );
     }
+    if !config.plugins.vision.enabled {
+        // 只为生图的参考图建作用域:看图插件关着就不注册 vision_analyze。
+        return;
+    }
     registry.register(ToolSpec::new(
         "vision_analyze",
         "分析图片。image 可以是本轮提示中的图片路径或 context_image_N；历史上下文图片会按需获取。",
@@ -841,6 +845,37 @@ mod tests {
             scripts_dir: root.join("scripts"),
             system_scripts_dir: root.join("system-scripts"),
         }
+    }
+
+    /// 平台回合的作用域不能只由看图插件把门:生图的参考图共用同一份作用域,
+    /// vision 关、生图开时若不建作用域,generate_image 会留着不受限的解析器。
+    #[test]
+    fn scoped_registration_binds_image_generation_even_without_vision() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::MiyuPaths {
+            root_dir: temp.path().to_path_buf(),
+            config_dir: temp.path().join("config"),
+            config_file: temp.path().join("config/config.jsonc"),
+            skills_dir: temp.path().join("config/skills"),
+            data_dir: temp.path().join("data"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            pictures_dir: temp.path().join("pictures"),
+            fish_hook_file: temp.path().join("fish"),
+            bash_hook_file: temp.path().join("bash"),
+            zsh_hook_file: temp.path().join("zsh"),
+            scripts_dir: temp.path().join("config/scripts"),
+            system_scripts_dir: temp.path().join("system-scripts"),
+        };
+        let mut config = AppConfig::default();
+        config.plugins.vision.enabled = false;
+        config.plugins.image_generation.enabled = true;
+
+        let mut registry = ToolRegistry::new();
+        register_scoped_local(&mut registry, config, paths, Vec::new());
+        // 看图插件关着 ⇒ 不注册 vision_analyze,但生图必须换成带作用域的版本。
+        assert!(!registry.contains("vision_analyze"));
+        assert!(registry.contains("generate_image"));
     }
 
     /// 当前文本模型自己能看图时就用它,不再绕道另配的多模态池。
