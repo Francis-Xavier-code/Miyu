@@ -863,29 +863,32 @@ fn coerce_declared_shapes(parameters: &Value, args: &mut Value) {
         let Some(declared) = schema.get("type").and_then(Value::as_str) else {
             continue;
         };
-        if !matches!(declared, "array" | "object") {
-            continue;
-        }
         let Some(Value::String(text)) = object.get(name) else {
             continue;
         };
         let text = text.trim();
-        let looks_right = match declared {
-            "array" => text.starts_with('['),
-            _ => text.starts_with('{'),
+        let restored = match declared {
+            "array" if text.starts_with('[') => {
+                serde_json::from_str::<Value>(text).ok().filter(Value::is_array)
+            }
+            "object" if text.starts_with('{') => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object),
+            // 数字/布尔被写成字符串同样常见:实测
+            // `"start_line": "1"` 让 edit_knowledge_base_file 一直报
+            // "start_line is required"。
+            "integer" => text.parse::<i64>().ok().map(Value::from),
+            "number" => text.parse::<f64>().ok().map(Value::from),
+            // 大小写都收:实测模型发过 Python 风格的 "False"。
+            "boolean" => match text.to_ascii_lowercase().as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            _ => None,
         };
-        if !looks_right {
-            continue;
-        }
-        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-            continue;
-        };
-        let matches_declared = match declared {
-            "array" => parsed.is_array(),
-            _ => parsed.is_object(),
-        };
-        if matches_declared {
-            object.insert(name.clone(), parsed);
+        if let Some(restored) = restored {
+            object.insert(name.clone(), restored);
         }
     }
 }
@@ -1220,6 +1223,40 @@ mod tests {
         coerce_declared_shapes(&parameters, &mut args);
         assert_eq!(args["todos"], json!([{"content":"a","status":"pending"}]));
         assert_eq!(args["config"], json!({"a":1}));
+
+        // 数字/布尔被写成字符串:实测 `"start_line": "1"` 让
+        // edit_knowledge_base_file 一直报 "start_line is required"。
+        let scalars = json!({
+            "type": "object",
+            "properties": {
+                "start_line": { "type": "integer" },
+                "ratio": { "type": "number" },
+                "background": { "type": "boolean" },
+                "command": { "type": "string" }
+            }
+        });
+        let mut args = json!({
+            "start_line": "1",
+            "ratio": "0.5",
+            "background": "true",
+            "command": "42"
+        });
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args["start_line"], json!(1));
+        assert_eq!(args["ratio"], json!(0.5));
+        assert_eq!(args["background"], json!(true));
+        // 声明成 string 的参数一个字节都不碰,哪怕它看起来像数字。
+        assert_eq!(args["command"], json!("42"));
+
+        // 解析不出来就别硬转。
+        let mut args = json!({ "background": "False" });
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args["background"], json!(false));
+
+        let mut args = json!({ "start_line": "第一行", "background": "yes" });
+        let before = args.clone();
+        coerce_declared_shapes(&scalars, &mut args);
+        assert_eq!(args, before);
 
         // 声明成 string 的参数一个字节都不碰:命令里恰好是一段 JSON 的
         // 情况必须原样透传。
