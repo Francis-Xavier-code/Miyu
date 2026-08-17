@@ -3373,11 +3373,15 @@ async fn handle_message_with_activity(
 
     // Built-in control commands bypass chat rate limits and preempt the
     // target session's active and queued work after authorization.
+    //
+    // 走完整的 send():命令输出和模型回复一样要过回复处理插件——/models
+    // 这种长清单在 QQ 里刷屏,该转图就得转图。限流与目标预留都不受影响:
+    // 前者在此之前就判完了,后者只对 FinalReply/Tool 生效。
     if let Some(command) = builtin_command {
         if let Some(response) =
             execute_builtin_command(&state, &context, target, &event, command).await
         {
-            if let Err(error) = context.send_bypass_plugins(response).await {
+            if let Err(error) = context.send(response).await {
                 tracing::warn!(target: "miyu::qq", error = %error, "{}", t("OneBot built-in command response failed", "OneBot 内置命令响应失败"));
             } else {
                 tracing::info!(target: "miyu::qq", self_id, sender_id = user_id, "{}", t("OneBot built-in command response sent", "OneBot 内置命令响应已发送"));
@@ -3441,8 +3445,9 @@ async fn handle_message_with_activity(
     }
 
     // Platform commands are independent of the LLM group wake trigger.
+    // 与内置命令同理,插件命令的输出也要过回复处理插件。
     if let Some(response) = plugin_command_response {
-        if let Err(error) = context.send_bypass_plugins(response).await {
+        if let Err(error) = context.send(response).await {
             tracing::warn!(target: "miyu::qq", error = %error, "{}", t("OneBot plugin command response failed", "OneBot 插件命令响应失败"));
         } else {
             tracing::info!(target: "miyu::qq", self_id, sender_id = user_id, "{}", t("OneBot plugin command response sent", "OneBot 插件命令响应已发送"));

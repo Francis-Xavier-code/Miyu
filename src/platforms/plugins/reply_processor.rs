@@ -1144,6 +1144,26 @@ mod tests {
         );
     }
 
+    /// 命令输出和模型回复走同一套处理。`/models` 这种长清单在群里刷屏，
+    /// 该转就得转——它此前压根到不了这里，onebot 侧用的是
+    /// `send_bypass_plugins`。
+    #[tokio::test]
+    async fn command_output_is_processed_like_a_model_reply() {
+        let (_temp, mut context) = test_context(true);
+        set_plugin_setting(&mut context, "mode", json!("forward"));
+        let plugin = ReplyProcessorPlugin::new().unwrap();
+
+        let long_listing =
+            OutboundMessage::markdown(OutboundOrigin::Command, "x".repeat(301));
+        let converted = plugin.before_send(&context, long_listing).await.unwrap();
+        assert!(matches!(converted.primary.body, OutboundBody::Forward(_)));
+
+        // 阈值以下照旧原样发,和 FinalReply 一致。
+        let short = OutboundMessage::markdown(OutboundOrigin::Command, "x".repeat(300));
+        let unchanged = plugin.before_send(&context, short).await.unwrap();
+        assert!(matches!(unchanged.primary.body, OutboundBody::Segments(_)));
+    }
+
     #[tokio::test]
     async fn forward_mode_preserves_the_selected_response_target_without_guessing_sender() {
         let (_temp, mut context) = test_context(true);
