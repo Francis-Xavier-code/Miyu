@@ -182,12 +182,18 @@ fn resize_for_transfer(
     cell_width: u16,
     cell_height: u16,
 ) -> DynamicImage {
+    // 只缩不放。放大不会凭空长出细节，纯粹是拿显存和串口带宽换零收益：一张
+    // 128×128 的表情包按网格放大到 624×624 就是 23.8 倍像素（显式 `300x200`
+    // 时 172 倍）。而 `write_image` 发的 `c=`/`r=` 已经告诉 kitty 要铺满多少
+    // 格，尺寸对不上时它本来就会自己缩放——放大交给终端的 GPU 做，是免费的。
     let width = u32::from(cols)
         .saturating_mul(u32::from(cell_width))
-        .clamp(1, MAX_TRANSFER_DIMENSION);
+        .clamp(1, MAX_TRANSFER_DIMENSION)
+        .min(image.width().max(1));
     let height = u32::from(rows)
         .saturating_mul(u32::from(cell_height))
-        .clamp(1, MAX_TRANSFER_DIMENSION);
+        .clamp(1, MAX_TRANSFER_DIMENSION)
+        .min(image.height().max(1));
     image.thumbnail(width, height)
 }
 
@@ -382,5 +388,103 @@ mod tests {
 
         assert!(output.contains("c=1,r=1,m=1;"));
         assert!(output.contains("\x1b\\\x1b_Gq=2,m=0;"));
+    }
+}
+
+#[cfg(test)]
+mod transfer_size_probe {
+    use super::*;
+
+    /// 改前的算法：网格多大就传多大，比原图大也照放。
+    fn upscaling_resize(
+        image: DynamicImage,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> DynamicImage {
+        let width = u32::from(cols)
+            .saturating_mul(u32::from(cell_width))
+            .clamp(1, MAX_TRANSFER_DIMENSION);
+        let height = u32::from(rows)
+            .saturating_mul(u32::from(cell_height))
+            .clamp(1, MAX_TRANSFER_DIMENSION);
+        image.thumbnail(width, height)
+    }
+
+    /// 量尺：`cargo test --lib transfer_size_probe::transfer_canvas_size -- --ignored --nocapture`
+    ///
+    /// 方案 G3 说「300×200 cells 会 clamp 到 2048×2048 RGBA，约 16 MiB」。量下来
+    /// 那个 clamp 基本不咬人——照片本来就在缩小。真花钱的是**小图被放大**。
+    ///
+    /// 「写进终端」是最终吐给 tty 的转义序列字节数（RGBA 走 base64，约 ×1.35）。
+    #[test]
+    #[ignore]
+    fn transfer_canvas_size() {
+        // 8×16 是常见 cell 尺寸；终端问不出来时代码也回退到它
+        let (cell_w, cell_h) = (8u16, 16u16);
+        println!(
+            "\n  {:<24}{:<12}{:>19}{:>19}{:>10}",
+            "场景", "原图", "改前 画布/写入", "改后 画布/写入", "省"
+        );
+        for (label, image_w, image_h, term_cols, term_rows, requested) in [
+            ("表情包 终端 120×40", 128u32, 128u32, 120u16, 40u16, None),
+            ("照片 终端 120×40", 1920, 1080, 120, 40, None),
+            ("照片 终端 240×60", 1920, 1080, 240, 60, None),
+            ("照片 显式 300×200", 1920, 1080, 120, 40, Some("300x200")),
+            ("小图 显式 300×200", 128, 128, 120, 40, Some("300x200")),
+            ("公式条 终端 120×40", 900, 96, 120, 40, None),
+        ] {
+            let image = DynamicImage::new_rgba8(image_w, image_h);
+            let (max_cols, max_rows) = parse_size(requested, term_cols, term_rows).unwrap();
+            let (cols, rows) = fit_cells(image_w, image_h, max_cols, max_rows, cell_w, cell_h);
+
+            let mut written = Vec::new();
+            for (index, sent) in [
+                upscaling_resize(image.clone(), cols, rows, cell_w, cell_h),
+                resize_for_transfer(image.clone(), cols, rows, cell_w, cell_h),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut buffer = Vec::new();
+                write_image(&mut buffer, &sent, 1, cols, rows).unwrap();
+                written.push((
+                    format!("{}x{}", sent.width(), sent.height()),
+                    buffer.len(),
+                    index,
+                ));
+            }
+            let (before_size, before_bytes, _) = &written[0];
+            let (after_size, after_bytes, _) = &written[1];
+            println!(
+                "  {label:<24}{:<12}{:>19}{:>19}{:>9.0}%",
+                format!("{image_w}x{image_h}"),
+                format!("{before_size} {:.2}MiB", *before_bytes as f64 / 1048576.0),
+                format!("{after_size} {:.2}MiB", *after_bytes as f64 / 1048576.0),
+                (1.0 - *after_bytes as f64 / *before_bytes as f64) * 100.0,
+            );
+        }
+    }
+
+    /// 传输画布永远不该超过原图——放大是纯浪费，交给终端做。
+    #[test]
+    fn transfer_never_upscales() {
+        for (width, height) in [(1u32, 1u32), (16, 16), (128, 128), (900, 96), (4000, 3000)] {
+            let sent = resize_for_transfer(DynamicImage::new_rgba8(width, height), 300, 200, 8, 16);
+            assert!(
+                sent.width() <= width && sent.height() <= height,
+                "{width}x{height} 被放大成了 {}x{}",
+                sent.width(),
+                sent.height()
+            );
+        }
+    }
+
+    /// 但该缩的还得缩：大图仍要压进网格，否则显存白花。
+    #[test]
+    fn transfer_still_downscales_large_images() {
+        let sent = resize_for_transfer(DynamicImage::new_rgba8(4000, 3000), 120, 39, 8, 16);
+        assert!(sent.width() <= 960 && sent.height() <= 624);
     }
 }
