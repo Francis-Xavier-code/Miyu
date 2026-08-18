@@ -1,0 +1,508 @@
+{
+  "files": {
+    "src/agent/compact.rs": {
+      "tests": 97,
+      "total": 940
+    },
+    "src/agent/conversation.rs": {
+      "tests": 0,
+      "total": 12
+    },
+    "src/agent/mod.rs": {
+      "tests": 3501,
+      "total": 9799
+    },
+    "src/agent/overflow.rs": {
+      "tests": 0,
+      "total": 102
+    },
+    "src/alarm.rs": {
+      "tests": 77,
+      "total": 279
+    },
+    "src/cli.rs": {
+      "tests": 2362,
+      "total": 16897
+    },
+    "src/cli/keyboard_enhancement.rs": {
+      "tests": 22,
+      "total": 106
+    },
+    "src/clipboard.rs": {
+      "tests": 0,
+      "total": 384
+    },
+    "src/config.rs": {
+      "tests": 2480,
+      "total": 8723
+    },
+    "src/config_tui.rs": {
+      "tests": 482,
+      "total": 9444
+    },
+    "src/daemon.rs": {
+      "tests": 0,
+      "total": 11
+    },
+    "src/default_kb.rs": {
+      "tests": 59,
+      "total": 619
+    },
+    "src/default_models.rs": {
+      "tests": 0,
+      "total": 6
+    },
+    "src/host_info.rs": {
+      "tests": 65,
+      "total": 230
+    },
+    "src/i18n.rs": {
+      "tests": 71,
+      "total": 201
+    },
+    "src/ipc.rs": {
+      "tests": 439,
+      "total": 1621
+    },
+    "src/json_extract.rs": {
+      "tests": 45,
+      "total": 90
+    },
+    "src/llm/cache_log.rs": {
+      "tests": 79,
+      "total": 269
+    },
+    "src/llm/mod.rs": {
+      "tests": 87,
+      "total": 536
+    },
+    "src/llm/openai_compatible.rs": {
+      "tests": 772,
+      "total": 8655
+    },
+    "src/llm/provider_capabilities.rs": {
+      "tests": 15,
+      "total": 89
+    },
+    "src/llm/request_log.rs": {
+      "tests": 0,
+      "total": 97
+    },
+    "src/logging.rs": {
+      "tests": 43,
+      "total": 163
+    },
+    "src/main.rs": {
+      "tests": 0,
+      "total": 57
+    },
+    "src/memory/mod.rs": {
+      "tests": 1013,
+      "total": 4213
+    },
+    "src/memory/organizer.rs": {
+      "tests": 180,
+      "total": 496
+    },
+    "src/models_cache.rs": {
+      "tests": 75,
+      "total": 1340
+    },
+    "src/notify.rs": {
+      "tests": 24,
+      "total": 96
+    },
+    "src/paths.rs": {
+      "tests": 812,
+      "total": 2400
+    },
+    "src/persona_hint.rs": {
+      "tests": 176,
+      "total": 522
+    },
+    "src/platforms/access_control.rs": {
+      "tests": 0,
+      "total": 118
+    },
+    "src/platforms/assets.rs": {
+      "tests": 11,
+      "total": 180
+    },
+    "src/platforms/avatar.rs": {
+      "tests": 50,
+      "total": 180
+    },
+    "src/platforms/commands.rs": {
+      "tests": 143,
+      "total": 337
+    },
+    "src/platforms/file_reader.rs": {
+      "tests": 48,
+      "total": 262
+    },
+    "src/platforms/mod.rs": {
+      "tests": 1604,
+      "total": 4107
+    },
+    "src/platforms/onebot.rs": {
+      "tests": 3910,
+      "total": 10476
+    },
+    "src/platforms/plugins/access_manager.rs": {
+      "tests": 297,
+      "total": 770
+    },
+    "src/platforms/plugins/group_management.rs": {
+      "tests": 182,
+      "total": 1659
+    },
+    "src/platforms/plugins/meme_collector.rs": {
+      "tests": 20,
+      "total": 489
+    },
+    "src/platforms/plugins/message_history/mod.rs": {
+      "tests": 123,
+      "total": 566
+    },
+    "src/platforms/plugins/message_history/store.rs": {
+      "tests": 971,
+      "total": 2984
+    },
+    "src/platforms/plugins/message_history/tools.rs": {
+      "tests": 310,
+      "total": 1537
+    },
+    "src/platforms/plugins/message_recall.rs": {
+      "tests": 66,
+      "total": 623
+    },
+    "src/platforms/plugins/mod.rs": {
+      "tests": 100,
+      "total": 871
+    },
+    "src/platforms/plugins/real_context/active_judgement_skip.rs": {
+      "tests": 329,
+      "total": 673
+    },
+    "src/platforms/plugins/real_context/affection.rs": {
+      "tests": 127,
+      "total": 1561
+    },
+    "src/platforms/plugins/real_context/judge.rs": {
+      "tests": 186,
+      "total": 787
+    },
+    "src/platforms/plugins/real_context/mod.rs": {
+      "tests": 1042,
+      "total": 3924
+    },
+    "src/platforms/plugins/renderer.rs": {
+      "tests": 699,
+      "total": 3410
+    },
+    "src/platforms/plugins/reply_processor.rs": {
+      "tests": 543,
+      "total": 1355
+    },
+    "src/platforms/tool.rs": {
+      "tests": 0,
+      "total": 323
+    },
+    "src/platforms/types.rs": {
+      "tests": 0,
+      "total": 509
+    },
+    "src/prompts.rs": {
+      "tests": 0,
+      "total": 35
+    },
+    "src/question.rs": {
+      "tests": 75,
+      "total": 348
+    },
+    "src/question_tui.rs": {
+      "tests": 276,
+      "total": 1375
+    },
+    "src/render/math.rs": {
+      "tests": 195,
+      "total": 1184
+    },
+    "src/render/mod.rs": {
+      "tests": 2202,
+      "total": 6483
+    },
+    "src/render/wait_spinner.rs": {
+      "tests": 218,
+      "total": 580
+    },
+    "src/shell/bash.rs": {
+      "tests": 70,
+      "total": 162
+    },
+    "src/shell/fish.rs": {
+      "tests": 126,
+      "total": 435
+    },
+    "src/shell/mod.rs": {
+      "tests": 79,
+      "total": 549
+    },
+    "src/shell/zsh.rs": {
+      "tests": 70,
+      "total": 162
+    },
+    "src/skills.rs": {
+      "tests": 418,
+      "total": 2001
+    },
+    "src/state/conversation_db.rs": {
+      "tests": 16,
+      "total": 5924
+    },
+    "src/state/migrations.rs": {
+      "tests": 337,
+      "total": 1255
+    },
+    "src/state/mod.rs": {
+      "tests": 3037,
+      "total": 5102
+    },
+    "src/state/usage.rs": {
+      "tests": 219,
+      "total": 725
+    },
+    "src/token_counter.rs": {
+      "tests": 0,
+      "total": 255
+    },
+    "src/token_estimate.rs": {
+      "tests": 163,
+      "total": 213
+    },
+    "src/tools/alarm.rs": {
+      "tests": 0,
+      "total": 194
+    },
+    "src/tools/api_quota.rs": {
+      "tests": 41,
+      "total": 454
+    },
+    "src/tools/apply_patch.rs": {
+      "tests": 211,
+      "total": 998
+    },
+    "src/tools/archlinux.rs": {
+      "tests": 58,
+      "total": 863
+    },
+    "src/tools/artifact.rs": {
+      "tests": 96,
+      "total": 410
+    },
+    "src/tools/ask_question.rs": {
+      "tests": 0,
+      "total": 13
+    },
+    "src/tools/calculator.rs": {
+      "tests": 0,
+      "total": 216
+    },
+    "src/tools/caniplayonlinux_query.rs": {
+      "tests": 75,
+      "total": 841
+    },
+    "src/tools/clipboard.rs": {
+      "tests": 0,
+      "total": 198
+    },
+    "src/tools/deep_research.rs": {
+      "tests": 28,
+      "total": 1009
+    },
+    "src/tools/deepseek_status.rs": {
+      "tests": 13,
+      "total": 363
+    },
+    "src/tools/default_tools.rs": {
+      "tests": 260,
+      "total": 1231
+    },
+    "src/tools/diagnostics.rs": {
+      "tests": 35,
+      "total": 2060
+    },
+    "src/tools/edit_replace.rs": {
+      "tests": 112,
+      "total": 250
+    },
+    "src/tools/exchange_rate.rs": {
+      "tests": 0,
+      "total": 97
+    },
+    "src/tools/fcitx_wiki.rs": {
+      "tests": 104,
+      "total": 565
+    },
+    "src/tools/hash_codec.rs": {
+      "tests": 45,
+      "total": 204
+    },
+    "src/tools/html_conversion.rs": {
+      "tests": 103,
+      "total": 380
+    },
+    "src/tools/http_response.rs": {
+      "tests": 0,
+      "total": 73
+    },
+    "src/tools/image_generation.rs": {
+      "tests": 107,
+      "total": 567
+    },
+    "src/tools/jobs.rs": {
+      "tests": 371,
+      "total": 1445
+    },
+    "src/tools/kitty_image.rs": {
+      "tests": 82,
+      "total": 387
+    },
+    "src/tools/knowledge_base.rs": {
+      "tests": 82,
+      "total": 1666
+    },
+    "src/tools/load_tools.rs": {
+      "tests": 276,
+      "total": 437
+    },
+    "src/tools/man.rs": {
+      "tests": 0,
+      "total": 164
+    },
+    "src/tools/mcp.rs": {
+      "tests": 64,
+      "total": 443
+    },
+    "src/tools/memes.rs": {
+      "tests": 438,
+      "total": 1985
+    },
+    "src/tools/memory.rs": {
+      "tests": 73,
+      "total": 446
+    },
+    "src/tools/mod.rs": {
+      "tests": 311,
+      "total": 911
+    },
+    "src/tools/moegirl.rs": {
+      "tests": 26,
+      "total": 194
+    },
+    "src/tools/package_advisor.rs": {
+      "tests": 68,
+      "total": 576
+    },
+    "src/tools/patch_preview.rs": {
+      "tests": 32,
+      "total": 282
+    },
+    "src/tools/protondb_query.rs": {
+      "tests": 112,
+      "total": 550
+    },
+    "src/tools/registry.rs": {
+      "tests": 407,
+      "total": 1410
+    },
+    "src/tools/repeat_reminder.rs": {
+      "tests": 68,
+      "total": 192
+    },
+    "src/tools/scripts.rs": {
+      "tests": 604,
+      "total": 1602
+    },
+    "src/tools/skills.rs": {
+      "tests": 138,
+      "total": 487
+    },
+    "src/tools/subagent_runner.rs": {
+      "tests": 35,
+      "total": 577
+    },
+    "src/tools/task.rs": {
+      "tests": 0,
+      "total": 535
+    },
+    "src/tools/todowrite.rs": {
+      "tests": 121,
+      "total": 499
+    },
+    "src/tools/tool_descriptions.rs": {
+      "tests": 4,
+      "total": 147
+    },
+    "src/tools/usage_query.rs": {
+      "tests": 34,
+      "total": 177
+    },
+    "src/tools/vision.rs": {
+      "tests": 214,
+      "total": 1020
+    },
+    "src/tools/weather.rs": {
+      "tests": 161,
+      "total": 1434
+    },
+    "src/tools/web.rs": {
+      "tests": 75,
+      "total": 2029
+    },
+    "src/tools/web_images.rs": {
+      "tests": 401,
+      "total": 2719
+    },
+    "src/tools/workspace.rs": {
+      "tests": 33,
+      "total": 161
+    },
+    "src/tools/write.rs": {
+      "tests": 59,
+      "total": 153
+    },
+    "src/tools/xuanxue.rs": {
+      "tests": 0,
+      "total": 248
+    },
+    "src/transfer/export.rs": {
+      "tests": 0,
+      "total": 396
+    },
+    "src/transfer/fixups.rs": {
+      "tests": 94,
+      "total": 165
+    },
+    "src/transfer/import.rs": {
+      "tests": 0,
+      "total": 236
+    },
+    "src/transfer/manifest.rs": {
+      "tests": 0,
+      "total": 58
+    },
+    "src/transfer/mod.rs": {
+      "tests": 400,
+      "total": 409
+    },
+    "src/transfer/registry.rs": {
+      "tests": 0,
+      "total": 438
+    },
+    "src/web.rs": {
+      "tests": 2287,
+      "total": 12845
+    }
+  }
+}

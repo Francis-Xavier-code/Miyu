@@ -8,6 +8,10 @@ repository = "https://github.com/SHORiN-KiWATA/Miyu"
 description = "Command-line AI assistant"
 autobins = false
 
+[lib]
+name = "miyu"
+path = "src/lib.rs"
+
 [[bin]]
 name = "miyu"
 path = "src/main.rs"

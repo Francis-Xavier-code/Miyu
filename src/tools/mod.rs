@@ -20,7 +20,6 @@ mod html_conversion;
 mod http_response;
 mod image_generation;
 pub mod jobs;
-pub(crate) mod kitty_image;
 pub mod knowledge_base;
 mod load_tools;
 mod man;
@@ -48,6 +47,7 @@ pub mod workspace;
 mod write;
 mod xuanxue;
 
+use crate::agent::AgentMode;
 use crate::config::AppConfig;
 use crate::i18n::{is_zh, text as t};
 use crate::paths::MiyuPaths;
@@ -234,8 +234,7 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "analyze_image" | "vision_analyze" => t("Analyze image", "分析图片"),
         "print_image" => t("Display image", "显示图片"),
         "generate_image" => t("Generate image", "生成图片"),
-        "search_meme" => t("Search memes", "搜索表情包"),
-        "show_meme" => t("Send meme", "发送表情"),
+        "use_meme" => t("Meme", "表情包"),
         "manage_meme" => t("Manage memes", "管理表情包"),
         "deep_research" => t("Deep research", "深度研究"),
         "upload_knowledge_base_file" | "upload_text_to_knowledge_base" => {
@@ -456,7 +455,7 @@ pub(crate) fn rescope_platform_memory_tools(
     registry: &mut ToolRegistry,
     config: &AppConfig,
     paths: &MiyuPaths,
-    context: &crate::platforms::PlatformTurnContext,
+    context: &dyn crate::platform_types::PlatformToolContext,
     readonly: bool,
 ) {
     if !config.tools.enabled || !config.memory_config().enabled {
@@ -466,7 +465,7 @@ pub(crate) fn rescope_platform_memory_tools(
         registry.unregister(name);
     }
     let principal = context.principal().stable_key();
-    let access = if context.is_admin {
+    let access = if context.is_admin() {
         crate::memory::MemoryAccess::Privileged
     } else {
         crate::memory::MemoryAccess::principal(principal.clone())
@@ -478,7 +477,7 @@ pub(crate) fn rescope_platform_memory_tools(
             paths.clone(),
             access,
             Some(principal),
-            context.sender_display_name.clone(),
+            context.sender_display_name(),
         );
     } else {
         memory::register_with_context(
@@ -487,7 +486,7 @@ pub(crate) fn rescope_platform_memory_tools(
             paths.clone(),
             access,
             Some(principal),
-            context.sender_display_name.clone(),
+            context.sender_display_name(),
         );
     }
 }
@@ -594,6 +593,50 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
         load_tools::register(&mut registry);
     }
     registry
+}
+
+/// 按模式与配置组装工具注册表：REPL、daemon、WebUI、子代理都从这里拿。
+///
+/// 组装顺序有意义，不是随手排的：
+///
+/// 1. 先按模式选底座（`normal` 面向日常对话，`dev` 面向写代码），工具总开关
+///    关掉时给一个空注册表而不是提前返回——调用方拿到的永远是同一个类型。
+/// 2. 技能只在工具开着时注册；技能创作工具（`manage_skill`）只在 normal 模式
+///    出现，dev 模式下模型该写代码不该写技能。
+/// 3. `ask_question` 单独由调用方决定：daemon 与 WebUI 能弹面板，一次性
+///    `miyu ask` 不能，所以它是参数而不是模式的函数。
+/// 4. 最后登记脚本工具的显示名——这一步要在所有注册之后，否则新注册的脚本
+///    在渲染层会显示成原始工具名。
+///
+/// 这个函数原本长在 `cli.rs` 里，于是 `web` 和 `tools` 都得反过来
+/// `use crate::cli`，把两个底层模块钉死在最上层。它实际只依赖
+/// tools/config/paths/agent，与 CLI 毫无关系，所以下沉到这里——拆分要断的
+/// 两条边（`web→cli`、`tools→cli`）一次都断掉。
+pub(crate) fn build_tool_registry(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    mode: AgentMode,
+    interactive_questions: bool,
+) -> anyhow::Result<ToolRegistry> {
+    let mut registry = if config.tools.enabled {
+        match mode {
+            AgentMode::Normal => builtin_registry(config, paths),
+            AgentMode::Dev => dev_registry(config, paths),
+        }
+    } else {
+        ToolRegistry::new()
+    };
+    if config.tools.enabled && config.skills.enabled {
+        register_skills(&mut registry, config, paths)?;
+        if mode == AgentMode::Normal {
+            register_skill_authoring(&mut registry, config.clone(), paths.clone());
+        }
+    }
+    if config.tools.enabled && interactive_questions {
+        register_ask_question(&mut registry);
+    }
+    register_script_display_names(&registry);
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -740,6 +783,7 @@ mod tests {
         assert_eq!(english, chinese);
     }
 
+
     #[test]
     fn restricted_platform_registry_has_no_host_or_write_tools() {
         let temp = tempfile::tempdir().unwrap();
@@ -758,9 +802,9 @@ mod tests {
             assert!(!names.iter().any(|name| name == forbidden), "{forbidden}");
         }
         for name in names {
-            // generate_image is the deliberate Writes exception: it only
-            // saves its own API output under the plugin's output directory.
-            if name == "generate_image" {
+            // 两个明示的 Writes 例外：都只写自己插件的目录，碰不到主机文件。
+            // generate_image 写图片输出目录；manage_meme 写人格的表情库。
+            if name == "generate_image" || name == "manage_meme" {
                 continue;
             }
             assert_eq!(
@@ -789,7 +833,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let config = AppConfig::default();
-        let normal = crate::cli::build_tool_registry(
+        let normal = build_tool_registry(
             &config,
             &paths,
             crate::agent::AgentMode::Normal,
@@ -797,7 +841,7 @@ mod tests {
         )
         .unwrap();
         let dev =
-            crate::cli::build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false)
+            build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false)
                 .unwrap();
 
         assert!(normal.contains("manage_skill"));

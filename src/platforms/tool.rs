@@ -1,13 +1,12 @@
-use super::types::{ConversationKind, OutboundMessage, OutboundOrigin, OutboundSegment};
 use super::PlatformTurnContext;
 use crate::i18n::agent_text as t;
+use crate::platform_types::{ConversationKind, OutboundMessage, OutboundOrigin, OutboundSegment};
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
 const MAX_TOOL_IMAGES: usize = 4;
 const MAX_TOOL_FILES: usize = 4;
 const MAX_TOOL_MENTIONS: usize = 32;

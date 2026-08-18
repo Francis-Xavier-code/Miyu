@@ -1,17 +1,16 @@
-use super::types::{
-    OutboundMessage, OutboundOrigin, PlatformContextFileRef, PlatformContextImageRef,
-    PlatformConversation, PlatformInboundEvent, SendReceipt, TriggerDecision,
-};
 use super::PlatformTurnContext;
 use crate::config::AppConfig;
 use crate::paths::MiyuPaths;
+use crate::platform_types::{
+    OutboundMessage, OutboundOrigin, PlatformContextFileRef, PlatformContextImageRef,
+    PlatformConversation, PlatformInboundEvent, SendReceipt, TriggerDecision,
+};
 use crate::state::PlatformSessionBinding;
 use crate::tools::ToolRegistry;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::sync::Arc;
-
 pub(super) const FIXED_OUTPUT_METADATA_KEY: &str = "platform.fixed_output";
 pub(super) const SUPPRESS_FINAL_REPLY_METADATA_KEY: &str = "platform.suppress_final_reply";
 pub(super) const SUPPRESS_PRIOR_REPLY_METADATA_KEY: &str = "platform.suppress_prior_reply";

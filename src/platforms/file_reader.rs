@@ -1,6 +1,6 @@
-use super::types::PlatformContextFileRef;
 use super::PlatformTurnContext;
 use crate::i18n::agent_text as t;
+use crate::platform_types::PlatformContextFileRef;
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -36,7 +36,9 @@ pub(crate) fn register(
     files: Vec<PlatformContextFileRef>,
 ) {
     let state = Arc::new(FileReaderState { context, files });
-    let description = if state.context.conversation.kind == super::types::ConversationKind::Group {
+    let description = if state.context.conversation.kind
+        == crate::platform_types::ConversationKind::Group
+    {
         t(
             "Read a text file uploaded to the current QQ group. `file` must be a file id from the visible chat history (e.g. file_<message_id>_1). Compressed archives, executables, images, video, and other binary formats are rejected; text is capped at 128 KiB per call.",
             "读取当前 QQ 群上传的文本文件。`file` 必须是可见聊天记录中的文件 ID（例如 file_<message_id>_1）。压缩包、可执行文件、图片、视频等二进制格式会被拒绝；单次最多读取 128 KiB 文本。",
@@ -103,7 +105,7 @@ async fn read(arguments: Value, state: Arc<FileReaderState>) -> Result<String> {
             "file id `{raw}` is not attached to the current platform turn; available: {}",
             available.join(", ")
         )
-    } else if state.context.conversation.kind == super::types::ConversationKind::Group {
+    } else if state.context.conversation.kind == crate::platform_types::ConversationKind::Group {
         bail!("group files must be referenced by their file_... id from chat history")
     } else {
         None

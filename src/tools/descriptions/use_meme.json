@@ -1,0 +1,62 @@
+{
+  "name": "use_meme",
+  "display_name": "表情包",
+  "description": "发表情包。action=search 按场景、情绪、标签或画面内容找候选；action=show 发送并在终端渲染（GIF 默认静态预览）。除非用户给了具体 id，否则发之前先 search。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "search",
+          "show"
+        ],
+        "description": "search 找候选，show 发送。"
+      },
+      "query": {
+        "type": "string",
+        "description": "search：场景、情绪、画面内容或意图。"
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "search：偏好标签。"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "search：候选上限，默认取配置，最大 3。"
+      },
+      "id": {
+        "type": "string",
+        "description": "show：完整 sha256 id 或唯一短 id。"
+      },
+      "library": {
+        "type": "string",
+        "description": "可选表情库覆盖。"
+      },
+      "size": {
+        "type": "string",
+        "description": "show：chafa 尺寸，例如 40x15。"
+      },
+      "width": {
+        "type": "integer",
+        "description": "show：输出宽度（单元格）。"
+      },
+      "height": {
+        "type": "integer",
+        "description": "show：输出高度（单元格）。"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "additionalProperties": false
+  },
+  "always_loaded": true,
+  "load_policy": "summary",
+  "groups": [
+    "memes"
+  ]
+}
