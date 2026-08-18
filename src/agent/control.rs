@@ -254,11 +254,7 @@ impl Drop for QueueIngressReservation {
 }
 
 impl AgentTurnControl {
-    pub fn new(
-        mode: AgentMode,
-        normal_tools: ToolRegistry,
-        dev_tools: ToolRegistry,
-    ) -> Self {
+    pub fn new(mode: AgentMode, normal_tools: ToolRegistry, dev_tools: ToolRegistry) -> Self {
         Self {
             mode: Arc::new(Mutex::new(mode)),
             normal_tools,

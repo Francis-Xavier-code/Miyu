@@ -51,8 +51,7 @@ impl Agent {
         // 开关把门:vision 关、生图开时,平台回合的 generate_image 会留着不受
         // 限的解析器,不可信用户一句话就能让它把宿主上任意文件当参考图上传。
         if self.tools_enabled
-            && (self.config.plugins.vision.enabled
-                || self.config.plugins.image_generation.enabled)
+            && (self.config.plugins.vision.enabled || self.config.plugins.image_generation.enabled)
             && self.image_platform.is_some()
         {
             let mut tools = self.tools.lock().unwrap();
@@ -172,7 +171,10 @@ impl Agent {
         })
     }
 
-    pub(in crate::agent) async fn clipboard_image_message(&self, img: ClipboardImage) -> Result<Option<ChatMessage>> {
+    pub(in crate::agent) async fn clipboard_image_message(
+        &self,
+        img: ClipboardImage,
+    ) -> Result<Option<ChatMessage>> {
         if self.current_model_supports_vision() {
             return Ok(Some(ChatMessage::user_parts(vec![
                 ChatContentPart::ImageUrl {
@@ -216,7 +218,10 @@ impl Agent {
             .collect()
     }
 
-    pub(in crate::agent) fn queued_prompt_images(&self, prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>>> {
+    pub(in crate::agent) fn queued_prompt_images(
+        &self,
+        prompt: &QueuedPrompt,
+    ) -> Result<Vec<Option<PastedImage>>> {
         let mut images = queued_prompt_images(prompt)?;
         for attachment in &prompt.uploaded_attachments {
             if attachment.kind != "image" {

@@ -103,7 +103,10 @@ impl Agent {
     /// Mechanical prune behind the harvest gate: rewriting history is a
     /// prefix-cache reset, so the batch must save at least ~window/64 tokens
     /// (~window/16 chars) to pay for it. Protects the newest 2 turns.
-    pub(in crate::agent) fn prune_stale_history(&self, context_window: usize) -> Result<crate::state::PruneStats> {
+    pub(in crate::agent) fn prune_stale_history(
+        &self,
+        context_window: usize,
+    ) -> Result<crate::state::PruneStats> {
         let min_saved_chars = (context_window / 16).max(8192);
         let stats = self.state.prune_stale_tool_reports(2, min_saved_chars)?;
         if stats.turns > 0 {
@@ -121,7 +124,10 @@ impl Agent {
     /// geometry is what stops the re-compaction loop); chat sessions default
     /// smaller because casual history has less verbatim value.
     pub(in crate::agent) fn compact_tail_budget(&self, context_window: usize) -> usize {
-        self.config.context.compact_tail_tokens.unwrap_or(16384.min(context_window / 4))
+        self.config
+            .context
+            .compact_tail_tokens
+            .unwrap_or(16384.min(context_window / 4))
     }
 
     pub(in crate::agent) async fn handle_overflow<F>(
@@ -152,12 +158,10 @@ impl Agent {
             // thing that helps. snip prunes stale tool reports mechanically
             // (no LLM call); soft just says the context is growing, once.
             if let Some(window) = context_window {
-                let snip_threshold = (window as f32
-                    * self.config.context.compact_snip_ratio)
-                    .max(1.0) as usize;
-                let soft_threshold = (window as f32
-                    * self.config.context.compact_soft_ratio)
-                    .max(1.0) as usize;
+                let snip_threshold =
+                    (window as f32 * self.config.context.compact_snip_ratio).max(1.0) as usize;
+                let soft_threshold =
+                    (window as f32 * self.config.context.compact_soft_ratio).max(1.0) as usize;
                 if context_tokens >= snip_threshold {
                     if self.config.context.prune_stale_tool_reports {
                         let stats = self.prune_stale_history(window)?;
@@ -199,9 +203,8 @@ impl Agent {
                     return Ok(None);
                 }
                 let window = context_window.unwrap();
-                let force_threshold = (window as f32
-                    * self.config.context.compact_force_ratio)
-                    .max(1.0) as usize;
+                let force_threshold =
+                    (window as f32 * self.config.context.compact_force_ratio).max(1.0) as usize;
                 let force = context_tokens >= force_threshold;
                 // Prune first: it is free, and when it alone lands the
                 // context back under the trigger the paid summary call (and
@@ -209,8 +212,8 @@ impl Agent {
                 if self.config.context.prune_stale_tool_reports {
                     let stats = self.prune_stale_history(window)?;
                     if stats.turns > 0 && !force {
-                        let post_tokens = usize::try_from(self.effective_context_tokens()?)
-                            .unwrap_or(usize::MAX);
+                        let post_tokens =
+                            usize::try_from(self.effective_context_tokens()?).unwrap_or(usize::MAX);
                         if !check.check_tokens(post_tokens) {
                             on_event(AgentEvent::Notice {
                                 text: crate::i18n::text(

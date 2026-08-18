@@ -75,7 +75,11 @@ impl ReasoningTitleFilter {
         self.release_without_title()
     }
 
-    pub(in crate::agent) fn finish_decision(&mut self, title: String, rest: String) -> (Option<String>, Option<String>) {
+    pub(in crate::agent) fn finish_decision(
+        &mut self,
+        title: String,
+        rest: String,
+    ) -> (Option<String>, Option<String>) {
         self.pending.clear();
         self.decided = true;
         self.trim_body_prefix = rest.is_empty();

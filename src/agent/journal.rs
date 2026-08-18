@@ -300,7 +300,11 @@ impl TurnJournalSink {
         }
     }
 
-    pub(in crate::agent) fn push_chunk<F>(&mut self, chunk: ChatStreamChunk, on_event: &mut F) -> Result<()>
+    pub(in crate::agent) fn push_chunk<F>(
+        &mut self,
+        chunk: ChatStreamChunk,
+        on_event: &mut F,
+    ) -> Result<()>
     where
         F: FnMut(AgentEvent) -> Result<()>,
     {

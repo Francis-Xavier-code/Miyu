@@ -117,6 +117,21 @@ impl Agent {
 
     /// Stops the idle cache-keepalive loop (called whenever a new request is
     /// about to change the context, and before dropping the agent).
+    /// 测试用：塞一份请求快照，好让 `start_cache_keepalive` 真的起得来
+    /// （它没有快照就直接返回）。
+    #[cfg(test)]
+    pub(in crate::agent) fn seed_request_snapshot_for_test(&mut self) {
+        self.last_request_snapshot = Some((vec![ChatMessage::system("probe")], Vec::new()));
+    }
+
+    /// 测试用：拿到取消标志，好在 `Agent` 被丢掉之后验证它确实被翻了。
+    #[cfg(test)]
+    pub(in crate::agent) fn keepalive_cancel_flag(
+        &self,
+    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.keepalive_cancel.clone()
+    }
+
     pub fn cancel_cache_keepalive(&mut self) {
         if let Some(cancel) = self.keepalive_cancel.take() {
             cancel.store(true, std::sync::atomic::Ordering::Release);
@@ -359,7 +374,10 @@ impl Agent {
         self.state.session_cumulative_token_totals()
     }
 
-    pub(in crate::agent) fn tool_definition_tokens(&self, loaded_tools: &BTreeSet<String>) -> usize {
+    pub(in crate::agent) fn tool_definition_tokens(
+        &self,
+        loaded_tools: &BTreeSet<String>,
+    ) -> usize {
         let tools = self.tools.lock().unwrap();
         let definitions = if tools::is_stub_loading_mode(&self.config.tools.loading_mode) {
             tools.stub_definitions()
@@ -384,7 +402,11 @@ impl Agent {
         self.preset_dialogs = if self.mode == AgentMode::Dev {
             Vec::new()
         } else {
-            persona_hint::load_dialogs(&self.config, &self.paths, &self.config.active_persona_scope())
+            persona_hint::load_dialogs(
+                &self.config,
+                &self.paths,
+                &self.config.active_persona_scope(),
+            )
         };
     }
 

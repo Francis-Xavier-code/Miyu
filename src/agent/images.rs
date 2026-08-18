@@ -9,7 +9,9 @@
 
 use crate::agent::*;
 
-pub(in crate::agent) fn queued_prompt_images(prompt: &QueuedPrompt) -> Result<Vec<Option<PastedImage>>> {
+pub(in crate::agent) fn queued_prompt_images(
+    prompt: &QueuedPrompt,
+) -> Result<Vec<Option<PastedImage>>> {
     prompt
         .attachments
         .iter()
@@ -83,7 +85,10 @@ pub(in crate::agent) fn resolve_pasted_image_paths(
         .collect()
 }
 
-pub(in crate::agent) fn rewrite_image_placeholders_with_paths(input: &str, paths: &[Option<String>]) -> String {
+pub(in crate::agent) fn rewrite_image_placeholders_with_paths(
+    input: &str,
+    paths: &[Option<String>],
+) -> String {
     let mut output = String::new();
     let mut rest = input;
     while let Some(start) = rest.find("[Image ") {

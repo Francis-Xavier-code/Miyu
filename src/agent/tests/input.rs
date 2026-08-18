@@ -1,9 +1,7 @@
 //! 用户输入的清洗。
 
-use crate::agent::*;
 use super::shared::*;
-
-
+use crate::agent::*;
 
 #[test]
 fn strips_pasted_system_reminder_from_user_input() {

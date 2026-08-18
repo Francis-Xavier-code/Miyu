@@ -1,10 +1,10 @@
 //! 上下文的可见性、化石回放与裁剪。
 
+use super::shared::*;
 use crate::agent::*;
 use crate::config::AppConfig;
 use crate::tools::{empty_parameters, ToolSpec};
 use tokio::net::TcpListener;
-use super::shared::*;
 
 /// 剪枝必须幂等:第二次扫过不能再改写,否则每次落库都掰一次前缀。
 #[test]
@@ -12,7 +12,10 @@ fn tool_result_pruning_is_bounded_and_idempotent() {
     let output = "x".repeat(20_000);
     let pruned = prune_tool_output(&output, 8192, 4096, 1024);
     assert!(pruned.chars().count() < output.chars().count());
-    assert!(pruned.contains("14880") || pruned.contains("已省略"), "{pruned}");
+    assert!(
+        pruned.contains("14880") || pruned.contains("已省略"),
+        "{pruned}"
+    );
     assert_eq!(prune_tool_output(&pruned, 8192, 4096, 1024), pruned);
     // 预算内的输出一个字节都不动。
     let small = "short output";
@@ -45,7 +48,8 @@ fn structured_platform_context_can_suppress_ambiguous_session_replay() {
 
     assert!(agent
         .chat_messages("current", "new user")
-        .unwrap().0
+        .unwrap()
+        .0
         .iter()
         .any(|message| format!("{:?}", message.content).contains("anonymous old user")));
     agent.set_session_history_suppressed(true);
@@ -71,9 +75,7 @@ fn fossilized_transient_tail_replays_between_user_and_assistant() {
             "old",
             &[
                 ChatMessage::turn_context("<runtime now=\"frozen stamp\"/>"),
-                ChatMessage::turn_context(
-                    "<associative-memory>frozen recall</associative-memory>",
-                ),
+                ChatMessage::turn_context("<associative-memory>frozen recall</associative-memory>"),
             ],
         )
         .unwrap();
@@ -208,7 +210,10 @@ fn turn_context_blocks_already_visible_in_fossils_are_skipped() {
     let messages = vec![
         ChatMessage::system("prompt"),
         // 上一轮化石里已经带着同样的通知
-        ChatMessage::plain("user", format!("<qq-request-context>…</qq-request-context>\n\n{notice}")),
+        ChatMessage::plain(
+            "user",
+            format!("<qq-request-context>…</qq-request-context>\n\n{notice}"),
+        ),
         ChatMessage::plain("assistant", "回复"),
     ];
     assert!(turn_context_block_visible(&messages, notice));
@@ -333,7 +338,6 @@ fn turn_context_tokens_match_sent_messages() {
 
     turn.tool_reports.push("persisted tool result".to_string());
     assert!(turn_context_tokens(&turn) > without_reasoning);
-
 }
 
 #[test]
@@ -821,8 +825,10 @@ fn derive_tool_flow_reconstructs_rounds_from_live_messages() {
     };
     let mut messages = vec![ChatMessage::plain("user", "历史,不该被扫到")];
     let live_start = messages.len();
-    let mut assistant =
-        ChatMessage::assistant("先查一下", Some(vec![call("c1", "run_command", "{\"command\":\"ls\"}")]));
+    let mut assistant = ChatMessage::assistant(
+        "先查一下",
+        Some(vec![call("c1", "run_command", "{\"command\":\"ls\"}")]),
+    );
     assistant.reasoning_content = Some("想想".to_string());
     messages.push(assistant);
     messages.push(ChatMessage::tool("c1", "file-a\nfile-b"));
@@ -856,7 +862,11 @@ fn derive_tool_flow_reconstructs_rounds_from_live_messages() {
 fn spill_replacement_respects_budget_and_char_boundaries() {
     let output = "长".repeat(40_000);
     let replaced = spill_replacement(&output, 10_000, "/tmp/x.txt").expect("should spill");
-    assert!(replaced.len() <= 10_000, "replacement {} > cap", replaced.len());
+    assert!(
+        replaced.len() <= 10_000,
+        "replacement {} > cap",
+        replaced.len()
+    );
     assert!(replaced.contains("已省略"));
     assert!(replaced.contains("/tmp/x.txt"));
     assert!(replaced.starts_with('长'));

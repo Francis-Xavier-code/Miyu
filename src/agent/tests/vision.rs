@@ -1,11 +1,11 @@
 //! 视觉能力的判定与图片投递。
 
+use super::shared::*;
 use crate::agent::*;
 use crate::config::{ActiveProviderModelConfig, AppConfig, ProviderConfig};
 use crate::platforms::{ConversationKind, PlatformConversation};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
-use super::shared::*;
 
 #[test]
 fn vision_support_requires_every_effective_text_pool_model() {
@@ -163,7 +163,7 @@ async fn binary_image_reaches_vision_pool_then_text_model() {
         api_key: Some("test-key".to_string()),
         models: vec!["vision-model".to_string()],
         model_context_window: Default::default(),
-model_temperature: HashMap::new(),
+        model_temperature: HashMap::new(),
         model_modalities: [(
             "vision-model".to_string(),
             vec!["text".to_string(), "image".to_string()],
@@ -236,8 +236,7 @@ model_temperature: HashMap::new(),
         .unwrap();
 
     assert_eq!(result.content, "I can see it.");
-    let vision_request: Value =
-        serde_json::from_slice(&vision_request_rx.await.unwrap()).unwrap();
+    let vision_request: Value = serde_json::from_slice(&vision_request_rx.await.unwrap()).unwrap();
     let vision_parts = vision_request["messages"]
         .as_array()
         .unwrap()

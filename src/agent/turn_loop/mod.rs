@@ -17,8 +17,6 @@ mod stream;
 use crate::agent::*;
 
 impl Agent {
-
-
     pub(in crate::agent) async fn chat_with_tools<F>(
         &mut self,
         current_turn_id: &str,
@@ -151,8 +149,7 @@ impl Agent {
                 }
             }
             if self.config.cache.keepalive_seconds > 0 && responses_continuation.is_none() {
-                self.last_request_snapshot =
-                    Some((request_messages.clone(), definitions.clone()));
+                self.last_request_snapshot = Some((request_messages.clone(), definitions.clone()));
             }
             let round_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let round = {
@@ -241,11 +238,8 @@ impl Agent {
                     {
                         overflow_recovery_attempted = true;
                         let window = window.unwrap();
-                        let check = overflow::OverflowCheck::new(
-                            Some(window),
-                            self.trim_at_ratio,
-                            None,
-                        );
+                        let check =
+                            overflow::OverflowCheck::new(Some(window), self.trim_at_ratio, None);
                         on_event(AgentEvent::CompactStart)?;
                         let compactor = compact::Compactor::new(
                             self.client.clone(),
@@ -566,13 +560,12 @@ impl Agent {
             let defer_sibling_tools = question_call_count == 1 && result.tool_calls.len() > 1;
             // Multiple `task` calls in one batch run concurrently (subagents
             // are independent by design); everything else stays serial.
-            let mut parallel_task_outputs =
-                if defer_sibling_tools {
-                    std::collections::HashMap::new()
-                } else {
-                    self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
-                        .await?
-                };
+            let mut parallel_task_outputs = if defer_sibling_tools {
+                std::collections::HashMap::new()
+            } else {
+                self.execute_parallel_task_calls(&result.tool_calls, &loaded_tools, on_event)
+                    .await?
+            };
             for (call_index, call) in result.tool_calls.into_iter().enumerate() {
                 if let Some(group_output) = parallel_task_outputs.remove(&call_index) {
                     // Executed in the parallel group; events already emitted.

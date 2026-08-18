@@ -91,10 +91,18 @@ fn persists_loaded_tools_with_previous_tool_report_wrapper() {
 fn tool_footprint_extracts_paths_and_memories() {
     let fp = tool_call_footprint("read_file", r#"{"path":"/tmp/a.txt"}"#).unwrap();
     assert!(fp.read.contains("/tmp/a.txt"));
-    let fp = tool_call_footprint("edit_string", r#"{"path":"b.rs","old_string":"x","new_string":"y"}"#).unwrap();
+    let fp = tool_call_footprint(
+        "edit_string",
+        r#"{"path":"b.rs","old_string":"x","new_string":"y"}"#,
+    )
+    .unwrap();
     assert!(fp.modified.contains("b.rs"));
     // stub-mode wrapped arguments unwrap
-    let fp = tool_call_footprint("write_file", r#"{"arguments":{"path":"c.md","content":"hi"}}"#).unwrap();
+    let fp = tool_call_footprint(
+        "write_file",
+        r#"{"arguments":{"path":"c.md","content":"hi"}}"#,
+    )
+    .unwrap();
     assert!(fp.modified.contains("c.md"));
     let fp = tool_call_footprint("remember_fact", r#"{"content":"用户住在杭州"}"#).unwrap();
     assert!(fp.memories.contains("用户住在杭州"));

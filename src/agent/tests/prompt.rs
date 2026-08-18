@@ -1,10 +1,10 @@
 //! 系统提示词的组装与字节稳定性。
 
+use super::shared::*;
 use crate::agent::*;
 use crate::config::AppConfig;
 use crate::platforms::{ConversationKind, PlatformConversation};
 use tokio::net::TcpListener;
-use super::shared::*;
 
 #[test]
 fn runtime_context_contains_dynamic_runtime_only() {
@@ -45,7 +45,12 @@ fn host_environment_rides_the_system_prompt_for_owners_only() {
     let temp = tempfile::tempdir().unwrap();
     let paths = test_paths(temp.path());
 
-    let owner = with_host_environment("base".to_string(), PromptAudience::Owner, &paths, AgentMode::Normal);
+    let owner = with_host_environment(
+        "base".to_string(),
+        PromptAudience::Owner,
+        &paths,
+        AgentMode::Normal,
+    );
     assert!(owner.starts_with("base\n\n<host-environment os=\""));
     assert!(owner.contains("/>"));
     assert!(owner.contains("LaTeX"), "渲染能力说明应跟随 owner 提示词");
@@ -72,8 +77,18 @@ fn host_environment_is_byte_stable_across_prompt_rebuilds() {
     let paths = test_paths(temp.path());
     // Rebuilt on every turn by `prepare_for_turn`; a value that drifted
     // between rebuilds would move the prefix and cost a cache miss a turn.
-    let first = with_host_environment(String::new(), PromptAudience::Owner, &paths, AgentMode::Normal);
-    let second = with_host_environment(String::new(), PromptAudience::Owner, &paths, AgentMode::Normal);
+    let first = with_host_environment(
+        String::new(),
+        PromptAudience::Owner,
+        &paths,
+        AgentMode::Normal,
+    );
+    let second = with_host_environment(
+        String::new(),
+        PromptAudience::Owner,
+        &paths,
+        AgentMode::Normal,
+    );
     assert_eq!(first, second);
 }
 
@@ -253,12 +268,10 @@ async fn persona_reminder_fossilizes_on_interval_and_replays() {
     agent.set_platform_context_images(context.clone(), Vec::new());
     agent.chat_stream("第一条消息", |_| Ok(())).await.unwrap();
 
-    let expected_reminder =
-        "<persona-reminder>回复很短，从不用Emoji。\
+    let expected_reminder = "<persona-reminder>回复很短，从不用Emoji。\
          就算是讲解答疑，也只说最关键的两三步，整条不超过一百字，\
          一次说不完就等对方追问。</persona-reminder>";
-    let request: serde_json::Value =
-        serde_json::from_slice(&first_chat_rx.await.unwrap()).unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&first_chat_rx.await.unwrap()).unwrap();
     let messages = request["messages"].as_array().unwrap();
     // 提醒以化石身份入列(位置在 runtime 之后、随机注入的表情包
     // 提醒之前),不再断言绝对末尾——只断言恰好一份。

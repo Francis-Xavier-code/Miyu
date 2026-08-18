@@ -3,7 +3,7 @@
 use crate::agent::*;
 use crate::config::{AppConfig, ProviderConfig};
 use crate::paths::MiyuPaths;
-use crate::platforms::{ OutboundMessage, PlatformAdapter, SendReceipt, };
+use crate::platforms::{OutboundMessage, PlatformAdapter, SendReceipt};
 use futures_util::future::BoxFuture;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +58,7 @@ pub(super) fn queue_test_config(base_url: String) -> AppConfig {
             api_key: Some("test-key".to_string()),
             models: vec!["test-model".to_string()],
             model_context_window: Default::default(),
-model_temperature: HashMap::new(),
+            model_temperature: HashMap::new(),
             model_modalities: Default::default(),
             model_costs: Default::default(),
             default_model: "test-model".to_string(),

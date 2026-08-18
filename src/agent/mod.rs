@@ -1,13 +1,13 @@
 mod artifacts;
 mod context;
 mod control;
-mod images;
 mod history;
+mod images;
 mod input;
 mod journal;
 mod prompt;
-mod reasoning;
 mod pruning;
+mod reasoning;
 mod reports;
 mod setup;
 mod tool_report;
@@ -18,8 +18,8 @@ use control::*;
 // 子模块本身是私有的，得显式再导出
 pub(crate) use context::archive_and_delete_visible_turns;
 pub(crate) use control::{
-    AgentMode, AgentTurnControl, QueueIngressBarrier, QueueIngressReservation,
-    RedoPromptInput, TurnSupersedeSignal,
+    AgentMode, AgentTurnControl, QueueIngressBarrier, QueueIngressReservation, RedoPromptInput,
+    TurnSupersedeSignal,
 };
 use images::*;
 use journal::*;
@@ -28,10 +28,10 @@ use reasoning::*;
 use reports::*;
 use tool_report::*;
 mod compact;
-mod turn_loop;
-mod describe;
 mod conversation;
+mod describe;
 pub(crate) mod overflow;
+mod turn_loop;
 
 use crate::clipboard::{ClipboardImage, PastedImage};
 use crate::config::{AppConfig, PromptAudience};
@@ -307,36 +307,6 @@ struct GroupTaskOutput {
 }
 
 impl Agent {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// /reset-memory:清空本模式人格的长期记忆(会话历史/技能不动),
     /// 然后重建句柄。dev 作用域由构造期的 dev_scoped 配置自动继承。
     pub fn wipe_memory(&mut self) -> Result<()> {
@@ -560,7 +530,20 @@ impl Agent {
             responses_continuation: None,
         }))
     }
+}
 
+/// keepalive 循环是 `tokio::spawn` 出去的独立任务，只认那个 `AtomicBool`。
+///
+/// `Agent` 被丢掉时——回合结束、会话切换、平台回合收尾——没人翻这个标志，
+/// 任务就会继续按 interval 发请求。那不只是内存和线程，**是真的在花钱**：
+/// 每次 ping 都是一次带完整前缀的 LLM 请求。
+///
+/// 原来只在「新回合开始」时取消（`chat_stream_turn` / `redo_stream_turn`），
+/// 而每个平台回合用的是一个临时 `Agent`，跑完就丢，那条路上永远轮不到取消。
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.cancel_cache_keepalive();
+    }
 }
 
 #[derive(Default)]
@@ -603,7 +586,9 @@ impl UsageAccumulator {
             .saturating_add(usage.completion_tokens);
         let total = usage.effective_total_tokens();
         self.total_tokens = self.total_tokens.saturating_add(total);
-        self.cache_read_tokens = self.cache_read_tokens.saturating_add(usage.cache_read_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
         self.cache_write_tokens = self
             .cache_write_tokens
             .saturating_add(usage.cache_write_tokens);

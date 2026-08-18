@@ -9,7 +9,9 @@
 use crate::agent::*;
 
 impl Agent {
-    pub(in crate::agent) fn trim_visible_context(&self) -> Result<Vec<crate::state::StoredConversationEntry>> {
+    pub(in crate::agent) fn trim_visible_context(
+        &self,
+    ) -> Result<Vec<crate::state::StoredConversationEntry>> {
         let Some(context_window) = self.context_window() else {
             return Ok(Vec::new());
         };
@@ -87,7 +89,10 @@ impl Agent {
         )
     }
 
-    pub(in crate::agent) fn initial_loaded_tools(&self, messages: &[ChatMessage]) -> Result<BTreeSet<String>> {
+    pub(in crate::agent) fn initial_loaded_tools(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<BTreeSet<String>> {
         if !self.config.tools.persist_loaded_tools {
             return Ok(BTreeSet::new());
         }
@@ -178,7 +183,11 @@ impl Agent {
     /// Renders one stored turn exactly as the live request rendered it
     /// (byte-identical replay incl. the fossilized transient tail), shared by
     /// the main request path and the compaction fork prefix.
-    pub(in crate::agent) fn push_history_turn(&self, messages: &mut Vec<ChatMessage>, turn: &crate::state::Turn) {
+    pub(in crate::agent) fn push_history_turn(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        turn: &crate::state::Turn,
+    ) {
         messages.push(self.turn_user_message(turn));
         // Fossilized transient tail (v7 append-only): replay the
         // system messages that followed the user message in the live
@@ -265,7 +274,10 @@ impl Agent {
     /// summarization request built on this prefix re-reads the history at
     /// cached price instead of full price (the serialized fallback shares no
     /// bytes with the provider's cache).
-    pub(in crate::agent) fn compact_fork_prefix(&self, fold_turn_ids: &[String]) -> Result<Vec<ChatMessage>> {
+    pub(in crate::agent) fn compact_fork_prefix(
+        &self,
+        fold_turn_ids: &[String],
+    ) -> Result<Vec<ChatMessage>> {
         let fold: std::collections::HashSet<&str> =
             fold_turn_ids.iter().map(|id| id.as_str()).collect();
         let mut messages = vec![ChatMessage::system(self.system_prompt.clone())];
@@ -286,7 +298,9 @@ impl Agent {
         Ok(messages)
     }
 
-    pub(in crate::agent) fn live_tool_definitions(&self) -> Result<Vec<crate::llm::ToolDefinition>> {
+    pub(in crate::agent) fn live_tool_definitions(
+        &self,
+    ) -> Result<Vec<crate::llm::ToolDefinition>> {
         if !self.tools_enabled {
             return Ok(Vec::new());
         }
@@ -303,7 +317,10 @@ impl Agent {
         )
     }
 
-    pub(in crate::agent) fn followup_user_message(&self, followup: &crate::state::TurnFollowup) -> ChatMessage {
+    pub(in crate::agent) fn followup_user_message(
+        &self,
+        followup: &crate::state::TurnFollowup,
+    ) -> ChatMessage {
         if !self.current_model_supports_vision() {
             return ChatMessage::plain("user", &followup.content);
         }

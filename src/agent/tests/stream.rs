@@ -497,3 +497,52 @@ async fn round_usage_event_fires_per_model_request() {
     assert!(!rounds[0].2);
     server.await.unwrap();
 }
+
+/// keepalive 循环是 spawn 出去的独立任务，只认那个 AtomicBool。`Agent` 被丢掉
+/// 时如果没人翻标志，它会继续按 interval 发请求——每次 ping 都是一次带完整
+/// 前缀的 LLM 请求，**是真的在花钱**。
+///
+/// 原来只在「新回合开始」时取消，而每个平台回合用的是临时 Agent、跑完就丢，
+/// 那条路上永远轮不到取消。
+#[tokio::test]
+async fn dropping_the_agent_stops_the_keepalive_loop() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut config = queue_test_config(base_url);
+    // 打开 keepalive：默认是 0（关闭），关着的话这条路根本不会起任务
+    config.cache.keepalive_seconds = 3_600;
+    config.cache.keepalive_max_pings = 20;
+
+    let state = StateStore::new(&paths).unwrap();
+    state.init_files().unwrap();
+    let provider = config.provider(None).unwrap().clone();
+    let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+    let mut agent = Agent::new(
+        config,
+        &paths,
+        state,
+        client,
+        ToolRegistry::new(),
+        AgentMode::Normal,
+    )
+    .unwrap();
+
+    agent.seed_request_snapshot_for_test();
+    agent.start_cache_keepalive();
+    let cancel = agent
+        .keepalive_cancel_flag()
+        .expect("开了 keepalive 就该有取消标志");
+    assert!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "刚起来不该是已取消"
+    );
+
+    drop(agent);
+
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::Acquire),
+        "Agent 被丢掉之后 keepalive 必须停——否则它会继续发请求计费"
+    );
+}

@@ -92,13 +92,13 @@ impl Agent {
         messages.extend(prepared.hints);
         // 记忆联想不再按模式关断:dev 的 MemoryStore 指向保留人格 "dev"
         // 的独立库(构造时作用域化),联想/落库都发生在自己的命名空间里。
-        let association_exclusion = self
-            .state
-            .oldest_visible_turn_timestamp(&turn_id)?
-            .map(|since| crate::memory::AssociationExclusion {
-                session_id: self.state.session_id().to_string(),
-                since,
-            });
+        let association_exclusion =
+            self.state
+                .oldest_visible_turn_timestamp(&turn_id)?
+                .map(|since| crate::memory::AssociationExclusion {
+                    session_id: self.state.session_id().to_string(),
+                    since,
+                });
         if let Some(mut association) = self
             .memory
             .association(&input, association_exclusion.as_ref())?
