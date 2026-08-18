@@ -1,7 +1,7 @@
 //! 回合生命周期、打断与陈旧恢复。
 
-use crate::state::*;
 use super::shared::*;
+use crate::state::*;
 
 #[test]
 fn turn_lifecycle() {
@@ -71,8 +71,7 @@ fn question_exchange_persists_with_user_role_history() {
         }],
     };
     let exchange =
-        crate::question::QuestionExchange::new(request, vec![vec!["全部".to_string()]])
-            .unwrap();
+        crate::question::QuestionExchange::new(request, vec![vec!["全部".to_string()]]).unwrap();
     store.append_question_exchange("turn_1", &exchange).unwrap();
     store.complete_turn("turn_1", "已经配置。", None).unwrap();
 
@@ -645,4 +644,33 @@ fn interrupted_turn_is_evictable_but_summary_and_running_turn_are_not() {
         vec!["completed", "interrupted"]
     );
     assert_eq!(evicted[1].status, TurnStatus::Interrupted);
+}
+
+/// 量尺：`cargo test --lib state::tests::turns::tool_report_write_amplification -- --ignored --nocapture`
+///
+/// `append_tool_report` 每追加一条都要「读整列 → 解析 → push → 整个序列化 →
+/// 写回」。一个回合里 N 次工具调用，写回字节数是 O(N²)。
+#[test]
+#[ignore]
+fn tool_report_write_amplification() {
+    println!("\n  报告数  理论写入KB  实际写入KB   放大   耗时(ms)");
+    for count in [10usize, 20, 40, 80] {
+        let (_temp, store) = test_store();
+        store
+            .start_turn("probe", "hello", std::process::id())
+            .unwrap();
+        let report = "x".repeat(2 * 1024);
+        let start = std::time::Instant::now();
+        for _ in 0..count {
+            store.append_persisted_context("probe", &report).unwrap();
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let ideal = count * 2;
+        // 第 k 次写回的是「当前全部 k 条」→ 总量 = 2KB × (1+2+…+N)
+        let actual = 2 * count * (count + 1) / 2;
+        println!(
+            "  {count:>6}  {ideal:>10}  {actual:>11}  {:>5.1}×  {ms:>9.1}",
+            actual as f64 / ideal as f64
+        );
+    }
 }

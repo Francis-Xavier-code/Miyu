@@ -5,7 +5,8 @@
 
 use crate::platforms::plugins::group_management::*;
 
-pub(in crate::platforms::plugins::group_management) const ROLE_KEY: &str = "qq_group_management.bot_role";
+pub(in crate::platforms::plugins::group_management) const ROLE_KEY: &str =
+    "qq_group_management.bot_role";
 
 pub(in crate::platforms::plugins::group_management) const OFFENDERS_KEY: &str = "offender_history";
 
@@ -113,6 +114,10 @@ pub(in crate::platforms::plugins::group_management) fn update_offender(
                 operator_id: record.operator_id.clone(),
                 record_id: record.record_id.clone(),
             });
+            // 外层 map 早有上限,但每个人的 reason_history 只 push 不裁——
+            // 高频被禁者会一直累积,而这份记录是整块 JSON 读改写的,越长越
+            // 慢也越占。裁掉最旧的,留最近的那批。
+            trim_vec(&mut entry.reason_history, MAX_REASON_HISTORY_PER_OFFENDER);
             if map.len() > settings.max_offender_history_per_group {
                 if let Some(remove) = map
                     .iter()
@@ -128,7 +133,11 @@ pub(in crate::platforms::plugins::group_management) fn update_offender(
     Ok(())
 }
 
-pub(in crate::platforms::plugins::group_management) fn append_kick(context: &PlatformTurnContext, record: &KickRecord, max: usize) -> Result<()> {
+pub(in crate::platforms::plugins::group_management) fn append_kick(
+    context: &PlatformTurnContext,
+    record: &KickRecord,
+    max: usize,
+) -> Result<()> {
     context.state_store.plugin_update_json(
         &GroupManagementPlugin::scope(context),
         KICKS_KEY,
@@ -142,7 +151,11 @@ pub(in crate::platforms::plugins::group_management) fn append_kick(context: &Pla
     Ok(())
 }
 
-pub(in crate::platforms::plugins::group_management) fn append_event(context: &PlatformTurnContext, event: &ManagementEvent, max: usize) -> Result<()> {
+pub(in crate::platforms::plugins::group_management) fn append_event(
+    context: &PlatformTurnContext,
+    event: &ManagementEvent,
+    max: usize,
+) -> Result<()> {
     context.state_store.plugin_update_json(
         &GroupManagementPlugin::scope(context),
         EVENTS_KEY,
@@ -258,7 +271,10 @@ pub(in crate::platforms::plugins::group_management) fn load_all_events(
     Ok(events)
 }
 
-pub(in crate::platforms::plugins::group_management) fn action_matches(filter: &str, action: &str) -> bool {
+pub(in crate::platforms::plugins::group_management) fn action_matches(
+    filter: &str,
+    action: &str,
+) -> bool {
     match filter {
         "all" => true,
         "ban" => matches!(action, "ban" | "unban"),
@@ -270,7 +286,10 @@ pub(in crate::platforms::plugins::group_management) fn action_matches(filter: &s
 
 /// 每条禁言事件的当前状态：后续有解禁则 unmuted，后续被再次禁言覆盖则
 /// overridden，否则按到期时间判 active/expired。输入必须按时间升序。
-pub(in crate::platforms::plugins::group_management) fn ban_statuses(events: &[ManagementEvent], now: i64) -> HashMap<String, String> {
+pub(in crate::platforms::plugins::group_management) fn ban_statuses(
+    events: &[ManagementEvent],
+    now: i64,
+) -> HashMap<String, String> {
     let mut statuses = HashMap::new();
     for (index, event) in events.iter().enumerate() {
         if event.action != "ban" {
@@ -302,7 +321,10 @@ pub(in crate::platforms::plugins::group_management) fn ban_statuses(events: &[Ma
     statuses
 }
 
-pub(in crate::platforms::plugins::group_management) fn query_history(args: Value, context: &PlatformTurnContext) -> Result<String> {
+pub(in crate::platforms::plugins::group_management) fn query_history(
+    args: Value,
+    context: &PlatformTurnContext,
+) -> Result<String> {
     let scope = match resolve_query_scope(&args, context) {
         Ok(scope) => scope,
         Err(error) => return json_result(false, &error.to_string(), Value::Null),
@@ -371,7 +393,10 @@ pub(in crate::platforms::plugins::group_management) struct MemberStats {
     pub(in crate::platforms::plugins::group_management) last_reason: String,
 }
 
-pub(in crate::platforms::plugins::group_management) fn aggregate_member_stats(action: &str, events: &[ManagementEvent]) -> Vec<MemberStats> {
+pub(in crate::platforms::plugins::group_management) fn aggregate_member_stats(
+    action: &str,
+    events: &[ManagementEvent],
+) -> Vec<MemberStats> {
     let mut map: HashMap<String, MemberStats> = HashMap::new();
     for event in events
         .iter()
@@ -479,7 +504,18 @@ pub(in crate::platforms::plugins::group_management) async fn record_real_context
         .await
 }
 
-pub(in crate::platforms::plugins::group_management) fn trim_vec<T>(values: &mut Vec<T>, max: usize) {
+/// 每个被禁者最多留多少条封禁理由。
+///
+/// 这份历史是给「屡犯判定」和历史查询用的：同一个人在同一个群里被禁 50 次，
+/// 早就够判定了，更早的记录对决策没有增量。上限乘以群内被禁者上限（500）
+/// 就是这份 JSON 的最坏体积。
+pub(in crate::platforms::plugins::group_management) const MAX_REASON_HISTORY_PER_OFFENDER: usize =
+    50;
+
+pub(in crate::platforms::plugins::group_management) fn trim_vec<T>(
+    values: &mut Vec<T>,
+    max: usize,
+) {
     let max = max.max(1);
     if values.len() > max {
         values.drain(..values.len() - max);
@@ -495,4 +531,37 @@ pub(in crate::platforms::plugins::group_management) fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    /// 外层 map 早有上限，但每个人的 reason_history 原来只 push 不裁——
+    /// 同一个人被禁一千次就存一千条，而这份记录每次封禁都要整块 JSON
+    /// 读改写，越长越慢也越占。
+    #[test]
+    fn one_offenders_reason_history_is_bounded() {
+        let mut history = OffenderHistory::default();
+        for index in 0..1_000 {
+            history.reason_history.push(ReasonEntry {
+                reason: format!("理由 {index}"),
+                duration: 60,
+                banned_at: index,
+                operator_id: "op".to_string(),
+                record_id: format!("{index:012x}"),
+            });
+            trim_vec(&mut history.reason_history, MAX_REASON_HISTORY_PER_OFFENDER);
+        }
+        assert_eq!(
+            history.reason_history.len(),
+            MAX_REASON_HISTORY_PER_OFFENDER
+        );
+        // 裁掉的是最旧的，留下的是最近那批
+        assert_eq!(history.reason_history.last().unwrap().reason, "理由 999");
+        assert_eq!(
+            history.reason_history.first().unwrap().reason,
+            format!("理由 {}", 1_000 - MAX_REASON_HISTORY_PER_OFFENDER)
+        );
+    }
 }

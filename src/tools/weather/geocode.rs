@@ -8,7 +8,8 @@
 
 use crate::tools::weather::*;
 
-pub(in crate::tools::weather) const GEOCODING_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub(in crate::tools::weather) const GEOCODING_CACHE_TTL: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
 
 pub(in crate::tools::weather) const FORECAST_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -18,11 +19,13 @@ pub(in crate::tools::weather) struct CacheEntry<T> {
     pub(in crate::tools::weather) value: T,
 }
 
-pub(in crate::tools::weather) static GEOCODING_CACHE: OnceLock<Mutex<HashMap<String, CacheEntry<Vec<GeocodingResult>>>>> =
-    OnceLock::new();
+pub(in crate::tools::weather) static GEOCODING_CACHE: OnceLock<
+    Mutex<HashMap<String, CacheEntry<Vec<GeocodingResult>>>>,
+> = OnceLock::new();
 
-pub(in crate::tools::weather) static FORECAST_CACHE: OnceLock<Mutex<HashMap<String, CacheEntry<ForecastResponse>>>> =
-    OnceLock::new();
+pub(in crate::tools::weather) static FORECAST_CACHE: OnceLock<
+    Mutex<HashMap<String, CacheEntry<ForecastResponse>>>,
+> = OnceLock::new();
 
 pub(in crate::tools::weather) async fn selected_location(
     client: &reqwest::Client,
@@ -63,7 +66,12 @@ pub(in crate::tools::weather) async fn geocode_location(
         }
         bail!("no geocoding results for {}", request.location);
     }
-    write_cache(geocoding_cache(), cache_key, results.clone(), GEOCODING_CACHE_TTL);
+    write_cache(
+        geocoding_cache(),
+        cache_key,
+        results.clone(),
+        GEOCODING_CACHE_TTL,
+    );
     Ok(results)
 }
 
@@ -108,7 +116,9 @@ pub(in crate::tools::weather) fn geocoding_query_names(location: &str) -> Vec<St
     names
 }
 
-pub(in crate::tools::weather) fn translated_location_aliases(normalized: &str) -> &'static [&'static str] {
+pub(in crate::tools::weather) fn translated_location_aliases(
+    normalized: &str,
+) -> &'static [&'static str] {
     match normalized {
         "东京" | "東亰" | "東京" | "东京都" | "東京都" | "日本东京" | "日本東京" | "日本东京都"
         | "日本東京都" | "东京日本" | "東京日本" => &["Tokyo", "東京"],
@@ -148,11 +158,13 @@ pub(in crate::tools::weather) fn dedup_locations(locations: &mut Vec<GeocodingRe
     });
 }
 
-pub(in crate::tools::weather) fn geocoding_cache() -> &'static Mutex<HashMap<String, CacheEntry<Vec<GeocodingResult>>>> {
+pub(in crate::tools::weather) fn geocoding_cache(
+) -> &'static Mutex<HashMap<String, CacheEntry<Vec<GeocodingResult>>>> {
     GEOCODING_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(in crate::tools::weather) fn forecast_cache() -> &'static Mutex<HashMap<String, CacheEntry<ForecastResponse>>> {
+pub(in crate::tools::weather) fn forecast_cache(
+) -> &'static Mutex<HashMap<String, CacheEntry<ForecastResponse>>> {
     FORECAST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -170,10 +182,32 @@ pub(in crate::tools::weather) fn read_cache<T: Clone>(
     }
 }
 
-pub(in crate::tools::weather) fn write_cache<T>(cache: &Mutex<HashMap<String, CacheEntry<T>>>, key: String, value: T, ttl: Duration) {
+/// 两个缓存各自的条目上限。TTL 只挡得住「同一个地名反复查」，挡不住
+/// 「短时间内查一堆不同地名」——那种情况下条目在 TTL 内全是活的。
+pub(in crate::tools::weather) const MAX_CACHE_ENTRIES: usize = 512;
+
+pub(in crate::tools::weather) fn write_cache<T>(
+    cache: &Mutex<HashMap<String, CacheEntry<T>>>,
+    key: String,
+    value: T,
+    ttl: Duration,
+) {
     if let Ok(mut cache) = cache.lock() {
         // 读取只判过期不删;写入时顺手清掉,常驻 daemon 不积死条目。
         cache.retain(|_, entry| entry.inserted_at.elapsed() <= ttl);
+        // 清完还超量说明是「短时间内查了成百上千个不同地名」——TTL 拦不住
+        // 这种，得有条数上限兜底。淘汰最旧的那批，键是地名/坐标，丢了只是
+        // 下次重查一次。
+        while cache.len() >= MAX_CACHE_ENTRIES {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
         cache.insert(
             key,
             CacheEntry {
@@ -214,4 +248,28 @@ pub(in crate::tools::weather) fn location_score(query: &str, location: &Geocodin
         _ => 0,
     };
     score + location.population.unwrap_or(0).min(10_000_000) as i64
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    /// TTL 只挡「同一个地名反复查」。短时间内查一堆不同地名时，条目全在
+    /// TTL 内、一条都不会被 retain 清掉——原来这里没有条数上限。
+    #[test]
+    fn the_cache_is_bounded_even_when_nothing_has_expired() {
+        let cache: Mutex<HashMap<String, CacheEntry<u32>>> = Mutex::new(HashMap::new());
+        let ttl = Duration::from_secs(3_600);
+        for index in 0..MAX_CACHE_ENTRIES * 3 {
+            write_cache(&cache, format!("地名{index}"), index as u32, ttl);
+            assert!(
+                cache.lock().unwrap().len() <= MAX_CACHE_ENTRIES,
+                "第 {index} 次写入后超了上限"
+            );
+        }
+        // 留下的是最近写的那批
+        let cache = cache.lock().unwrap();
+        assert!(cache.contains_key(&format!("地名{}", MAX_CACHE_ENTRIES * 3 - 1)));
+        assert!(!cache.contains_key("地名0"));
+    }
 }
