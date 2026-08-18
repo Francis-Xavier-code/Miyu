@@ -419,7 +419,7 @@ pub(in crate::web) fn rebuild_for_config(
         None
     };
     let context = match next_agent.as_ref().map_or_else(
-        || cold_context(&next_config, &target_state_store),
+        || cold_context(&next_config, paths, &target_state_store),
         current_context,
     ) {
         Ok(context) => context,

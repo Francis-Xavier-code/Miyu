@@ -274,21 +274,10 @@ pub(in crate::cli) async fn run_direct_repl(
     } else {
         config.active_persona_scope()
     };
-    if let Ok(Some(session_id)) = state.repl_session(&persona) {
-        state.adopt_session(&session_id);
-    } else if initial_mode == AgentMode::Dev {
-        // dev 无「终端会话」可退:自举一个 dev 会话并钉住指针。
-        let record = state.create_session(
-            crate::state::DEV_PERSONA,
-            "",
-            crate::state::USER_SESSION_KIND,
-            None,
-        )?;
-        state.adopt_session(&record.session_id);
-        let _ = state.set_repl_session(&persona, &record.session_id);
-    } else {
-        let _ = state.set_repl_session(&persona, &state.session_id());
-    }
+    // 与远端 `GetReplSession` 同一条语义（见 `ensure_repl_session`）：指针缺失
+    // 就自举本车道的会话，绝不退到终端集成那条。
+    let repl_session_id = state.ensure_repl_session(&persona)?;
+    state.adopt_session(&repl_session_id);
     apply_session_model_override(&state, &mut config);
     let memory_organizer = MemoryOrganizer::spawn()?;
     let memory_organizer_handle = memory_organizer.handle();
@@ -330,7 +319,8 @@ pub(in crate::cli) async fn run_direct_repl(
         footer.update_thinking_variant(thinking_summary.as_deref());
         let next_input = if let Some(live) = live_repl.as_mut() {
             live.set_footer(footer.clone());
-            let input = match read_live_repl_input(live, paths, &JobsFeed::Local, None)? {
+            let jobs_feed = JobsFeed::Local(Some(state.session_id().to_string()));
+            let input = match read_live_repl_input(live, paths, &jobs_feed, None)? {
                 LiveReplOutcome::Exit | LiveReplOutcome::FollowWake { .. } => None,
                 // Direct mode owns its jobs in-process, so stop them here
                 // rather than through the daemon.
@@ -372,8 +362,9 @@ pub(in crate::cli) async fn run_direct_repl(
             None => break,
         };
         let input = input.trim();
-        let (command_input, command_args) = split_repl_command(input);
-        let command = resolve_repl_command(command_input);
+        // 只按完整命令名比对:前缀展开已从执行路径撤走(见 `parse_repl_input`),
+        // 否则 `/d 3` 会静默删掉 3 号会话。
+        let (command, command_args) = split_repl_command(input);
         let command_args_empty = command_args.trim().is_empty();
         if input.eq_ignore_ascii_case("exit")
             || input.eq_ignore_ascii_case("quit")
@@ -638,28 +629,24 @@ pub(in crate::cli) async fn run_direct_repl(
         // 落到这里的表内命令(如 /new /session)以前会原文发给模型当聊天
         // ——人格实验冒烟时实锤过。现在一律拦下提示,绝不进对话;完整的
         // 双 dispatch 后端归一记为技术债,此守门先消灭整个 bug 类。
-        if input.starts_with('/') {
-            let known = REPL_COMMAND_TABLE
-                .iter()
-                .any(|spec| spec.name.eq_ignore_ascii_case(&command));
-            if known {
-                println!(
-                    "{}",
-                    t(
-                        "this command needs the full (daemon) REPL; start without MIYU_DIRECT to use it",
-                        "该命令需要完整(daemon)REPL;不带 MIYU_DIRECT 启动即可使用"
-                    )
-                );
-            } else {
-                println!("{}: {command_input}", t("unknown command", "未知命令"));
-            }
+        //
+        // 只拦**表里有**的:不在表里的 `/xxx` 不是命令,是普通消息
+        // (`/home/shorin/x 这是什么`),照常发给模型。
+        if is_repl_command(command) {
+            println!(
+                "{}",
+                t(
+                    "this command needs the full (daemon) REPL; start without MIYU_DIRECT to use it",
+                    "该命令需要完整(daemon)REPL;不带 MIYU_DIRECT 启动即可使用"
+                )
+            );
             continue;
         }
         if input.is_empty() {
             continue;
         }
         push_history_capped(&mut input_history, input);
-        persist_repl_history_entry(paths, input);
+        persist_repl_history_entry(paths, &state.session_id(), input);
         if let Some(live) = live_repl.as_mut() {
             live.editor.record_history(input);
         }

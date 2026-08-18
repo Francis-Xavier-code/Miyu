@@ -556,7 +556,7 @@ fn ensure_jobs_visible(ids: &[String], current: Option<&str>, all: bool, verb: &
     let jobs = jobs().lock().unwrap();
     for id in ids {
         if let Some(job) = jobs.get(id) {
-            if !job_visible(job, current, all) {
+            if !job_visible(job.session_id.as_deref(), current, all) {
                 bail!("后台任务 {id} 属于其他会话；如确需{verb}请传 all=true");
             }
         }
@@ -565,15 +565,50 @@ fn ensure_jobs_visible(ids: &[String], current: Option<&str>, all: bool, verb: &
 }
 
 /// Session-scoped visibility: a tool call only sees jobs of its own turn
-/// session unless it passes `all=true`. Jobs or callers without a session
-/// (tests, direct invocations outside a turn) stay globally visible.
-fn job_visible(job: &JobEntry, current: Option<&str>, all: bool) -> bool {
+/// session unless it passes `all=true`.
+///
+/// **调用方在会话里、任务却没有会话** → 不可见（fail-closed）。以前这条走
+/// `_ => true`，于是任何没带 session 的任务（台账恢复的旧任务、异常路径漏抓
+/// 的）对**所有**会话可见——一个会话能 stop 掉另一个会话的东西。逃生门是
+/// `all=true`，它本来就是给「我知道我在干什么」准备的。
+///
+/// 调用方**不在**会话里（测试、turn scope 外的直接调用）仍然全局可见：那里
+/// 没有「本会话」可言，收紧只会让工具桥不可用。
+fn job_visible(job_session: Option<&str>, current: Option<&str>, all: bool) -> bool {
     if all {
         return true;
     }
-    match (current, job.session_id.as_deref()) {
+    match (current, job_session) {
         (Some(current), Some(session)) => current == session,
-        _ => true,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::job_visible;
+
+    /// 可见性是权限判定,不是显示偏好——`ensure_jobs_visible` 用它决定能不能
+    /// stop 掉一个任务。所以「拿不准」必须是不可见。
+    #[test]
+    fn a_sessionless_job_is_invisible_from_inside_a_session() {
+        // 同会话:看得见。
+        assert!(job_visible(Some("s1"), Some("s1"), false));
+        // 别的会话:看不见。
+        assert!(!job_visible(Some("s2"), Some("s1"), false));
+        // 任务没有会话,而我在某个会话里 —— 以前这里是 true,于是台账恢复的
+        // 旧任务、异常路径漏抓 session 的任务对**所有**会话可见,一个会话能
+        // stop 掉另一个会话的东西。
+        assert!(!job_visible(None, Some("s1"), false));
+        // all=true 是逃生门,上面三种一律放行。
+        for job_session in [Some("s1"), Some("s2"), None] {
+            assert!(job_visible(job_session, Some("s1"), true));
+        }
+        // 调用方不在会话里(测试、turn scope 外的工具桥):没有「本会话」可言,
+        // 收紧只会让它不可用,保持全局可见。
+        assert!(job_visible(Some("s1"), None, false));
+        assert!(job_visible(None, None, false));
     }
 }
 

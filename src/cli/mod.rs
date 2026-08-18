@@ -346,23 +346,53 @@ fn reload_repl_config(
 
 const REPL_HISTORY_CAP: usize = 200;
 
-fn repl_history_file(paths: &MiyuPaths) -> PathBuf {
+/// 一个会话一个历史文件。
+///
+/// 以前是全局一个 `state/repl-history.jsonl`，所有会话混在一起——上键会翻出
+/// 别的会话里敲的东西。会话 id 形如 `sess_1787036807476_a188fc33`，本来就是
+/// 安全的文件名，但它来自库里的字符串，还是过一遍白名单：一个 `../` 就能把
+/// 写入指到 state 目录外面去。
+fn repl_history_file(paths: &MiyuPaths, session_id: &str) -> PathBuf {
+    let safe = session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    paths
+        .state_dir
+        .join("repl-history")
+        .join(format!("{safe}.jsonl"))
+}
+
+/// 分会话之前的那个全局文件。**只读不写**：老记录都在里面，直接丢掉用户会
+/// 觉得「历史没了」。新条目一律写进会话文件。
+fn legacy_repl_history_file(paths: &MiyuPaths) -> PathBuf {
     paths.state_dir.join("repl-history.jsonl")
 }
 
-/// Prompt history that survives /reset and restarts: a global append-only
-/// file, capped on load. Conversation resets delete turns, so the file is
-/// the durable source; the turns-derived list only seeds sessions that
-/// predate it.
-fn load_persistent_repl_history(paths: &MiyuPaths) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(repl_history_file(paths)) else {
+fn read_repl_history_file(path: &std::path::Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let mut entries = content
+    content
         .lines()
         .filter_map(|line| serde_json::from_str::<String>(line).ok())
         .filter(|entry| !entry.trim().is_empty())
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// Prompt history that survives /reset and restarts: a per-session
+/// append-only file, capped on load. Conversation resets delete turns, so the
+/// file is the durable source; the turns-derived list only seeds sessions that
+/// predate it.
+fn load_persistent_repl_history(paths: &MiyuPaths, session_id: &str) -> Vec<String> {
+    let path = repl_history_file(paths, session_id);
+    let mut entries = read_repl_history_file(&path);
     if entries.len() > REPL_HISTORY_CAP {
         entries = entries.split_off(entries.len() - REPL_HISTORY_CAP);
         // Opportunistic rewrite keeps the file from growing without bound.
@@ -371,7 +401,7 @@ fn load_persistent_repl_history(paths: &MiyuPaths) -> Vec<String> {
             .filter_map(|entry| serde_json::to_string(entry).ok())
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = std::fs::write(repl_history_file(paths), rewritten + "\n");
+        let _ = std::fs::write(&path, rewritten + "\n");
     }
     entries
 }
@@ -387,7 +417,7 @@ fn push_history_capped(history: &mut Vec<String>, content: &str) {
     }
 }
 
-fn persist_repl_history_entry(paths: &MiyuPaths, entry: &str) {
+fn persist_repl_history_entry(paths: &MiyuPaths, session_id: &str, entry: &str) {
     let entry = entry.trim();
     if entry.is_empty() {
         return;
@@ -395,7 +425,7 @@ fn persist_repl_history_entry(paths: &MiyuPaths, entry: &str) {
     let Ok(line) = serde_json::to_string(entry) else {
         return;
     };
-    let path = repl_history_file(paths);
+    let path = repl_history_file(paths, session_id);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

@@ -166,16 +166,6 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
         let (slash_command, command_args) = match parse_repl_input(input) {
             ReplInput::Chat => (None, ""),
             ReplInput::Slash(command, args) => (Some(command), args),
-            ReplInput::UnknownSlash(name) => {
-                repl_note(
-                    &mut live_repl,
-                    &format!(
-                        "\x1b[2m{}: {name}\x1b[0m\n",
-                        t("unknown command; try /help", "未知命令，可用 /help 查看")
-                    ),
-                )?;
-                continue;
-            }
         };
         if let Some(command) = slash_command {
             let spec = repl_command_spec(command);
@@ -939,7 +929,7 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
         }
         push_history_capped(&mut history, input);
         live_repl.editor.record_history(input);
-        persist_repl_history_entry(paths, input);
+        persist_repl_history_entry(paths, &active_session_id, input);
         match try_run_remote_chat(
             paths,
             Some(&mut live_repl),

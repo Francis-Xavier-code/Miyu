@@ -259,6 +259,7 @@ pub(in crate::web) async fn actor_loop(
                 let result = clear_actor_session_content(
                     &mut agent,
                     &config,
+                    &paths,
                     &state_store,
                     &manager,
                     &session_id,
@@ -274,6 +275,7 @@ pub(in crate::web) async fn actor_loop(
                 let result = switch_actor_session(
                     agent.as_ref(),
                     &config,
+                    &paths,
                     &state_store,
                     &manager,
                     &events,
@@ -306,7 +308,7 @@ pub(in crate::web) async fn actor_loop(
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     if &*state_store.session_id() == &*session_id {
                         manager.lock().unwrap().context =
-                            actor_context(&agent, &config, &state_store).map_err(|error| {
+                            actor_context(&agent, &config, &paths, &state_store).map_err(|error| {
                                 AdminFailure::Internal(safe_error_message(&error))
                             })?;
                     }
@@ -343,7 +345,7 @@ pub(in crate::web) async fn actor_loop(
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     if &*state_store.session_id() == &*session_id {
                         manager.lock().unwrap().context =
-                            actor_context(&agent, &config, &state_store).map_err(|error| {
+                            actor_context(&agent, &config, &paths, &state_store).map_err(|error| {
                                 AdminFailure::Internal(safe_error_message(&error))
                             })?;
                     }
@@ -406,6 +408,7 @@ pub(in crate::web) async fn actor_loop(
 pub(in crate::web) fn switch_actor_session(
     agent: Option<&Agent>,
     config: &AppConfig,
+    paths: &MiyuPaths,
     state_store: &StateStore,
     manager: &Arc<Mutex<ManagerState>>,
     events: &EventHub,
@@ -417,7 +420,7 @@ pub(in crate::web) fn switch_actor_session(
     // here could wipe a session mid-turn.
     let switch = || -> Result<ContextSnapshot> {
         state_store.switch_session(session_id)?;
-        agent.map_or_else(|| cold_context(config, state_store), current_context)
+        agent.map_or_else(|| cold_context(config, paths, state_store), current_context)
     };
     let context = switch().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     let mut manager_state = manager.lock().unwrap();
@@ -469,7 +472,7 @@ pub(in crate::web) fn reset_actor_conversation(
                 agent.prepare_for_turn()?;
                 current_context(agent).map(Some)
             } else {
-                cold_context(config, &store).map(Some)
+                cold_context(config, paths, &store).map(Some)
             }
         } else {
             Ok(None)
@@ -506,7 +509,7 @@ pub(in crate::web) fn reset_actor_persona_state(
             agent.prepare_for_turn()?;
             current_context(agent)
         } else {
-            cold_context(daemon_config, state_store)
+            cold_context(daemon_config, paths, state_store)
         }
     };
     let context = reset().map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
@@ -521,6 +524,7 @@ pub(in crate::web) fn reset_actor_persona_state(
 pub(in crate::web) fn clear_actor_session_content(
     agent: &mut Option<Agent>,
     config: &AppConfig,
+    paths: &MiyuPaths,
     state_store: &StateStore,
     manager: &Arc<Mutex<ManagerState>>,
     session_id: &str,
@@ -540,7 +544,7 @@ pub(in crate::web) fn clear_actor_session_content(
                 .and_then(|()| agent.prepare_for_turn())
                 .and_then(|()| current_context(agent))
         } else {
-            cold_context(config, &store)
+            cold_context(config, paths, &store)
         }
         .map_err(|error| AdminFailure::Internal(safe_error_message(error)))?;
         manager.lock().unwrap().context = context;
@@ -584,11 +588,12 @@ pub(in crate::web) fn ensure_actor_agent<'a>(
 pub(in crate::web) fn actor_context(
     agent: &Option<Agent>,
     config: &AppConfig,
+    paths: &MiyuPaths,
     state: &StateStore,
 ) -> Result<ContextSnapshot> {
     agent
         .as_ref()
-        .map_or_else(|| cold_context(config, state), current_context)
+        .map_or_else(|| cold_context(config, paths, state), current_context)
 }
 
 #[allow(clippy::too_many_arguments)]

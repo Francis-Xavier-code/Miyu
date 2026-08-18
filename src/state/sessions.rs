@@ -146,7 +146,10 @@ impl StateStore {
         }
     }
 
-    pub(crate) fn platform_access_authorized(&self, authorization: &PlatformAccessAuthorization) -> bool {
+    pub(crate) fn platform_access_authorized(
+        &self,
+        authorization: &PlatformAccessAuthorization,
+    ) -> bool {
         if authorization.statically_authorized {
             return true;
         }
@@ -185,6 +188,32 @@ impl StateStore {
 
     pub fn set_repl_session(&self, persona: &str, session_id: &str) -> Result<()> {
         self.conv_db.set_repl_session(persona, session_id)
+    }
+
+    /// 这条人格车道的 REPL 会话；指针缺失就自举一条新的。
+    ///
+    /// 终端集成（shellhook）、普通 REPL、开发 REPL 是**三条并行车道**，各自
+    /// 记一个指针。normal 以前在指针缺失时退到 `session_id()`——那是终端集成
+    /// 那条车道，于是第一次 `miyu normal` 就把两边焊在同一个会话上，对话混成
+    /// 一摊。dev 早就是自举的，normal 没跟上。
+    ///
+    /// 远端（`GetReplSession`）与直连（`run_direct_repl`）两条入口共用这里：
+    /// 分开写过一次，改一边漏一边，行为就分叉了。
+    pub fn ensure_repl_session(&self, persona: &str) -> Result<String> {
+        match self.repl_session(persona)? {
+            Some(session_id) => Ok(session_id),
+            None => self.new_repl_session(persona),
+        }
+    }
+
+    /// 给这条人格车道新建一个会话并钉住指针。
+    ///
+    /// 名字留空是有意的：首条消息会自动命名。不动 `session_id()`——终端车道
+    /// 保持原样，用户要回去用 `/session`。
+    pub fn new_repl_session(&self, persona: &str) -> Result<String> {
+        let record = self.create_session(persona, "", crate::state::USER_SESSION_KIND, None)?;
+        self.set_repl_session(persona, &record.session_id)?;
+        Ok(record.session_id)
     }
 
     /// Claims persona-less sessions (schema-v2 migrated rows) for the active

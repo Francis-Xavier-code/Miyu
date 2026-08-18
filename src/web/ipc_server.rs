@@ -177,40 +177,26 @@ pub(in crate::web) async fn handle_ipc_connection(
                 active_persona_scope(&state)
             };
             let store = &state.state_store;
-            // A stale pointer (session deleted or archived elsewhere) must not
-            // strand the REPL: fall back to the terminal session and heal the
-            // pointer so the next start is a plain read. Dev 无「终端会话」
-            // 可退,指针缺失时自举一个新的 dev 会话。
-            let session_id = match store.repl_session(&persona).ok().flatten() {
-                Some(session_id) => session_id,
-                None if dev => {
-                    store
-                        .create_session(
-                            crate::state::DEV_PERSONA,
-                            "",
-                            crate::state::USER_SESSION_KIND,
-                            None,
-                        )
-                        .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?
-                        .session_id
-                }
-                None => store.session_id().to_string(),
-            };
+            // 终端集成、普通、开发是**三条并行车道**,各有各的会话指针。指针
+            // 缺失或指向已删/已归档的会话时,一律自举一个新的本地会话。
+            //
+            // normal 以前在这两处都退到 `store.session_id()`——那是终端集成
+            // (shellhook)的车道。于是第一次 `miyu normal` 就把 REPL 焊在终端
+            // 会话上,两边的对话混成一摊。dev 早就是自举的,normal 没跟上。
+            //
+            // 空名字是有意的:首条消息会自动命名(与 dev 同路)。不动
+            // `store.session_id()`,终端车道保持原样;要回去用 `/session`。
+            let session_id = store
+                .ensure_repl_session(&persona)
+                .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?;
+            // 指针有效但会话已归档/不是本地会话时同样换一条新的,别把 REPL
+            // 卡在一个进不去的会话上。
             let target = ipc::SessionRef::Id { id: session_id };
             let session_id = match resolve_available_local_session_ref(&state, &target) {
                 Ok(record) => record.session_id,
-                Err(_) if dev => {
-                    store
-                        .create_session(
-                            crate::state::DEV_PERSONA,
-                            "",
-                            crate::state::USER_SESSION_KIND,
-                            None,
-                        )
-                        .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?
-                        .session_id
-                }
-                Err(_) => store.session_id().to_string(),
+                Err(_) => store
+                    .new_repl_session(&persona)
+                    .map_err(|error| anyhow::anyhow!(safe_error_message(&error)))?,
             };
             let _ = store.set_repl_session(&persona, &session_id);
             ipc::send(

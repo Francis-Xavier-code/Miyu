@@ -219,7 +219,7 @@ pub(crate) async fn job_status(args: Value) -> Result<String> {
         prune_expired_terminal(&mut jobs);
         let mut rows = jobs
             .values()
-            .filter(|job| job_visible(job, current.as_deref(), all))
+            .filter(|job| job_visible(job.session_id.as_deref(), current.as_deref(), all))
             .collect::<Vec<_>>();
         rows.sort_by_key(|job| job.started_wall);
         // 每条带一段日志尾部:否则模型看完列表还得逐个再查一轮才知道进展,

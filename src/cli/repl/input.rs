@@ -12,7 +12,8 @@ pub(in crate::cli) fn read_live_repl_input(
     live: &mut LiveReplTail,
     paths: &MiyuPaths,
     jobs_feed: &JobsFeed,
-    wake_session: Option<&str>,
+    // 这个 REPL 的会话：唤醒回合按它认领，输入历史也按它刷新。
+    repl_session: Option<&str>,
 ) -> Result<LiveReplOutcome> {
     let mut raw = if std::mem::take(&mut live.raw_mode_handoff) {
         LiveRawMode::adopt()
@@ -27,11 +28,13 @@ pub(in crate::cli) fn read_live_repl_input(
         // 等待权自持:PTY 死亡后 crossterm 的 poll 会在内部对 HUP fd
         // 无限自旋、永不返回(实测),所以不能把"等 80ms"交给它——用裸
         // poll 等待并率先识别挂断,有输入就绪时才让 crossterm 取事件。
-        let mut pollfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let mut pollfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ready = unsafe { libc::poll(&mut pollfd, 1, 80) };
-        if ready == 1
-            && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
-        {
+        if ready == 1 && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
             return Ok(LiveReplOutcome::Exit);
         }
         // 就绪判定必须问 crossterm(它的内部缓冲对裸 poll 不可见):
@@ -51,7 +54,7 @@ pub(in crate::cli) fn read_live_repl_input(
             if typing {
                 continue;
             }
-            if let Some(session) = wake_session {
+            if let Some(session) = repl_session {
                 if let Some((run_id, label)) = jobs_feed.claim_wake_run(session) {
                     return Ok(LiveReplOutcome::FollowWake { run_id, label });
                 }
@@ -74,13 +77,38 @@ pub(in crate::cli) fn read_live_repl_input(
                 return Ok(LiveReplOutcome::Exit);
             }
             last_key_at = Instant::now();
-            match live.editor.handle_event(event::read()?, paths, false)? {
+            let event = event::read()?;
+            // 上键开始翻历史之前，先把别的 REPL 刚落盘的输入补进来。历史只在
+            // 启动时读一次，两个 REPL 同时开着时先开的那个原本永远看不到后开
+            // 的那个敲了什么（见 `refresh_repl_input_history`）。
+            //
+            // 只在输入框为空、也就是「从头开始翻」时刷：翻到一半重载会让
+            // history_index 指错行。
+            if live.editor.input.is_empty()
+                && matches!(
+                    &event,
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Up,
+                        kind,
+                        ..
+                    }) if *kind != KeyEventKind::Release
+                )
+            {
+                if let Some(session) = repl_session {
+                    if refresh_repl_input_history(&mut live.editor.history, paths, session) {
+                        live.editor.history_index = live.editor.history.len();
+                    }
+                }
+            }
+            match live.editor.handle_event(event, paths, false)? {
                 LiveEditorAction::None => {}
                 LiveEditorAction::Redraw => {
                     synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.redraw())?
                 }
                 LiveEditorAction::ClearScreen => {
-                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || live.clear_screen())?
+                    synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                        live.clear_screen()
+                    })?
                 }
                 LiveEditorAction::EmptySubmit => {
                     synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
@@ -448,19 +476,12 @@ pub(in crate::cli) fn read_repl_input(
                     )?;
                 }
                 KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((start, end)) = placeholder_before_or_at_cursor(&input, cursor) {
-                        clear_placeholder_payload(
-                            &input,
-                            start,
-                            end,
-                            &mut pasted_images,
-                            &mut pasted_texts,
-                        );
-                        remove_range_chars(&mut input, start, end);
-                        cursor = start;
-                    } else {
-                        remove_word_before_cursor(&mut input, &mut cursor);
-                    }
+                    remove_word_before_cursor(
+                        &mut input,
+                        &mut cursor,
+                        &mut pasted_images,
+                        &mut pasted_texts,
+                    );
                     history_clean_index = None;
                     is_pasted = false;
                     render_repl_input(

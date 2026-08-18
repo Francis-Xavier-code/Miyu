@@ -263,6 +263,49 @@ pub(in crate::cli) fn clear_placeholder_payload(
     }
 }
 
+/// Ctrl+W：往前删一个词，占位符整块删并清掉它的载荷。
+///
+/// 这里收了两个坑。
+///
+/// 一、**隔着空白也要整块删**。以前只在光标**紧贴**占位符时走整块删除，否则
+/// 退回按空白分词。但占位符自带空格（`[Pasted 1: ~3 lines]`），光标隔着一个
+/// 空格按 Ctrl+W，分词就切进它中段：屏幕上留下 `[Pasted 1: ~3`，再也解析不
+/// 回去，而载荷还挂在数组里，提交时被 `expand_pasted_text_placeholders`
+/// 原样展开——用户看到的和发出去的对不上。
+///
+/// 二、**两个调用点必须同一份逻辑**。live 编辑器和旧输入路径原先各写了一份
+/// 一模一样的分支，改一边漏一边就是行为分叉（AGENTS.md 2.4）。
+pub(in crate::cli) fn remove_word_before_cursor(
+    input: &mut String,
+    cursor: &mut usize,
+    pasted_images: &mut [Option<crate::clipboard::PastedImage>],
+    pasted_texts: &mut [Option<PastedText>],
+) {
+    if *cursor == 0 {
+        return;
+    }
+    // 光标落在占位符内部或紧贴其后时，连它**后半截**一起删——只删到光标会留残片。
+    // 其余情况按词退，词首落进占位符中段时 `word_start_before_cursor` 会退到它开头。
+    let (start, end) = match placeholder_before_or_at_cursor(input, *cursor) {
+        Some(range) => range,
+        None => (word_start_before_cursor(input, *cursor), *cursor),
+    };
+    // 一次 Ctrl+W 可能吞掉不止一个（`[Image 1][Image 2]` 中间没有空白）。
+    for (placeholder_start, placeholder_end) in find_repl_placeholders(input) {
+        if placeholder_start >= start && placeholder_end <= end {
+            clear_placeholder_payload(
+                input,
+                placeholder_start,
+                placeholder_end,
+                pasted_images,
+                pasted_texts,
+            );
+        }
+    }
+    remove_range_chars(input, start, end);
+    *cursor = start;
+}
+
 pub(in crate::cli) fn expand_pasted_text_placeholders(input: &str, pasted_texts: &[Option<PastedText>]) -> String {
     let placeholders = find_pasted_text_placeholders(input);
     if placeholders.is_empty() {

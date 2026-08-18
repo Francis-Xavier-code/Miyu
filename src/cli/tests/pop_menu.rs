@@ -91,7 +91,7 @@ fn filtered_pop_turns_keep_oldest_first_order() {
 fn pop_is_a_repl_command_with_an_optional_count() {
     assert!(repl_commands().contains(&"/pop"));
     assert_eq!(split_repl_command("/pop 3"), ("/pop", "3"));
-    // "/p" became ambiguous once /persona joined the table.
-    assert_eq!(resolve_repl_command("/po"), "/pop");
-    assert_eq!(resolve_repl_command("/pe"), "/persona");
+    // "/p" became ambiguous once /persona joined the table. 前缀只在 Tab 展开。
+    assert_eq!(complete_repl_command("/po"), Some("/pop"));
+    assert_eq!(complete_repl_command("/pe"), Some("/persona"));
 }

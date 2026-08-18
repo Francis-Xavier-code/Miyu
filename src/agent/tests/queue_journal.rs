@@ -720,11 +720,48 @@ async fn queued_prompts_are_consumed_after_tools_with_dispatch_time_mode() {
     server.await.unwrap();
 }
 
+/// stub 模式下 ask_question 必须直接发完整契约，而不是一句摘要 + 空壳。
+///
+/// 它是唯一绕过 `ToolRegistry` 分发的工具（`turn_loop` 按名字特判要交互通道），
+/// 所以注册表那道 `coerce_declared_shapes` 到不了它——**模型看到什么形状，就
+/// 照着填什么形状**，没有第二道兜底。`always_loaded: false` 时它在 stub 里只
+/// 剩 60 字摘要和 `{"type":"object"}`，模型拿不到 `questions` 是数组、
+/// `options` 的元素是对象这些信息，于是把 questions 填成字符串数组、options
+/// 填成字符串——下面那个用例里的补救解析就是这么被逼出来的。
+///
+/// 代价是每个交互会话的工具目录多约 2.5 KiB（≈650 token）常驻缓存前缀，按
+/// 十分之一计价，可以忽略。
+#[test]
+fn ask_question_ships_its_full_schema_in_stub_mode() {
+    let mut tools = ToolRegistry::new();
+    crate::tools::register_ask_question(&mut tools);
+    let definition = tools
+        .stub_definitions()
+        .into_iter()
+        .find(|definition| definition.function.name == "ask_question")
+        .expect("ask_question 应当在注册表里");
+    let questions = &definition.function.parameters["properties"]["questions"];
+    assert_eq!(
+        questions["type"], "array",
+        "stub 里拿不到 questions 的数组契约，模型只能猜形状"
+    );
+    let fields = &questions["items"]["properties"];
+    for field in ["header", "question", "options"] {
+        assert!(!fields[field].is_null(), "缺少 {field} 的字段契约");
+    }
+    assert_eq!(
+        fields["options"]["items"]["type"], "object",
+        "options 的元素必须声明成对象，否则模型会填字符串数组"
+    );
+}
+
 /// 端到端走一遍 ask_question 的分发：模型把 `questions` 序列化成字符串发过来，
 /// 回合应当照常弹出提问、拿到回答、继续跑完，而不是回一条 tool error。
 ///
 /// 这个工具不走 `ToolRegistry` 分发（要拿交互通道），所以注册表那道
 /// `coerce_declared_shapes` 到不了它——只有从这条路真跑一遍才算验过。
+/// 上面那条契约用例修好之后这种形状应当变罕见，但**兼容解析不能撤**：
+/// 模型仍然会偶尔填错，而这里没有第二道兜底。
 #[tokio::test]
 async fn ask_question_accepts_questions_serialized_as_a_json_string() {
     let temp = tempfile::tempdir().unwrap();

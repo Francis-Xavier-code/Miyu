@@ -18,8 +18,11 @@ fn compact_is_a_repl_command() {
 fn usage_and_persona_are_repl_commands() {
     assert!(repl_commands().contains(&"/usage"));
     assert!(repl_commands().contains(&"/persona"));
-    assert_eq!(resolve_repl_command("/us"), "/usage");
-    assert_eq!(split_repl_command("/persona Alice.md"), ("/persona", "Alice.md"));
+    assert_eq!(complete_repl_command("/us"), Some("/usage"));
+    assert_eq!(
+        split_repl_command("/persona Alice.md"),
+        ("/persona", "Alice.md")
+    );
 }
 
 #[test]
@@ -94,12 +97,15 @@ fn wipe_is_its_own_command_not_a_suffix_on_reset() {
     ));
 }
 
+/// 前缀展开只活在 Tab 补全里,不在执行路径上。用户按 Tab 看得见展开结果、
+/// 能反悔;回车则一律按完整名字算(见 `unique_prefixes_are_not_executed`)。
 #[test]
-fn partial_slash_command_resolves_unique_match() {
-    assert_eq!(resolve_repl_command("/model"), "/models");
-    assert_eq!(resolve_repl_command("/compa"), "/compact");
-    assert_eq!(resolve_repl_command("/co"), "/co");
-    assert_eq!(resolve_repl_command("hello"), "hello");
+fn tab_completion_still_expands_unique_prefixes() {
+    assert_eq!(complete_repl_command("/model"), Some("/models"));
+    assert_eq!(complete_repl_command("/compa"), Some("/compact"));
+    // 歧义前缀不展开:/config /compact /clear 都以 /c 开头。
+    assert_eq!(complete_repl_command("/co"), None);
+    assert_eq!(complete_repl_command("hello"), None);
 }
 
 #[test]
@@ -109,12 +115,7 @@ fn parse_repl_input_dispatches_by_table() {
         parse_repl_input("/models"),
         ReplInput::Slash(ReplSlashCommand::Models, "")
     ));
-    // Unique prefix resolves.
-    assert!(matches!(
-        parse_repl_input("/compa"),
-        ReplInput::Slash(ReplSlashCommand::Compact, "")
-    ));
-    // Exact match wins over ambiguous prefixes of longer names.
+    // `/reset` 与 `/reset all`:名字精确,参数原样带过去。
     assert!(matches!(
         parse_repl_input("/reset all"),
         ReplInput::Slash(ReplSlashCommand::Reset, "all")
@@ -124,15 +125,44 @@ fn parse_repl_input_dispatches_by_table() {
         parse_repl_input("/POP 3"),
         ReplInput::Slash(ReplSlashCommand::Pop, "3")
     ));
-    // Ambiguous prefix stays unknown.
-    assert!(matches!(
-        parse_repl_input("/co"),
-        ReplInput::UnknownSlash("/co")
-    ));
-    assert!(matches!(
-        parse_repl_input("/nope"),
-        ReplInput::UnknownSlash("/nope")
-    ));
+}
+
+/// 回车不做前缀展开。这些以前都会**静默执行**:`/n 什么的` 建了个叫「什么的」
+/// 的会话,`/d 3` 删掉 3 号会话。用户想说的只是一句普通的话。
+#[test]
+fn unique_prefixes_are_not_executed() {
+    for input in [
+        "/n 什么的", // 曾命中 /new [name]
+        "/d 3",      // 曾命中 /delete [name|index]
+        "/m gpt-4",  // 曾命中 /models
+        "/v 高",     // 曾命中 /variant
+        "/compa",    // 曾命中 /compact
+        "/se",       // 曾命中 /session
+    ] {
+        assert!(
+            matches!(parse_repl_input(input), ReplInput::Chat),
+            "{input} 必须当成聊天,不能当命令执行"
+        );
+    }
+}
+
+/// `/` 开头但不命中命令表的输入是**普通消息**,不是「未知命令」。
+/// 以前整行被丢弃、输入框也清空,用户只看到一句「未知命令」。
+#[test]
+fn unmatched_slash_input_falls_through_to_chat() {
+    for input in [
+        "/home/shorin/notes.md 这个文件讲了什么",
+        "/usr/bin 下面有什么",
+        "/nope",
+        "/rest", // 打错的命令也发给模型,模型会告诉你
+        "/",
+        "/1234",
+    ] {
+        assert!(
+            matches!(parse_repl_input(input), ReplInput::Chat),
+            "{input} 必须落到聊天"
+        );
+    }
 }
 
 #[test]

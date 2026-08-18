@@ -189,8 +189,13 @@ pub(in crate::cli) async fn run_live_agent_turn(
                             kind,
                             ..
                         }) if *kind != KeyEventKind::Release
-                    ) && live.editor.input.trim_start().starts_with('/')
-                    {
+                    ) && matches!(
+                        // 只拦真命令。以前是 `starts_with('/')`,于是
+                        // 「/home/x 这是什么」在回合中途按回车既不发送也不排队,
+                        // 文本卡在输入框里——用户看到的是「回车没反应」。
+                        parse_repl_input(live.editor.input.trim_start()),
+                        ReplInput::Slash(..)
+                    ) {
                         if live.external_output_active {
                             continue;
                         }

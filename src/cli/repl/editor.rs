@@ -8,23 +8,60 @@
 // 免得一次改动横跨太多文件而无法定位问题。
 use crate::cli::*;
 
+/// 这个会话的上键历史。
+///
+/// 三个来源按「从旧到新」拼起来——上键是从**末尾**往回走的，顺序错了最近敲的
+/// 就不在第一格：
+///
+/// 1. 分会话之前的全局文件（只读的老数据）
+/// 2. 本会话的对话记录里用户说过的话
+/// 3. 本会话的历史文件（`/reset` 删掉 turn 之后它仍在，是持久真相）
 pub(in crate::cli) fn load_repl_input_history(
     state: &StateStore,
     paths: &MiyuPaths,
 ) -> Result<Vec<String>> {
-    let mut merged: Vec<String> = state
+    let session_id = state.session_id();
+    let mut merged: Vec<String> = read_repl_history_file(&legacy_repl_history_file(paths));
+    let conversation = state
         .load_conversation()?
         .into_iter()
         .filter(|entry| entry.role == "user" && !entry.content.trim().is_empty())
         .map(|entry| strip_terminal_control_sequences(&entry.content))
-        .filter(|content| !content.trim().is_empty())
-        .collect();
-    for entry in load_persistent_repl_history(paths) {
+        .filter(|content| !content.trim().is_empty());
+    for entry in conversation {
+        if !merged.contains(&entry) {
+            merged.push(entry);
+        }
+    }
+    for entry in load_persistent_repl_history(paths, &session_id) {
         if !merged.contains(&entry) {
             merged.push(entry);
         }
     }
     Ok(merged)
+}
+
+/// 从磁盘补齐本会话的历史，返回是否真的多出了条目。
+///
+/// 历史以前只在 REPL 启动时读一次（`load_repl_input_history`），此后整个循环
+/// **没有任何重新加载的路径**。于是两个 REPL 同时开着时，先开的那个永远看不到
+/// 后来在另一个窗口敲的东西。上一轮排查按「先敲完再开第二个」测，走的是启动
+/// 加载那条路，当然是通的，所以没能复现——测错了顺序。
+///
+/// 只在「从空输入框开始翻」时调用：翻到一半重载会让 `history_index` 错位。
+pub(in crate::cli) fn refresh_repl_input_history(
+    history: &mut Vec<String>,
+    paths: &MiyuPaths,
+    session_id: &str,
+) -> bool {
+    let mut added = false;
+    for entry in load_persistent_repl_history(paths, session_id) {
+        if !history.contains(&entry) {
+            push_history_capped(history, &entry);
+            added = true;
+        }
+    }
+    added
 }
 
 pub(in crate::cli) struct LiveReplEditor {
@@ -182,6 +219,15 @@ impl LiveReplEditor {
                         self.escape_armed_until = Some(Instant::now() + Duration::from_secs(2));
                     }
                 }
+                // Ctrl+方向 必须排在裸方向之前:match 从上往下取第一个命中的
+                // 分支,裸 `KeyCode::Left` 不看修饰键,写在前面会把 Ctrl 组合
+                // 一起吃掉。
+                KeyCode::Left if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = word_start_before_cursor(&self.input, self.cursor);
+                }
+                KeyCode::Right if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = word_end_after_cursor(&self.input, self.cursor);
+                }
                 KeyCode::Left => {
                     if let Some((start, _)) = placeholder_at_cursor(&self.input, self.cursor) {
                         self.cursor = start;
@@ -280,21 +326,12 @@ impl LiveReplEditor {
                     return Ok(LiveEditorAction::Exit);
                 }
                 KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((start, end)) =
-                        placeholder_before_or_at_cursor(&self.input, self.cursor)
-                    {
-                        clear_placeholder_payload(
-                            &self.input,
-                            start,
-                            end,
-                            &mut self.pasted_images,
-                            &mut self.pasted_texts,
-                        );
-                        remove_range_chars(&mut self.input, start, end);
-                        self.cursor = start;
-                    } else {
-                        remove_word_before_cursor(&mut self.input, &mut self.cursor);
-                    }
+                    remove_word_before_cursor(
+                        &mut self.input,
+                        &mut self.cursor,
+                        &mut self.pasted_images,
+                        &mut self.pasted_texts,
+                    );
                     self.history_clean_index = None;
                     self.is_pasted = false;
                 }
@@ -460,20 +497,27 @@ pub(in crate::cli) fn repl_input_lines(input: &str) -> Vec<String> {
     lines
 }
 
+/// 判定一行输入是命令还是聊天。**只认完整命令名**——不命中就是聊天。
+///
+/// 两条边界都是踩出来的：
+///
+/// 一、回车不做前缀展开。以前 `/n 什么的` 唯一前缀命中 `/new [name]`，静默建
+/// 了个叫「什么的」的会话；`/d 3` 命中 `/delete [name|index]`，静默删掉 3 号
+/// 会话。用户想说的只是普通句子，代价却是数据没了。前缀展开留给 Tab
+/// （`complete_repl_command`）——那里用户看得见展开结果，能反悔。
+///
+/// 二、不命中回落聊天而不是报「未知命令」。`/home/shorin/x 这是什么` 是完全
+/// 正常的一句话，以前整行被丢弃、输入框也被清空。平台侧早就是这个语义
+/// （`platforms/commands.rs`：未注册名返回 `None`，继续当普通聊天），REPL 现在
+/// 对齐。代价是打错的命令（`/rest`）会发给模型，可接受——模型会告诉你。
 pub(in crate::cli) fn parse_repl_input(input: &str) -> ReplInput<'_> {
     if !input.starts_with('/') {
         return ReplInput::Chat;
     }
     let (name, args) = split_repl_command(input);
     let lowered = name.to_ascii_lowercase();
-    if let Some(spec) = REPL_COMMAND_TABLE.iter().find(|spec| spec.name == lowered) {
-        return ReplInput::Slash(spec.command, args);
-    }
-    let mut matches = REPL_COMMAND_TABLE
-        .iter()
-        .filter(|spec| spec.name.starts_with(&lowered));
-    match (matches.next(), matches.next()) {
-        (Some(spec), None) => ReplInput::Slash(spec.command, args),
-        _ => ReplInput::UnknownSlash(name),
+    match REPL_COMMAND_TABLE.iter().find(|spec| spec.name == lowered) {
+        Some(spec) => ReplInput::Slash(spec.command, args),
+        None => ReplInput::Chat,
     }
 }

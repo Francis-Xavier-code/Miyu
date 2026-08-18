@@ -85,6 +85,45 @@ async fn one_shot_sessions_are_mintable_runnable_and_deletable_but_nothing_else(
     assert!(resolve_turn_session(&state, Some(ask_id)).is_err());
 }
 
+/// 终端集成、普通 REPL、开发 REPL 是三条并行车道。
+///
+/// normal 以前在指针缺失时退到 `session_id()`——也就是终端集成那条——于是第一
+/// 次 `miyu normal` 就把两边焊在同一个会话上，shellhook 的对话和 REPL 的对话
+/// 混进同一段历史。dev 早就是自举的，normal 没跟上。
+#[test]
+fn the_three_repl_lanes_never_share_a_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = StateStore::new(&test_paths(temp.path())).unwrap();
+    store.init_files().unwrap();
+    let terminal = store.session_id().to_string();
+
+    let normal = store.ensure_repl_session("default").unwrap();
+    let dev = store
+        .ensure_repl_session(crate::state::DEV_PERSONA)
+        .unwrap();
+
+    assert_ne!(normal, terminal, "普通 REPL 不能落在终端集成会话上");
+    assert_ne!(dev, terminal, "开发 REPL 不能落在终端集成会话上");
+    assert_ne!(normal, dev, "普通与开发是两条车道");
+    // 自举不许移动终端车道——shellhook 还在那边说话。
+    assert_eq!(&*store.session_id(), terminal.as_str());
+
+    // 指针钉住了：再进一次回到同一条，不会每次开新会话。
+    assert_eq!(store.ensure_repl_session("default").unwrap(), normal);
+    assert_eq!(
+        store
+            .ensure_repl_session(crate::state::DEV_PERSONA)
+            .unwrap(),
+        dev
+    );
+
+    // 会话被删之后指针失效，换一条新的，而不是掉回终端车道。
+    store.delete_session(&normal).unwrap();
+    let healed = store.ensure_repl_session("default").unwrap();
+    assert_ne!(healed, normal);
+    assert_ne!(healed, terminal, "指针失效也不该退到终端集成会话");
+}
+
 #[tokio::test]
 async fn repl_session_lane_resumes_and_heals_without_moving_the_terminal_lane() {
     let temp = tempfile::tempdir().unwrap();

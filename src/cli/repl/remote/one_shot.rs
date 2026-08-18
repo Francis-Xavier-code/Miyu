@@ -149,8 +149,11 @@ pub(in crate::cli) async fn try_run_remote_chat(
                             kind,
                             ..
                         }) if *kind != KeyEventKind::Release
-                    ) && live_tail.editor.input.trim_start().starts_with('/')
-                    {
+                    ) && matches!(
+                        // 只拦真命令,理由同 live_turn.rs 的同一处判定。
+                        parse_repl_input(live_tail.editor.input.trim_start()),
+                        ReplInput::Slash(..)
+                    ) {
                         if live_tail.external_output_active {
                             continue;
                         }

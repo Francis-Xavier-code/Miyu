@@ -41,22 +41,18 @@ if [ "$before" -gt 0 ] && [ "$now" -lt "$before" ]; then
   echo "✗ 用例数从 $before 降到 $now——搬测试时漏了一整个 mod？"
   exit 1
 fi
+# 这里曾经放行 origin_tty_gates_and_writeback_against_real_pty，理由写的是
+# 「依赖本机 PTY 与子进程环境」。那个归因是错的：真凶是它内嵌的那段 Python
+# 在拆分模块时被重排掉了缩进，解释器 IndentationError 秒退、没有 stdout，
+# Rust 侧 lines.next() 拿到 None 就 panic —— 报错指向 Rust，人就往 Rust 查。
+#
+# 缩进修好之后这条豁免不但是死的，还留了个盲区:同一类重排再发生一次，门禁
+# 会静默放行。所以撤掉——任何用例失败都是红的。
 if [ "$failed" -gt 0 ]; then
-  # 已知例外:origin_tty_gates_and_writeback_against_real_pty 依赖本机 PTY
-  # 与子进程环境，在 HEAD 上同样失败（方案 03-Phase0 已记录）。拆分期不追它，
-  # 但也不能让它把「真的改坏了」盖过去——所以只放行这一个。
-  # grep 没匹配到时返回 1，pipefail 下会让命令替换整体失败、set -e 当场中断
-  # ——「没有意外失败」恰恰是最常见的情况，不兜住的话脚本永远跑不完。
-  unexpected=$({ printf '%s\n' "$output" | grep -E "^    [a-z_:]+::" \
-    | grep -v "origin_tty_gates_and_writeback_against_real_pty" || true; } | wc -l)
-  if [ "$unexpected" -gt 0 ]; then
-    echo "✗ 有 $failed 个用例失败，其中 $unexpected 个不在已知例外里"
-    exit 1
-  fi
-  echo "用例数 $now（基线 $before）；$failed 个失败，均为已知的 PTY 环境例外"
-else
-  echo "用例数 $now（基线 $before）"
+  echo "✗ 有 $failed 个用例失败"
+  exit 1
 fi
+echo "用例数 $now（基线 $before）"
 
 step "文件规模"
 python3 scripts/refactor_size_report.py --check

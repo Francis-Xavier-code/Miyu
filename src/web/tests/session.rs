@@ -122,6 +122,51 @@ fn target_session_state_does_not_move_the_default_session() {
     assert_eq!(&*state.state_store.session_id(), &*default_session_id);
 }
 
+/// daemon 冷启动后，当前会话的 footer 上下文不能是 0。
+///
+/// `cold_context` 曾经把 `tokens` 硬编码成 0，而 `session_state_for` 对「当前
+/// 会话」直接读 `manager.context` 这份内存快照、不重算——于是退出 REPL 再进去，
+/// 首帧显示 `0/168k`，要对话一次才恢复。会话里明明躺着几万 token 的历史。
+#[test]
+fn cold_started_daemon_reports_a_nonzero_context_for_the_current_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let store = StateStore::new(&paths).unwrap();
+    store.init_files().unwrap();
+    // 先攒出一段够长的历史，让它明显盖过系统提示词本身的量。
+    for index in 0..8 {
+        let turn_id = format!("turn-{index}");
+        store
+            .start_turn(
+                &turn_id,
+                &"用户说了很长一段话。".repeat(40),
+                std::process::id(),
+            )
+            .unwrap();
+        store
+            .complete_turn(&turn_id, &"助手也回了很长一段。".repeat(40), None)
+            .unwrap();
+    }
+
+    // 这一步就是「daemon 冷启动」：没有活的 Agent，只有配置和状态库。
+    let config = crate::config::AppConfig::default();
+    let cold = cold_context(&config, &paths, &store).unwrap();
+    assert!(
+        cold.tokens > 0,
+        "冷启动上下文是 {}，footer 会显示 0",
+        cold.tokens
+    );
+
+    // 而且要和「有 Agent 时」算出来的是同一个数——两条路口径不一致的话，
+    // 切个会话数字就跳。
+    let live = build_session_agent(&config, &paths, &store).unwrap();
+    assert_eq!(
+        cold.tokens,
+        live.effective_context_tokens().unwrap(),
+        "冷路径与热路径口径不一致"
+    );
+}
+
 #[test]
 fn local_session_resolution_rejects_platform_ids_and_prefers_local_names() {
     let temp = tempfile::tempdir().unwrap();

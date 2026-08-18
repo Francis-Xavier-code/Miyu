@@ -155,13 +155,28 @@ pub(in crate::platforms::onebot) async fn download_platform_file_capped(
 
 /// Saves inbound bytes under `<cache>/platform_files/qq/`, keeping only
 /// the basename (no path traversal) and suffixing on collision.
+///
+/// **返回前必须 flush。** `tokio::fs::File` 的 `write_all` 只把数据拷进内部
+/// 缓冲、把真正的写 `spawn_mandatory_blocking` 扔给阻塞线程池，然后立刻返回
+/// Ok（tokio `fs/file.rs` 的 `poll_write`：copy_from → spawn → `Poll::Ready`）。
+/// drop 不等它完成——tokio 自己的文档写着「要保证 drop 时文件立即关闭，必须先
+/// 调 flush」。
+///
+/// 不 flush 的后果不是「慢一点」，是**调用方拿到路径时文件可能还是空的**：
+/// 入站文件的路径会直接交给模型去读。线程池空闲时看不出来，繁忙时就丢数据。
+/// `download_platform_file` 那条路一直有 flush，这条漏了。
 pub(in crate::platforms::onebot) async fn save_platform_file(
     data_dir: &std::path::Path,
     name: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
     let (path, mut output) = create_platform_file(data_dir, name).await?;
-    if let Err(error) = output.write_all(bytes).await {
+    let written = async {
+        output.write_all(bytes).await?;
+        output.flush().await
+    }
+    .await;
+    if let Err(error) = written {
         drop(output);
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error).context("writing the inbound platform file");
