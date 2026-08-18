@@ -251,6 +251,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         .route("/styles.css", get(styles_asset))
         .route("/theme.css", get(theme_css))
         .route("/app.js", get(app_asset))
+        .route("/commands.js", get(commands_js_asset))
         .route("/vendor/katex/katex.min.js", get(katex_js_asset))
         .route("/vendor/katex/katex.min.css", get(katex_css_asset))
         .route("/vendor/katex/fonts/{font}", get(katex_font_asset))
@@ -325,6 +326,9 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
             get(get_thinking_variants).put(set_thinking_variants),
         )
         .route("/api/conversation/reset", post(reset_conversation))
+        .route("/api/commands", get(list_commands))
+        .route("/api/conversation/compact", post(compact_conversation))
+        .route("/api/memory/reset", post(reset_memory_http))
         .route("/api/jobs", get(list_jobs_http))
         .route("/api/usage/stats", get(usage_stats_web))
         .route("/api/usage/details", get(usage_details_web))

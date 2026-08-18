@@ -24,6 +24,7 @@ mod qq_history;
 mod tty;
 mod assets;
 mod attachments;
+mod commands_api;
 mod config_api;
 mod persona;
 mod prompt_files;
@@ -46,6 +47,7 @@ use qq_history::*;
 use tty::*;
 use assets::*;
 use attachments::*;
+use commands_api::*;
 use config_api::*;
 use persona::*;
 use prompt_files::*;
@@ -115,6 +117,8 @@ const MAX_PROMPT_DOCUMENTS: usize = 128;
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const STYLES_CSS: &str = include_str!("../../web/styles.css");
 const APP_JS: &str = include_str!("../../web/app.js");
+// 斜杠命令层单独一个文件:app.js 已经 9500 行,再往里长就找不到东西了。
+const COMMANDS_JS: &str = include_str!("../../web/commands.js");
 // KaTeX 0.18.4(vendored):公式渲染;字体只带 woff2(css 里 woff2 列首,
 // 现代浏览器不会去请求 woff/ttf 回退项)。
 const KATEX_JS: &str = include_str!("../../web/vendor/katex/katex.min.js");

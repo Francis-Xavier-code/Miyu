@@ -8336,6 +8336,23 @@
     const queueing = conversationRunning();
     const updateTarget = queueing ? activeTurnUpdateTarget(sessionId) : null;
     const content = elements.composerInput.value.trim();
+    // 命中命令表就当命令执行，不当消息发。不命中的 `/xxx` 照常发给模型
+    // ——与 REPL 同一语义（slash_commands::parse_repl_input）。
+    if (window.MiyuCommands?.match(content)) {
+      window.MiyuCommands.hide();
+      const handled = await window.MiyuCommands.tryRun(content, {
+        apiRequest,
+        sessionId: state.viewSessionId,
+        mode: viewSessionEntry()?.mode === "dev" ? "dev" : "normal",
+        notify: showToast,
+        confirm: async (message) => window.confirm(message)
+      });
+      if (handled) {
+        elements.composerInput.value = "";
+        resizeComposer();
+        return;
+      }
+    }
     const readyAttachments = state.composerAttachments.filter((item) => item.status === "ready");
     const attachmentIds = readyAttachments.map((item) => item.id);
     const sentAttachments = readyAttachments.map((item) => ({
@@ -9465,6 +9482,15 @@
       });
     });
     elements.composerInput.addEventListener("input", resizeComposer);
+    // 斜杠命令的补全菜单（逻辑在 commands.js，这里只喂输入、收回填）
+    elements.composerInput.addEventListener("input", () => {
+      window.MiyuCommands?.onInput(elements.composerInput.value, elements.composerDock, (name) => {
+        elements.composerInput.value = name;
+        elements.composerInput.focus();
+        resizeComposer();
+      });
+    });
+    elements.composerInput.addEventListener("blur", () => window.MiyuCommands?.hide());
     elements.attachButton.addEventListener("click", () => elements.attachmentInput.click());
     elements.attachmentInput.addEventListener("change", () => {
       addComposerFiles(elements.attachmentInput.files);
@@ -9508,6 +9534,12 @@
       state.composing = false;
     });
     elements.composerInput.addEventListener("keydown", (event) => {
+      // 菜单开着时它先吃掉上下键与 Tab/Enter：补全后再按一次回车才执行，
+      // 与 REPL 一致，用户有机会反悔。
+      if (window.MiyuCommands?.handleKey(event)) {
+        event.preventDefault();
+        return;
+      }
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !state.composing && event.keyCode !== 229) {
         event.preventDefault();
         if (!elements.sendButton.disabled) elements.composerForm.requestSubmit();
@@ -9582,6 +9614,9 @@
     bindEvents();
     resizeComposer();
     updateSettingsControls();
+    // 命令目录从服务端拉，前端不维护第二份清单。拉失败就当没有命令，
+    // 所有 / 开头的输入照常发给模型。
+    window.MiyuCommands?.load(apiRequest);
     loadBootstrap();
   }
 

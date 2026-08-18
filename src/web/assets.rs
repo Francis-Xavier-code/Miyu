@@ -60,6 +60,10 @@ pub(in crate::web) async fn index_asset(headers: HeaderMap) -> Response {
             .replace("href=\"/styles.css\"", concat!("href=\"/styles.css?v=", env!("MIYU_BUILD_ID"), "\""))
             .replace("src=\"/app.js\"", concat!("src=\"/app.js?v=", env!("MIYU_BUILD_ID"), "\""))
             .replace(
+                "src=\"/commands.js\"",
+                concat!("src=\"/commands.js?v=", env!("MIYU_BUILD_ID"), "\""),
+            )
+            .replace(
                 "href=\"/vendor/katex/katex.min.css\"",
                 concat!("href=\"/vendor/katex/katex.min.css?v=", env!("MIYU_BUILD_ID"), "\""),
             )
@@ -77,6 +81,14 @@ pub(in crate::web) async fn styles_asset(headers: HeaderMap) -> Response {
 
 pub(in crate::web) async fn app_asset(headers: HeaderMap) -> Response {
     embedded_asset(&headers, APP_JS.as_bytes(), "application/javascript; charset=utf-8")
+}
+
+pub(in crate::web) async fn commands_js_asset(headers: HeaderMap) -> Response {
+    embedded_asset(
+        &headers,
+        COMMANDS_JS.as_bytes(),
+        "application/javascript; charset=utf-8",
+    )
 }
 
 pub(in crate::web) async fn logo_asset(headers: HeaderMap) -> Response {

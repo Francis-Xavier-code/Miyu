@@ -6561,3 +6561,54 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
 .video-shell.webfs .vfs-btn { top: 16px; right: 16px; opacity: 1; }
 .video-caption { margin-top: 7px; font-size: var(--fs-micro); color: var(--text-soft);
   max-width: min(100%, 480px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 斜杠命令的补全菜单。挂在 .composer-dock（position: relative）上，从输入框
+   上方弹出——往下弹会被输入框自己盖住。 */
+.commandMenu {
+  position: absolute;
+  bottom: calc(100% - 6px);
+  left: max(18px, calc((100% - 940px) / 2));
+  right: max(18px, calc((100% - 940px) / 2));
+  z-index: 40;
+  max-height: min(320px, 50vh);
+  overflow-y: auto;
+  padding: 5px;
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: var(--float-shadow);
+}
+
+.commandMenuItem {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.commandMenuItem:hover,
+.commandMenuItem.isActive {
+  background: var(--surface-2);
+}
+
+.commandMenuName {
+  flex: 0 0 auto;
+  font-family: var(--mono-font, monospace);
+}
+
+.commandMenuHelp {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted, inherit);
+  font-size: 0.86em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
