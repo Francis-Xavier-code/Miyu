@@ -674,3 +674,67 @@ fn tool_report_write_amplification() {
         );
     }
 }
+
+/// 量尺：`cargo test --lib state::tests::turns::history_limit_scaling -- --ignored --nocapture`
+///
+/// `history(limit)` 把整个会话的所有回合（含每个回合的子表挂载）全读出来，
+/// 再取尾部 limit 条。会话越长，`miyu history -n 10` 越慢。
+#[test]
+#[ignore]
+fn history_limit_scaling() {
+    println!("\n  会话回合数   history(10) 耗时(ms)");
+    for turns in [50usize, 100, 200, 400] {
+        let (_temp, store) = test_store();
+        for index in 0..turns {
+            let turn_id = format!("turn{index}");
+            store
+                .start_turn(&turn_id, &format!("问题 {index}"), std::process::id())
+                .unwrap();
+            store
+                .complete_turn(&turn_id, &format!("回答 {index}"), None)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let got = store.history(10).unwrap();
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(got.len() <= 20, "history(10) 返回条目数异常：{}", got.len());
+        println!("  {turns:>10}   {ms:>18.2}");
+    }
+}
+
+/// 量尺：`cargo test --lib state::tests::turns::prune_rereads_archived_turns -- --ignored --nocapture`
+///
+/// `prune_stale_tool_reports` 的 SELECT 把每个已完成可见回合的 `tool_reports`
+/// 整块拉出来，然后在循环里对「已归档」的直接 `continue`。反复压缩时绝大多数
+/// 回合都已归档，等于每次把整个会话的报告读一遍再全扔掉。
+#[test]
+#[ignore]
+fn prune_rereads_archived_turns() {
+    println!("\n  回合数   首次 prune(ms)   再次 prune(ms)   再次读到的无用字节KB");
+    for turns in [50usize, 100, 200] {
+        let (_temp, store) = test_store();
+        let report = "x".repeat(2 * 1024);
+        for index in 0..turns {
+            let turn_id = format!("turn{index}");
+            store
+                .start_turn(&turn_id, &format!("问 {index}"), std::process::id())
+                .unwrap();
+            for _ in 0..3 {
+                store.append_persisted_context(&turn_id, &report).unwrap();
+            }
+            store
+                .complete_turn(&turn_id, &format!("答 {index}"), None)
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let first = store.prune_stale_tool_reports(5, 1).unwrap();
+        let first_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        let second = store.prune_stale_tool_reports(5, 1).unwrap();
+        let second_ms = start.elapsed().as_secs_f64() * 1000.0;
+        // 第二次一条都不该动，但报告还是被整块读了出来
+        let wasted_kb = (turns.saturating_sub(5)) * 3 * 2;
+        println!("  {turns:>6}   {first_ms:>13.2}   {second_ms:>13.2}   {wasted_kb:>18}");
+        let _ = (first, second);
+    }
+}
