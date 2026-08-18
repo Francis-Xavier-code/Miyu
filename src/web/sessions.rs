@@ -108,6 +108,21 @@ pub(in crate::web) async fn update_session_http(
     Ok(Json(json!({})).into_response())
 }
 
+/// 某个会话当前的待办清单。
+///
+/// WebUI 侧边有一块常驻面板显示它。工具事件只在 `todowrite` 跑的那一刻发生
+/// 一次，刷新页面或切回来就没了；这个接口让面板每次进会话都能拿到当前状态。
+pub(in crate::web) async fn session_todos_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_auth(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
+    let todos = tools::session_todos(&state.paths, &session_id);
+    Ok(Json(json!({ "todos": todos })))
+}
+
 /// Read-only snapshot of one session's conversation for per-view browsing:
 /// turns, queued follow-ups, and its currently running turns. Does not touch
 /// the global current-session pointer.

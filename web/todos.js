@@ -13,7 +13,7 @@
 window.MiyuTodos = (() => {
   const STATUS_ORDER = ["in_progress", "pending", "completed", "cancelled"];
   const STATUS_LABEL = {
-    pending: "待办",
+    pending: "待处理",
     in_progress: "进行中",
     completed: "已完成",
     cancelled: "已取消",
@@ -34,15 +34,20 @@ window.MiyuTodos = (() => {
     } catch (_) {
       return null;
     }
-    if (!Array.isArray(payload?.todos)) return null;
-    const todos = payload.todos.flatMap((item) => {
+    return normalize(payload?.todos);
+  }
+
+  /// 把一串待办规整成渲染要的形状。工具输出和 `GET /api/sessions/{id}/todos`
+  /// 是同一个数组形状,所以两条路共用这一份。
+  function normalize(list) {
+    if (!Array.isArray(list)) return null;
+    const todos = list.flatMap((item) => {
       const content = String(item?.content ?? item?.task ?? "").trim();
       if (!content) return [];
       const status = String(item?.status || "pending").toLowerCase();
       return [{ content, status, priority: String(item?.priority || "").trim() }];
     });
-    if (!todos.length) return null;
-    return todos;
+    return todos.length ? todos : null;
   }
 
   function statusRank(status) {
@@ -51,8 +56,11 @@ window.MiyuTodos = (() => {
   }
 
   function render(output) {
-    const todos = parse(output);
-    if (!todos) return null;
+    return renderList(parse(output));
+  }
+
+  function renderList(todos) {
+    if (!todos?.length) return null;
 
     const panel = document.createElement("div");
     panel.className = "todo-panel";
@@ -67,6 +75,17 @@ window.MiyuTodos = (() => {
     head.append(title, count);
     panel.appendChild(head);
 
+    const track = document.createElement("div");
+    track.className = "todo-progress";
+    track.setAttribute("role", "progressbar");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", String(todos.length));
+    track.setAttribute("aria-valuenow", String(done));
+    const fill = document.createElement("i");
+    fill.style.width = `${Math.round((done / todos.length) * 100)}%`;
+    track.appendChild(fill);
+    panel.appendChild(track);
+
     const list = document.createElement("ol");
     list.className = "todo-list";
     // 进行中的排最前——那是「现在在干什么」,列表存在的意义。
@@ -79,15 +98,20 @@ window.MiyuTodos = (() => {
       const text = document.createElement("span");
       text.className = "todo-text";
       text.textContent = todo.content;
-      const status = document.createElement("small");
-      status.className = "todo-status";
-      status.textContent = STATUS_LABEL[todo.status] || todo.status;
-      item.append(mark, text, status);
+      item.append(mark, text);
+      // 只有「进行中」写字。「待处理」是列表的默认状态,每行写一遍是噪点;
+      // 「已完成」也用不着——划掉的文字加对勾已经说清楚了。
+      if (todo.status === "in_progress") {
+        const status = document.createElement("small");
+        status.className = "todo-status";
+        status.textContent = STATUS_LABEL.in_progress;
+        item.appendChild(status);
+      }
       list.appendChild(item);
     }
     panel.appendChild(list);
     return panel;
   }
 
-  return { isTodoTool, parse, render };
+  return { isTodoTool, parse, normalize, render, renderList };
 })();

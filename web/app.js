@@ -254,6 +254,7 @@
     promptGrid: document.getElementById("promptGrid"),
     jumpBottomButton: document.getElementById("jumpBottomButton"),
     composerDock: document.getElementById("composerDock"),
+    stageTodos: document.getElementById("stageTodos"),
     modelLevelMenu: document.getElementById("modelLevelMenu"),
     composerRunIndicator: document.getElementById("composerRunIndicator"),
     jobsStrip: document.getElementById("jobsStrip"),
@@ -357,6 +358,8 @@
     stagedModelKeys: null,
     stagedFollowGlobal: false,
     stagedVariants: null,
+    stageTodos: null,
+    stageTodosGeneration: 0,
     expandedLevelKey: null,
     modelMenuTouched: false,
     modelMenuError: "",
@@ -4920,6 +4923,42 @@
     if (state.artifactOpen) renderArtifactWorkspace();
   }
 
+  /// 常驻任务面板：当前会话的待办。
+  ///
+  /// 两条更新路径。进会话/刷新走 `GET /api/sessions/{id}/todos`——工具事件
+  /// 只在 `todowrite` 跑的那一刻发生一次,不问一次就只有空面板；回合里 AI
+  /// 改了待办则直接吃 `tool.finished` 的输出,不必再往返一趟。
+  function renderStageTodos(todos) {
+    state.stageTodos = todos?.length ? todos : null;
+    const panel = elements.stageTodos;
+    panel.replaceChildren();
+    const card = state.stageTodos ? window.MiyuTodos?.renderList(state.stageTodos) : null;
+    if (!card) {
+      panel.hidden = true;
+      return;
+    }
+    panel.appendChild(card);
+    panel.hidden = false;
+  }
+
+  async function loadStageTodos(sessionId) {
+    const scope = String(sessionId || "");
+    if (!scope) {
+      renderStageTodos(null);
+      return;
+    }
+    const generation = ++state.stageTodosGeneration;
+    try {
+      const response = await apiRequest(`/api/sessions/${encodeURIComponent(scope)}/todos`);
+      const payload = await response.json();
+      if (generation !== state.stageTodosGeneration) return;
+      renderStageTodos(window.MiyuTodos?.normalize(payload?.todos) || null);
+    } catch (_) {
+      // 面板是附带信息,拿不到就空着,不打扰对话。
+      if (generation === state.stageTodosGeneration) renderStageTodos(null);
+    }
+  }
+
   function syncArtifactsFromTurns(turns) {
     let artifacts = [];
     for (const turn of turns) {
@@ -5764,6 +5803,7 @@
     const turns = [...state.turns].sort((left, right) => asFiniteNumber(left?.seq) - asFiniteNumber(right?.seq));
     state.turns = turns;
     syncArtifactsFromTurns(turns);
+    loadStageTodos(state.viewSessionId);
     if (state.finishedTurnArticles.size) {
       const knownTurnIds = new Set(turns.map((turn) => String(turn?.id)));
       for (const key of [...state.finishedTurnArticles.keys()]) {
@@ -6975,6 +7015,11 @@
       tool.resultDetail.wrapper.hidden = !tool.resultDetail.raw;
       const ok = Boolean(data?.ok);
       resetPreparingWindow(live);
+      // 只刷正在看的那个会话——后台会话的 todowrite 不该改屏幕上这块面板。
+      if (ok && window.MiyuTodos?.isTodoTool(tool.name)
+        && runSessionId(live.runId) === String(state.viewSessionId || "")) {
+        renderStageTodos(window.MiyuTodos.parse(output));
+      }
       // 与回看那份同构（`createPersistedToolCard`）：待办列表挂在签外面。
       // 只在这里画会让实时和刷新后长得不一样,那正是工具签之前踩过的坑。
       if (ok && window.MiyuTodos?.isTodoTool(tool.name)) {

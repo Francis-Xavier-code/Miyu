@@ -25,6 +25,15 @@ fn todos_path(paths: &MiyuPaths, session: &str) -> PathBuf {
     paths.state_dir.join("todos").join(format!("{session}.json"))
 }
 
+/// 某个会话当前的待办清单。
+///
+/// WebUI 的常驻面板要在刷新之后还能显示当前状态，而工具事件只在工具跑的
+/// 那一刻发生一次。读取收口在这里，调用方不自己拼 `todos/{session}.json`
+/// ——路径和损坏容错的规则只该有一份。
+pub(crate) fn session_todos(paths: &MiyuPaths, session: &str) -> Vec<Todo> {
+    load_todos(paths, session)
+}
+
 fn load_todos(paths: &MiyuPaths, session: &str) -> Vec<Todo> {
     let Ok(raw) = std::fs::read_to_string(todos_path(paths, session)) else {
         return Vec::new();

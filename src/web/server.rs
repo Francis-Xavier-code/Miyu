@@ -305,6 +305,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
             patch(update_session_http).delete(delete_session_http),
         )
         .route("/api/sessions/{session_id}/turns", get(session_turns_http))
+        .route("/api/sessions/{session_id}/todos", get(session_todos_http))
         .route(
             "/api/sessions/{session_id}/models",
             get(get_session_models_http).put(set_session_models_http),

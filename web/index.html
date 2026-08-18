@@ -74,6 +74,10 @@
         </button>
       </div>
 
+      <!-- 常驻任务面板：宽屏时正文两侧本来就空着一大片,把当前待办放在那儿,
+           不用翻回工具签去看。窄屏由 CSS 隐藏。 -->
+      <aside class="stage-todos" id="stageTodos" aria-label="任务列表" hidden></aside>
+
       <section class="conversation-stage" id="conversationStage">
         <div class="inline-error" id="errorRegion" role="alert" hidden></div>
 

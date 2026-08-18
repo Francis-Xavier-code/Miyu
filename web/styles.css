@@ -2273,12 +2273,70 @@ body.has-lightbox {
   overflow: hidden;
 }
 
-/* 任务列表:AI 列的待办是给人看的产出,所以挂在工具签外面,收起态也可见。 */
+/* 常驻任务面板。
+   正文固定 980px 居中,宽屏两侧本来就空着一大片。默认不显示——窄屏它会盖住
+   正文;`.main-stage` 是 container,按它的实际宽度而不是窗口宽度判断,这样
+   预览工作区展开、侧栏收起都能自动跟上。 */
+.stage-todos {
+  position: absolute;
+  z-index: 6;
+  /* 贴着正文左缘往左排,而不是贴侧栏——正文固定 980px 居中,`right` 从
+     stage 中线量出去正好落在正文左边,面板跟着正文走而不是跟着窗口走。 */
+  top: 46px;
+  right: calc(50% + 490px + 24px);
+  display: none;
+  width: 250px;
+  max-height: calc(100% - 210px);
+  overflow-y: auto;
+  scrollbar-color: var(--line-strong) transparent;
+  scrollbar-width: thin;
+}
+
+@container (min-width: 1360px) {
+  .stage-todos:not([hidden]) {
+    display: block;
+  }
+}
+
+/* 侧边这份去框：它悬在留白里,描边和底色反而显得突兀,也和正文抢注意力。
+   气泡里那份仍是卡片——那个嵌在一段对话中间,需要边界把自己划出来。 */
+.stage-todos .todo-panel {
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.stage-todos .todo-panel-head strong {
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.stage-todos .todo-progress {
+  margin-bottom: 14px;
+  background: color-mix(in srgb, var(--line) 60%, transparent);
+}
+
+/* 左侧一条竖线把这几行归拢成一组,代替原来的方框。 */
+.stage-todos .todo-list {
+  padding-left: 13px;
+  border-left: 1px solid var(--line);
+  gap: 9px;
+}
+
+.stage-todos .todo-text {
+  font-size: 12px;
+}
+
+/* 任务列表:AI 列的待办是给人看的产出,所以挂在工具签外面,收起态也可见。
+   状态一律靠左边那个标记表达,不写字——每行挂个「待办」是纯噪点。 */
 .todo-panel {
   margin-top: 5px;
-  padding: 9px 11px 10px;
+  padding: 12px 14px 13px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 9px;
   background: var(--surface-1);
 }
 
@@ -2286,41 +2344,61 @@ body.has-lightbox {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
   gap: 8px;
 }
 
 .todo-panel-head strong {
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .todo-panel-head small {
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.todo-progress {
+  overflow: hidden;
+  height: 3px;
+  margin-bottom: 11px;
+  border-radius: 999px;
+  background: var(--surface-3);
+}
+
+.todo-progress > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--text-soft) 55%, transparent);
+  transition: width 240ms ease;
 }
 
 .todo-list {
   display: grid;
   margin: 0;
   padding: 0;
-  gap: 3px;
+  gap: 7px;
   list-style: none;
 }
 
 .todo-item {
   display: grid;
   grid-template-columns: 13px minmax(0, 1fr) auto;
-  align-items: baseline;
-  font-size: 12px;
-  gap: 7px;
+  align-items: start;
+  font-size: 12.5px;
+  gap: 9px;
+  line-height: 1.45;
 }
 
 .todo-mark {
-  width: 9px;
-  height: 9px;
-  align-self: center;
+  position: relative;
+  width: 11px;
+  height: 11px;
+  margin-top: 3px;
   border: 1.5px solid var(--line-strong);
   border-radius: 50%;
 }
@@ -2331,34 +2409,61 @@ body.has-lightbox {
   overflow-wrap: anywhere;
 }
 
+/* 右侧状态字。跟着所在行的那档灰走,不自己上色——一张表里已完成的往往最多,
+   给它一块彩色就成了主角,而它恰恰最不需要注意。 */
 .todo-status {
+  align-self: center;
   color: var(--text-faint);
   font-size: 9.5px;
   white-space: nowrap;
 }
 
-.todo-item.is-in_progress .todo-mark {
-  border-color: var(--accent);
-  background: var(--accent);
+.todo-item.is-in_progress .todo-status {
+  color: var(--text-soft);
 }
 
+/* 整张表不上色。三种状态靠标记的形状分:空心圈、实心圆、圈里一个对勾;
+   轻重靠文字的明暗分。加颜色只会让「已完成」这种最不需要注意的行反而最亮。 */
+.todo-item.is-in_progress .todo-mark {
+  border-color: var(--text-soft);
+  background: var(--text-soft);
+}
+
+/* 三档灰阶:待办 --text-soft、进行中 --text、已完成 --text-faint+划掉。
+   进行中只靠「最深的那一档灰」站出来,不再加粗到 600——那和实心黑点是同一个
+   毛病,一行里两处都在使劲。 */
 .todo-item.is-in_progress .todo-text {
   color: var(--text);
-  font-weight: 600;
+  font-weight: 500;
 }
 
-.todo-item.is-in_progress .todo-status {
-  color: var(--accent);
-}
-
+/* 已完成:空心圈里一个淡对勾。实心色块太抢——一张表里完成的往往最多,
+   全都点亮就成了主角,而它们恰恰是最不需要注意的。 */
 .todo-item.is-completed .todo-mark {
-  border-color: var(--gold);
-  background: var(--gold);
+  border-color: color-mix(in srgb, var(--line-strong) 70%, transparent);
+  background: transparent;
+}
+
+.todo-item.is-completed .todo-mark::after {
+  position: absolute;
+  top: 0.5px;
+  left: 2.5px;
+  width: 3px;
+  height: 6px;
+  border: solid var(--text-faint);
+  border-width: 0 1.5px 1.5px 0;
+  content: "";
+  transform: rotate(42deg);
 }
 
 .todo-item.is-completed .todo-text {
   color: var(--text-faint);
   text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-faint) 55%, transparent);
+}
+
+.todo-item.is-cancelled .todo-mark {
+  border-style: dashed;
 }
 
 .todo-item.is-cancelled .todo-text {
