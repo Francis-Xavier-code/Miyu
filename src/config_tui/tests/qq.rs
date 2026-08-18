@@ -1,7 +1,13 @@
 //! QQ 会话、人格与模型选择。
 
-use crate::config_tui::{parse_id_lines, parse_id_list, parse_keyword_lines, platform_conversation_id_label, platform_conversation_kind_label, platform_persona_summary, route_pool_summary, t, vision_provider_model_choice_values, PersonaMenuTarget};
-use crate::config::{AppConfig, PlatformConversationKind, PlatformModelPoolInheritance, PlatformPersonaOverride};
+use crate::config::{
+    AppConfig, PlatformConversationKind, PlatformModelPoolInheritance, PlatformPersonaOverride,
+};
+use crate::config_tui::{
+    parse_id_lines, parse_id_list, parse_keyword_lines, platform_conversation_id_label,
+    platform_conversation_kind_label, platform_persona_summary, route_pool_summary, t,
+    vision_provider_model_choice_values, PersonaMenuTarget,
+};
 
 #[test]
 fn route_pool_and_id_helpers_express_inheritance_and_positive_ids() {
@@ -140,4 +146,47 @@ fn explicit_vision_choices_only_include_image_capable_models() {
 
     assert!(choices.contains(&format!("{provider_id}\tvision")));
     assert!(!choices.contains(&format!("{provider_id}\ttext-only")));
+}
+
+/// 服务端下架模型之后，配置里会留一条指向不存在模型的残留。多模态/嵌入两个
+/// 列表原本没有删除键，那条残留在 TUI 里删不掉——只能手改 config.jsonc。
+///
+/// 删除走的是文本模型列表同一个入口，语义是「整条删掉」：从供应商的 models
+/// 里移除，连带清掉模态、上下文窗口，以及它在各个池子里的引用。
+#[test]
+fn removing_a_stale_model_clears_every_reference_to_it() {
+    let mut config = AppConfig::default();
+    let provider = &mut config.providers[0];
+    let provider_id = provider.id.clone();
+    provider.models = vec!["gone".to_string(), "alive".to_string()];
+    for model in ["gone", "alive"] {
+        provider.model_modalities.insert(
+            model.to_string(),
+            vec!["text".to_string(), "image".to_string()],
+        );
+        provider
+            .model_context_window
+            .insert(model.to_string(), 128_000);
+    }
+    config
+        .toggle_active_multimodal_provider_model(&provider_id, "gone")
+        .unwrap();
+    config
+        .toggle_active_multimodal_provider_model(&provider_id, "alive")
+        .unwrap();
+    config.embedding.provider_id = provider_id.clone();
+    config.embedding.model = "gone".to_string();
+    assert!(config.is_active_multimodal_provider_model(&provider_id, "gone"));
+
+    config
+        .remove_active_provider_model(&provider_id, "gone")
+        .unwrap();
+
+    let provider = &config.providers[0];
+    assert!(!provider.models.iter().any(|model| model == "gone"));
+    assert!(!provider.model_modalities.contains_key("gone"));
+    assert!(!provider.model_context_window.contains_key("gone"));
+    assert!(!config.is_active_multimodal_provider_model(&provider_id, "gone"));
+    // 同一个供应商里还活着的那个不受牵连
+    assert!(config.is_active_multimodal_provider_model(&provider_id, "alive"));
 }

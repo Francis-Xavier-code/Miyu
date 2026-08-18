@@ -86,7 +86,11 @@ pub(in crate::config_tui) fn fetch_models(provider: &ProviderConfig) -> Result<V
         .collect())
 }
 
-pub(in crate::config_tui) fn auto_configure_model_tags(paths: &MiyuPaths, provider: &mut ProviderConfig, model: &str) {
+pub(in crate::config_tui) fn auto_configure_model_tags(
+    paths: &MiyuPaths,
+    provider: &mut ProviderConfig,
+    model: &str,
+) {
     if provider.model_modalities.contains_key(model) {
         return;
     }
@@ -122,7 +126,10 @@ pub(in crate::config_tui) struct ModelInfo {
     pub(in crate::config_tui) id: String,
 }
 
-pub(in crate::config_tui) fn select_active_provider(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn select_active_provider(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut choices = config.text_provider_model_choices();
     if choices.is_empty() {
         message(
@@ -207,7 +214,10 @@ pub(in crate::config_tui) fn embedding_model_label(config: &AppConfig) -> String
     }
 }
 
-pub(in crate::config_tui) fn edit_embedding_model(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_embedding_model(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut candidates: Vec<(String, String)> = Vec::new();
     for provider in &config.providers {
         for model in &provider.models {
@@ -226,6 +236,7 @@ pub(in crate::config_tui) fn edit_embedding_model(stdout: &mut io::Stdout, confi
         )?;
         return Ok(());
     }
+    // 列表尾部两项不是模型(高级设置/清除选择),删除键要挡住它们
     let mut options: Vec<String> = candidates
         .iter()
         .map(|(provider, model)| format!("{provider}/{model}"))
@@ -246,14 +257,31 @@ pub(in crate::config_tui) fn edit_embedding_model(stdout: &mut io::Stdout, confi
             &options,
             selected,
             t(
-                "[Enter]select [j/k]move [q]back",
-                "[Enter]选择 [j/k]移动 [q]返回",
+                "[Enter]select [j/k]move [d]remove [q]back",
+                "[Enter]选择 [j/k]移动 [d]移除 [q]返回",
             ),
         )?;
         match read_key()? {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
+            KeyCode::Char('d') if selected < candidates.len() => {
+                let (provider, model) = candidates[selected].clone();
+                config.remove_active_provider_model(&provider, &model)?;
+                candidates.remove(selected);
+                options.remove(selected);
+                if candidates.is_empty() {
+                    message(
+                        stdout,
+                        t(
+                            "The last embedding model was removed.",
+                            "已移除最后一个语义模型。",
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                selected = selected.min(candidates.len().saturating_sub(1));
+            }
             KeyCode::Enter => {
                 if selected == options.len() - 1 {
                     config.embedding.provider_id.clear();
@@ -274,7 +302,10 @@ pub(in crate::config_tui) fn edit_embedding_model(stdout: &mut io::Stdout, confi
     }
 }
 
-pub(in crate::config_tui) fn edit_embedding_advanced(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_embedding_advanced(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut fields = vec![
         Field::new(
             t("Request timeout (seconds)", "请求超时（秒）"),
@@ -343,7 +374,10 @@ pub(in crate::config_tui) fn tier_display_name(tier: crate::config::ModelTier) -
 /// Tier pool overview: pick a tier, then toggle models for it. Subagents
 /// choose a tier by task complexity; unconfigured pools fall back to the
 /// main model pool.
-pub(in crate::config_tui) fn select_subagent_tiers(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn select_subagent_tiers(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     use crate::config::ModelTier;
     let mut selected = 0usize;
     loop {
@@ -663,7 +697,10 @@ pub(in crate::config_tui) fn edit_model_form(
         ),
         thinking_variant_field(&variant_options, stored_variant.as_deref()),
         Field::new(
-            t("Temperature (empty = provider default)", "Temperature (留空=供应商默认)"),
+            t(
+                "Temperature (empty = provider default)",
+                "Temperature (留空=供应商默认)",
+            ),
             provider
                 .model_temperature
                 .get(model)
@@ -790,7 +827,10 @@ pub(in crate::config_tui) fn edit_model_form(
     }
 }
 
-pub(in crate::config_tui) fn thinking_variant_field(options: &ThinkingVariantOptions, stored: Option<&str>) -> Field {
+pub(in crate::config_tui) fn thinking_variant_field(
+    options: &ThinkingVariantOptions,
+    stored: Option<&str>,
+) -> Field {
     let mut choices = Vec::with_capacity(options.variants.len() + 2);
     choices.push(String::new());
     if let Some(stored) = stored.filter(|stored| {
@@ -808,7 +848,10 @@ pub(in crate::config_tui) fn thinking_variant_field(options: &ThinkingVariantOpt
     .empty_choice_label("default")
 }
 
-pub(in crate::config_tui) fn provider_model_choice_values(config: &AppConfig, include_current: bool) -> Vec<String> {
+pub(in crate::config_tui) fn provider_model_choice_values(
+    config: &AppConfig,
+    include_current: bool,
+) -> Vec<String> {
     let mut choices = vec![String::new()];
     if include_current {
         choices.push(format!(
@@ -824,7 +867,9 @@ pub(in crate::config_tui) fn provider_model_choice_values(config: &AppConfig, in
     choices
 }
 
-pub(in crate::config_tui) fn vision_provider_model_choice_values(config: &AppConfig) -> Vec<String> {
+pub(in crate::config_tui) fn vision_provider_model_choice_values(
+    config: &AppConfig,
+) -> Vec<String> {
     let mut choices = vec![
         String::new(),
         format!("{OPENCODE_PROVIDER_ID}\t{OPENCODE_DEFAULT_VISION_MODEL}"),
@@ -854,7 +899,10 @@ pub(in crate::config_tui) fn active_multimodal_label(config: &AppConfig) -> Stri
     }
 }
 
-pub(in crate::config_tui) fn modality_field_value(provider: &ProviderConfig, model: &str) -> String {
+pub(in crate::config_tui) fn modality_field_value(
+    provider: &ProviderConfig,
+    model: &str,
+) -> String {
     provider
         .input_modalities(model)
         .unwrap_or_else(|| vec!["text".to_string()])
@@ -878,7 +926,7 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
     stdout: &mut io::Stdout,
     config: &mut AppConfig,
 ) -> Result<()> {
-    let choices = config.multimodal_provider_model_choices();
+    let mut choices = config.multimodal_provider_model_choices();
     if choices.is_empty() {
         message(
             stdout,
@@ -915,8 +963,8 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
             &options,
             selected,
             t(
-                "[Tab]activate/deactivate [Enter/q]confirm",
-                "[Tab]激活/取消 [Enter/q]确认",
+                "[Tab]activate/deactivate [Enter/q]confirm [d]remove",
+                "[Tab]激活/取消 [Enter/q]确认 [d]移除",
             ),
         )?;
         match read_key()? {
@@ -927,6 +975,25 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
                 let choice = choices[selected].clone();
                 config
                     .toggle_active_multimodal_provider_model(&choice.provider_id, &choice.model)?;
+            }
+            // 和文本模型列表一样的语义:把这个模型从供应商里整条删掉,连带
+            // 清掉它在各个池子/路由里的引用。服务端下架了模型之后,配置里
+            // 那条残留是没别的地方删得掉的。
+            KeyCode::Char('d') => {
+                let choice = choices[selected].clone();
+                config.remove_active_provider_model(&choice.provider_id, &choice.model)?;
+                choices = config.multimodal_provider_model_choices();
+                if choices.is_empty() {
+                    message(
+                        stdout,
+                        t(
+                            "The last multimodal model was removed.",
+                            "已移除最后一个多模态模型。",
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                selected = selected.min(choices.len().saturating_sub(1));
             }
             _ => {}
         }
