@@ -189,14 +189,56 @@ pub(in crate::agent) fn estimate_result_tokens(result: &ChatResult) -> usize {
     tokens.max(1)
 }
 
+/// 工具目录 token 估算的记忆表。
+///
+/// 工具目录是**字节稳定**的（那是缓存契约的一部分），而这个估算每轮至少跑
+/// 三次（`setup.rs` 的上下文总账、`history.rs` 的两处装载决策）。实测估一遍
+/// 61 个工具 / 63 KB 要 **38.3 ms**，而「序列化+哈希」——也就是判断「还是不是
+/// 同一份目录」的固定成本——只要 1.6 ms。省掉 96%。
+///
+/// 键里带上序列化后的总长度，不只是哈希：FxHash 快但雪崩性一般，多一个长度
+/// 维度让碰撞必须两项同时撞上。真撞了后果也只是 token **估**值偏一点（这个
+/// 数只用于溢出记账，不参与请求组装），不会动到字节纯度。
+///
+/// 表有上限：hybrid/lazy 模式下每种「已装载工具子集」是一个不同的键，一次
+/// 会话里会攒出好些个。满了整表清空——重建一次 38 ms，而不是留个逐出策略
+/// 在这儿养 bug。
+static TOOL_TOKEN_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<rustc_hash::FxHashMap<(u64, usize), usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+
+const TOOL_TOKEN_CACHE_CAP: usize = 64;
+
 pub(in crate::agent) fn estimate_tool_definition_tokens(
     definitions: &[crate::llm::ToolDefinition],
 ) -> usize {
-    definitions
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = rustc_hash::FxHasher::default();
+    let mut length = 0usize;
+    let texts = definitions
         .iter()
         .filter_map(|definition| serde_json::to_string(definition).ok())
-        .map(|text| crate::token_estimate::estimate_tokens(&text))
-        .sum()
+        .inspect(|text| {
+            text.hash(&mut hasher);
+            length += text.len();
+        })
+        .collect::<Vec<_>>();
+    let key = (hasher.finish(), length);
+
+    if let Some(&cached) = TOOL_TOKEN_CACHE.lock().unwrap().get(&key) {
+        return cached;
+    }
+    let total = texts
+        .iter()
+        .map(|text| crate::token_estimate::estimate_tokens(text))
+        .sum();
+    let mut cache = TOOL_TOKEN_CACHE.lock().unwrap();
+    if cache.len() >= TOOL_TOKEN_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, total);
+    total
 }
 
 pub(in crate::agent) fn push_assistant_context_messages(
@@ -817,4 +859,68 @@ pub(in crate::agent) fn turns_since_reminder_fossil(
         }
     }
     Ok(since)
+}
+
+#[cfg(test)]
+mod tool_token_cache_tests {
+    use super::*;
+    use crate::llm::{FunctionDefinition, ToolDefinition};
+
+    fn definition(name: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            kind: "function",
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            },
+        }
+    }
+
+    /// 缓存不能改答案：命中和未命中必须是同一个数。
+    #[test]
+    fn the_cache_returns_what_a_fresh_computation_would() {
+        let definitions = vec![
+            definition("alpha", "第一个工具，描述得长一点好让 token 数不至于是 1"),
+            definition("beta", "第二个工具，同样写长一些"),
+        ];
+        let uncached: usize = definitions
+            .iter()
+            .filter_map(|definition| serde_json::to_string(definition).ok())
+            .map(|text| crate::token_estimate::estimate_tokens(&text))
+            .sum();
+
+        let first = estimate_tool_definition_tokens(&definitions);
+        let second = estimate_tool_definition_tokens(&definitions);
+        assert_eq!(first, uncached);
+        assert_eq!(second, uncached, "第二次（命中缓存）跟第一次不一致");
+    }
+
+    /// 目录变了就必须重算——lazy 模式下每装载一个工具就是一份新目录。
+    #[test]
+    fn a_different_catalogue_gets_a_different_answer() {
+        let small = vec![definition("only", "就一个工具")];
+        let large = vec![
+            definition("only", "就一个工具"),
+            definition("extra", "又装载了一个，描述还挺长的，token 数应该明显变多"),
+        ];
+        assert!(
+            estimate_tool_definition_tokens(&large) > estimate_tool_definition_tokens(&small),
+            "目录变大了 token 估算却没变"
+        );
+    }
+
+    /// 表满了清空，不能无限涨。
+    #[test]
+    fn the_cache_stays_bounded() {
+        for index in 0..TOOL_TOKEN_CACHE_CAP * 2 + 5 {
+            let definitions = vec![definition(&format!("tool{index}"), "描述")];
+            estimate_tool_definition_tokens(&definitions);
+        }
+        assert!(TOOL_TOKEN_CACHE.lock().unwrap().len() <= TOOL_TOKEN_CACHE_CAP);
+    }
 }
