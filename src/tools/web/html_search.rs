@@ -8,6 +8,11 @@
 //! 地址再交出去。
 
 use crate::tools::web::*;
+use futures_util::StreamExt;
+
+/// 跳转解析的并发度。跟仓库其它抓取路径（`web_images`、`api_quota`、
+/// `caniplayonlinux_query`）一样取 4。
+const RESOLVE_CONCURRENCY: usize = 4;
 
 pub(in crate::tools::web) fn is_ddg_blocked() -> bool {
     DDG_BLOCKED_UNTIL
@@ -181,7 +186,10 @@ pub(in crate::tools::web) async fn search_duckduckgo(
     bail!("DuckDuckGo returned no parseable results and fallback returned no results");
 }
 
-pub(in crate::tools::web) fn parse_duckduckgo_html(html: &str, max_results: usize) -> Vec<CrawlerResult> {
+pub(in crate::tools::web) fn parse_duckduckgo_html(
+    html: &str,
+    max_results: usize,
+) -> Vec<CrawlerResult> {
     let mut results = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rest = html;
@@ -268,7 +276,10 @@ pub(in crate::tools::web) async fn search_yahoo_html(
     parse_yahoo_html(&html, max_results)
 }
 
-pub(in crate::tools::web) fn parse_yahoo_html(html: &str, max_results: usize) -> Vec<CrawlerResult> {
+pub(in crate::tools::web) fn parse_yahoo_html(
+    html: &str,
+    max_results: usize,
+) -> Vec<CrawlerResult> {
     let mut results = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rest = html;
@@ -396,11 +407,21 @@ pub(in crate::tools::web) async fn parse_so_html(
 
     let mut results = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (title, href, snippet) in candidates {
+    // 保序的有界并发。`buffered`（不是 `buffer_unordered`）按**输入顺序**交付，
+    // 所以下面的去重和「够了就停」看到的次序跟串行版一模一样，结果不会变。
+    // 代价是最多多解析 3 个候选（在飞的那些），换掉
+    // max_results 次串行往返——这条路上每个候选都是一次跳转解析的 HTTP 往返。
+    let mut resolving = futures_util::stream::iter(candidates.into_iter().map(
+        |(title, href, snippet)| async move {
+            let resolved = resolve_so_url(client, &href).await;
+            (title, resolved, snippet)
+        },
+    ))
+    .buffered(RESOLVE_CONCURRENCY);
+    while let Some((title, resolved, snippet)) = resolving.next().await {
         if results.len() >= max_results {
             break;
         }
-        let resolved = resolve_so_url(client, &href).await;
         if !resolved.is_empty() && is_result_url_allowed(&resolved) {
             let key = dedupe_key(&resolved);
             if seen.insert(key) {
@@ -553,11 +574,21 @@ pub(in crate::tools::web) async fn parse_sogou_html(
 
     let mut results = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (title, href, snippet) in candidates {
+    // 保序的有界并发。`buffered`（不是 `buffer_unordered`）按**输入顺序**交付，
+    // 所以下面的去重和「够了就停」看到的次序跟串行版一模一样，结果不会变。
+    // 代价是最多多解析 3 个候选（在飞的那些），换掉
+    // max_results 次串行往返——这条路上每个候选都是一次跳转解析的 HTTP 往返。
+    let mut resolving = futures_util::stream::iter(candidates.into_iter().map(
+        |(title, href, snippet)| async move {
+            let resolved = resolve_sogou_url(client, &href).await;
+            (title, resolved, snippet)
+        },
+    ))
+    .buffered(RESOLVE_CONCURRENCY);
+    while let Some((title, resolved, snippet)) = resolving.next().await {
         if results.len() >= max_results {
             break;
         }
-        let resolved = resolve_sogou_url(client, &href).await;
         if !resolved.is_empty() && is_result_url_allowed(&resolved) {
             let key = dedupe_key(&resolved);
             if seen.insert(key) {
@@ -573,7 +604,10 @@ pub(in crate::tools::web) async fn parse_sogou_html(
     results
 }
 
-pub(in crate::tools::web) async fn resolve_sogou_url(client: &reqwest::Client, href: &str) -> String {
+pub(in crate::tools::web) async fn resolve_sogou_url(
+    client: &reqwest::Client,
+    href: &str,
+) -> String {
     let href = html_unescape(href.trim());
     if href.is_empty() {
         return String::new();
@@ -746,4 +780,66 @@ pub(in crate::tools::web) fn strip_nav_link_runs(text: &str) -> String {
     }
     out.extend(&chars[cursor..]);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod resolve_concurrency_probe {
+    use super::*;
+
+    /// 改前的写法：跳转一个一个串行解析。
+    async fn resolve_serially(client: &reqwest::Client, hrefs: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for href in hrefs {
+            out.push(resolve_so_url(client, href).await);
+        }
+        out
+    }
+
+    /// 量尺：`cargo test --lib resolve_concurrency_probe -- --ignored --nocapture`
+    ///
+    /// **会真的去请求 so.com**，所以 `#[ignore]`。
+    ///
+    /// 360/搜狗的结果链接是跳转包装，每条都要一次 HTTP 往返才能还原成真实地址。
+    /// 原来这是个串行 for 循环，条数就是 `max_results`。
+    ///
+    /// 这里用的是**打不通的 URL**，所以每条都吃满 15 秒超时——量的是**最坏
+    /// 情况**（站点吊死时用户要等多久），不是日常延迟。日常每条几百毫秒，
+    /// 加速比同样约 4×，但绝对值小得多。
+    ///
+    /// 顺带钉住顺序：`buffered` 保序，去重和「够了就停」都依赖它。
+    #[tokio::test]
+    #[ignore]
+    async fn resolving_links_concurrently_is_faster() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("Mozilla/5.0")
+            .build()
+            .unwrap();
+        let hrefs: Vec<String> = (0..8)
+            .map(|index| format!("https://www.so.com/link?m=probe{index}"))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let serial = resolve_serially(&client, &hrefs).await;
+        let serial_time = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let concurrent: Vec<String> =
+            futures_util::stream::iter(hrefs.iter().map(|href| resolve_so_url(&client, href)))
+                .buffered(RESOLVE_CONCURRENCY)
+                .collect()
+                .await;
+        let concurrent_time = started.elapsed();
+
+        println!(
+            "\n  {} 条打不通的跳转（每条吃满 15s 超时，最坏情况）：\n  \
+             串行 {:.2}s → 并发{RESOLVE_CONCURRENCY} {:.2}s（快 {:.1}×）",
+            hrefs.len(),
+            serial_time.as_secs_f64(),
+            concurrent_time.as_secs_f64(),
+            serial_time.as_secs_f64() / concurrent_time.as_secs_f64().max(0.001),
+        );
+        // 顺序必须保住——去重和「够了就停」都依赖它
+        assert_eq!(serial, concurrent, "并发版打乱了顺序");
+    }
 }
