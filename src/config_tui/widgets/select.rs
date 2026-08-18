@@ -5,7 +5,11 @@
 
 use crate::config_tui::*;
 
-pub(in crate::config_tui) fn select_bool(stdout: &mut io::Stdout, label: &str, current: bool) -> Result<bool> {
+pub(in crate::config_tui) fn select_bool(
+    stdout: &mut io::Stdout,
+    label: &str,
+    current: bool,
+) -> Result<bool> {
     let mut selected = if current { 0 } else { 1 };
     let options = [
         boolean_label(true).to_string(),
@@ -110,7 +114,11 @@ pub(in crate::config_tui) fn choice_label(choice: &str, empty_label: &str) -> St
     }
 }
 
-pub(in crate::config_tui) fn choice_display_label(choice: &str, empty_label: &str, raw: bool) -> String {
+pub(in crate::config_tui) fn choice_display_label(
+    choice: &str,
+    empty_label: &str,
+    raw: bool,
+) -> String {
     if choice.is_empty() {
         empty_label.to_string()
     } else if raw {

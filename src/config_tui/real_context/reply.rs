@@ -204,7 +204,10 @@ pub(in crate::config_tui) fn edit_real_context_active_reply(
     }
 }
 
-pub(in crate::config_tui) fn edit_active_judgement_skip_ids(stdout: &mut io::Stdout, state: &StateStore) -> Result<()> {
+pub(in crate::config_tui) fn edit_active_judgement_skip_ids(
+    stdout: &mut io::Stdout,
+    state: &StateStore,
+) -> Result<()> {
     let original = match active_judgement_skip_ids(state) {
         Ok(ids) => ids,
         Err(error) => {

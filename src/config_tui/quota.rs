@@ -5,7 +5,10 @@
 
 use crate::config_tui::*;
 
-pub(in crate::config_tui) fn edit_api_quota(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_api_quota(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let options = [
@@ -132,7 +135,10 @@ pub(in crate::config_tui) fn edit_api_quota_accounts(
     }
 }
 
-pub(in crate::config_tui) fn confirm_api_quota_delete(stdout: &mut io::Stdout, account: &str) -> Result<bool> {
+pub(in crate::config_tui) fn confirm_api_quota_delete(
+    stdout: &mut io::Stdout,
+    account: &str,
+) -> Result<bool> {
     let options = [
         t("Cancel", "取消").to_string(),
         format!("{}: {account}", t("Delete", "删除")),
@@ -208,7 +214,9 @@ pub(in crate::config_tui) fn next_api_quota_account_id(_config: &ApiQuotaProvide
     format!("account-{nanos}-{sequence}")
 }
 
-pub(in crate::config_tui) fn next_api_quota_account_name(config: &ApiQuotaProviderConfig) -> String {
+pub(in crate::config_tui) fn next_api_quota_account_name(
+    config: &ApiQuotaProviderConfig,
+) -> String {
     let mut number = 2usize;
     loop {
         let candidate = format!("账号 {number}");

@@ -149,7 +149,11 @@ pub(in crate::config_tui) fn draw_menu_with_editing(
     Ok(())
 }
 
-pub(in crate::config_tui) fn menu_window(item_count: usize, selected: usize, visible_rows: usize) -> std::ops::Range<usize> {
+pub(in crate::config_tui) fn menu_window(
+    item_count: usize,
+    selected: usize,
+    visible_rows: usize,
+) -> std::ops::Range<usize> {
     if item_count == 0 || visible_rows == 0 {
         return 0..0;
     }
@@ -269,7 +273,11 @@ pub(in crate::config_tui) fn column_visible_rows() -> usize {
         .unwrap_or(1)
 }
 
-pub(in crate::config_tui) fn column_scroll(selected: usize, scroll: usize, visible_rows: usize) -> usize {
+pub(in crate::config_tui) fn column_scroll(
+    selected: usize,
+    scroll: usize,
+    visible_rows: usize,
+) -> usize {
     if visible_rows == 0 {
         return 0;
     }
@@ -282,7 +290,11 @@ pub(in crate::config_tui) fn column_scroll(selected: usize, scroll: usize, visib
     }
 }
 
-pub(in crate::config_tui) fn insert_char_at_cursor(value: &mut String, cursor: &mut usize, ch: char) {
+pub(in crate::config_tui) fn insert_char_at_cursor(
+    value: &mut String,
+    cursor: &mut usize,
+    ch: char,
+) {
     let byte_index = byte_index_for_char(value, *cursor);
     value.insert(byte_index, ch);
     *cursor += 1;
@@ -334,7 +346,9 @@ pub(in crate::config_tui) fn read_key() -> Result<KeyCode> {
     read_key_with_timeout(None).map(|key| key.expect("blocking read should return a key"))
 }
 
-pub(in crate::config_tui) fn read_key_with_timeout(timeout: Option<Duration>) -> Result<Option<KeyCode>> {
+pub(in crate::config_tui) fn read_key_with_timeout(
+    timeout: Option<Duration>,
+) -> Result<Option<KeyCode>> {
     loop {
         if let Some(timeout) = timeout {
             if !event::poll(timeout)? {

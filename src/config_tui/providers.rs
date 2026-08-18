@@ -27,6 +27,9 @@ pub(in crate::config_tui) struct ProviderBrowser<'a> {
     pub(in crate::config_tui) status: String,
     pub(in crate::config_tui) loading: bool,
     pub(in crate::config_tui) fetch_seq: u64,
+    /// 删供应商牵连很广（连带清掉它在各个池子与路由里的每一处引用），
+    /// 手滑一下要能退回来。
+    pub(in crate::config_tui) undo: ConfigUndo,
     pub(in crate::config_tui) fetch_rx: Option<Receiver<FetchResult>>,
 }
 
@@ -145,6 +148,7 @@ pub(in crate::config_tui) fn select_active_provider(
         .iter()
         .position(|choice| config.is_active_provider_model(&choice.provider_id, &choice.model))
         .unwrap_or(0);
+    let mut undo = ConfigUndo::default();
     loop {
         let options = choices
             .iter()
@@ -163,9 +167,13 @@ pub(in crate::config_tui) fn select_active_provider(
             t(" SELECT TEXT MODEL ", " 选择文本模型 "),
             &options,
             selected,
-            t(
-                "[Tab]activate/deactivate [Enter/q]confirm [d]remove",
-                "[Tab]激活/取消 [Enter/q]确认 [d]移除",
+            &format!(
+                "{}{}",
+                t(
+                    "[Tab]activate/deactivate [Enter/q]confirm [d]remove",
+                    "[Tab]激活/取消 [Enter/q]确认 [d]移除",
+                ),
+                undo.hint()
             ),
         )?;
         match read_key()? {
@@ -178,20 +186,29 @@ pub(in crate::config_tui) fn select_active_provider(
                 config.toggle_active_provider_model(&choice.provider_id, &choice.model)?;
             }
             KeyCode::Char('d') => {
+                undo.record(config);
                 let choice = choices[selected].clone();
                 config.remove_active_provider_model(&choice.provider_id, &choice.model)?;
                 choices = config.text_provider_model_choices();
                 if choices.is_empty() {
+                    // 列表空了就退不回来了(界面没东西可画),所以当场撤销并说明
+                    undo.undo(config);
                     message(
                         stdout,
                         t(
-                            "The active model was removed; no models are currently available.",
-                            "已移除激活模型，当前没有可用模型。",
+                            "That was the last model; removal was undone.",
+                            "这是最后一个模型，已撤销该删除。",
                         ),
                     )?;
-                    return Ok(());
+                    choices = config.text_provider_model_choices();
                 }
                 selected = selected.min(choices.len().saturating_sub(1));
+            }
+            KeyCode::Char('u') => {
+                if undo.undo(config) {
+                    choices = config.text_provider_model_choices();
+                    selected = selected.min(choices.len().saturating_sub(1));
+                }
             }
             _ => {}
         }
@@ -218,15 +235,21 @@ pub(in crate::config_tui) fn edit_embedding_model(
     stdout: &mut io::Stdout,
     config: &mut AppConfig,
 ) -> Result<()> {
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    for provider in &config.providers {
-        for model in &provider.models {
-            if model_is_embedding(provider, model) {
-                candidates.push((provider.id.clone(), model.clone()));
+    // 候选每轮从 config 重建：删除和撤销都改的是 config 本身，重建比两边各维护
+    // 一份再想办法同步简单，也不会漏。
+    fn embedding_candidates(config: &AppConfig) -> Vec<(String, String)> {
+        let mut candidates = Vec::new();
+        for provider in &config.providers {
+            for model in &provider.models {
+                if model_is_embedding(provider, model) {
+                    candidates.push((provider.id.clone(), model.clone()));
+                }
             }
         }
+        candidates
     }
-    if candidates.is_empty() {
+
+    if embedding_candidates(config).is_empty() {
         message(
             stdout,
             t(
@@ -236,29 +259,36 @@ pub(in crate::config_tui) fn edit_embedding_model(
         )?;
         return Ok(());
     }
-    // 列表尾部两项不是模型(高级设置/清除选择),删除键要挡住它们
-    let mut options: Vec<String> = candidates
-        .iter()
-        .map(|(provider, model)| format!("{provider}/{model}"))
-        .collect();
-    options.push(t("Advanced settings", "高级设置").to_string());
-    options.push(t("Clear selection", "清除选择").to_string());
-    let mut selected = candidates
+    let mut selected = embedding_candidates(config)
         .iter()
         .position(|(provider, model)| {
             provider == config.embedding.provider_id.trim()
                 && model == config.embedding.model.trim()
         })
         .unwrap_or(0);
+    let mut undo = ConfigUndo::default();
     loop {
+        let candidates = embedding_candidates(config);
+        // 尾部两项不是模型，删除键要挡住它们
+        let mut options: Vec<String> = candidates
+            .iter()
+            .map(|(provider, model)| format!("{provider}/{model}"))
+            .collect();
+        options.push(t("Advanced settings", "高级设置").to_string());
+        options.push(t("Clear selection", "清除选择").to_string());
+        selected = selected.min(options.len() - 1);
         draw_menu(
             stdout,
             t(" EMBEDDING MODEL ", " EMBEDDING 模型 "),
             &options,
             selected,
-            t(
-                "[Enter]select [j/k]move [d]remove [q]back",
-                "[Enter]选择 [j/k]移动 [d]移除 [q]返回",
+            &format!(
+                "{}{}",
+                t(
+                    "[Enter]select [j/k]move [d]remove [q]back",
+                    "[Enter]选择 [j/k]移动 [d]移除 [q]返回",
+                ),
+                undo.hint()
             ),
         )?;
         match read_key()? {
@@ -266,21 +296,23 @@ pub(in crate::config_tui) fn edit_embedding_model(
             KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(options.len() - 1),
             KeyCode::Char('d') if selected < candidates.len() => {
+                undo.record(config);
                 let (provider, model) = candidates[selected].clone();
                 config.remove_active_provider_model(&provider, &model)?;
-                candidates.remove(selected);
-                options.remove(selected);
-                if candidates.is_empty() {
+                if embedding_candidates(config).is_empty() {
+                    // 空列表没法继续画，当场撤销并说明
+                    undo.undo(config);
                     message(
                         stdout,
                         t(
-                            "The last embedding model was removed.",
-                            "已移除最后一个语义模型。",
+                            "That was the last embedding model; removal was undone.",
+                            "这是最后一个语义模型，已撤销该删除。",
                         ),
                     )?;
-                    return Ok(());
                 }
-                selected = selected.min(candidates.len().saturating_sub(1));
+            }
+            KeyCode::Char('u') => {
+                undo.undo(config);
             }
             KeyCode::Enter => {
                 if selected == options.len() - 1 {
@@ -943,6 +975,7 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
             config.is_active_multimodal_provider_model(&choice.provider_id, &choice.model)
         })
         .unwrap_or(0);
+    let mut undo = ConfigUndo::default();
     loop {
         let options = choices
             .iter()
@@ -962,9 +995,13 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
             t(" SELECT MULTIMODAL MODEL ", " 选择多模态模型 "),
             &options,
             selected,
-            t(
-                "[Tab]activate/deactivate [Enter/q]confirm [d]remove",
-                "[Tab]激活/取消 [Enter/q]确认 [d]移除",
+            &format!(
+                "{}{}",
+                t(
+                    "[Tab]activate/deactivate [Enter/q]confirm [d]remove",
+                    "[Tab]激活/取消 [Enter/q]确认 [d]移除",
+                ),
+                undo.hint()
             ),
         )?;
         match read_key()? {
@@ -980,6 +1017,7 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
             // 清掉它在各个池子/路由里的引用。服务端下架了模型之后,配置里
             // 那条残留是没别的地方删得掉的。
             KeyCode::Char('d') => {
+                undo.record(config);
                 let choice = choices[selected].clone();
                 config.remove_active_provider_model(&choice.provider_id, &choice.model)?;
                 choices = config.multimodal_provider_model_choices();
@@ -994,6 +1032,12 @@ pub(in crate::config_tui) fn select_active_multimodal_provider(
                     return Ok(());
                 }
                 selected = selected.min(choices.len().saturating_sub(1));
+            }
+            KeyCode::Char('u') => {
+                if undo.undo(config) {
+                    choices = config.multimodal_provider_model_choices();
+                    selected = selected.min(choices.len().saturating_sub(1));
+                }
             }
             _ => {}
         }

@@ -140,7 +140,9 @@ pub(in crate::config_tui) fn edit_qq_id_list(
     }
 }
 
-pub(in crate::config_tui) fn parse_keyword_lines(value: &str) -> std::result::Result<Vec<String>, String> {
+pub(in crate::config_tui) fn parse_keyword_lines(
+    value: &str,
+) -> std::result::Result<Vec<String>, String> {
     let mut parsed = Vec::new();
     for (index, line) in value.lines().enumerate() {
         let keyword = line.trim();
@@ -162,7 +164,10 @@ pub(in crate::config_tui) fn parse_keyword_lines(value: &str) -> std::result::Re
     Ok(parsed)
 }
 
-pub(in crate::config_tui) fn edit_keyword_list(stdout: &mut io::Stdout, keywords: &mut Vec<String>) -> Result<()> {
+pub(in crate::config_tui) fn edit_keyword_list(
+    stdout: &mut io::Stdout,
+    keywords: &mut Vec<String>,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let mut options = vec![

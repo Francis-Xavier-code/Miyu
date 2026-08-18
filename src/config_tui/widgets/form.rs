@@ -106,7 +106,11 @@ pub(in crate::config_tui) fn draw_inline_editor(
     Ok(())
 }
 
-pub(in crate::config_tui) fn run_form(stdout: &mut io::Stdout, title: &str, fields: &mut [Field]) -> Result<bool> {
+pub(in crate::config_tui) fn run_form(
+    stdout: &mut io::Stdout,
+    title: &str,
+    fields: &mut [Field],
+) -> Result<bool> {
     run_form_from(stdout, title, fields, false)
 }
 
@@ -114,7 +118,11 @@ pub(in crate::config_tui) fn run_form(stdout: &mut io::Stdout, title: &str, fiel
 /// reached from a menu row that already showed the value: the row said what it
 /// was, Enter said "change it", so a second Enter to begin typing is a keypress
 /// that asks a question nobody had.
-pub(in crate::config_tui) fn run_form_editing(stdout: &mut io::Stdout, title: &str, fields: &mut [Field]) -> Result<bool> {
+pub(in crate::config_tui) fn run_form_editing(
+    stdout: &mut io::Stdout,
+    title: &str,
+    fields: &mut [Field],
+) -> Result<bool> {
     run_form_from(stdout, title, fields, true)
 }
 
@@ -336,7 +344,10 @@ pub(in crate::config_tui) fn run_form_without_buttons(
 /// 预设对话列表式编辑器(验收 #19):每行一对 user/assistant,回车编辑、
 /// [a] 新增、[d] 删除;退出时把列表写回 `user:`/`assistant:` 行格式,
 /// 与手写 dialogs 文件同构,存量文件无需迁移。
-pub(in crate::config_tui) fn edit_dialog_list(stdout: &mut io::Stdout, value: &mut String) -> Result<()> {
+pub(in crate::config_tui) fn edit_dialog_list(
+    stdout: &mut io::Stdout,
+    value: &mut String,
+) -> Result<()> {
     let mut pairs = crate::persona_hint::parse_dialogs(value);
     let mut selected = 0usize;
     loop {
@@ -381,12 +392,9 @@ pub(in crate::config_tui) fn edit_dialog_list(stdout: &mut io::Stdout, value: &m
             }
             KeyCode::Enter if !pairs.is_empty() => {
                 let (question, answer) = pairs[selected].clone();
-                if let Some(pair) = edit_dialog_pair(
-                    stdout,
-                    t(" EDIT DIALOG ", " 编辑对话 "),
-                    &question,
-                    &answer,
-                )? {
+                if let Some(pair) =
+                    edit_dialog_pair(stdout, t(" EDIT DIALOG ", " 编辑对话 "), &question, &answer)?
+                {
                     pairs[selected] = pair;
                 }
             }
@@ -422,7 +430,10 @@ pub(in crate::config_tui) fn edit_dialog_pair(
     Ok(Some((question, answer)))
 }
 
-pub(in crate::config_tui) fn edit_textarea(stdout: &mut io::Stdout, value: &mut String) -> Result<()> {
+pub(in crate::config_tui) fn edit_textarea(
+    stdout: &mut io::Stdout,
+    value: &mut String,
+) -> Result<()> {
     execute!(
         stdout,
         Show,

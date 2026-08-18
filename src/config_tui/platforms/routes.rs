@@ -242,14 +242,18 @@ pub(in crate::config_tui) fn edit_platform_model_route(
     }
 }
 
-pub(in crate::config_tui) fn platform_conversation_kind_label(kind: PlatformConversationKind) -> &'static str {
+pub(in crate::config_tui) fn platform_conversation_kind_label(
+    kind: PlatformConversationKind,
+) -> &'static str {
     match kind {
         PlatformConversationKind::Private => t("Private chat", "私聊"),
         PlatformConversationKind::Group => t("Group chat", "群聊"),
     }
 }
 
-pub(in crate::config_tui) fn platform_conversation_id_label(kind: PlatformConversationKind) -> &'static str {
+pub(in crate::config_tui) fn platform_conversation_id_label(
+    kind: PlatformConversationKind,
+) -> &'static str {
     match kind {
         PlatformConversationKind::Private => t("QQ id", "QQ 号"),
         PlatformConversationKind::Group => t("Group id", "群号"),
@@ -308,7 +312,10 @@ pub(in crate::config_tui) fn select_platform_conversation_kind(
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_conversation_extra_prompt(stdout: &mut io::Stdout, prompt: &mut String) -> Result<()> {
+pub(in crate::config_tui) fn edit_conversation_extra_prompt(
+    stdout: &mut io::Stdout,
+    prompt: &mut String,
+) -> Result<()> {
     edit_textarea(stdout, prompt)?;
     Ok(())
 }
@@ -475,7 +482,10 @@ pub(in crate::config_tui) fn select_qq_model_pool(
     )
 }
 
-pub(in crate::config_tui) fn select_non_whitelist_model_pool(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn select_non_whitelist_model_pool(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let choices = config.text_provider_model_choices();
     select_model_pool(
         stdout,

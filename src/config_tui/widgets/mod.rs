@@ -18,7 +18,10 @@ use crate::config_tui::*;
 
 /// 子界面出错时的兜底提示:错误只作废当次表单输入,绝不让它穿透主循环
 /// 把 TUI 崩出(崩出会连带丢掉本次全部未保存修改)。
-pub(in crate::config_tui) fn show_tui_error(stdout: &mut io::Stdout, error: &anyhow::Error) -> Result<()> {
+pub(in crate::config_tui) fn show_tui_error(
+    stdout: &mut io::Stdout,
+    error: &anyhow::Error,
+) -> Result<()> {
     let options = vec![
         format!("{error:#}"),
         t("Press any key to go back", "按任意键返回").to_string(),
@@ -85,4 +88,3 @@ pub(in crate::config_tui) fn normalize_base_url(value: &str) -> String {
     }
     url
 }
-

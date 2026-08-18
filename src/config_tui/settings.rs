@@ -30,7 +30,10 @@ pub(in crate::config_tui) fn confirm_save_on_exit(stdout: &mut io::Stdout) -> Re
     }
 }
 
-pub(in crate::config_tui) fn edit_settings(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_settings(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let language = language_choice_value(&config.display.language).unwrap_or("auto");
     let mut fields = vec![
         Field::boolean(t("Enable tools", "工具启用"), config.tools.enabled),
@@ -94,7 +97,10 @@ pub(in crate::config_tui) fn edit_settings(stdout: &mut io::Stdout, config: &mut
         .choices(&["compact", "pop"]),
         // Appended rather than inserted: the read-back below is positional.
         Field::new(
-            t("Turns replayed when reopening the REPL", "重开 REPL 回放的轮数"),
+            t(
+                "Turns replayed when reopening the REPL",
+                "重开 REPL 回放的轮数",
+            ),
             config.display.repl_replay_turns.to_string(),
         ),
         // 验收:default_mode 只能改 config.jsonc 不像话——空=裸 miyu 出帮助。

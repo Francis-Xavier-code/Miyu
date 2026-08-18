@@ -203,7 +203,9 @@ pub(in crate::config_tui) fn apply_group_join_approval_values(
     merge_group_join_approval_settings(instance, settings);
 }
 
-pub(in crate::config_tui) fn group_join_approval_group_label(group: &QqGroupJoinApprovalGroupConfig) -> String {
+pub(in crate::config_tui) fn group_join_approval_group_label(
+    group: &QqGroupJoinApprovalGroupConfig,
+) -> String {
     format!(
         "{} · {}",
         group.group_id,
@@ -331,7 +333,10 @@ pub(in crate::config_tui) fn upsert_group_join_approval_group(
     }
 }
 
-pub(in crate::config_tui) fn edit_group_join_approval(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_group_join_approval(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let (mut enabled, mut settings) = group_join_approval_values(config)?;
     let mut selected = 0usize;
     let mut editing: Option<(usize, String, usize)> = None;
@@ -466,7 +471,10 @@ pub(in crate::config_tui) fn edit_group_join_approval(stdout: &mut io::Stdout, c
     }
 }
 
-pub(in crate::config_tui) fn edit_message_history(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_message_history(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let instance = config
         .platforms
         .qq
@@ -538,7 +546,10 @@ pub(in crate::config_tui) fn edit_message_history(stdout: &mut io::Stdout, confi
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_meme_collector(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_meme_collector(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let instance = config.platforms.qq.plugins.get(QQ_MEME_COLLECTOR_PLUGIN_ID);
     let enabled = instance.map(|value| value.enabled_or(true)).unwrap_or(true);
     let settings = instance
@@ -598,7 +609,9 @@ pub(in crate::config_tui) fn edit_meme_collector(stdout: &mut io::Stdout, config
     Ok(())
 }
 
-pub(in crate::config_tui) fn reply_processor_values(config: &AppConfig) -> Result<(bool, ReplyProcessorSettingsForm)> {
+pub(in crate::config_tui) fn reply_processor_values(
+    config: &AppConfig,
+) -> Result<(bool, ReplyProcessorSettingsForm)> {
     let Some(instance) = config.platforms.qq.plugins.get(REPLY_PROCESSOR_PLUGIN_ID) else {
         return Ok((true, ReplyProcessorSettingsForm::default()));
     };
@@ -628,7 +641,10 @@ pub(in crate::config_tui) fn apply_reply_processor_values(
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_reply_processor(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_reply_processor(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let (mut plugin_enabled, mut settings) = reply_processor_values(config)?;
     loop {
         let mode_choices = vec![

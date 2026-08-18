@@ -67,7 +67,10 @@ pub(in crate::config_tui) fn select_platforms(
     }
 }
 
-pub(in crate::config_tui) fn edit_platform_command_prefix(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_platform_command_prefix(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let Some(value) = edit_inline_value(
         stdout,
         t(" COMMAND TRIGGER PREFIX ", " 命令触发前缀 "),
@@ -97,14 +100,19 @@ pub(in crate::config_tui) fn edit_platform_command_prefix(stdout: &mut io::Stdou
     Ok(())
 }
 
-pub(in crate::config_tui) fn platform_command_permission_label(permission: PlatformCommandPermission) -> &'static str {
+pub(in crate::config_tui) fn platform_command_permission_label(
+    permission: PlatformCommandPermission,
+) -> &'static str {
     match permission {
         PlatformCommandPermission::Everyone => t("Everyone", "所有人"),
         PlatformCommandPermission::AdminOnly => t("Administrators only", "仅管理员"),
     }
 }
 
-pub(in crate::config_tui) fn select_platform_commands(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn select_platform_commands(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let options = commands::BUILTIN_COMMANDS
@@ -196,7 +204,11 @@ pub(in crate::config_tui) fn enabled_label(value: bool) -> &'static str {
     }
 }
 
-pub(in crate::config_tui) fn edit_qq(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_qq(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let qq = &config.platforms.qq;
@@ -547,7 +559,10 @@ pub(in crate::config_tui) fn rate_limit_label(limit: PlatformRateLimit) -> Strin
 /// already does it. The menu row above already renders "N / M 秒", so routing
 /// Enter through a two-item submenu only restated that summary before letting
 /// anyone type — two keypresses to reach a field that was never in doubt.
-pub(in crate::config_tui) fn edit_platform_rate_limit(stdout: &mut io::Stdout, limit: &mut PlatformRateLimit) -> Result<()> {
+pub(in crate::config_tui) fn edit_platform_rate_limit(
+    stdout: &mut io::Stdout,
+    limit: &mut PlatformRateLimit,
+) -> Result<()> {
     let mut fields = vec![
         Field::new(
             t(
@@ -588,7 +603,10 @@ pub(in crate::config_tui) fn edit_platform_rate_limit(stdout: &mut io::Stdout, l
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_qq_token(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_qq_token(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     if let Some(value) = edit_inline_value(
         stdout,
         t(" REVERSE WEBSOCKET TOKEN ", " 反向 WebSocket 验证 Token "),
@@ -600,7 +618,10 @@ pub(in crate::config_tui) fn edit_qq_token(stdout: &mut io::Stdout, config: &mut
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_qq_advanced(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_qq_advanced(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let qq = &config.platforms.qq;
     let mut fields = vec![
         Field::new(
@@ -659,4 +680,3 @@ pub(in crate::config_tui) fn edit_qq_advanced(stdout: &mut io::Stdout, config: &
     }
     Ok(())
 }
-

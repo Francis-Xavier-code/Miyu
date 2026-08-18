@@ -40,10 +40,7 @@ pub(in crate::config_tui) fn edit_custom_prompts(
             t(" CUSTOM PROMPTS ", " 自定义提示词 "),
             &options,
             selected,
-            t(
-                "[Enter]select/toggle [q]back",
-                "[Enter]选择/切换 [q]返回",
-            ),
+            t("[Enter]select/toggle [q]back", "[Enter]选择/切换 [q]返回"),
         )?;
         match read_key()? {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
@@ -113,7 +110,10 @@ pub(in crate::config_tui) fn edit_normal_mode_prompts(
 /// 开发模式的「AI 提示词」:编辑 config/dev-prompt.md 一个文件。清空
 /// 保存=删文件,运行时回退内置默认一行;记忆按保留人格 "dev" 落库,
 /// 与这份提示词的内容完全解耦——怎么改都不会切库。
-pub(in crate::config_tui) fn edit_dev_prompt(stdout: &mut io::Stdout, paths: &MiyuPaths) -> Result<()> {
+pub(in crate::config_tui) fn edit_dev_prompt(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+) -> Result<()> {
     let path = paths.config_dir.join(crate::config::DEV_PROMPT_FILE);
     let current = std::fs::read_to_string(&path).unwrap_or_default();
     let prefill = if current.trim().is_empty() {
@@ -145,7 +145,11 @@ pub(in crate::config_tui) fn edit_dev_prompt(stdout: &mut io::Stdout, paths: &Mi
     Ok(())
 }
 
-pub(in crate::config_tui) fn edit_personas(stdout: &mut io::Stdout, paths: &MiyuPaths, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_personas(
+    stdout: &mut io::Stdout,
+    paths: &MiyuPaths,
+    config: &mut AppConfig,
+) -> Result<()> {
     manage_personas(stdout, paths, config, PersonaMenuTarget::Global)?;
     Ok(())
 }
@@ -170,7 +174,10 @@ impl PersonaMenuTarget {
         }
     }
 
-    pub(in crate::config_tui) fn custom_name<'a>(&'a self, config: &'a AppConfig) -> Option<&'a str> {
+    pub(in crate::config_tui) fn custom_name<'a>(
+        &'a self,
+        config: &'a AppConfig,
+    ) -> Option<&'a str> {
         match self {
             Self::Global => (!config.prompt.active_persona.trim().is_empty())
                 .then_some(config.prompt.active_persona.as_str()),
@@ -432,11 +439,14 @@ pub(in crate::config_tui) struct PersonaFormValues {
 
 /// 人格附属文件现值:防失忆提示(hints/<scope>.md)与预设对话
 /// (dialogs/<scope>.md)。
-pub(in crate::config_tui) fn persona_aux_values(paths: &MiyuPaths, config: &AppConfig, scope: &str) -> (String, String) {
-    let hint =
-        std::fs::read_to_string(crate::persona_hint::manual_hint_path(config, paths, scope))
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default();
+pub(in crate::config_tui) fn persona_aux_values(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    scope: &str,
+) -> (String, String) {
+    let hint = std::fs::read_to_string(crate::persona_hint::manual_hint_path(config, paths, scope))
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
     let dialogs = crate::persona_hint::dialogs_raw(config, paths, scope);
     (hint, dialogs)
 }
@@ -476,7 +486,11 @@ pub(in crate::config_tui) fn write_persona_aux(
     Ok(())
 }
 
-pub(in crate::config_tui) fn persona_aux_fields(hint: String, dialogs: String, miyu: bool) -> Vec<Field> {
+pub(in crate::config_tui) fn persona_aux_fields(
+    hint: String,
+    dialogs: String,
+    miyu: bool,
+) -> Vec<Field> {
     let (hint_label, dialogs_label) = if miyu {
         (
             t(
@@ -679,7 +693,11 @@ pub(in crate::config_tui) fn move_persona_scope(
     Ok(())
 }
 
-pub(in crate::config_tui) fn remove_persona_scope(paths: &MiyuPaths, config: &AppConfig, name: &str) -> Result<()> {
+pub(in crate::config_tui) fn remove_persona_scope(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    name: &str,
+) -> Result<()> {
     remove_dir_if_exists(config.persona_memory_data_dir(paths, name))?;
     remove_dir_if_exists(config.persona_memory_state_dir(paths, name))?;
     remove_dir_if_exists(config.persona_skills_dir(paths, name))?;
@@ -831,11 +849,18 @@ pub(in crate::config_tui) fn edit_identity(
     )
 }
 
-pub(in crate::config_tui) fn list_identities(paths: &MiyuPaths, config: &AppConfig) -> Result<Vec<String>> {
+pub(in crate::config_tui) fn list_identities(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+) -> Result<Vec<String>> {
     list_markdown_files(&config.identities_dir_path(paths))
 }
 
-pub(in crate::config_tui) fn read_identity(paths: &MiyuPaths, config: &AppConfig, name: &str) -> Result<String> {
+pub(in crate::config_tui) fn read_identity(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    name: &str,
+) -> Result<String> {
     let path = config.identity_path(paths, name);
     if path.exists() {
         Ok(std::fs::read_to_string(path)?)
@@ -844,7 +869,12 @@ pub(in crate::config_tui) fn read_identity(paths: &MiyuPaths, config: &AppConfig
     }
 }
 
-pub(in crate::config_tui) fn write_identity(paths: &MiyuPaths, config: &AppConfig, name: &str, content: &str) -> Result<()> {
+pub(in crate::config_tui) fn write_identity(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    name: &str,
+    content: &str,
+) -> Result<()> {
     let path = config.identity_path(paths, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -894,7 +924,10 @@ pub(in crate::config_tui) fn edit_prompt_file_values(
     Ok(Some((name, fields[1].value.clone())))
 }
 
-pub(in crate::config_tui) fn list_personas(paths: &MiyuPaths, config: &AppConfig) -> Result<Vec<String>> {
+pub(in crate::config_tui) fn list_personas(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+) -> Result<Vec<String>> {
     let mut names = list_markdown_files(&config.prompts_dir_path(paths))?;
     names.retain(|name| !name.eq_ignore_ascii_case("system-prompt.md"));
     Ok(names)
@@ -918,7 +951,11 @@ pub(in crate::config_tui) fn list_markdown_files(dir: &std::path::Path) -> Resul
     Ok(names)
 }
 
-pub(in crate::config_tui) fn read_persona(paths: &MiyuPaths, config: &AppConfig, name: &str) -> Result<String> {
+pub(in crate::config_tui) fn read_persona(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    name: &str,
+) -> Result<String> {
     let path = config.persona_path(paths, name);
     if path.exists() {
         Ok(std::fs::read_to_string(path)?)
@@ -927,7 +964,12 @@ pub(in crate::config_tui) fn read_persona(paths: &MiyuPaths, config: &AppConfig,
     }
 }
 
-pub(in crate::config_tui) fn write_persona(paths: &MiyuPaths, config: &AppConfig, name: &str, content: &str) -> Result<()> {
+pub(in crate::config_tui) fn write_persona(
+    paths: &MiyuPaths,
+    config: &AppConfig,
+    name: &str,
+    content: &str,
+) -> Result<()> {
     let path = config.persona_path(paths, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

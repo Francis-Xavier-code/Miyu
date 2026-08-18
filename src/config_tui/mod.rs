@@ -6,6 +6,7 @@ mod providers;
 mod quota;
 mod real_context;
 mod settings;
+mod undo;
 mod widgets;
 use personas::*;
 use platforms::*;
@@ -15,6 +16,7 @@ use providers::*;
 use quota::*;
 use real_context::*;
 use settings::*;
+use undo::*;
 use widgets::*;
 
 use crate::config::{
@@ -234,6 +236,7 @@ impl<'a> ProviderBrowser<'a> {
             loading: false,
             fetch_seq: 0,
             fetch_rx: None,
+            undo: ConfigUndo::default(),
         }
     }
 
@@ -263,6 +266,7 @@ impl<'a> ProviderBrowser<'a> {
                     KeyCode::Char('r') => self.refresh_models(),
                     KeyCode::Char('a') => self.add_provider(stdout)?,
                     KeyCode::Char('d') => self.delete_provider(),
+                    KeyCode::Char('u') => self.undo_delete(),
                     KeyCode::Tab if self.active_col == 2 => self.toggle_model_activation(),
                     KeyCode::Enter | KeyCode::Char('i') => self.select_or_edit(stdout)?,
                     _ => {}
@@ -463,8 +467,20 @@ impl<'a> ProviderBrowser<'a> {
         if self.config.providers.is_empty() {
             return;
         }
+        self.undo.record(self.config);
         let removed = self.config.providers.remove(self.provider_idx);
         self.config.remove_provider_references(&removed.id);
+        self.provider_idx = self
+            .provider_idx
+            .min(self.config.providers.len().saturating_sub(1));
+        self.refresh_models();
+    }
+
+    /// 退回上一步。分步的:连按几次就退几步（上限见 `ConfigUndo`）。
+    fn undo_delete(&mut self) {
+        if !self.undo.undo(self.config) {
+            return;
+        }
         self.provider_idx = self
             .provider_idx
             .min(self.config.providers.len().saturating_sub(1));
@@ -661,11 +677,14 @@ impl<'a> ProviderBrowser<'a> {
                 format!("Search: {}_  [Enter]confirm [Esc]cancel", self.filter)
             }
         } else {
-            t(
-                "[h/l]column [j/k]move [Tab]activate model [Enter]model settings [/]search [r]refresh [a]add [d]delete [q]back",
-                "[h/l]切栏 [j/k]移动 [Tab]激活模型 [Enter]模型设置 [/]搜索 [r]刷新 [a]添加 [d]删除 [q]返回",
+            format!(
+                "{}{}",
+                t(
+                    "[h/l]column [j/k]move [Tab]activate model [Enter]model settings [/]search [r]refresh [a]add [d]delete [q]back",
+                    "[h/l]切栏 [j/k]移动 [Tab]激活模型 [Enter]模型设置 [/]搜索 [r]刷新 [a]添加 [d]删除 [q]返回",
+                ),
+                self.undo.hint()
             )
-            .to_string()
         };
         let status = if self.loading {
             format!("{}", self.status)

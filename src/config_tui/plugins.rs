@@ -6,7 +6,10 @@
 
 use crate::config_tui::*;
 
-pub(in crate::config_tui) fn edit_plugins(stdout: &mut io::Stdout, config: &mut AppConfig) -> Result<()> {
+pub(in crate::config_tui) fn edit_plugins(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let count = plugin_names().len();
@@ -22,7 +25,11 @@ pub(in crate::config_tui) fn edit_plugins(stdout: &mut io::Stdout, config: &mut 
     }
 }
 
-pub(in crate::config_tui) fn draw_plugin_menu(stdout: &mut io::Stdout, config: &AppConfig, selected: usize) -> Result<()> {
+pub(in crate::config_tui) fn draw_plugin_menu(
+    stdout: &mut io::Stdout,
+    config: &AppConfig,
+    selected: usize,
+) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     let width = cols.saturating_sub(4).max(60);
     let height = rows.saturating_sub(2).max(10);
@@ -84,7 +91,12 @@ pub(in crate::config_tui) fn draw_plugin_menu(stdout: &mut io::Stdout, config: &
     Ok(())
 }
 
-pub(in crate::config_tui) fn plugin_row(state: &str, name: &str, description: &str, width: usize) -> String {
+pub(in crate::config_tui) fn plugin_row(
+    state: &str,
+    name: &str,
+    description: &str,
+    width: usize,
+) -> String {
     let fixed = pad(state, 8) + &pad(name, 24);
     let remaining = width.saturating_sub(display_width(&fixed)).max(10);
     fixed + &truncate(description, remaining)
@@ -220,7 +232,11 @@ pub(in crate::config_tui) fn toggle_plugin(config: &mut AppConfig, index: usize)
     }
 }
 
-pub(in crate::config_tui) fn edit_plugin_detail(stdout: &mut io::Stdout, config: &mut AppConfig, index: usize) -> Result<()> {
+pub(in crate::config_tui) fn edit_plugin_detail(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+    index: usize,
+) -> Result<()> {
     // api_quota 是 plugin_names() 的最后一项(下标 12):它有专门的账号
     // 管理界面,不走通用表单。
     if index == plugin_names().len() - 1 {
@@ -258,7 +274,10 @@ pub(in crate::config_tui) fn plugin_fields(config: &AppConfig, index: usize) -> 
             )
             .sensitive(),
             Field::textarea(
-                t("Exa API Keys (optional; keyless free quota)", "Exa API Keys（可留空用免费额度）"),
+                t(
+                    "Exa API Keys (optional; keyless free quota)",
+                    "Exa API Keys（可留空用免费额度）",
+                ),
                 config.plugins.web.exa_api_keys.join("\n"),
             )
             .sensitive(),
@@ -659,7 +678,11 @@ pub(in crate::config_tui) fn plugin_fields(config: &AppConfig, index: usize) -> 
     }
 }
 
-pub(in crate::config_tui) fn apply_plugin_fields(config: &mut AppConfig, index: usize, fields: &[Field]) -> Result<()> {
+pub(in crate::config_tui) fn apply_plugin_fields(
+    config: &mut AppConfig,
+    index: usize,
+    fields: &[Field],
+) -> Result<()> {
     match index {
         0 => {
             config.plugins.web.enabled = parse_bool_field(&fields[0].value)?;

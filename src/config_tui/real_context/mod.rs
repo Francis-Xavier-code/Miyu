@@ -16,7 +16,9 @@ pub(in crate::config_tui) use reply::*;
 
 use crate::config_tui::*;
 
-pub(in crate::config_tui) fn real_context_values(config: &AppConfig) -> Result<(bool, RealContextPluginSettings)> {
+pub(in crate::config_tui) fn real_context_values(
+    config: &AppConfig,
+) -> Result<(bool, RealContextPluginSettings)> {
     let Some(instance) = config.platforms.qq.plugins.get(REAL_CONTEXT_PLUGIN_ID) else {
         return Ok((true, RealContextPluginSettings::default()));
     };
@@ -160,11 +162,17 @@ pub(in crate::config_tui) fn edit_real_context_history(
     }
 }
 
-pub(in crate::config_tui) fn real_context_bool(fields: &[Field], index: usize) -> std::result::Result<bool, String> {
+pub(in crate::config_tui) fn real_context_bool(
+    fields: &[Field],
+    index: usize,
+) -> std::result::Result<bool, String> {
     parse_bool_field(&fields[index].value).map_err(|error| error.to_string())
 }
 
-pub(in crate::config_tui) fn real_context_value<T>(fields: &[Field], index: usize) -> std::result::Result<T, String>
+pub(in crate::config_tui) fn real_context_value<T>(
+    fields: &[Field],
+    index: usize,
+) -> std::result::Result<T, String>
 where
     T: std::str::FromStr,
 {
@@ -225,7 +233,9 @@ pub(in crate::config_tui) fn real_context_media_mode_value(value: &str) -> Optio
     }
 }
 
-pub(in crate::config_tui) fn real_context_model_pool_summary(pool: Option<&[ActiveProviderModelConfig]>) -> String {
+pub(in crate::config_tui) fn real_context_model_pool_summary(
+    pool: Option<&[ActiveProviderModelConfig]>,
+) -> String {
     match pool {
         None | Some([]) => t("inherit platform", "继承平台池").to_string(),
         Some(entries) => route_pool_summary(Some(entries), PlatformModelPoolInheritance::Platform),
