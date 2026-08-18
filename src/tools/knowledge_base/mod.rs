@@ -3,6 +3,7 @@ mod store;
 pub(crate) use search::embed_text;
 mod files;
 mod index;
+use index::keyword_search_blocking;
 
 use search::*;
 use store::*;
@@ -207,7 +208,7 @@ impl KnowledgeBase {
         let limit = max_results
             .unwrap_or(self.config.plugins.knowledge_base.max_search_results)
             .clamp(1, 50);
-        let mut results = self.keyword_search(query, limit)?;
+        let mut results = self.keyword_search(query, limit).await?;
         let strongest = results.first().map(|item| item.score).unwrap_or(0.0);
         let mut semantic_used = false;
         if allow_semantic
@@ -251,7 +252,6 @@ impl KnowledgeBase {
             "embedding_model": self.config.plugins.knowledge_base.embedding_model,
         }))
     }
-
 }
 
 async fn tool_search_readonly(args: Value, config: AppConfig, paths: MiyuPaths) -> Result<String> {
@@ -432,7 +432,7 @@ mod tests {
     use super::*;
     use crate::paths::MiyuPaths;
 
-    fn test_paths(root: &Path) -> MiyuPaths {
+    pub(super) fn test_paths(root: &Path) -> MiyuPaths {
         MiyuPaths {
             root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
@@ -507,5 +507,116 @@ mod tests {
         let error = kb.edit_lines("note.md", 2, 2, "two").unwrap_err();
 
         assert!(error.to_string().contains("out of range"));
+    }
+}
+
+#[cfg(test)]
+mod scaling_probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// 量尺，不是断言：`cargo test --lib knowledge_base::scaling_probe -- --ignored --nocapture`
+    ///
+    /// keyword_search 对库里**每个**文件做「整读 + 整份 lowercase 拷贝」，
+    /// 而且是在 `async fn search_existing` 里同步跑——这段时间 tokio worker
+    /// 是卡住的。这里量的就是那段卡住有多长。
+    #[test]
+    #[ignore]
+    fn keyword_search_scaling() {
+        println!("\n  文件数  每文件KB   库总量MB   搜索耗时(ms)");
+        for (files, kb_each) in [(20usize, 32usize), (50, 32), (100, 32), (200, 32)] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = super::tests::test_paths(temp.path());
+            let kb = KnowledgeBase::new(AppConfig::default(), paths).unwrap();
+            // 内容里不含查询词,走的是「全扫一遍都没命中」这条最坏路径
+            let body = "lorem ipsum dolor sit amet ".repeat(kb_each * 1024 / 27);
+            for index in 0..files {
+                let source = temp.path().join(format!("doc{index}.md"));
+                std::fs::write(&source, &body).unwrap();
+                kb.import_file(&source, &format!("docs/doc{index}.md"))
+                    .unwrap();
+            }
+            let start = Instant::now();
+            let found = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(kb.keyword_search("需要检索的关键词", 5))
+                .unwrap();
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(found);
+            let total_mb = (files * kb_each) as f64 / 1024.0;
+            println!("  {files:>6}  {kb_each:>8}  {total_mb:>9.1}  {ms:>13.1}");
+        }
+    }
+
+    /// 真正要证明的不是搜索本身变快了（活儿一样多），而是**搜索期间别的
+    /// 异步任务还转不转**。单 worker 运行时上放一个 5ms 心跳，量它被堵住的
+    /// 最长间隔：同步跑 = 堵满整个搜索时长，spawn_blocking = 基本不堵。
+    #[test]
+    #[ignore]
+    fn keyword_search_does_not_freeze_the_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = super::tests::test_paths(temp.path());
+        let kb = KnowledgeBase::new(AppConfig::default(), paths).unwrap();
+        let body = "lorem ipsum dolor sit amet ".repeat(200 * 1024 / 27);
+        for index in 0..30 {
+            let source = temp.path().join(format!("doc{index}.md"));
+            std::fs::write(&source, &body).unwrap();
+            kb.import_file(&source, &format!("docs/doc{index}.md"))
+                .unwrap();
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for (label, blocking) in [
+            ("同步跑（改前的做法）", true),
+            ("spawn_blocking（现在）", false),
+        ] {
+            let gap = runtime.block_on(async {
+                let worst = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let probe = worst.clone();
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let halt = stop.clone();
+                let ticker = tokio::spawn(async move {
+                    let mut last = Instant::now();
+                    while !halt.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        let gap = last.elapsed().as_millis() as u64;
+                        probe.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
+                        last = Instant::now();
+                    }
+                });
+                tokio::task::yield_now().await;
+                // 搜索必须也在 spawn 出来的任务里跑,才会和心跳抢同一个
+                // worker——`block_on` 的 future 跑在调用线程上,放这儿量不出
+                // 任何东西(第一版探针就是这么白跑的)。
+                let records = kb.list().unwrap();
+                let search = tokio::spawn(async move {
+                    if blocking {
+                        // 改前的形状:在 async 上下文里直接同步跑
+                        let found =
+                            keyword_search_blocking(records, "需要检索的关键词", 5, 200, 200);
+                        std::hint::black_box(found.unwrap());
+                    } else {
+                        let found = tokio::task::spawn_blocking(move || {
+                            keyword_search_blocking(records, "需要检索的关键词", 5, 200, 200)
+                        })
+                        .await
+                        .unwrap();
+                        std::hint::black_box(found.unwrap());
+                    }
+                });
+                let _ = search.await;
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = ticker.await;
+                worst.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            println!("  {label:<26} 心跳最长被堵 {gap:>5} ms");
+        }
     }
 }

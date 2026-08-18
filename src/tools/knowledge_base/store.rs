@@ -21,7 +21,11 @@ pub struct EditResult {
     pub(in crate::tools::knowledge_base) semantic_refreshed: bool,
 }
 
-pub(in crate::tools::knowledge_base) fn reject_non_kb_upload(content: &str, title: &str, file_name: &str) -> Result<()> {
+pub(in crate::tools::knowledge_base) fn reject_non_kb_upload(
+    content: &str,
+    title: &str,
+    file_name: &str,
+) -> Result<()> {
     let text = format!("{content}\n{title}\n{file_name}").to_ascii_lowercase();
     let forbidden = [
         "skill", "skills/", "skll", "记忆", "memory", "persona", "identity", "prompt", "配置",
@@ -57,7 +61,10 @@ pub(in crate::tools::knowledge_base) fn init_semantic_db(conn: &Connection) -> R
     Ok(())
 }
 
-pub(in crate::tools::knowledge_base) fn kb_root(config: &KnowledgeBasePluginConfig, paths: &MiyuPaths) -> PathBuf {
+pub(in crate::tools::knowledge_base) fn kb_root(
+    config: &KnowledgeBasePluginConfig,
+    paths: &MiyuPaths,
+) -> PathBuf {
     let configured = config.data_dir.trim();
     if configured.is_empty() {
         paths.data_dir.join("kb")

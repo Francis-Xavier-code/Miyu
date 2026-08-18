@@ -17,7 +17,12 @@ pub(in crate::tools::knowledge_base) struct SearchResult {
 }
 
 impl SearchResult {
-    pub(in crate::tools::knowledge_base) fn new(path: String, score: f32, snippets: Vec<String>, source: &'static str) -> Self {
+    pub(in crate::tools::knowledge_base) fn new(
+        path: String,
+        score: f32,
+        snippets: Vec<String>,
+        source: &'static str,
+    ) -> Self {
         Self {
             path,
             score,
@@ -120,7 +125,10 @@ pub(in crate::tools::knowledge_base) fn query_tokens(value: &str) -> Vec<String>
         .collect()
 }
 
-pub(in crate::tools::knowledge_base) fn flush_chinese(chars: &mut Vec<char>, tokens: &mut Vec<String>) {
+pub(in crate::tools::knowledge_base) fn flush_chinese(
+    chars: &mut Vec<char>,
+    tokens: &mut Vec<String>,
+) {
     if chars.is_empty() {
         return;
     }
@@ -132,7 +140,11 @@ pub(in crate::tools::knowledge_base) fn flush_chinese(chars: &mut Vec<char>, tok
     chars.clear();
 }
 
-pub(in crate::tools::knowledge_base) fn find_positions(content: &str, needle: &str, limit: usize) -> Vec<usize> {
+pub(in crate::tools::knowledge_base) fn find_positions(
+    content: &str,
+    needle: &str,
+    limit: usize,
+) -> Vec<usize> {
     let mut positions = Vec::new();
     let mut start = 0;
     while let Some(pos) = content[start..].find(needle) {
@@ -201,7 +213,12 @@ pub(in crate::tools::knowledge_base) fn extract_snippets(
     snippets
 }
 
-pub(in crate::tools::knowledge_base) fn snippet_chars(content: &str, start: usize, end: usize, context: usize) -> String {
+pub(in crate::tools::knowledge_base) fn snippet_chars(
+    content: &str,
+    start: usize,
+    end: usize,
+    context: usize,
+) -> String {
     let start = content[..start.min(content.len())]
         .char_indices()
         .rev()
@@ -216,7 +233,11 @@ pub(in crate::tools::knowledge_base) fn snippet_chars(content: &str, start: usiz
     compact_whitespace(&content[start..end])
 }
 
-pub(in crate::tools::knowledge_base) fn build_chunks(content: &str, chunk_chars: usize, overlap: usize) -> Vec<Chunk> {
+pub(in crate::tools::knowledge_base) fn build_chunks(
+    content: &str,
+    chunk_chars: usize,
+    overlap: usize,
+) -> Vec<Chunk> {
     let chars = content.char_indices().collect::<Vec<_>>();
     let mut chunks = Vec::new();
     let mut start_char = 0usize;
@@ -247,7 +268,11 @@ pub(in crate::tools::knowledge_base) fn build_chunks(content: &str, chunk_chars:
     chunks
 }
 
-pub(in crate::tools::knowledge_base) fn merge_results(results: &mut Vec<SearchResult>, semantic: Vec<SearchResult>, limit: usize) {
+pub(in crate::tools::knowledge_base) fn merge_results(
+    results: &mut Vec<SearchResult>,
+    semantic: Vec<SearchResult>,
+    limit: usize,
+) {
     for item in semantic {
         if let Some(existing) = results.iter_mut().find(|result| result.path == item.path) {
             existing.score += item.score * 0.6;
@@ -265,7 +290,10 @@ pub(in crate::tools::knowledge_base) fn merge_results(results: &mut Vec<SearchRe
     results.truncate(limit);
 }
 
-pub(in crate::tools::knowledge_base) fn score_file_name(query: &str, name: &str) -> (f64, &'static str) {
+pub(in crate::tools::knowledge_base) fn score_file_name(
+    query: &str,
+    name: &str,
+) -> (f64, &'static str) {
     let query = query.replace('\\', "/").to_ascii_lowercase();
     let name = name.replace('\\', "/").to_ascii_lowercase();
     let base = file_name(&name);

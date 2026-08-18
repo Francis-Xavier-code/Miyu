@@ -88,7 +88,11 @@ impl KnowledgeBase {
         self.find_by_name_existing(query, max_results)
     }
 
-    pub(in crate::tools::knowledge_base) fn find_by_name_existing(&self, query: &str, max_results: Option<usize>) -> Result<Value> {
+    pub(in crate::tools::knowledge_base) fn find_by_name_existing(
+        &self,
+        query: &str,
+        max_results: Option<usize>,
+    ) -> Result<Value> {
         let limit = max_results
             .unwrap_or(self.config.plugins.knowledge_base.max_search_results)
             .clamp(1, 50);
@@ -150,7 +154,10 @@ impl KnowledgeBase {
     /// `default-kb/kb/4. xx/文件.md`): exact match first, then a unique
     /// suffix match; otherwise fail with concrete candidates so the model
     /// can self-correct in one step.
-    pub(in crate::tools::knowledge_base) fn resolve_stored_name(&self, rel: &str) -> Result<String> {
+    pub(in crate::tools::knowledge_base) fn resolve_stored_name(
+        &self,
+        rel: &str,
+    ) -> Result<String> {
         let records = self.list_existing()?;
         if records.iter().any(|record| record.name == rel) {
             return Ok(rel.to_string());
@@ -339,7 +346,11 @@ impl KnowledgeBase {
         Ok(())
     }
 
-    pub(in crate::tools::knowledge_base) fn import_file(&self, source: &Path, name: &str) -> Result<String> {
+    pub(in crate::tools::knowledge_base) fn import_file(
+        &self,
+        source: &Path,
+        name: &str,
+    ) -> Result<String> {
         // 先看元数据再整读:超大文件不该先撑满 RAM 再被大小校验拒绝。
         let max_bytes = self.config.plugins.knowledge_base.max_file_size_kb * 1024;
         let size = std::fs::metadata(source)?.len();
@@ -364,7 +375,11 @@ impl KnowledgeBase {
         Ok(name.to_string())
     }
 
-    pub(in crate::tools::knowledge_base) fn validate_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    pub(in crate::tools::knowledge_base) fn validate_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
         if bytes.is_empty() {
             bail!("file is empty")
         }
@@ -404,7 +419,10 @@ impl KnowledgeBase {
         Ok(path)
     }
 
-    pub(in crate::tools::knowledge_base) fn existing_file_path(&self, rel: &str) -> Result<PathBuf> {
+    pub(in crate::tools::knowledge_base) fn existing_file_path(
+        &self,
+        rel: &str,
+    ) -> Result<PathBuf> {
         let rel = normalize_relative_path(rel)?;
         let path = self.files_dir.join(&rel);
         let base = self

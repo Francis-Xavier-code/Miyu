@@ -49,7 +49,10 @@ impl KnowledgeBase {
         result
     }
 
-    pub(in crate::tools::knowledge_base) fn refresh_semantic_after_write(&self, name: &str) -> Result<bool> {
+    pub(in crate::tools::knowledge_base) fn refresh_semantic_after_write(
+        &self,
+        name: &str,
+    ) -> Result<bool> {
         if !self.config.plugins.knowledge_base.embedding_enabled {
             return Ok(false);
         }
@@ -61,11 +64,49 @@ impl KnowledgeBase {
         Ok(true)
     }
 
-    pub(in crate::tools::knowledge_base) fn keyword_search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    /// 关键词检索：库里每个文件整读一遍再逐词扫。
+    ///
+    /// 这活儿是**无界**的（跟库大小成正比，实测约 7.3 ms/MB），原来直接在
+    /// `async fn search_existing` 里同步跑——整段时间一个 tokio worker 被占死，
+    /// 100MB 的库就是 700ms 的运行时冻结。挪进 `spawn_blocking`：算什么、
+    /// 算多久一个字节都没变，只是不再占着异步线程。
+    ///
+    /// 循环只依赖 `list()` 的结果和三个配置数值，全部拷进闭包即可，不必让
+    /// 闭包借到 `&self`。
+    pub(in crate::tools::knowledge_base) async fn keyword_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let records = self.list()?;
+        let proximity_window_chars = self.config.plugins.knowledge_base.proximity_window_chars;
+        let snippet_context_chars = self.config.plugins.knowledge_base.snippet_context_chars;
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            keyword_search_blocking(
+                records,
+                &query,
+                limit,
+                proximity_window_chars,
+                snippet_context_chars,
+            )
+        })
+        .await?
+    }
+}
+
+pub(in crate::tools::knowledge_base) fn keyword_search_blocking(
+    records: Vec<FileRecord>,
+    query: &str,
+    limit: usize,
+    proximity_window_chars: usize,
+    snippet_context_chars: usize,
+) -> Result<Vec<SearchResult>> {
+    {
         let tokens = query_tokens(query);
         let phrase = query.to_ascii_lowercase();
         let mut results = Vec::new();
-        for record in self.list()? {
+        for record in records {
             let path = PathBuf::from(&record.path);
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
@@ -97,18 +138,11 @@ impl KnowledgeBase {
             if !tokens.is_empty() {
                 score += (matched.len() as f32 / tokens.len() as f32) * 55.0;
             }
-            if let Some((start, end, coverage)) = best_window(
-                &positions_by_token,
-                &tokens,
-                self.config.plugins.knowledge_base.proximity_window_chars,
-            ) {
+            if let Some((start, end, coverage)) =
+                best_window(&positions_by_token, &tokens, proximity_window_chars)
+            {
                 score += coverage * 120.0;
-                let snippet = snippet_chars(
-                    &content,
-                    start,
-                    end,
-                    self.config.plugins.knowledge_base.snippet_context_chars,
-                );
+                let snippet = snippet_chars(&content, start, end, snippet_context_chars);
                 results.push(SearchResult::new(
                     record.name,
                     score,
@@ -118,12 +152,8 @@ impl KnowledgeBase {
                 continue;
             }
             if score > 0.0 {
-                let snippets = extract_snippets(
-                    &content,
-                    &content_lower,
-                    &tokens,
-                    self.config.plugins.knowledge_base.snippet_context_chars,
-                );
+                let snippets =
+                    extract_snippets(&content, &content_lower, &tokens, snippet_context_chars);
                 results.push(SearchResult::new(record.name, score, snippets, "keyword"));
             }
         }
@@ -135,8 +165,13 @@ impl KnowledgeBase {
         results.truncate(limit);
         Ok(results)
     }
+}
 
-    pub(in crate::tools::knowledge_base) async fn semantic_search(&self, query: &str) -> Result<Vec<SearchResult>> {
+impl KnowledgeBase {
+    pub(in crate::tools::knowledge_base) async fn semantic_search(
+        &self,
+        query: &str,
+    ) -> Result<Vec<SearchResult>> {
         let Some((provider, model)) = self.embedding_provider()? else {
             return Ok(Vec::new());
         };
@@ -261,7 +296,9 @@ impl KnowledgeBase {
         Ok(())
     }
 
-    pub(in crate::tools::knowledge_base) fn embedding_provider(&self) -> Result<Option<(ProviderConfig, String)>> {
+    pub(in crate::tools::knowledge_base) fn embedding_provider(
+        &self,
+    ) -> Result<Option<(ProviderConfig, String)>> {
         let embedding = &self.config.embedding;
         if !embedding.is_configured() {
             return Ok(None);
