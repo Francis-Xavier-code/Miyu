@@ -1,5 +1,6 @@
 use super::{html_conversion, http_response};
 use anyhow::{bail, Result};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::time::Duration;
@@ -8,6 +9,19 @@ const BASE_URL: &str = "https://caniplayonlinux.com";
 const TOOL_DISPLAY_NAME: &str = "查询是否能在Linux上玩";
 const PAGE_SIZE: usize = 24;
 const MAX_LIMIT: usize = 10;
+/// 同时在飞的目录页数。跟仓库其它抓取路径（`web_images`、`api_quota`）一样
+/// 取 4——请求总数不变，只是别排成一队慢慢等。
+const PAGE_CONCURRENCY: usize = 4;
+/// 整个目录扫描的墙钟预算。
+///
+/// 这个站没有搜索接口（`?q=` 实测被忽略，照样返回全部 108 页），所以「按名字
+/// 找一个游戏」只能整本目录抓下来在本地筛。实测 2,586 个游戏 = 108 页、
+/// 每页约 317 ms：串行走完 **34 秒**，而每页超时是 25 秒，站点抽风时最坏
+/// **45 分钟**——就为了返回最多 10 条。
+///
+/// 超预算就带着已扫到的部分返回，并在 `warnings` 里说清楚扫了多少：结果不全
+/// 是可以接受的，卡住 45 分钟不行。
+const CATALOGUE_BUDGET: Duration = Duration::from_secs(20);
 
 const TOOL_DESC: &str = "查询 caniplayonlinux.com 的实时 Linux 游戏兼容性信息。适用于用户询问某个游戏是否能在 Linux 上玩、是否可通过 Proton 运行、是否 Steam Deck Verified、推荐 Proton 版本、是否有已知 Linux 问题或修复方法的场景。该工具只读抓取网页并返回结构化结果，包括标题、来源链接、兼容性结论、Proton 推荐、Steam Deck 状态、摘要、备注、已知问题、修复建议和验证时间等可用字段。返回内容来自第三方站点实时解析；不要编造缺失字段，未返回的信息应视为未知。允许子代理调用。";
 
@@ -50,16 +64,46 @@ pub(super) async fn query(args: Value) -> Result<String> {
     let mut all_games = extract_games_from_list_page(&first_html);
     let mut warnings = Vec::new();
 
-    for page in 2..=pages {
-        let url = format!("{BASE_URL}/games/{page}/");
-        match fetch_text(&client, &url).await {
-            Ok(html) => all_games.extend(extract_games_from_list_page(&html)),
-            Err(err) => warnings.push(json!({
+    let deadline = tokio::time::Instant::now() + CATALOGUE_BUDGET;
+    let mut pending = futures_util::stream::iter((2..=pages).map(|page| {
+        let client = &client;
+        async move {
+            let url = format!("{BASE_URL}/games/{page}/");
+            let result = fetch_text(client, &url).await;
+            (url, result)
+        }
+    }))
+    .buffer_unordered(PAGE_CONCURRENCY);
+
+    let mut scanned = 1usize;
+    let mut budget_spent = false;
+    loop {
+        match tokio::time::timeout_at(deadline, pending.next()).await {
+            Err(_) => {
+                budget_spent = true;
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some((_, Ok(html)))) => {
+                all_games.extend(extract_games_from_list_page(&html));
+                scanned += 1;
+            }
+            Ok(Some((url, Err(err)))) => warnings.push(json!({
                 "kind": "page_fetch_failed",
                 "url": url,
                 "error": err.to_string(),
             })),
         }
+    }
+    drop(pending);
+    if budget_spent {
+        warnings.push(json!({
+            "kind": "catalogue_scan_truncated",
+            "scanned_pages": scanned,
+            "total_pages": pages,
+            "budget_seconds": CATALOGUE_BUDGET.as_secs(),
+            "note": "目录未扫完就用光了时间预算；结果可能漏掉未扫到的游戏",
+        }));
     }
 
     let mut matches = unique_by_url(all_games)
@@ -835,6 +879,46 @@ mod tests {
         assert_eq!(
             section_excerpt(text, "Fixes", "Verdict", 100),
             Some("Real fix".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalogue_probe {
+    use super::*;
+
+    /// 量尺：`cargo test --lib catalogue_probe -- --ignored --nocapture`
+    ///
+    /// **会真的去抓 caniplayonlinux.com**，所以是 `#[ignore]`：默认不跑，别把
+    /// 人家站点当 CI 的一部分。
+    ///
+    /// 改前是 `for page in 2..=pages` 一页一页串行等，实测 108 页 × 317 ms =
+    /// 34 秒。这条量的是有界并发（4）+ 20 秒预算之后是什么样。
+    #[tokio::test]
+    #[ignore]
+    async fn full_catalogue_scan_timing() {
+        let started = std::time::Instant::now();
+        let output = query(json!({"query": "hades", "limit": 3})).await.unwrap();
+        let elapsed = started.elapsed();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        let warnings = parsed
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let hits = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        println!(
+            "\n  一次完整查询：{:.1} 秒，命中 {hits} 条，warnings {warnings} 条\n  \
+             （串行版实测 34 秒；每页超时 25 秒时最坏 45 分钟）",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            elapsed < CATALOGUE_BUDGET + Duration::from_secs(15),
+            "用了 {elapsed:?}，预算没兜住"
         );
     }
 }
