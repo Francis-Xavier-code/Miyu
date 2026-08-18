@@ -103,11 +103,7 @@ pub(crate) fn kitty_sequence_with_grid(
 }
 
 /// 渲染成 Kitty 序列,撑满 max 框(看图语义,print_image 用)。
-pub(crate) fn kitty_sequence(
-    image: &DynamicImage,
-    max_cols: u16,
-    max_rows: u16,
-) -> Result<String> {
+pub(crate) fn kitty_sequence(image: &DynamicImage, max_cols: u16, max_rows: u16) -> Result<String> {
     let (cell_width, cell_height) = cell_pixel_size();
     let (cols, rows) = fit_cells(
         image.width(),
@@ -433,11 +429,18 @@ mod transfer_size_probe {
             ("照片 终端 240×60", 1920, 1080, 240, 60, None),
             ("照片 显式 300×200", 1920, 1080, 120, 40, Some("300x200")),
             ("小图 显式 300×200", 128, 128, 120, 40, Some("300x200")),
-            ("公式条 终端 120×40", 900, 96, 120, 40, None),
+            // 公式走的是 render::math，它**故意**造 2× 网格的画布让传输层折半
+            // （见那边「传输层 thumbnail 恰好折半」的注释），网格由它自己定，
+            // 不经过 fit_cells。这里照它的真实形态摆，验证改动没碰到这条路。
+            ("公式 2× 画布 100×3 格", 1600, 96, 120, 40, Some("math")),
         ] {
             let image = DynamicImage::new_rgba8(image_w, image_h);
-            let (max_cols, max_rows) = parse_size(requested, term_cols, term_rows).unwrap();
-            let (cols, rows) = fit_cells(image_w, image_h, max_cols, max_rows, cell_w, cell_h);
+            let (cols, rows) = if requested == Some("math") {
+                (100u16, 3u16)
+            } else {
+                let (max_cols, max_rows) = parse_size(requested, term_cols, term_rows).unwrap();
+                fit_cells(image_w, image_h, max_cols, max_rows, cell_w, cell_h)
+            };
 
             let mut written = Vec::new();
             for (index, sent) in [
