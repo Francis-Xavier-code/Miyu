@@ -37,7 +37,7 @@ mod skills;
 mod subagent_runner;
 mod task;
 mod todowrite;
-pub(crate) use todowrite::session_todos;
+pub(crate) use todowrite::{clear_session_todos, session_todos};
 pub(crate) mod usage_query;
 pub mod tool_descriptions;
 pub mod vision;

@@ -637,3 +637,61 @@ fn a_flood_of_new_peers_cannot_reset_an_active_block() {
         Err(LoginFailure::RateLimited)
     ));
 }
+
+/// 重置对话要连待办一起清。
+///
+/// 待办按会话存在库外面（`todos/{session}.json`），而重置那条路上一串清理
+/// 动作全走 `StateStore`——加清理项时天然会漏掉它，于是「对话重来了，上一轮
+/// 的待办还挂在侧边面板上，模型下一次读 todo 也还是旧的」。
+/// 清空会话内容（平台会话与 WebUI 的「清空」）同理，两条都钉住。
+#[test]
+fn resetting_a_conversation_also_clears_its_todo_list() {
+    for clear_only in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let state = DaemonState::for_test(paths.clone(), 8330).unwrap();
+        let config = state.manager.lock().unwrap().config.clone();
+        let session_id = state.state_store.session_id().to_string();
+
+        let todos = paths.state_dir.join("todos");
+        std::fs::create_dir_all(&todos).unwrap();
+        std::fs::write(
+            todos.join(format!("{session_id}.json")),
+            r#"[{"content":"上一轮的活","status":"pending","priority":"high"}]"#,
+        )
+        .unwrap();
+        assert!(
+            !crate::tools::session_todos(&paths, &session_id).is_empty(),
+            "前置条件不成立：清单没写进去"
+        );
+
+        let mut agent = None;
+        let result = if clear_only {
+            clear_actor_session_content(
+                &mut agent,
+                &config,
+                &paths,
+                &state.state_store,
+                &state.manager,
+                &session_id,
+            )
+        } else {
+            reset_actor_conversation(
+                &mut agent,
+                &config,
+                &paths,
+                &state.state_store,
+                &state.manager,
+                &state.events,
+                &session_id,
+            )
+        };
+        result.unwrap();
+
+        assert!(
+            crate::tools::session_todos(&paths, &session_id).is_empty(),
+            "{}后待办还在——面板和模型看到的都是上一轮的清单",
+            if clear_only { "清空会话" } else { "重置对话" }
+        );
+    }
+}

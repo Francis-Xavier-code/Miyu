@@ -34,6 +34,20 @@ pub(crate) fn session_todos(paths: &MiyuPaths, session: &str) -> Vec<Todo> {
     load_todos(paths, session)
 }
 
+/// 清掉某个会话的待办。
+///
+/// 待办按会话存在库外面（`todos/{session}.json`），所以「重置对话」那条路上
+/// 一串清理动作全走 `StateStore`，唯独漏了它——对话重来了，上一轮的待办还挂
+/// 在侧边面板上，模型下一次读 todo 也还是旧的。
+pub(crate) fn clear_session_todos(paths: &MiyuPaths, session: &str) -> Result<()> {
+    match std::fs::remove_file(todos_path(paths, session)) {
+        Ok(()) => Ok(()),
+        // 没建过清单是常态，不是错误。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn load_todos(paths: &MiyuPaths, session: &str) -> Vec<Todo> {
     let Ok(raw) = std::fs::read_to_string(todos_path(paths, session)) else {
         return Vec::new();
