@@ -929,7 +929,7 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
         }
         push_history_capped(&mut history, input);
         live_repl.editor.record_history(input);
-        persist_repl_history_entry(paths, input);
+        persist_repl_history_entry(paths, &active_session_id, input);
         match try_run_remote_chat(
             paths,
             Some(&mut live_repl),

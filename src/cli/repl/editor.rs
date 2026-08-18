@@ -8,23 +8,60 @@
 // 免得一次改动横跨太多文件而无法定位问题。
 use crate::cli::*;
 
+/// 这个会话的上键历史。
+///
+/// 三个来源按「从旧到新」拼起来——上键是从**末尾**往回走的，顺序错了最近敲的
+/// 就不在第一格：
+///
+/// 1. 分会话之前的全局文件（只读的老数据）
+/// 2. 本会话的对话记录里用户说过的话
+/// 3. 本会话的历史文件（`/reset` 删掉 turn 之后它仍在，是持久真相）
 pub(in crate::cli) fn load_repl_input_history(
     state: &StateStore,
     paths: &MiyuPaths,
 ) -> Result<Vec<String>> {
-    let mut merged: Vec<String> = state
+    let session_id = state.session_id();
+    let mut merged: Vec<String> = read_repl_history_file(&legacy_repl_history_file(paths));
+    let conversation = state
         .load_conversation()?
         .into_iter()
         .filter(|entry| entry.role == "user" && !entry.content.trim().is_empty())
         .map(|entry| strip_terminal_control_sequences(&entry.content))
-        .filter(|content| !content.trim().is_empty())
-        .collect();
-    for entry in load_persistent_repl_history(paths) {
+        .filter(|content| !content.trim().is_empty());
+    for entry in conversation {
+        if !merged.contains(&entry) {
+            merged.push(entry);
+        }
+    }
+    for entry in load_persistent_repl_history(paths, &session_id) {
         if !merged.contains(&entry) {
             merged.push(entry);
         }
     }
     Ok(merged)
+}
+
+/// 从磁盘补齐本会话的历史，返回是否真的多出了条目。
+///
+/// 历史以前只在 REPL 启动时读一次（`load_repl_input_history`），此后整个循环
+/// **没有任何重新加载的路径**。于是两个 REPL 同时开着时，先开的那个永远看不到
+/// 后来在另一个窗口敲的东西。上一轮排查按「先敲完再开第二个」测，走的是启动
+/// 加载那条路，当然是通的，所以没能复现——测错了顺序。
+///
+/// 只在「从空输入框开始翻」时调用：翻到一半重载会让 `history_index` 错位。
+pub(in crate::cli) fn refresh_repl_input_history(
+    history: &mut Vec<String>,
+    paths: &MiyuPaths,
+    session_id: &str,
+) -> bool {
+    let mut added = false;
+    for entry in load_persistent_repl_history(paths, session_id) {
+        if !history.contains(&entry) {
+            push_history_capped(history, &entry);
+            added = true;
+        }
+    }
+    added
 }
 
 pub(in crate::cli) struct LiveReplEditor {

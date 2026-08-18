@@ -729,24 +729,29 @@ fn strips_terminal_control_sequences_from_repl_text() {
     );
 }
 
-#[test]
-fn repl_history_loads_user_messages_from_state() {
-    let temp = tempfile::tempdir().unwrap();
-    let paths = MiyuPaths {
+/// 只需要 state_dir 的 fixture：历史文件、状态库都落在它下面。
+fn state_only_paths(root: &std::path::Path) -> MiyuPaths {
+    MiyuPaths {
         root_dir: PathBuf::new(),
         config_dir: PathBuf::new(),
         config_file: PathBuf::new(),
         skills_dir: PathBuf::new(),
         data_dir: PathBuf::new(),
         cache_dir: PathBuf::new(),
-        state_dir: temp.path().to_path_buf(),
+        state_dir: root.to_path_buf(),
         pictures_dir: PathBuf::new(),
         fish_hook_file: PathBuf::new(),
         bash_hook_file: PathBuf::new(),
         zsh_hook_file: PathBuf::new(),
         scripts_dir: PathBuf::new(),
         system_scripts_dir: PathBuf::new(),
-    };
+    }
+}
+
+#[test]
+fn repl_history_loads_user_messages_from_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = state_only_paths(temp.path());
     let state = StateStore::new(&paths).unwrap();
     state.start_turn("turn_1", "first", 999999).unwrap();
     state.complete_turn("turn_1", "reply", None).unwrap();
@@ -755,5 +760,86 @@ fn repl_history_loads_user_messages_from_state() {
     assert_eq!(
         load_repl_input_history(&state, &paths).unwrap(),
         vec!["first".to_string(), "second".to_string()]
+    );
+}
+
+/// 两个 REPL 同时开着时，后敲的内容要能被先开的那个翻出来。
+///
+/// 历史以前只在启动时读一次，之后整个循环没有重新加载的路径——先开的那个
+/// REPL 的 `Vec` 就此冻结。上一轮排查按「先敲完再开第二个」测，走的是启动
+/// 加载那条路，当然是通的，所以没复现。
+#[test]
+fn a_second_repl_sees_what_the_first_one_just_typed() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = state_only_paths(temp.path());
+
+    // REPL#2 先开：拿到一份当时的快照。
+    let mut second_repl_history = vec!["老条目".to_string()];
+
+    // REPL#1 后敲了两条（提交前就落盘，与生产路径一致）。
+    persist_repl_history_entry(&paths, "sess_a", "cargo test --all");
+    persist_repl_history_entry(&paths, "sess_a", "看一下 tokio 的文档");
+
+    // REPL#2 按上键 → 现读一次。
+    assert!(refresh_repl_input_history(
+        &mut second_repl_history,
+        &paths,
+        "sess_a"
+    ));
+    assert_eq!(
+        second_repl_history,
+        vec![
+            "老条目".to_string(),
+            "cargo test --all".to_string(),
+            "看一下 tokio 的文档".to_string(),
+        ],
+        "最近敲的必须在末尾——上键是从末尾往回走的"
+    );
+
+    // 再刷一次没有新东西，不该重复追加。
+    assert!(!refresh_repl_input_history(
+        &mut second_repl_history,
+        &paths,
+        "sess_a"
+    ));
+    assert_eq!(second_repl_history.len(), 3);
+}
+
+/// 历史按会话隔离：别的会话敲的东西不该出现在这个会话的上键里。
+#[test]
+fn repl_history_does_not_leak_across_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = state_only_paths(temp.path());
+
+    persist_repl_history_entry(&paths, "sess_a", "只属于 A");
+    persist_repl_history_entry(&paths, "sess_b", "只属于 B");
+
+    let mut a = Vec::new();
+    refresh_repl_input_history(&mut a, &paths, "sess_a");
+    assert_eq!(a, vec!["只属于 A".to_string()]);
+
+    let mut b = Vec::new();
+    refresh_repl_input_history(&mut b, &paths, "sess_b");
+    assert_eq!(b, vec!["只属于 B".to_string()]);
+}
+
+/// 分会话之前的全局文件仍然读得到——直接丢掉用户会觉得「历史没了」。
+/// 它排在最前面：里面的都是更早的输入，上键从末尾走，最近的要在后面。
+#[test]
+fn legacy_global_history_is_still_reachable() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = state_only_paths(temp.path());
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(
+        paths.state_dir.join("repl-history.jsonl"),
+        "\"分会话之前敲的\"\n",
+    )
+    .unwrap();
+    persist_repl_history_entry(&paths, "default", "分会话之后敲的");
+
+    let state = StateStore::new(&paths).unwrap();
+    assert_eq!(
+        load_repl_input_history(&state, &paths).unwrap(),
+        vec!["分会话之前敲的".to_string(), "分会话之后敲的".to_string()]
     );
 }

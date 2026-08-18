@@ -645,7 +645,7 @@ pub(in crate::cli) async fn run_direct_repl(
             continue;
         }
         push_history_capped(&mut input_history, input);
-        persist_repl_history_entry(paths, input);
+        persist_repl_history_entry(paths, &state.session_id(), input);
         if let Some(live) = live_repl.as_mut() {
             live.editor.record_history(input);
         }
