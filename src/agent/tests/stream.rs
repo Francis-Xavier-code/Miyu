@@ -437,6 +437,83 @@ async fn guard_denied_tool_soft_fails_and_turn_continues() {
     server.await.unwrap();
 }
 
+/// 回合中途死掉时，「已经调过哪些工具、拿到什么结果」必须已经落盘。
+///
+/// `tool_flow` 以前只在整个回合跑完之后写一次（`stream.rs` 的
+/// `set_turn_tool_flow`）。可正文和工具报告都能从流水物化出来，唯独它不能——
+/// 而它正是 `history.rs` 回放给模型的那一份。丢了它，模型下一轮只看到半截
+/// 文字，会把已经跑过的命令、读过的文件原样再来一遍。这就是「崩溃后续不上」。
+///
+/// 这里用「第一轮返回工具调用、第二轮请求直接断连」模拟中途死亡：回合以失败
+/// 告终，但那次工具调用的记录必须留在库里。
+#[tokio::test]
+async fn a_turn_that_dies_mid_loop_keeps_the_tools_it_already_ran() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut config = queue_test_config(base_url);
+    config.tools.enabled = true;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(ToolSpec::new(
+        "run_command",
+        "runs commands",
+        empty_parameters(),
+        |_| async { Ok("已经跑过了，别再跑一遍".to_string()) },
+    ));
+    let control = AgentTurnControl::new(AgentMode::Normal, tools.clone(), tools.clone());
+
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let _ = read_test_http_request(&mut first).await;
+        write_test_sse(
+            &mut first,
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        )
+        .await;
+        // 工具轮之后的这次请求直接断连 —— 相当于进程在这里死掉。
+        let (second, _) = listener.accept().await.unwrap();
+        drop(second);
+    });
+
+    let state = StateStore::new(&paths).unwrap();
+    state.init_files().unwrap();
+    let provider = config.provider(None).unwrap().clone();
+    let client = OpenAiCompatibleClient::new(&provider, &config, &paths).unwrap();
+    let mut agent = Agent::new(
+        config,
+        &paths,
+        state.clone(),
+        client,
+        tools,
+        AgentMode::Normal,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .chat_stream_with_control("跑一下 ls", &[], &control, |_| Ok(()))
+        .await;
+    assert!(outcome.is_err(), "第二轮断连，回合应当失败");
+
+    let turn = state.load_turns().unwrap().pop().expect("回合应当已落库");
+    assert!(
+        !turn.tool_flow.is_empty(),
+        "回合中途死掉，tool_flow 却是空的——模型下一轮会把 run_command 再跑一遍"
+    );
+    let ran = turn
+        .tool_flow
+        .iter()
+        .flat_map(|round| round.calls.iter())
+        .any(|call| call.name == "run_command");
+    assert!(ran, "tool_flow 里没有已经执行过的 run_command");
+    server.await.unwrap();
+}
+
 /// 回合内每次模型请求结束都发射 RoundUsage(provider 未报 usage 时走
 /// 估算路径),这是 footer/WebUI 逐请求刷新计量的事件源。
 #[tokio::test]

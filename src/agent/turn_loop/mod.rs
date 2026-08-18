@@ -904,6 +904,15 @@ impl Agent {
                     }
                 }
             }
+            // 本轮工具结果已经全部进了 `messages`,趁这里把 tool_flow 落一次盘。
+            //
+            // 崩溃恢复时正文和工具报告都能从流水物化出来(`interrupted_projection`
+            // 与追加型的 `turn_tool_reports`),唯独 tool_flow 不能——它以前只在整
+            // 个回合跑完后写一次(`stream.rs` 的 `set_turn_tool_flow`),进程中途死
+            // 掉这份就从没存在过。而 tool_flow 正是 `history.rs` 回放给模型的那份
+            // 「调过哪些工具、拿到什么结果」,丢了它模型下一轮只看到半截文字,会把
+            // 已经跑过的命令、读过的文件原样再来一遍。
+            self.checkpoint_tool_flow(current_turn_id, messages, replay_start);
             if question_round_allowed {
                 tool_round = tool_round.saturating_sub(1);
             }
@@ -975,6 +984,34 @@ impl Agent {
                     }
                 }
             }
+        }
+    }
+
+    /// 把「到目前为止调过哪些工具、拿到什么结果」落一次盘。
+    ///
+    /// 与回合结束时那次写入(`stream.rs`)同一套派生与裁剪,`set_turn_tool_flow`
+    /// 是 UPDATE,后写覆盖先写,重复调用幂等。
+    ///
+    /// **失败只告警不中断回合**:这是一次耐久性检查点,不是回合的产出。为了它
+    /// 把一个正在跑的回合掐掉,比丢掉这份检查点糟得多——回合结束时那次写入仍然
+    /// 是 `?`,真有持久化问题跑不掉。
+    fn checkpoint_tool_flow(
+        &self,
+        turn_id: &str,
+        messages: &[ChatMessage],
+        replay_start: usize,
+    ) {
+        let mut tool_flow = derive_tool_flow(messages, replay_start);
+        prune_tool_flow(&mut tool_flow, &self.config.context);
+        if tool_flow.is_empty() {
+            return;
+        }
+        if let Err(error) = self.state.set_turn_tool_flow(turn_id, &tool_flow) {
+            tracing::warn!(
+                turn_id,
+                error = %error,
+                "tool flow checkpoint failed; a crash here would lose what the turn already did"
+            );
         }
     }
 }
