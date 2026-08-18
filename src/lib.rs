@@ -35,6 +35,7 @@ mod question_tui;
 mod render;
 mod runtime;
 mod shell;
+mod slash_commands;
 mod skills;
 mod state;
 mod terminal;

@@ -172,3 +172,29 @@ fn every_repl_slash_command_has_a_table_entry() {
         assert_eq!(repl_command_spec(spec.command).command, spec.command);
     }
 }
+
+/// WebUI 的命令是 REPL 那张表的**子集**，不是另一份清单。
+///
+/// 命令表原本是 `pub(in crate::cli)`，WebUI 够不到，只能自己再维护一份——
+/// 加一条命令忘了改另一边，两个界面就分叉了。上提到 crate 级之后
+/// `GET /api/commands` 直接从这张表按 `web` 标记过滤。
+#[test]
+fn web_commands_are_a_subset_of_the_repl_table() {
+    let web = crate::slash_commands::web_commands();
+    assert!(!web.is_empty(), "WebUI 一条命令都没开，命令平面等于没做");
+    for spec in &web {
+        assert!(
+            REPL_COMMAND_TABLE
+                .iter()
+                .any(|entry| entry.name == spec.name),
+            "{} 不在 REPL 命令表里——WebUI 不该有自己的命令",
+            spec.name
+        );
+        // 前端拿到的每条都要能渲染成一行「名字 参数提示 —— 帮助」。
+        assert!(!spec.help().is_empty(), "{} 没有帮助文案", spec.name);
+    }
+    // 开了 web 的命令，WebUI 侧必须真有实现（commands.js 的 tryRun 里逐条分支）。
+    // 这里钉住当前这批，加新命令时会红，提醒你两边一起改。
+    let names = web.iter().map(|spec| spec.name).collect::<Vec<_>>();
+    assert_eq!(names, ["/compact", "/reset-memory"]);
+}
