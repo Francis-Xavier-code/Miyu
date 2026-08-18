@@ -74,6 +74,16 @@ pub(super) fn queue_test_config(base_url: String) -> AppConfig {
     // 人格提醒会触发一次蒸馏 LLM 调用,与各测试的 mock 应答序列冲突;
     // 测提醒本身的用例再显式打开。
     config.prompt.persona_reminder = false;
+    // 自动表情包提醒是**掷骰子**决定的(`memes::auto_meme_reminder` 里
+    // `rand::random::<f32>()` 对 `auto_send_probability`,默认 0.05),掷中就往
+    // 消息尾部塞一条 system-reminder。
+    //
+    // 5% 看着小,但 `manual_persona_reminder_overrides_distillation` 断言的正是
+    // **最后一条消息**,被顶掉就报红。todolist 把它记成「典型并发时序 flake,
+    // 单独跑 8/8 全过」——归因错了,和并发毫无关系:5% 下连过 8 次的概率是
+    // 0.95⁸ ≈ 66%,「单独跑没事」只是运气。
+    config.plugins.memes.auto_send_enabled = false;
+    config.plugins.memes.auto_send_platform_enabled = false;
     config
 }
 
