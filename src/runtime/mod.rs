@@ -11,25 +11,25 @@
 //!
 //! `ApiError` 也在这里——`validate_content` 的返回类型是它，分开会立刻长出
 //! 一条 `runtime → web` 的新边。
-mod state;
-mod run;
 mod actor;
+mod dto;
+mod error;
 mod events;
 mod questions;
-mod error;
-mod turn_update;
+mod run;
 mod session_ops;
-mod dto;
+mod state;
+mod turn_update;
 
-pub(crate) use state::*;
-pub(crate) use run::*;
 pub(crate) use actor::*;
+pub(crate) use dto::*;
+pub(crate) use error::*;
 pub(crate) use events::*;
 pub(crate) use questions::*;
-pub(crate) use error::*;
-pub(crate) use turn_update::*;
+pub(crate) use run::*;
 pub(crate) use session_ops::*;
-pub(crate) use dto::*;
+pub(crate) use state::*;
+pub(crate) use turn_update::*;
 
 use axum::http::StatusCode;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -99,3 +99,6 @@ pub(crate) const EVENT_CAPACITY: usize = 4096;
 // ── LOGIN_WINDOW / LOGIN_ATTEMPT_LIMIT ──
 pub(crate) const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 pub(crate) const LOGIN_ATTEMPT_LIMIT: u8 = 5;
+/// 限流表最多跟踪多少个来源。满了先清过期条目，仍然满就拒绝新来源——
+/// 表只增不删的话，IPv6 轮换能把它撑到几十上百 MB。
+pub(crate) const MAX_TRACKED_LOGIN_PEERS: usize = 4_096;

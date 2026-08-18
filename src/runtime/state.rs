@@ -12,8 +12,8 @@ use crate::config::AppConfig;
 use crate::llm::OpenAiCompatibleClient;
 use crate::paths::MiyuPaths;
 use crate::platforms::PlatformRuntime;
-use crate::tools::build_tool_registry;
 use crate::state::StateStore;
+use crate::tools::build_tool_registry;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -77,7 +77,6 @@ impl DaemonState {
             platforms: PlatformRuntime::new()?,
         })
     }
-
 }
 
 #[derive(Clone, Default)]
@@ -235,13 +234,55 @@ impl WebAuth {
         })
     }
 
-    pub(crate) fn login(&self, peer: IpAddr, password: &str) -> std::result::Result<String, LoginFailure> {
+    /// 限流表的键。IPv6 按 **/64 前缀**归并。
+    ///
+    /// 按完整地址记的话，攻击者拿一个 /64（2⁶⁴ 个地址，随手轮换）就能让
+    /// `attempts` 无限增长——这张表只增不删，是暴露在网络侧的内存耗尽入口。
+    /// 而 /64 在现实里就是同一个来源，业界限流也按它算，归并之后轮换地址
+    /// 不再有意义，限流本身还更严。
+    ///
+    /// 代价：同一个 /64 下的两个人共用一个计数桶。个人助手的 Web 界面里
+    /// 这是可接受的取舍，也是标准做法。
+    fn attempt_key(peer: IpAddr) -> IpAddr {
+        match peer {
+            IpAddr::V4(_) => peer,
+            IpAddr::V6(address) => {
+                let mut octets = address.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+        }
+    }
+
+    /// 限流表当前跟踪了多少个来源。给测试量「有没有无限涨」用。
+    #[cfg(test)]
+    pub(crate) fn tracked_login_peers(&self) -> usize {
+        self.attempts.lock().unwrap().len()
+    }
+
+    pub(crate) fn login(
+        &self,
+        peer: IpAddr,
+        password: &str,
+    ) -> std::result::Result<String, LoginFailure> {
         let Some(expected) = self.password_digest else {
             return Ok(String::new());
         };
         let now = Instant::now();
+        let peer = Self::attempt_key(peer);
         {
             let mut attempts = self.attempts.lock().unwrap();
+            // 窗口过了的条目留着没意义(下面本来就会重置计数),顺手清掉。
+            // 只清过期的:还在窗口内的条目一旦被淘汰,计数就归零了,那等于
+            // 给攻击者一条「刷满表把自己的记录挤掉」的绕过路径。
+            if attempts.len() >= MAX_TRACKED_LOGIN_PEERS {
+                attempts.retain(|_, entry| now.duration_since(entry.window_started) < LOGIN_WINDOW);
+            }
+            // 清完还是满的,说明这么多来源正在同时失败。此时不再收新条目——
+            // 宁可让新来源走没有计数的路径,也不能把正在被限的记录挤掉。
+            if attempts.len() >= MAX_TRACKED_LOGIN_PEERS && !attempts.contains_key(&peer) {
+                return Err(LoginFailure::RateLimited);
+            }
             let entry = attempts.entry(peer).or_insert(LoginAttempt {
                 window_started: now,
                 failures: 0,
@@ -278,7 +319,10 @@ impl WebAuth {
 }
 
 // ── cold_context ──
-pub(crate) fn cold_context(config: &AppConfig, state_store: &StateStore) -> Result<ContextSnapshot> {
+pub(crate) fn cold_context(
+    config: &AppConfig,
+    state_store: &StateStore,
+) -> Result<ContextSnapshot> {
     let cumulative = state_store.session_cumulative_token_totals()?;
     Ok(ContextSnapshot {
         tokens: 0,

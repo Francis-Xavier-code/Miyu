@@ -142,7 +142,8 @@ pub(crate) fn normalize_answers(
             }
         }
     }
-    crate::question::validate_answers(request, &answers).map_err(|error| safe_error_message(&error))?;
+    crate::question::validate_answers(request, &answers)
+        .map_err(|error| safe_error_message(&error))?;
     Ok(answers)
 }
 

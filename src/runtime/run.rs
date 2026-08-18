@@ -106,7 +106,11 @@ impl ManagerState {
         })
     }
 
-    pub(crate) fn session_runs_match_audience(&self, session_id: &str, audience: PromptAudience) -> bool {
+    pub(crate) fn session_runs_match_audience(
+        &self,
+        session_id: &str,
+        audience: PromptAudience,
+    ) -> bool {
         let mut runs = self
             .active_runs
             .values()

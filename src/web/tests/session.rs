@@ -1,7 +1,7 @@
 //! 会话切换、重置、人格与模型覆盖。
 
 use super::shared::*;
-use crate::runtime::LOGIN_ATTEMPT_LIMIT;
+use crate::runtime::{LOGIN_ATTEMPT_LIMIT, MAX_TRACKED_LOGIN_PEERS};
 use crate::state::PlatformSessionBindingKey;
 use crate::web::*;
 
@@ -523,4 +523,72 @@ fn web_persona_scope_batch_migration_supports_swaps() {
             .persona,
         "a"
     );
+}
+
+/// 限流表原来只增不删：IPv6 一个 /64 有 2⁶⁴ 个地址，轮换着打就能把它撑爆。
+/// 这是暴露在网络侧的内存耗尽入口。
+///
+/// 归并到 /64 之后，轮换地址不再产生新条目——同一个 /64 打一万次也只占一格，
+/// 而且限流本身更严：它们共用一个计数桶，第 6 次就被挡。
+#[test]
+fn ipv6_rotation_cannot_grow_the_rate_limit_table() {
+    let auth = WebAuth::new(Some("correct horse"));
+    for index in 0..10_000u16 {
+        // 同一个 /64，只有低 64 位在变
+        let peer = IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            0,
+            0,
+            0,
+            0,
+            index >> 8,
+            index & 0xff,
+        ));
+        let _ = auth.login(peer, "wrong");
+    }
+    assert_eq!(
+        auth.tracked_login_peers(),
+        1,
+        "同一个 /64 的一万次尝试应当只占一格"
+    );
+}
+
+/// 不同的 /64 仍然各记各的——归并不能把限流粒度粗到没用。
+#[test]
+fn different_ipv6_prefixes_are_tracked_separately() {
+    let auth = WebAuth::new(Some("correct horse"));
+    for prefix in 0..8u16 {
+        let peer = IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, prefix, 0, 0, 0, 0, 1,
+        ));
+        let _ = auth.login(peer, "wrong");
+    }
+    assert_eq!(auth.tracked_login_peers(), 8);
+}
+
+/// 表满了之后不能把「正在被限的记录」挤掉——那等于给攻击者一条重置计数的路。
+#[test]
+fn a_flood_of_new_peers_cannot_reset_an_active_block() {
+    let auth = WebAuth::new(Some("correct horse"));
+    let victim = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+    for _ in 0..LOGIN_ATTEMPT_LIMIT {
+        let _ = auth.login(victim, "wrong");
+    }
+    assert!(matches!(
+        auth.login(victim, "wrong"),
+        Err(LoginFailure::RateLimited)
+    ));
+
+    // 拿远超容量的新来源猛灌
+    for index in 0..(MAX_TRACKED_LOGIN_PEERS as u32 + 500u32) {
+        let peer = IpAddr::V4(std::net::Ipv4Addr::from(index.to_be_bytes()));
+        let _ = auth.login(peer, "wrong");
+    }
+    assert!(auth.tracked_login_peers() <= MAX_TRACKED_LOGIN_PEERS);
+    // 被限的那个仍然被限，密码对了也不放行（窗口内）
+    assert!(matches!(
+        auth.login(victim, "correct horse"),
+        Err(LoginFailure::RateLimited)
+    ));
 }
