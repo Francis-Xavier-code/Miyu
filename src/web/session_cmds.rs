@@ -136,9 +136,17 @@ pub(in crate::web) async fn handle_session_command(
                 .create_session(session_persona, &name, kind, None)
                 .map_err(|error| safe_error_message(&error))?;
             if kind == crate::state::USER_SESSION_KIND {
+                // mode 必须一起发。前端收到事件就把会话插进列表了，此后
+                // `createSession` 的 HTTP 响应（带 mode 的那份）会因为
+                // 「已存在」被跳过——事件里少一个字段，新建的 dev 会话就
+                // 一直挂在「普通模式」组下，直到刷新走 /api/sessions 才纠正。
                 state.events.publish(
                     "session.created",
-                    json!({ "session_id": record.session_id, "name": record.name }),
+                    json!({
+                        "session_id": record.session_id,
+                        "name": record.name,
+                        "mode": session_mode_label(&record),
+                    }),
                 );
             }
             if switch {

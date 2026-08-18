@@ -453,7 +453,7 @@ textarea:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   width: 100%;
-  min-height: 48px;
+  min-height: 30px;
   align-items: stretch;
   border-radius: 8px;
   background: transparent;
@@ -487,27 +487,31 @@ textarea:disabled {
 
 .session-item-main {
   display: grid;
-  grid-template-columns: 17px minmax(0, 1fr);
+  grid-template-columns: 11px minmax(0, 1fr);
   min-width: 0;
   align-items: center;
-  padding: 5px 7px 5px 11px;
+  padding: 2px 7px 2px 11px;
   border-radius: 8px;
   background: transparent;
   color: inherit;
   cursor: pointer;
-  gap: 8px;
+  gap: 7px;
   text-align: left;
+}
+
+/* 行首那一格:有状态就画,没有就空着。格子常驻,文字左缘才不会跟着动。 */
+.session-lead {
+  display: grid;
+  width: 11px;
+  height: 11px;
+  place-items: center;
 }
 
 .session-item-main.is-renaming {
   cursor: default;
 }
 
-.session-item-main > .icon-slot {
-  width: 15px;
-  height: 15px;
-  color: var(--accent);
-}
+
 
 .session-copy {
   display: grid;
@@ -535,37 +539,41 @@ textarea:disabled {
 }
 
 /* 运行中:转圈。动效表达「正在发生」——静态点和「有未读」看不出区别。 */
+/* 盲文点阵转圈,和 REPL 里工具运行时那个同款(`wait_spinner.rs` 的
+   BRAILLE_FRAMES)。同一件事在两个界面用同一个形状;圆环那种到处都是,
+   这个一眼就认得出是 Miyu 在干活。
+
+   换帧交给 JS(`startBrailleTicker`)。CSS 那两种做法都不可靠:动画
+   `content` 只有 Chrome 认;十帧竖排靠 `steps()` 平移则要求行高和字形
+   度量严丝合缝,盲文点阵一旦落到 fallback 字体就错位。 */
 .session-run-spinner {
-  display: inline-block;
-  flex: 0 0 auto;
-  box-sizing: border-box;
+  display: grid;
   width: 11px;
-  height: 11px;
-  border: 1.5px solid color-mix(in srgb, var(--online) 28%, transparent);
-  border-top-color: var(--online);
-  border-radius: 50%;
-  animation: session-run-spin 0.8s linear infinite;
+  height: 14px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--gold);
+  font-family: var(--font-mono);
+  /* 盲文点阵的字面比同号数字小一圈——点只占字身中间那一块,四周留白很多。
+     要和旁边的未读圆点看着一样大,字号得往上顶。 */
+  font-size: 17px;
+  line-height: 1;
 }
 
-/* 未读绿点。生命周期是「回合结束 → 用户切进来」，不是「已完成」。
-   呼吸动画复用侧栏在线点那条（`status-pulse`），两处都是「这里有动静」的
-   语义，视觉语言要一致。 */
+/* 未读:实心金圆 + 呼吸。生命周期是「回合结束 → 用户切进来」,不是「已完成」。
+   金色和上面的转圈同色——这一列讲的是同一件事(这个会话有你该看的东西),
+   只是一个在进行、一个已出结果;而顶上那个绿点讲的是连接状态,不该同色。
+   呼吸动画复用 `status-pulse`,靠 currentcolor 自动取金。 */
 .session-unread-dot {
   display: inline-block;
   flex: 0 0 auto;
-  /* 外框与 spinner 同宽，两者互换时整行不抖；真正的点靠 radial-gradient 居中 */
+  /* 外框与 spinner 同宽,两者互换时整行不抖;真正的点靠 radial-gradient 居中 */
   width: 11px;
   height: 11px;
   border-radius: 50%;
-  color: var(--online);
+  color: var(--gold);
   background: radial-gradient(circle, currentcolor 0 3.5px, transparent 3.5px);
   animation: status-pulse 2.4s ease-in-out infinite;
-}
-
-@keyframes session-run-spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -818,13 +826,24 @@ textarea:disabled {
   display: none;
 }
 
+/* 模式图标在这里出现一次,不在每一行会话前面重复。 */
 .session-group-header {
-  margin: 10px 4px 2px;
+  display: flex;
+  align-items: center;
+  margin: 12px 4px 3px;
+  padding-left: 7px;
   color: var(--text-faint);
   font-size: 11px;
   font-weight: 600;
+  gap: 6px;
   letter-spacing: 0.04em;
   user-select: none;
+}
+
+.session-group-header .icon-slot {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
 }
 
 .mode-chooser-overlay {

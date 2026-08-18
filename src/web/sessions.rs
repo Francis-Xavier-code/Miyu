@@ -337,6 +337,19 @@ pub(in crate::web) fn sessions_with_dev(
     Ok(rows)
 }
 
+/// 会话模式由人格推导（创建时定死）。
+///
+/// 单独一个函数是因为它有两个发布口——REST 的会话对象和 `session.created`
+/// 事件——而前端两条路都要用它分组。之前只有 REST 那份带上了，事件那份漏了，
+/// 结果新建的 dev 会话在刷新之前一直显示在「普通模式」组里。
+pub(in crate::web) fn session_mode_label(record: &crate::state::SessionRecord) -> &'static str {
+    if record.persona == crate::state::DEV_PERSONA {
+        "dev"
+    } else {
+        "normal"
+    }
+}
+
 pub(in crate::web) fn session_record_json(record: &crate::state::SessionRecord) -> Value {
     json!({
         "session_id": record.session_id,
@@ -345,8 +358,7 @@ pub(in crate::web) fn session_record_json(record: &crate::state::SessionRecord) 
         "workspace": record.workspace,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
-        // 会话模式由人格推导(创建时定死),列表/选择器靠它标注类型。
-        "mode": if record.persona == crate::state::DEV_PERSONA { "dev" } else { "normal" },
+        "mode": session_mode_label(record),
     })
 }
 

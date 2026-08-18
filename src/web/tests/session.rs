@@ -695,3 +695,43 @@ fn resetting_a_conversation_also_clears_its_todo_list() {
         );
     }
 }
+
+/// `session.created` 事件必须带上 mode。
+///
+/// 会话模式有两个发布口：REST 的会话对象和这个事件。前端收到事件就把会话插
+/// 进列表了，此后 HTTP 响应会因为「已存在」被跳过——事件里少一个字段，新建的
+/// dev 会话就一直挂在「普通模式」组下，直到刷新走 `/api/sessions` 才纠正。
+/// 两个口同源于 `session_mode_label`，这里钉住事件那一路。
+#[tokio::test]
+async fn session_created_event_carries_the_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = DaemonState::for_test(test_paths(temp.path()), 8331).unwrap();
+    // 从当前位置起订：`subscribe_after` 会把此后发布的事件重放出来，不会
+    // 因为「发布发生在 recv 之前」而漏掉。
+    let after = state.events.latest_id();
+
+    let payload = handle_session_command(
+        &state,
+        IpcCommand::CreateSession {
+            name: Some("dev 会话".to_string()),
+            switch: false,
+            kind: None,
+            mode: Some("dev".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload["session"]["mode"], "dev", "REST 那一路就没带 mode");
+
+    let record = state
+        .events
+        .replay_after(after)
+        .into_iter()
+        .find(|event| event.kind == "session.created")
+        .map(|event| serde_json::from_str::<serde_json::Value>(&event.data).unwrap())
+        .expect("没有发出 session.created 事件");
+    assert_eq!(
+        record["mode"], "dev",
+        "事件里没有 mode——前端会把这个 dev 会话分到普通模式组"
+    );
+}

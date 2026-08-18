@@ -406,6 +406,7 @@
     programmaticScroll: false,
     settingsOpener: null,
     consolePanel: "usage",
+    brailleFrame: 0,
     sidebarOpener: null,
     sidebarCollapsed: false,
     sidebarAutoCollapsed: false,
@@ -3178,8 +3179,24 @@
       main.title = isView ? sessionDisplayName(session) : `查看「${sessionDisplayName(session)}」`;
       main.addEventListener("click", () => openSessionView(id));
     }
-    const icon = id === "default" ? "terminal" : session?.mode === "dev" ? "code" : "message-circle";
-    main.appendChild(makeIconSlot(icon));
+    // 行首那一格只放状态指示器。模式图标搬去了分组标题——同一组里每行都
+    // 画一遍相同的图标，重复十几次也说不出新东西，还占着状态该用的位置。
+    // 空着的时候格子仍在，文字左缘不会因为有没有指示器而移位。
+    const lead = document.createElement("span");
+    lead.className = "session-lead";
+    if (sessionHasRuns(id)) {
+      const spinner = document.createElement("span");
+      spinner.className = "session-run-spinner";
+      spinner.title = "有回复正在运行";
+      spinner.textContent = BRAILLE_FRAMES[state.brailleFrame % BRAILLE_FRAMES.length];
+      lead.appendChild(spinner);
+    } else if (state.unreadSessions.has(id)) {
+      const dot = document.createElement("span");
+      dot.className = "session-unread-dot";
+      dot.title = "有未读的新回复";
+      lead.appendChild(dot);
+    }
+    main.appendChild(lead);
 
     const copy = document.createElement("span");
     copy.className = "session-copy";
@@ -3240,21 +3257,6 @@
 
     const trailing = document.createElement("span");
     trailing.className = "session-trailing";
-
-    // 两个状态语义不同，形式也要不同：动效表「正在发生」，静态绿点表
-    // 「有你没看过的新内容」。共用一个点的话，跑完瞬间点消失，用户完全
-    // 不知道那边已经出结果了。
-    if (sessionHasRuns(id)) {
-      const spinner = document.createElement("span");
-      spinner.className = "session-run-spinner";
-      spinner.title = "有回复正在运行";
-      trailing.appendChild(spinner);
-    } else if (state.unreadSessions.has(id)) {
-      const dot = document.createElement("span");
-      dot.className = "session-unread-dot";
-      dot.title = "有未读的新回复";
-      trailing.appendChild(dot);
-    }
 
     const menuButton = document.createElement("button");
     menuButton.type = "button";
@@ -3327,19 +3329,40 @@
       (session) => !isTerminalSession(session?.session_id) && session?.mode === "dev"
     );
     if (normal.length) {
-      elements.sessionItems.appendChild(buildSessionGroupHeader("普通模式"));
+      elements.sessionItems.appendChild(buildSessionGroupHeader("普通模式", "message-circle"));
       for (const session of normal) elements.sessionItems.appendChild(buildSessionItem(session));
     }
     if (dev.length) {
-      elements.sessionItems.appendChild(buildSessionGroupHeader("开发模式"));
+      elements.sessionItems.appendChild(buildSessionGroupHeader("开发模式", "code"));
       for (const session of dev) elements.sessionItems.appendChild(buildSessionItem(session));
     }
   }
 
-  function buildSessionGroupHeader(label) {
+  // 和 REPL 的 `wait_spinner.rs::BRAILLE_FRAMES` 同一组帧。
+  const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+  /// 一个计时器喂所有转圈。
+  ///
+  /// 每个转圈各起一个 interval 的话,列表一重画就要收拾一批计时器,漏一个就
+  /// 是一个永远跑下去的定时器;而且各自起跑点不同,几行并排时相位乱跳。
+  /// 共用一个帧号还有个好处:重画时新建的元素直接落在当前帧上,不会从头闪。
+  function startBrailleTicker() {
+    window.setInterval(() => {
+      const spinners = document.querySelectorAll(".session-run-spinner");
+      if (!spinners.length) return;
+      state.brailleFrame = (state.brailleFrame + 1) % BRAILLE_FRAMES.length;
+      const glyph = BRAILLE_FRAMES[state.brailleFrame];
+      for (const spinner of spinners) spinner.textContent = glyph;
+    }, 90);
+  }
+
+  function buildSessionGroupHeader(label, icon) {
     const header = document.createElement("div");
     header.className = "session-group-header";
-    header.textContent = label;
+    if (icon) header.appendChild(makeIconSlot(icon));
+    const text = document.createElement("span");
+    text.textContent = label;
+    header.appendChild(text);
     return header;
   }
 
@@ -3439,6 +3462,8 @@
     disposeAllLiveRuns();
     clearViewSyncTimer();
     state.viewSessionId = sessionId;
+    // 记住浏览位置，刷新后回到这里而不是跳去终端车道（见 preferredBootSession）。
+    if (!isTerminalSession(sessionId)) safeStorageSet(VIEW_SESSION_KEY, sessionId);
     if (state.sessionModelOverrideFor !== sessionId) {
       // 会话切换：先按"跟随全局"显示，再异步取回该会话的覆盖池。
       state.sessionModelOverride = null;
@@ -3528,6 +3553,19 @@
         return String(turn?.id) === String(live.turnId) && turn?.status === "running";
       })) {
         live.redoCommitted = true;
+      }
+      // 立刻把气泡建出来,不等下一个事件。
+      //
+      // 事件环只留 4096 条,而一次流式回复光 delta 就能把它冲掉,所以
+      // `beginRunReplay()` 从 0 重放几乎必然撞上 resync——两轮之后放弃,
+      // 恢复的 run 就只剩一个空壳:没有气泡、没有停止按钮,要等下一个
+      // delta 才有东西可看。模型正在思考或跑长工具时,这段空白能有几十秒,
+      // 用户看到的是「明明在跑却什么都没有,也停不掉」。
+      //
+      // 气泡先立起来,停止按钮和等待动效就都回来了;正文由后续事件续上。
+      if (live.operation !== "redo") {
+        ensureLiveArticle(live);
+        showTypingIndicator(live);
       }
       restored = true;
     }
@@ -8321,6 +8359,27 @@
     if (unauthorized) window.requestAnimationFrame(() => elements.loginPassword.focus());
   }
 
+  const VIEW_SESSION_KEY = "miyu.web.viewSession";
+
+  /// 页面加载后该打开哪个会话。
+  ///
+  /// 不能直接用 daemon 的 `current_session`：那个指针归终端车道所有（shellhook
+  /// 与 CLI 用它），而终端集成会话在 WebUI 的侧栏里是隐藏的——刷新一下就掉进
+  /// 一个列表里根本看不到的会话，看着像「我的对话没了」。
+  ///
+  /// 顺序：上次浏览的 → 当前指针（如果它在列表里可见）→ 列表第一个。
+  function preferredBootSession() {
+    const remembered = safeStorageGet(VIEW_SESSION_KEY);
+    if (remembered && findSession(remembered) && !isTerminalSession(remembered)) return remembered;
+    if (state.currentSessionId
+      && findSession(state.currentSessionId)
+      && !isTerminalSession(state.currentSessionId)) {
+      return state.currentSessionId;
+    }
+    const visible = state.sessions.find((session) => !isTerminalSession(session?.session_id));
+    return visible ? String(visible.session_id) : "";
+  }
+
   function applyBootstrap(snapshot) {
     state.blocked = false;
     clearViewSyncTimer();
@@ -8355,6 +8414,8 @@
     updateContext();
     state.replayRunIds = null;
     state.replayCutoff = 0;
+    const boot = preferredBootSession();
+    if (boot && boot !== state.viewSessionId) state.viewSessionId = boot;
     const keepView = state.viewSessionId && state.viewSessionId !== state.currentSessionId && findSession(state.viewSessionId);
     if (keepView) {
       // 视图停留在非默认会话：全局重载不改变浏览位置，改用会话接口回填。
@@ -8820,7 +8881,36 @@
     }
   }
 
+  /// 光标是不是已经在某个能打字的地方。
+  ///
+  /// `contenteditable` 也算——artifact 的源码视图和将来的富文本都是它,漏判
+  /// 会让 `/` 快捷键在用户正打字时抢走焦点。
+  function typingSomewhere() {
+    const node = document.activeElement;
+    if (!node) return false;
+    if (node.isContentEditable) return true;
+    const tag = node.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  }
+
   function handleGlobalKeydown(event) {
+    // `/` 直接跳到输入框(YouTube 那套)。只聚焦,不把斜杠本身送进去——
+    // 快捷键是「跳过去」,不是「替我打一个字」;真要发命令,落到输入框之后
+    // 再敲一次 `/` 就行,那一下会正常触发命令菜单。
+    if (event.key === "/"
+      && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !typingSomewhere()
+      && !state.blocked
+      && !consoleIsOpen()
+      && !window.MiyuLightbox?.isOpen()
+      && !elements.resetDialog.open
+      && !elements.composerInput.disabled) {
+      event.preventDefault();
+      elements.composerInput.focus();
+      const at = elements.composerInput.value.length;
+      elements.composerInput.setSelectionRange(at, at);
+      return;
+    }
     if (event.key === "Escape") {
       if (elements.resetDialog.open) return;
       if (!elements.artifactResourceMenu.hidden) {
@@ -9826,6 +9916,7 @@
     window.MiyuCommands?.load(apiRequest);
     // 灯箱自己不会画图标（图标集在这边），把工厂函数递过去。
     window.MiyuLightbox?.init({ makeIconSlot });
+    startBrailleTicker();
     loadBootstrap();
   }
 
