@@ -442,15 +442,36 @@ mod tests {
         assert!(!refresh_skills(&mut registry, &config, &paths).unwrap());
     }
 
+    /// 技能清单只存在于 `load_skill` 的描述里，所以这个工具必须常驻——它一旦
+    /// 懒加载，stub 模式只留描述第一行，清单被整段砍掉，模型**看不到任何技能
+    /// 名**，只能瞎猜。实测过一次：模型连试 gaming / linux-game-compat /
+    /// linux-gaming 三个名字，真名是 linux-game-compatibility，一个没蒙对，
+    /// 一轮烧掉 208k token 去找一个一直都在的内置技能。
     #[test]
-    fn dynamic_load_skill_keeps_the_builtin_loading_policy() {
+    fn load_skill_is_always_loaded_so_its_catalog_is_visible() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let config = AppConfig::default();
         let mut registry = ToolRegistry::new();
         register_skills(&mut registry, &config, &paths).unwrap();
         let load_skill = registry.get("load_skill").unwrap();
-        assert!(!load_skill.always_loaded);
+        assert!(load_skill.always_loaded, "懒加载会把技能清单砍掉");
+        // 清单确实在描述里,而且 stub 模式下会原样发出去。
+        assert!(
+            load_skill.description.contains("<available_skills>"),
+            "描述里没有清单,常驻也没意义"
+        );
+        let stub = registry
+            .stub_definitions()
+            .into_iter()
+            .find(|definition| definition.function.name == "load_skill")
+            .expect("load_skill 应当在 stub 目录里");
+        assert!(
+            stub.function
+                .description
+                .contains("<name>skill-creator</name>"),
+            "stub 里看不到技能名——模型只能猜"
+        );
         assert_eq!(
             load_skill.load_policy,
             super::super::tool_descriptions::LoadPolicy::Summary
