@@ -44,6 +44,7 @@ impl ReplFooterStatus {
             _ => ("mixed".to_string(), t("Mixed", "混合").to_string()),
         };
 
+        let window = config.active_context_window_with_source().ok().flatten();
         Self {
             model,
             provider: provider_id,
@@ -51,7 +52,11 @@ impl ReplFooterStatus {
             thinking: None,
             token_usage: render::TokenMeter {
                 session_tokens,
-                context_window: config.active_context_window().ok().flatten(),
+                context_window: window.map(|(value, _)| value),
+                context_window_assumed: matches!(
+                    window,
+                    Some((_, crate::config::ContextWindowSource::Assumed))
+                ),
                 ..meter_cumulative(cumulative)
             },
         }
@@ -125,8 +130,15 @@ impl ReplFooterStatus {
         meter.cumulative_cached_tokens += turn.cache_read;
     }
 
-    pub(in crate::cli) fn update_context_window(&mut self, context_window: Option<usize>) {
+    /// `assumed` 必须跟着窗口值一起传：只更新数字、不更新出处，footer 就会拿
+    /// 上一次的出处去解释这一次的数——切个会话或换个模型就错了。
+    pub(in crate::cli) fn update_context_window(
+        &mut self,
+        context_window: Option<usize>,
+        assumed: bool,
+    ) {
         self.token_usage.context_window = context_window;
+        self.token_usage.context_window_assumed = assumed;
     }
 
     /// Returns whether anything actually moved, so an idle tick only forces a

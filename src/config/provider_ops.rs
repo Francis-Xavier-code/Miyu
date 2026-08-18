@@ -570,20 +570,39 @@ impl AppConfig {
     }
 
     pub fn active_context_window(&self) -> Result<Option<usize>> {
+        Ok(self
+            .active_context_window_with_source()?
+            .map(|(window, _)| window))
+    }
+
+    /// 同上，外带**这个数是哪来的**。
+    ///
+    /// 池子里只要有一个模型的窗口是猜的，整个池子就算猜的：显示的是各模型的
+    /// 最小值，而那个「猜的」成员真实窗口要是更小，最小值本身就是错的。
+    pub fn active_context_window_with_source(
+        &self,
+    ) -> Result<Option<(usize, ContextWindowSource)>> {
         let choices = self.active_provider_model_choices();
         if choices.is_empty() {
             return Ok(None);
         }
         let mut windows = Vec::new();
+        let mut assumed = false;
         for choice in choices {
-            let Some(window) =
-                self.context_window_for_provider_model(&choice.provider_id, &choice.model)?
+            let Some((window, source)) =
+                self.context_window_with_source(&choice.provider_id, &choice.model)?
             else {
                 return Ok(None);
             };
+            assumed |= source == ContextWindowSource::Assumed;
             windows.push(window);
         }
-        Ok(windows.into_iter().min())
+        let source = if assumed {
+            ContextWindowSource::Assumed
+        } else {
+            ContextWindowSource::Known
+        };
+        Ok(windows.into_iter().min().map(|window| (window, source)))
     }
 
     pub fn context_window_for_provider_model(
@@ -591,6 +610,26 @@ impl AppConfig {
         provider_id: &str,
         model: &str,
     ) -> Result<Option<usize>> {
+        Ok(self
+            .context_window_with_source(provider_id, model)?
+            .map(|(window, _)| window))
+    }
+
+    /// 解析一个模型的上下文窗口，并说清楚**这个数是哪来的**。
+    ///
+    /// 三级兜底里前两级有出处，第三级 `context.default_context_window` 是个通用
+    /// 常数（默认 168000），跟这个模型没有任何关系——它只是让溢出判定有个数可
+    /// 用，不是「这个模型的窗口就是 168k」。
+    ///
+    /// 分开报出来是因为两种用途要的东西相反：溢出/压缩必须拿到一个数才能干活，
+    /// 而 footer 把猜的数渲染成 `47k/168k(28%)` 就是在撒谎——用户没法分辨那个
+    /// 百分比是量出来的还是编的。同一个道理见 `render::usage::cache_percent`：
+    /// 供应商没说过缓存，就不能渲染成 0%。
+    pub fn context_window_with_source(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<Option<(usize, ContextWindowSource)>> {
         let provider = self.provider(Some(provider_id))?;
         if let Some(window) = provider
             .model_context_window
@@ -598,14 +637,15 @@ impl AppConfig {
             .copied()
             .filter(|&w| w > 0)
         {
-            return Ok(Some(window));
+            return Ok(Some((window, ContextWindowSource::Known)));
         }
-        Ok(crate::models_cache::context_window(provider_id, model)
-            .map(|w| w as usize)
-            .or_else(|| {
-                (self.context.default_context_window > 0)
-                    .then_some(self.context.default_context_window)
-            }))
+        if let Some(window) = crate::models_cache::context_window(provider_id, model) {
+            return Ok(Some((window as usize, ContextWindowSource::Known)));
+        }
+        Ok((self.context.default_context_window > 0).then_some((
+            self.context.default_context_window,
+            ContextWindowSource::Assumed,
+        )))
     }
 
     pub fn upsert_provider(&mut self, provider: ProviderConfig) {

@@ -235,7 +235,7 @@ pub(in crate::cli) async fn apply_repl_session_switch(
         ReplFooterStatus::from_config(&session_config, state.context_tokens, *cumulative_tokens);
     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
     footer.update_thinking_variant(client.thinking_variant_summary().as_deref());
-    footer.update_context_window(state.context_window);
+    footer.update_context_window(state.context_window, state.context_window_assumed);
     live_repl.refresh_footer(footer.clone())?;
     // Every REPL session change funnels through here, so this is the one place
     // the REPL lane needs to be remembered. Best effort: losing the write only

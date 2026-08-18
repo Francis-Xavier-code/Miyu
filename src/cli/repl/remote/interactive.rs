@@ -45,7 +45,10 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
     let thinking_summary = client.thinking_variant_summary();
     footer.update_thinking_variant(thinking_summary.as_deref());
-    footer.update_context_window(daemon_state.context_window);
+    footer.update_context_window(
+        daemon_state.context_window,
+        daemon_state.context_window_assumed,
+    );
     let mut live_repl = LiveReplTail::new(mode, history.clone(), Vec::new(), footer.clone())?;
     let jobs_shared = spawn_jobs_poll_thread(paths.clone());
     let jobs_feed = JobsFeed::Shared(jobs_shared.clone());
@@ -505,7 +508,10 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                         let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                         footer
                             .update_thinking_variant(client.thinking_variant_summary().as_deref());
-                        footer.update_context_window(state.context_window);
+                        footer.update_context_window(
+                            state.context_window,
+                            state.context_window_assumed,
+                        );
                         live_repl.set_footer(footer.clone());
                         repl_note(
                             &mut live_repl,
@@ -544,7 +550,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                     // Push the rebuilt footer into the live editor now; without
                     // this the on-screen model label stays stale until the next
                     // input event redraws the editor.
@@ -596,7 +603,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     let client = OpenAiCompatibleClient::from_config(&session_config, paths)?;
                     let thinking_summary = client.thinking_variant_summary();
                     footer.update_thinking_variant(thinking_summary.as_deref());
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                     live_repl.set_footer(footer.clone());
                     repl_note(
                         &mut live_repl,
@@ -656,7 +664,10 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                             );
                             let thinking_summary = client.thinking_variant_summary();
                             footer.update_thinking_variant(thinking_summary.as_deref());
-                            footer.update_context_window(state.context_window);
+                            footer.update_context_window(
+                                state.context_window,
+                                state.context_window_assumed,
+                            );
                             live_repl.set_footer(footer.clone());
                             repl_note(
                                 &mut live_repl,
@@ -698,7 +709,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     }
                     cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::Pop => {
@@ -764,7 +776,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     }
                     cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::Compact => {
@@ -833,7 +846,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     }
                     cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                     footer.update_cumulative_tokens(cumulative_tokens);
                 }
                 ReplSlashCommand::ResetMemory => {
@@ -996,7 +1010,8 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     cumulative_tokens = state_cumulative(&state);
                     footer.update_session_tokens(state.context_tokens);
                     footer.update_cumulative_tokens(state_cumulative(&state));
-                    footer.update_context_window(state.context_window);
+                    footer
+                        .update_context_window(state.context_window, state.context_window_assumed);
                 }
             }
             Err(err) => {

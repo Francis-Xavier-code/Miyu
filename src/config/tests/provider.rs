@@ -1,7 +1,7 @@
 //! 供应商、模型池与能力标签。
 
-use crate::config::*;
 use super::shared::*;
+use crate::config::*;
 
 #[test]
 fn model_temperature_override_beats_provider_default() {
@@ -772,4 +772,124 @@ fn extra_body_rejects_non_object_config_values() {
 
         assert!(serde_json::from_value::<ProviderConfig>(provider).is_err());
     }
+}
+
+// ── 窗口值的出处 ────────────────────────────────────────────────
+
+/// 谁都没给窗口时用的是 `context.default_context_window`——那是个通用常数，
+/// 跟具体模型没有任何关系。必须报成 `Assumed`，否则 footer 会拿它算出一个
+/// 看起来很确定的百分比。
+#[test]
+fn a_window_that_falls_through_to_the_global_default_is_marked_assumed() {
+    let mut config = AppConfig::default();
+    config.active_provider = "anthropic".to_string();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "anthropic")
+        .unwrap();
+    provider.models = vec!["a-model-nobody-has-heard-of".to_string()];
+    provider.default_model = "a-model-nobody-has-heard-of".to_string();
+
+    assert_eq!(
+        config.active_context_window_with_source().unwrap(),
+        Some((168_000, ContextWindowSource::Assumed))
+    );
+}
+
+/// 用户在配置里写死的窗口是有出处的，照常出百分比。
+#[test]
+fn a_window_written_in_the_config_is_known() {
+    let mut config = AppConfig::default();
+    config.active_provider = "anthropic".to_string();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "anthropic")
+        .unwrap();
+    provider.models = vec!["a-model-nobody-has-heard-of".to_string()];
+    provider.default_model = "a-model-nobody-has-heard-of".to_string();
+    provider
+        .model_context_window
+        .insert("a-model-nobody-has-heard-of".to_string(), 1_000_000);
+
+    assert_eq!(
+        config.active_context_window_with_source().unwrap(),
+        Some((1_000_000, ContextWindowSource::Known))
+    );
+}
+
+/// 池子里混了一个猜的，整池就算猜的。
+///
+/// 显示的是各模型的最小值——那个「猜的」成员真实窗口要是比最小值还小，最小值
+/// 本身就是错的，所以不能因为最小值恰好来自有出处的那个就报 `Known`。
+#[test]
+fn one_assumed_model_makes_the_whole_pool_assumed() {
+    let mut config = AppConfig::default();
+    config.active_provider = "anthropic".to_string();
+    {
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == "anthropic")
+            .unwrap();
+        provider.models = vec!["pinned".to_string(), "guessed".to_string()];
+        provider.default_model = "pinned".to_string();
+        // 写死的那个比兜底值**小**，所以最小值来自「有出处」的那一个
+        provider
+            .model_context_window
+            .insert("pinned".to_string(), 100_000);
+    }
+    config.active_provider_models = Some(vec![
+        ActiveProviderModelConfig {
+            provider_id: "anthropic".to_string(),
+            model: "pinned".to_string(),
+        },
+        ActiveProviderModelConfig {
+            provider_id: "anthropic".to_string(),
+            model: "guessed".to_string(),
+        },
+    ]);
+
+    let (window, source) = config.active_context_window_with_source().unwrap().unwrap();
+    assert_eq!(window, 100_000, "最小值应该来自写死的那个");
+    assert_eq!(
+        source,
+        ContextWindowSource::Assumed,
+        "池子里有一个是猜的，整池就不能算有出处"
+    );
+}
+
+/// 量尺：`MIYU_HOME=~/.miyu cargo test --lib real_config_window_source -- --ignored --nocapture`
+///
+/// 拿**用户真实的配置和模型缓存**跑一遍窗口解析，看它到底解出多少、算不算有
+/// 出处。纯读，不写任何东西。
+///
+/// 存在的理由：这条链有三级兜底、还带按 base_url 的供应商别名对齐，光看代码
+/// 和翻缓存文件很容易推错——我就推错过两次。
+#[test]
+#[ignore]
+fn real_config_window_source() {
+    let Some(home) = std::env::var_os("MIYU_HOME") else {
+        println!("\n  跳过：没给 MIYU_HOME");
+        return;
+    };
+    let paths = crate::paths::MiyuPaths::new().unwrap();
+    println!("\n  MIYU_HOME = {}", std::path::Path::new(&home).display());
+    let config = AppConfig::load(&paths).unwrap();
+    crate::models_cache::ensure_active_metadata(&paths, &config);
+
+    for choice in config.active_provider_model_choices() {
+        let resolved = config
+            .context_window_with_source(&choice.provider_id, &choice.model)
+            .unwrap();
+        println!(
+            "  {} / {} → {:?}",
+            choice.provider_id, choice.model, resolved
+        );
+    }
+    println!(
+        "  池子聚合 → {:?}",
+        config.active_context_window_with_source().unwrap()
+    );
 }

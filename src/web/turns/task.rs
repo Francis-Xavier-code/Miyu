@@ -592,7 +592,12 @@ pub(in crate::web) enum OverflowOutcome {
 /// keep answering messages they no longer want processed. Published before
 /// `run.cancelled` so clients still draining the event stream can clear
 /// their queue bubbles.
-pub(in crate::web) fn drop_cancelled_queue(store: &StateStore, events: &EventHub, run_id: &str, session_id: &str) {
+pub(in crate::web) fn drop_cancelled_queue(
+    store: &StateStore,
+    events: &EventHub,
+    run_id: &str,
+    session_id: &str,
+) {
     match store.delete_queued_prompts() {
         Ok(prompt_ids) => {
             for prompt_id in prompt_ids {
@@ -735,6 +740,7 @@ pub(in crate::web) fn current_context(agent: &Agent) -> Result<ContextSnapshot> 
     Ok(ContextSnapshot {
         tokens: agent.effective_context_tokens()?,
         window: agent.context_window(),
+        window_assumed: agent.context_window_assumed(),
         cumulative_tokens: cumulative.total,
         cumulative_prompt_tokens: cumulative.prompt,
         cumulative_cache_read_tokens: cumulative.cache_read,

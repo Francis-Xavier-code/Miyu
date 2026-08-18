@@ -172,16 +172,37 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn context_window(&self, config: &AppConfig) -> Result<Option<usize>> {
+        Ok(self
+            .context_window_with_source(config)?
+            .map(|(window, _)| window))
+    }
+
+    /// 同上，外带这个数是哪来的。
+    ///
+    /// 端点池里只要有一个模型的窗口是猜的，整池就算猜的——取的是最小值，而那个
+    /// 「猜的」成员真实窗口要是更小，最小值本身就是错的。
+    pub fn context_window_with_source(
+        &self,
+        config: &AppConfig,
+    ) -> Result<Option<(usize, crate::config::ContextWindowSource)>> {
+        use crate::config::ContextWindowSource;
         let choices = self.endpoint_model_choices();
         let mut windows = Vec::with_capacity(choices.len());
+        let mut assumed = false;
         for (provider_id, model) in choices {
-            let Some(window) = config.context_window_for_provider_model(&provider_id, &model)?
+            let Some((window, source)) = config.context_window_with_source(&provider_id, &model)?
             else {
                 return Ok(None);
             };
+            assumed |= source == ContextWindowSource::Assumed;
             windows.push(window);
         }
-        Ok(windows.into_iter().min())
+        let source = if assumed {
+            ContextWindowSource::Assumed
+        } else {
+            ContextWindowSource::Known
+        };
+        Ok(windows.into_iter().min().map(|window| (window, source)))
     }
 
     /// Marks a client whose caller collects output and delivers it in one

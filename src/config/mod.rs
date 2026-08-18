@@ -37,6 +37,17 @@ pub const DEFAULT_DEV_SYSTEM_PROMPT: &str = "You are a helpful software engineer
 pub const MAX_REPL_REPLAY_TURNS: usize = 20;
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 const LEGACY_DEFAULT_TEMPERATURE: f32 = 0.7;
+/// 上下文窗口那个数是哪来的。
+///
+/// `Known` = 用户在配置里写死的，或 models.dev / 供应商 `/models` 报的。
+/// `Assumed` = 谁都没给，用的是 `context.default_context_window` 那个通用常数
+/// ——它跟具体模型没有任何关系，只是让溢出判定有个数可用。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextWindowSource {
+    Known,
+    Assumed,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {

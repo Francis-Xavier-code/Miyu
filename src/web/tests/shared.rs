@@ -49,6 +49,7 @@ pub(super) fn manager_with_run(
         context: ContextSnapshot {
             tokens: 0,
             window: None,
+            window_assumed: false,
             cumulative_tokens: 0,
             cumulative_prompt_tokens: 0,
             cumulative_cache_read_tokens: 0,

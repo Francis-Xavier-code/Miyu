@@ -313,7 +313,7 @@ pub(in crate::cli) async fn run_direct_repl(
     );
     let thinking_summary = client.thinking_variant_summary();
     footer.update_thinking_variant(thinking_summary.as_deref());
-    footer.update_context_window(agent.context_window());
+    footer.update_context_window(agent.context_window(), agent.context_window_assumed());
     loop {
         let thinking_summary = client.thinking_variant_summary();
         footer.update_thinking_variant(thinking_summary.as_deref());
@@ -409,7 +409,10 @@ pub(in crate::cli) async fn run_direct_repl(
                     )?;
                     agent.reload_config(config.clone(), client.clone())?;
                     agent.switch_mode(mode, registry);
-                    footer.update_context_window(agent.context_window());
+                    footer.update_context_window(
+                        agent.context_window(),
+                        agent.context_window_assumed(),
+                    );
                     println!("{}", t("configuration reloaded", "配置已重新加载"));
                 }
                 Ok(false) => {}
@@ -439,7 +442,7 @@ pub(in crate::cli) async fn run_direct_repl(
                 build_tool_registry(&config, paths, mode, crate::question_tui::available(false))?;
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
-            footer.update_context_window(agent.context_window());
+            footer.update_context_window(agent.context_window(), agent.context_window_assumed());
             if let Some(live) = live_repl.as_mut() {
                 live.set_footer(footer.clone());
             }
@@ -461,7 +464,7 @@ pub(in crate::cli) async fn run_direct_repl(
                 build_tool_registry(&config, paths, mode, crate::question_tui::available(false))?;
             agent.reload_config(config.clone(), client.clone())?;
             agent.switch_mode(mode, registry);
-            footer.update_context_window(agent.context_window());
+            footer.update_context_window(agent.context_window(), agent.context_window_assumed());
             if let Some(live) = live_repl.as_mut() {
                 live.set_footer(footer.clone());
             }

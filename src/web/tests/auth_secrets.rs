@@ -56,6 +56,7 @@ fn config_response_never_serializes_secret_values() {
         ContextSnapshot {
             tokens: 0,
             window: None,
+            window_assumed: false,
             cumulative_tokens: 0,
             cumulative_prompt_tokens: 0,
             cumulative_cache_read_tokens: 0,

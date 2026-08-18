@@ -352,6 +352,17 @@ impl Agent {
         self.client.context_window(&self.config).ok().flatten()
     }
 
+    /// 上面那个数是不是猜的。猜的时候 footer 不能拿它算百分比。
+    pub fn context_window_assumed(&self) -> bool {
+        matches!(
+            self.client
+                .context_window_with_source(&self.config)
+                .ok()
+                .flatten(),
+            Some((_, crate::config::ContextWindowSource::Assumed))
+        )
+    }
+
     pub fn effective_context_tokens(&self) -> Result<u64> {
         let (messages, _) = self.chat_messages("", "")?;
         let mut tokens = overflow::estimate_messages_tokens(&messages) as u64;

@@ -344,6 +344,7 @@ mod tests {
             state: SessionState {
                 context_tokens: 12,
                 context_window: Some(1000),
+                context_window_assumed: false,
                 cumulative_tokens: 34,
                 cumulative_prompt_tokens: 20,
                 cumulative_cache_read_tokens: 10,

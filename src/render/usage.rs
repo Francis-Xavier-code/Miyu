@@ -21,6 +21,10 @@ pub struct TokenMeter {
     pub turn_cached_tokens: u64,
     pub session_tokens: u64,
     pub context_window: Option<usize>,
+    /// `context_window` 是不是猜的（配置里的通用兜底常数，跟具体模型无关）。
+    /// 猜的时候只显示带 `~` 的数、不出百分比——同 `cache_percent` 的规矩：
+    /// 没有真实依据的比率不能渲染成一个看起来很确定的数字。
+    pub context_window_assumed: bool,
     /// Σ: session-lifetime total. `None` hides it on narrow terminals.
     pub cumulative_tokens: Option<u64>,
     pub cumulative_prompt_tokens: u64,
@@ -65,25 +69,37 @@ pub(crate) fn format_token_usage_inline(meter: &TokenMeter) -> String {
 pub(crate) fn format_token_usage_inline_opts(meter: &TokenMeter, show_percent: bool) -> String {
     let context_window = meter.context_window.map(|value| value as u64);
     let context = context_window
-        .map(format_compact_count)
+        .map(|value| {
+            // `~` 是「这个数没有出处」的标记：既没在配置里写死，models.dev 和
+            // 供应商的 /models 也都不报，用的是通用兜底常数。数照给——溢出判定
+            // 确实会按它办事——但得让人看出来它是估的。
+            let assumed = if meter.context_window_assumed {
+                "~"
+            } else {
+                ""
+            };
+            format!("{assumed}{}", format_compact_count(value))
+        })
         .unwrap_or_else(|| "?".to_string());
-    let usage_ratio = if let Some(context_window) = context_window.filter(|value| *value > 0) {
-        format!(
-            "{:.1}%",
-            meter.session_tokens as f64 / context_window as f64 * 100.0
-        )
-    } else {
-        "?".to_string()
-    };
+    // 窗口是猜的时候不出百分比。`47k/168k(28%)` 里那个 28% 看起来是量出来的，
+    // 实际分母是编的——用户没法分辨，还可能因此去手动 compact。宁可不给。
+    let usage_ratio = context_window
+        .filter(|value| *value > 0)
+        .filter(|_| !meter.context_window_assumed)
+        .map(|context_window| {
+            format!(
+                "{:.1}%",
+                meter.session_tokens as f64 / context_window as f64 * 100.0
+            )
+        });
 
-    let mut session = if show_percent {
-        format!(
+    let mut session = match usage_ratio {
+        Some(usage_ratio) if show_percent => format!(
             "{}/{}({usage_ratio})",
             format_compact_count(meter.session_tokens),
             context,
-        )
-    } else {
-        format!("{}/{}", format_compact_count(meter.session_tokens), context)
+        ),
+        _ => format!("{}/{}", format_compact_count(meter.session_tokens), context),
     };
     if let Some(cumulative_tokens) = meter.cumulative_tokens {
         session.push_str(&format!(

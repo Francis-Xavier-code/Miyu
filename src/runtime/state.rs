@@ -341,9 +341,14 @@ pub(crate) fn cold_context(
 ) -> Result<ContextSnapshot> {
     let cumulative = state_store.session_cumulative_token_totals()?;
     let tokens = cold_context_tokens(config, paths, state_store).unwrap_or(0);
+    let window = config.active_context_window_with_source()?;
     Ok(ContextSnapshot {
         tokens,
-        window: config.active_context_window()?,
+        window: window.map(|(value, _)| value),
+        window_assumed: matches!(
+            window,
+            Some((_, crate::config::ContextWindowSource::Assumed))
+        ),
         cumulative_tokens: cumulative.total,
         cumulative_prompt_tokens: cumulative.prompt,
         cumulative_cache_read_tokens: cumulative.cache_read,

@@ -16,6 +16,10 @@ pub(crate) const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 pub struct SessionState {
     pub context_tokens: u64,
     pub context_window: Option<usize>,
+    /// `context_window` 是不是猜出来的。默认 false——跟老 daemon 说话时按
+    /// 「有出处」处理，显示跟以前一模一样，不会平白多出一堆波浪号。
+    #[serde(default)]
+    pub context_window_assumed: bool,
     pub cumulative_tokens: u64,
     /// Prompt and cache-read halves behind Σ's cache rate. Defaulted so a REPL
     /// talking to an older daemon degrades to "no cache reported" instead of

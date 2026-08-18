@@ -125,6 +125,9 @@ impl ManagerState {
 pub(crate) struct ContextSnapshot {
     pub(crate) tokens: u64,
     pub(crate) window: Option<usize>,
+    /// `window` 是猜的还是有出处的。见 `ContextWindowSource`——猜的那个数跟具体
+    /// 模型无关，footer 不能拿它算百分比。
+    pub(crate) window_assumed: bool,
     pub(crate) cumulative_tokens: u64,
     pub(crate) cumulative_prompt_tokens: u64,
     pub(crate) cumulative_cache_read_tokens: u64,

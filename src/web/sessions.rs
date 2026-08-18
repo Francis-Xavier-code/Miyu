@@ -9,11 +9,6 @@
 
 use crate::web::*;
 
-
-
-
-
-
 pub(in crate::web) async fn list_sessions_http(
     State(state): State<DaemonState>,
     headers: HeaderMap,
@@ -22,8 +17,7 @@ pub(in crate::web) async fn list_sessions_http(
     let current = state.state_store.session_id();
     let persona = active_persona_scope(&state);
     // 侧栏按模式分组:普通+dev 一起下发,mode 字段区分(问题七)。
-    let sessions =
-        sessions_with_dev(&state.state_store, &persona).map_err(ApiError::internal)?;
+    let sessions = sessions_with_dev(&state.state_store, &persona).map_err(ApiError::internal)?;
     let sessions = sessions
         .iter()
         .map(|overview| session_overview_json(overview, &current))
@@ -283,7 +277,10 @@ pub(in crate::web) const TURN_TARGET_KINDS: &[&str] = &[
 
 /// Most recently updated other user session, or a fresh default session when
 /// none is left.
-pub(in crate::web) fn fallback_session_id(state: &DaemonState, exclude: &str) -> std::result::Result<String, String> {
+pub(in crate::web) fn fallback_session_id(
+    state: &DaemonState,
+    exclude: &str,
+) -> std::result::Result<String, String> {
     let persona = active_persona_scope(state);
     let sessions = state
         .state_store
@@ -297,7 +294,12 @@ pub(in crate::web) fn fallback_session_id(state: &DaemonState, exclude: &str) ->
     }
     let record = state
         .state_store
-        .create_session(&persona, t("Terminal session", "终端集成会话"), "user", None)
+        .create_session(
+            &persona,
+            t("Terminal session", "终端集成会话"),
+            "user",
+            None,
+        )
         .map_err(|error| safe_error_message(&error))?;
     state.events.publish(
         "session.created",
@@ -333,7 +335,10 @@ pub(in crate::web) fn session_record_json(record: &crate::state::SessionRecord) 
     })
 }
 
-pub(in crate::web) fn session_overview_json(overview: &crate::state::SessionOverview, current: &str) -> Value {
+pub(in crate::web) fn session_overview_json(
+    overview: &crate::state::SessionOverview,
+    current: &str,
+) -> Value {
     let mut value = session_record_json(&overview.record);
     value["turn_count"] = json!(overview.turn_count);
     value["last_user_content"] = json!(overview.last_user_content);
@@ -556,11 +561,7 @@ pub(in crate::web) fn session_for_persona(
             return Ok(session_id);
         }
     }
-    if let Some(overview) = state_store
-        .list_local_sessions(persona)?
-        .into_iter()
-        .next()
-    {
+    if let Some(overview) = state_store.list_local_sessions(persona)?.into_iter().next() {
         return Ok(overview.record.session_id);
     }
     Ok(state_store
@@ -614,7 +615,11 @@ pub(in crate::web) fn session_title_from_prompt(prompt: &str) -> String {
     title
 }
 
-pub(in crate::web) fn build_session_agent(config: &AppConfig, paths: &MiyuPaths, state: &StateStore) -> Result<Agent> {
+pub(in crate::web) fn build_session_agent(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    state: &StateStore,
+) -> Result<Agent> {
     crate::models_cache::ensure_active_metadata(paths, config);
     let client = OpenAiCompatibleClient::from_config(config, paths)?;
     let registry = build_tool_registry(config, paths, AgentMode::Normal, true)?;
@@ -638,6 +643,7 @@ pub(in crate::web) fn session_state(
     Ok(ipc::SessionState {
         context_tokens: context.tokens,
         context_window: context.window,
+        context_window_assumed: context.window_assumed,
         cumulative_tokens: context.cumulative_tokens,
         cumulative_prompt_tokens: context.cumulative_prompt_tokens,
         cumulative_cache_read_tokens: context.cumulative_cache_read_tokens,
@@ -650,7 +656,10 @@ pub(in crate::web) fn session_state(
     })
 }
 
-pub(in crate::web) fn session_state_for(state: &DaemonState, session_id: &str) -> Result<ipc::SessionState> {
+pub(in crate::web) fn session_state_for(
+    state: &DaemonState,
+    session_id: &str,
+) -> Result<ipc::SessionState> {
     let record = state
         .state_store
         .session_record(session_id)?
@@ -666,6 +675,7 @@ pub(in crate::web) fn session_state_for(state: &DaemonState, session_id: &str) -
     Ok(ipc::SessionState {
         context_tokens: context.tokens,
         context_window: context.window,
+        context_window_assumed: context.window_assumed,
         cumulative_tokens: context.cumulative_tokens,
         cumulative_prompt_tokens: context.cumulative_prompt_tokens,
         cumulative_cache_read_tokens: context.cumulative_cache_read_tokens,
@@ -677,7 +687,9 @@ pub(in crate::web) fn session_state_for(state: &DaemonState, session_id: &str) -
 
 /// Global admin reservation (config/model changes): requires that no turn is
 /// running in any session.
-pub(in crate::web) fn reserve_admin(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
+pub(in crate::web) fn reserve_admin(
+    manager: &Arc<Mutex<ManagerState>>,
+) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
     if !manager.active_runs.is_empty() || manager.admin_busy {
         return Err(ApiError::new(StatusCode::CONFLICT, ipc::ADMIN_BUSY_MESSAGE));
@@ -703,7 +715,9 @@ pub(in crate::web) fn reserve_admin_for_session(
 
 /// Light admin reservation (session/model updates): serializes against other
 /// admin operations but is allowed while turns are running.
-pub(in crate::web) fn reserve_admin_light(manager: &Arc<Mutex<ManagerState>>) -> std::result::Result<(), ApiError> {
+pub(in crate::web) fn reserve_admin_light(
+    manager: &Arc<Mutex<ManagerState>>,
+) -> std::result::Result<(), ApiError> {
     let mut manager = manager.lock().unwrap();
     if manager.admin_busy {
         return Err(ApiError::new(StatusCode::CONFLICT, ipc::ADMIN_BUSY_MESSAGE));
@@ -712,7 +726,9 @@ pub(in crate::web) fn reserve_admin_light(manager: &Arc<Mutex<ManagerState>>) ->
     Ok(())
 }
 
-pub(in crate::web) fn require_no_running_turn(state_store: &StateStore) -> std::result::Result<(), ApiError> {
+pub(in crate::web) fn require_no_running_turn(
+    state_store: &StateStore,
+) -> std::result::Result<(), ApiError> {
     if state_store
         .has_any_running_turns()
         .map_err(ApiError::internal)?
