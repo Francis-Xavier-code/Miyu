@@ -586,9 +586,14 @@ pub(in crate::web) async fn usage_stats_web(
     let range = crate::state::UsageRange::parse(query.range.as_deref().unwrap_or("1d"));
     let config = state.manager.lock().unwrap().config.clone();
     crate::models_cache::ensure_active_metadata(&state.paths, &config);
-    let stats = state
-        .state_store
-        .usage_stats(range, Some(&config))
+    // 整读整解析 usage-history.jsonl，而那个文件只增不轮转：本机 5.7 天就
+    // 攒到 2.2 MB / 86 ms，一年是 141 MB / 5.5 秒。同步跑就是把一个 tokio
+    // worker 冻这么久。两条工具路径（platforms/tool.rs、tools/usage_query.rs）
+    // 早就是 spawn_blocking，这两个 handler 漏了。
+    let store = state.state_store.clone();
+    let stats = tokio::task::spawn_blocking(move || store.usage_stats(range, Some(&config)))
+        .await
+        .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true, "stats": stats })).into_response())
 }
@@ -602,10 +607,14 @@ pub(in crate::web) async fn usage_details_web(
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let config = state.manager.lock().unwrap().config.clone();
     crate::models_cache::ensure_active_metadata(&state.paths, &config);
-    let records = state
-        .state_store
-        .usage_details(limit, query.src.as_deref(), query.model.as_deref(), Some(&config))
-        .map_err(ApiError::internal)?;
+    let store = state.state_store.clone();
+    let (src, model) = (query.src.clone(), query.model.clone());
+    let records = tokio::task::spawn_blocking(move || {
+        store.usage_details(limit, src.as_deref(), model.as_deref(), Some(&config))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true, "records": records })).into_response())
 }
 
