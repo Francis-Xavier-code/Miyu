@@ -305,8 +305,38 @@ pub(crate) fn markdown_to_plain(text: &str) -> String {
 }
 
 /// Removes `**`, `__`, backticks and rewrites `[text](url)` → `text (url)`.
+/// 找出第一个下标 >= `from` 的 `needle` 位置。
+///
+/// `positions` 是升序的候选下标，`cursor` 是**跨调用保留**的游标。调用方的
+/// `from` 只增不减，所以游标只前进不回退，整趟下来是 O(n) 而不是每次重扫。
+fn next_position_at_or_after(
+    positions: &[usize],
+    cursor: &mut usize,
+    from: usize,
+) -> Option<usize> {
+    while *cursor < positions.len() && positions[*cursor] < from {
+        *cursor += 1;
+    }
+    positions.get(*cursor).copied()
+}
+
 pub(crate) fn strip_inline_markup(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
+    // 原来每遇到一个 `[` 就往后线性找 `]`（找不到就 i += 1 再来一遍），
+    // 一串未匹配的 `[` 就是 O(n²)：实测 16,000 个 `[` 要 358ms，而每条 QQ
+    // 出站消息都走这条路。改成预扫一遍位置 + 单调游标，整体降到 O(n)。
+    let close_positions: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, c)| (*c == ']').then_some(index))
+        .collect();
+    let paren_positions: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, c)| (*c == ')').then_some(index))
+        .collect();
+    let mut close_cursor = 0;
+    let mut paren_cursor = 0;
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < chars.len() {
@@ -316,15 +346,18 @@ pub(crate) fn strip_inline_markup(line: &str) -> String {
             '`' => i += 1,
             '[' => {
                 // Try [text](url); anything else is emitted verbatim.
-                let close = chars[i + 1..].iter().position(|&c| c == ']');
-                let parsed = close.and_then(|offset| {
-                    let close = i + 1 + offset;
+                let close = next_position_at_or_after(&close_positions, &mut close_cursor, i + 1);
+                let parsed = close.and_then(|close| {
                     if chars.get(close + 1) == Some(&'(') {
-                        let end = chars[close + 2..].iter().position(|&c| c == ')');
-                        end.map(|len| {
+                        let end = next_position_at_or_after(
+                            &paren_positions,
+                            &mut paren_cursor,
+                            close + 2,
+                        );
+                        end.map(|end| {
                             let text: String = chars[i + 1..close].iter().collect();
-                            let url: String = chars[close + 2..close + 2 + len].iter().collect();
-                            (close + 2 + len + 1, text, url)
+                            let url: String = chars[close + 2..end].iter().collect();
+                            (end + 1, text, url)
                         })
                     } else {
                         None
@@ -485,4 +518,156 @@ pub(crate) async fn download_capped(
         bytes.extend_from_slice(&chunk);
     }
     Ok((bytes, content_type))
+}
+
+#[cfg(test)]
+mod strip_markup_tests {
+    use super::*;
+
+    /// 改之前的实现，逐字抄下来当参照。
+    ///
+    /// 性能改动的铁律是「只改执行方式，不改结果」，而这条路决定用户在 QQ 里
+    /// 看到的每一个字。断言几个手挑的用例守不住这种改动——真正的验证是拿旧
+    /// 实现当预言机，在一大堆输入上比对逐字节相等。
+    fn reference_strip_inline_markup(line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '*' if chars.get(i + 1) == Some(&'*') => i += 2,
+                '_' if chars.get(i + 1) == Some(&'_') => i += 2,
+                '`' => i += 1,
+                '[' => {
+                    let close = chars[i + 1..].iter().position(|&c| c == ']');
+                    let parsed = close.and_then(|offset| {
+                        let close = i + 1 + offset;
+                        if chars.get(close + 1) == Some(&'(') {
+                            let end = chars[close + 2..].iter().position(|&c| c == ')');
+                            end.map(|len| {
+                                let text: String = chars[i + 1..close].iter().collect();
+                                let url: String =
+                                    chars[close + 2..close + 2 + len].iter().collect();
+                                (close + 2 + len + 1, text, url)
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    match parsed {
+                        Some((next, text, url)) => {
+                            out.push_str(&text);
+                            if !url.is_empty() && url != text {
+                                out.push_str(" (");
+                                out.push_str(&url);
+                                out.push(')');
+                            }
+                            i = next;
+                        }
+                        None => {
+                            out.push('[');
+                            i += 1;
+                        }
+                    }
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// 手挑的边界：嵌套、未闭合、空 URL、URL 与文本相同、中文、末尾截断。
+    #[test]
+    fn the_rewrite_matches_the_previous_implementation_on_edge_cases() {
+        let cases = [
+            "",
+            "[",
+            "]",
+            "[]",
+            "[]()",
+            "[a](b)",
+            "[a](a)",
+            "[a]()",
+            "[a](",
+            "[a]b",
+            "[[a]](b)",
+            "[[[[[[",
+            "[a][b][c]",
+            "[中文](https://例子.测试)",
+            "**粗**_斜_`码`[链接](u)",
+            "prefix [a](b) middle [c](d) suffix",
+            "[未闭合 [又一个 [还有",
+            "[a](b))(",
+            "```[a](b)```",
+        ];
+        for case in cases {
+            assert_eq!(
+                strip_inline_markup(case),
+                reference_strip_inline_markup(case),
+                "输入：{case:?}"
+            );
+        }
+    }
+
+    /// 用确定性的伪随机组合生成上万条输入，逐条比对——手挑的用例覆盖不到
+    /// 「游标恰好停在某处」这类内部状态。
+    #[test]
+    fn the_rewrite_matches_the_previous_implementation_on_generated_input() {
+        let alphabet = ['[', ']', '(', ')', '*', '_', '`', 'a', '中', ' '];
+        // 线性同余，固定种子=可复现
+        let mut state: u64 = 0x5DEE_CE66_D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) as usize
+        };
+        for _ in 0..5_000 {
+            let len = next() % 40;
+            let input: String = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            assert_eq!(
+                strip_inline_markup(&input),
+                reference_strip_inline_markup(&input),
+                "输入：{input:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scaling_probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// 测量伸缩性，不测绝对耗时——绝对值跟机器走，倍率不跟。
+    ///
+    /// 用 `cargo test --lib scaling_probe -- --ignored --nocapture` 手工跑。
+    /// 平时不进测试套：它是量尺，不是断言。
+    fn elapsed_ms(input: &str) -> f64 {
+        let start = Instant::now();
+        let out = strip_inline_markup(input);
+        std::hint::black_box(out);
+        start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    #[test]
+    #[ignore]
+    fn strip_inline_markup_scaling() {
+        println!("\n  输入长度      耗时(ms)   相对 2× 前");
+        let mut previous: Option<f64> = None;
+        for k in [1_000usize, 2_000, 4_000, 8_000, 16_000] {
+            // 未匹配的 `[`:每个都会触发一次「往后找 `]`」的全量扫描
+            let input = "[".repeat(k);
+            let ms = elapsed_ms(&input);
+            let ratio = previous.map(|p| ms / p).unwrap_or(f64::NAN);
+            println!("  {k:>8}    {ms:>9.3}   {ratio:>8.2}×");
+            previous = Some(ms);
+        }
+        println!("  （线性≈2×，二次方≈4×）");
+    }
 }
