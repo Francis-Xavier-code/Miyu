@@ -141,8 +141,14 @@ static KATEX_FONTS: &[(&str, &[u8])] = &[
     ("KaTeX_Size4-Regular.woff2", include_bytes!("../../web/vendor/katex/fonts/KaTeX_Size4-Regular.woff2")),
     ("KaTeX_Typewriter-Regular.woff2", include_bytes!("../../web/vendor/katex/fonts/KaTeX_Typewriter-Regular.woff2")),
 ];
-const MIYU_LOGO: &[u8] = include_bytes!("../../pics/miyu-logo.png");
-const MIYU_WALLPAPER: &[u8] = include_bytes!("../../pics/miyuwallpaper.png");
+// 这两张是 `pics/` 里原图的**显示尺寸副本**，不是原图。原图 1254×1254 和
+// 3344×1882，而 WebUI 里头像只显示 38/64 px、看板图最大 330×178 px——浏览器
+// 解码是按像素数来的，原图会占掉 30 MiB GPU 纹理去画两个缩略图，还让二进制
+// 多背 7.2 MiB。降到 256×256 和 1280×720（2x DPR 仍有富余）后纹理 3.7 MiB。
+// 原图留在 `pics/` 不动：README、终端演示、外部链接还在引用。
+// 重新生成见 `scripts/gen_web_assets.py`。
+const MIYU_LOGO: &[u8] = include_bytes!("../../web/assets/miyu-logo.png");
+const MIYU_WALLPAPER: &[u8] = include_bytes!("../../web/assets/miyuwallpaper.png");
 
 
 
