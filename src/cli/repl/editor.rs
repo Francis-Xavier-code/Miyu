@@ -182,6 +182,15 @@ impl LiveReplEditor {
                         self.escape_armed_until = Some(Instant::now() + Duration::from_secs(2));
                     }
                 }
+                // Ctrl+方向 必须排在裸方向之前:match 从上往下取第一个命中的
+                // 分支,裸 `KeyCode::Left` 不看修饰键,写在前面会把 Ctrl 组合
+                // 一起吃掉。
+                KeyCode::Left if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = word_start_before_cursor(&self.input, self.cursor);
+                }
+                KeyCode::Right if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = word_end_after_cursor(&self.input, self.cursor);
+                }
                 KeyCode::Left => {
                     if let Some((start, _)) = placeholder_at_cursor(&self.input, self.cursor) {
                         self.cursor = start;
@@ -280,21 +289,12 @@ impl LiveReplEditor {
                     return Ok(LiveEditorAction::Exit);
                 }
                 KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((start, end)) =
-                        placeholder_before_or_at_cursor(&self.input, self.cursor)
-                    {
-                        clear_placeholder_payload(
-                            &self.input,
-                            start,
-                            end,
-                            &mut self.pasted_images,
-                            &mut self.pasted_texts,
-                        );
-                        remove_range_chars(&mut self.input, start, end);
-                        self.cursor = start;
-                    } else {
-                        remove_word_before_cursor(&mut self.input, &mut self.cursor);
-                    }
+                    remove_word_before_cursor(
+                        &mut self.input,
+                        &mut self.cursor,
+                        &mut self.pasted_images,
+                        &mut self.pasted_texts,
+                    );
                     self.history_clean_index = None;
                     self.is_pasted = false;
                 }

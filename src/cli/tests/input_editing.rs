@@ -199,6 +199,99 @@ async fn config_reload_request_times_out_when_daemon_does_not_respond() {
     let _ = server.await;
 }
 
+/// Ctrl+←/→ 按词跳。以前这两个分支不看修饰键，Ctrl 组合和裸方向键一样只挪
+/// 一个字符。
+#[test]
+fn ctrl_arrows_jump_by_word() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = pop_test_paths(temp.path());
+    let ctrl_left = || Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    let ctrl_right = || Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    let mut editor = LiveReplEditor::new(AgentMode::Normal, Vec::new());
+
+    // ASCII：三个词，从行尾往回跳到每个词首。
+    editor.input = "cargo test --all".to_string();
+    editor.cursor = editor.input.chars().count();
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 11, "应停在 --all 的词首");
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 6, "应停在 test 的词首");
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 0);
+    // 到行首后再按不越界。
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 0);
+
+    // 往右跳到每个词尾，到行尾后不越界。
+    editor.handle_event(ctrl_right(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 5);
+    editor.handle_event(ctrl_right(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 10);
+    editor.handle_event(ctrl_right(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 16);
+    editor.handle_event(ctrl_right(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 16);
+
+    // 连续空格算一段：跨过去，不在中间停。
+    editor.input = "a    b".to_string();
+    editor.cursor = 6;
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 5);
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 0);
+
+    // 中英混排：CJK 没有空格，整段是一个词。
+    editor.input = "查一下 tokio 的文档".to_string();
+    editor.cursor = editor.input.chars().count();
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 10, "应停在「的文档」词首");
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 4, "应停在 tokio 词首");
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert_eq!(editor.cursor, 0);
+}
+
+/// 占位符自带空格，按空白分词一定会切进它中段。跳词必须整块跨过去——
+/// 光标落进占位符内部，后续删除/渲染都会拿到半截文本。
+#[test]
+fn ctrl_arrows_treat_placeholders_as_atomic() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = pop_test_paths(temp.path());
+    let ctrl_left = || Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    let ctrl_right = || Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    let mut editor = LiveReplEditor::new(AgentMode::Normal, Vec::new());
+
+    let input = "看 [Pasted 1: ~3 lines] 这段";
+    let placeholders = find_repl_placeholders(input);
+    assert_eq!(placeholders.len(), 1, "样例里应当只有一个占位符");
+    let (start, end) = placeholders[0];
+
+    editor.input = input.to_string();
+    editor.cursor = editor.input.chars().count();
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert!(
+        editor.cursor <= start || editor.cursor >= end,
+        "光标 {} 落进了占位符 {start}..{end} 内部",
+        editor.cursor
+    );
+    editor.handle_event(ctrl_left(), &paths, false).unwrap();
+    assert!(
+        editor.cursor <= start || editor.cursor >= end,
+        "光标 {} 落进了占位符 {start}..{end} 内部",
+        editor.cursor
+    );
+
+    editor.cursor = 0;
+    for _ in 0..4 {
+        editor.handle_event(ctrl_right(), &paths, false).unwrap();
+        assert!(
+            editor.cursor <= start || editor.cursor >= end,
+            "光标 {} 落进了占位符 {start}..{end} 内部",
+            editor.cursor
+        );
+    }
+}
+
 #[test]
 fn live_editor_restores_clear_screen_and_double_escape_controls() {
     let temp = tempfile::tempdir().unwrap();
@@ -436,17 +529,79 @@ fn input_helpers_edit_at_cursor() {
 
 #[test]
 fn input_helpers_remove_word_before_cursor() {
+    let mut nothing_pasted = (Vec::new(), Vec::new());
     let mut input = "hello world  ".to_string();
     let mut cursor = input.chars().count();
-    remove_word_before_cursor(&mut input, &mut cursor);
+    remove_word_before_cursor(
+        &mut input,
+        &mut cursor,
+        &mut nothing_pasted.0,
+        &mut nothing_pasted.1,
+    );
     assert_eq!(input, "hello ");
     assert_eq!(cursor, 6);
 
     let mut input = "前面 中间 后面".to_string();
     let mut cursor = 6;
-    remove_word_before_cursor(&mut input, &mut cursor);
+    remove_word_before_cursor(
+        &mut input,
+        &mut cursor,
+        &mut nothing_pasted.0,
+        &mut nothing_pasted.1,
+    );
     assert_eq!(input, "前面 后面");
     assert_eq!(cursor, 3);
+}
+
+/// Ctrl+W 必须把占位符整块删掉，**隔着空白时也一样**。
+///
+/// 占位符自带空格（`[Pasted 1: ~3 lines]`），按空白分词会切进它中段，只删掉
+/// ` lines]`，屏幕上留下 `[Pasted 1: ~3` 这种再也解析不回去的残片；更糟的是
+/// 载荷还挂在数组里，提交时被展开——用户看到的和发出去的对不上。
+#[test]
+fn ctrl_w_removes_a_placeholder_whole_even_across_whitespace() {
+    let paste = |lines: usize| {
+        Some(PastedText {
+            text: "x\n".repeat(lines),
+        })
+    };
+
+    // 隔着一个空格：以前在这里切进中段。
+    let mut input = "看 [Pasted 1: ~3 lines] ".to_string();
+    let mut cursor = input.chars().count();
+    let mut images = Vec::new();
+    let mut texts = vec![paste(3)];
+    remove_word_before_cursor(&mut input, &mut cursor, &mut images, &mut texts);
+    assert_eq!(input, "看 ", "占位符必须整块消失，不留残片");
+    assert_eq!(cursor, input.chars().count());
+    assert!(texts[0].is_none(), "载荷没清掉，提交时会被展开回来");
+
+    // 紧贴其后：原本就该整块删，别改坏。
+    let mut input = "看 [Pasted 1: ~3 lines]".to_string();
+    let mut cursor = input.chars().count();
+    let mut texts = vec![paste(3)];
+    remove_word_before_cursor(&mut input, &mut cursor, &mut Vec::new(), &mut texts);
+    assert_eq!(input, "看 ");
+    assert!(texts[0].is_none());
+
+    // 两个占位符贴在一起时一次只删一个：占位符就是一个词，Ctrl+W 删一个词。
+    let mut input = "[Image 1][Image 2]".to_string();
+    let mut cursor = input.chars().count();
+    let mut images = vec![None, None];
+    remove_word_before_cursor(&mut input, &mut cursor, &mut images, &mut Vec::new());
+    assert_eq!(input, "[Image 1]");
+    assert_eq!(cursor, 9);
+    remove_word_before_cursor(&mut input, &mut cursor, &mut images, &mut Vec::new());
+    assert_eq!(input, "");
+    assert_eq!(cursor, 0);
+
+    // 占位符后面还有普通词时，先删那个词，别误伤占位符。
+    let mut input = "[Pasted 1: ~3 lines] 这段".to_string();
+    let mut cursor = input.chars().count();
+    let mut texts = vec![paste(3)];
+    remove_word_before_cursor(&mut input, &mut cursor, &mut Vec::new(), &mut texts);
+    assert_eq!(input, "[Pasted 1: ~3 lines] ");
+    assert!(texts[0].is_some(), "没碰到的占位符，载荷不能被清掉");
 }
 
 #[test]

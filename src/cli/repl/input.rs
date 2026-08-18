@@ -448,19 +448,12 @@ pub(in crate::cli) fn read_repl_input(
                     )?;
                 }
                 KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((start, end)) = placeholder_before_or_at_cursor(&input, cursor) {
-                        clear_placeholder_payload(
-                            &input,
-                            start,
-                            end,
-                            &mut pasted_images,
-                            &mut pasted_texts,
-                        );
-                        remove_range_chars(&mut input, start, end);
-                        cursor = start;
-                    } else {
-                        remove_word_before_cursor(&mut input, &mut cursor);
-                    }
+                    remove_word_before_cursor(
+                        &mut input,
+                        &mut cursor,
+                        &mut pasted_images,
+                        &mut pasted_texts,
+                    );
                     history_clean_index = None;
                     is_pasted = false;
                     render_repl_input(

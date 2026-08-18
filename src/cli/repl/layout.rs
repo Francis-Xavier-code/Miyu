@@ -315,22 +315,44 @@ pub(in crate::cli) fn remove_char_before_cursor(value: &mut String, cursor: &mut
     *cursor -= 1;
 }
 
-pub(in crate::cli) fn remove_word_before_cursor(value: &mut String, cursor: &mut usize) {
-    if *cursor == 0 {
-        return;
-    }
+/// Ctrl+Left 的落点：先跨过光标左边的连续空白，再跨过一整个词。
+///
+/// 分词只按空白，不按标点——第一版刻意保守：`remove_word_before_cursor`
+/// （Ctrl+W）用的就是这套语义，两个键的「词」必须是同一个词，否则
+/// Ctrl+Left 再 Ctrl+W 会删掉和你看到的不一样的东西。
+///
+/// 落点若掉进 `[Image N: ...]` 占位符中段（占位符自带空格，按空白分词一定会
+/// 切进去），整块跳到它的**开头**——占位符在编辑器里是一个不可分割的字符。
+pub(in crate::cli) fn word_start_before_cursor(value: &str, cursor: usize) -> usize {
     let chars = value.chars().collect::<Vec<_>>();
-    let mut start = (*cursor).min(chars.len());
+    let mut start = cursor.min(chars.len());
     while start > 0 && chars[start - 1].is_whitespace() {
         start -= 1;
     }
     while start > 0 && !chars[start - 1].is_whitespace() {
         start -= 1;
     }
-    let byte_start = byte_index_for_char(value, start);
-    let byte_end = byte_index_for_char(value, *cursor);
-    value.replace_range(byte_start..byte_end, "");
-    *cursor = start;
+    match placeholder_at_cursor(value, start) {
+        Some((placeholder_start, _)) => placeholder_start,
+        None => start,
+    }
+}
+
+/// Ctrl+Right 的落点：先跨过光标右边的连续空白，再跨过一整个词。
+/// 占位符处理同 [`word_start_before_cursor`]，只是snap 到**结尾**。
+pub(in crate::cli) fn word_end_after_cursor(value: &str, cursor: usize) -> usize {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut end = cursor.min(chars.len());
+    while end < chars.len() && chars[end].is_whitespace() {
+        end += 1;
+    }
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    match placeholder_at_cursor(value, end) {
+        Some((_, placeholder_end)) => placeholder_end,
+        None => end,
+    }
 }
 
 pub(in crate::cli) fn remove_char_at_cursor(value: &mut String, cursor: usize) {
