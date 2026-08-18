@@ -380,8 +380,20 @@ impl ConversationDb {
             if archive.is_some() {
                 continue;
             }
-            let reports: Vec<String> =
-                serde_json::from_str(&reports_json).unwrap_or_default();
+            // v25 起报告分两处：老的还在 JSON 列，新的在子表。裁剪必须两边都看，
+            // 否则子表那部分永远不会被折叠——只看列的话它一条都发现不了。
+            let mut reports: Vec<String> = serde_json::from_str(&reports_json).unwrap_or_default();
+            let child_reports: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT report FROM turn_tool_reports WHERE turn_id = ?1
+                     ORDER BY report_id ASC",
+                )?;
+                let collected = stmt
+                    .query_map(params![turn_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                collected
+            };
+            reports.extend(child_reports);
             if reports.is_empty() {
                 continue;
             }
@@ -396,7 +408,10 @@ impl ConversationDb {
             );
             saved_chars += total.saturating_sub(placeholder.len());
             let new_json = serde_json::to_string(&vec![placeholder])?;
-            updates.push((turn_id, reports_json, new_json));
+            // 归档的是**合并后的全部**，不是列里那一部分——否则子表那些报告
+            // 会被折叠掉却没进归档，等于凭空丢数据。
+            let archived = serde_json::to_string(&reports)?;
+            updates.push((turn_id, archived, new_json));
         }
         if updates.is_empty() || saved_chars < min_saved_chars {
             tx.rollback()?;
@@ -410,6 +425,14 @@ impl ConversationDb {
             )?;
             for (turn_id, original, replacement) in &updates {
                 stmt.execute(params![turn_id, original, replacement, session_id])?;
+            }
+        }
+        {
+            // 折叠完必须清掉子表行。否则读回来是「占位符 + 原文全接在后面」，
+            // 裁剪等于白做——占位符只是多了一条。
+            let mut stmt = tx.prepare("DELETE FROM turn_tool_reports WHERE turn_id = ?1")?;
+            for (turn_id, _, _) in &updates {
+                stmt.execute(params![turn_id])?;
             }
         }
         tx.commit()?;

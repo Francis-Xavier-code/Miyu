@@ -117,7 +117,10 @@ impl ConversationDb {
         Ok(prompts)
     }
 
-    pub(crate) fn user_attachments_for_prompt(&self, prompt_id: &str) -> Result<Vec<UserAttachment>> {
+    pub(crate) fn user_attachments_for_prompt(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Vec<UserAttachment>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT attachment_id, file_name, mime, kind, size_bytes, width,
@@ -129,5 +132,4 @@ impl ConversationDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(attachments)
     }
-
 }

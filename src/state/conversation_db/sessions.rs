@@ -70,7 +70,11 @@ impl ConversationDb {
     /// Reads a persona-scoped session pointer, returning `None` when it points
     /// at something the caller must not land on (wrong persona, non-user kind,
     /// archived, or already deleted). Callers fall back and heal the pointer.
-    pub(crate) fn persona_session_pointer(&self, prefix: &str, persona: &str) -> Result<Option<String>> {
+    pub(crate) fn persona_session_pointer(
+        &self,
+        prefix: &str,
+        persona: &str,
+    ) -> Result<Option<String>> {
         let key = format!("{prefix}:{persona}");
         let conn = self.conn.lock().unwrap();
         let session_id = conn

@@ -121,6 +121,7 @@ pub(crate) fn map_artifact_asset_row(row: &rusqlite::Row) -> rusqlite::Result<Ar
 }
 
 pub(crate) fn attach_turn_children_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+    attach_tool_reports_locked(conn, turns)?;
     attach_question_exchanges_locked(conn, turns)?;
     attach_followups_locked(conn, turns)?;
     attach_turn_attachments_locked(conn, turns)?;
@@ -232,7 +233,10 @@ pub(crate) fn truncate_chars_owned(value: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-pub(crate) fn attach_turn_journal_events_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+pub(crate) fn attach_turn_journal_events_locked(
+    conn: &Connection,
+    turns: &mut [Turn],
+) -> Result<()> {
     // BTreeMap keeps the chunking below deterministic; HashMap iteration order
     // would shuffle turn ids across the 900-id chunks between calls.
     let indexes = turns
@@ -349,7 +353,10 @@ pub(crate) fn attach_turn_attachments_locked(conn: &Connection, turns: &mut [Tur
     Ok(())
 }
 
-pub(crate) fn attach_question_exchanges_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+pub(crate) fn attach_question_exchanges_locked(
+    conn: &Connection,
+    turns: &mut [Turn],
+) -> Result<()> {
     if turns.is_empty() {
         return Ok(());
     }
@@ -438,7 +445,10 @@ pub(crate) fn attach_followups_locked(conn: &Connection, turns: &mut [Turn]) -> 
     Ok(())
 }
 
-pub(crate) fn attach_prompt_attachments_locked(conn: &Connection, prompts: &mut [QueuedPrompt]) -> Result<()> {
+pub(crate) fn attach_prompt_attachments_locked(
+    conn: &Connection,
+    prompts: &mut [QueuedPrompt],
+) -> Result<()> {
     let indexes = prompts
         .iter()
         .enumerate()
@@ -483,7 +493,10 @@ pub(crate) fn attach_prompt_attachments_locked(conn: &Connection, prompts: &mut 
     Ok(())
 }
 
-pub(crate) fn attach_followup_attachments_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+pub(crate) fn attach_followup_attachments_locked(
+    conn: &Connection,
+    turns: &mut [Turn],
+) -> Result<()> {
     let mut locations = std::collections::HashMap::new();
     for (turn_index, turn) in turns.iter().enumerate() {
         for (followup_index, followup) in turn.followups.iter().enumerate() {
@@ -525,6 +538,50 @@ pub(crate) fn attach_followup_attachments_locked(conn: &Connection, turns: &mut 
                 turns[turn_index].followups[followup_index]
                     .uploaded_attachments
                     .push(attachment);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把 `turn_tool_reports` 里的报告接到各回合尾部（v25）。
+///
+/// **接在尾部，不是覆盖**：老回合的报告还在 `turns.tool_reports` 那个 JSON 列
+/// 里（v25 不回填、不删列），`map_turn_row` 已经把它读进来了。跨升级的那种
+/// 回合两边都有内容，先列后子表正是它们真实发生的顺序。
+///
+/// 排序用 `report_id`——自增主键，插入顺序即报告顺序，所以写入端连
+/// `MAX(seq)` 都不用查。
+///
+/// 900 一批是跟着同文件其它 `attach_*` 走的：SQLite 默认变量上限 999。
+pub(crate) fn attach_tool_reports_locked(conn: &Connection, turns: &mut [Turn]) -> Result<()> {
+    if turns.is_empty() {
+        return Ok(());
+    }
+    let indexes = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.turn_id.clone(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let turn_ids = indexes.keys().collect::<Vec<_>>();
+    for chunk in turn_ids.chunks(900) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT turn_id, report FROM turn_tool_reports
+             WHERE turn_id IN ({placeholders})
+             ORDER BY report_id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (turn_id, report) in rows {
+            if let Some(&index) = indexes.get(&turn_id) {
+                turns[index].tool_reports.push(report);
             }
         }
     }

@@ -147,10 +147,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "retire_session_goals",
         apply: apply_v24_retire_session_goals,
     },
+    Migration {
+        version: 25,
+        name: "tool_reports_child_table",
+        apply: apply_v25_tool_reports_child_table,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 24;
+pub const LATEST_VERSION: i64 = 25;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -257,6 +262,51 @@ mod tests {
             user_version(&conn).unwrap(),
             MIGRATIONS.last().unwrap().version
         );
+    }
+
+    /// v24 的老库升到 v25：新表建出来，列里的老报告一个字节不动。
+    ///
+    /// v25 是**纯增量**的——不回填、不删列。所以这条要证的是「什么都没被搬」，
+    /// 而不是「搬对了」。
+    #[test]
+    fn v25_adds_the_child_table_without_touching_existing_reports() {
+        let mut conn = open_migrated();
+        conn.execute_batch(
+            "DROP TABLE turn_tool_reports;
+             PRAGMA user_version = 24;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO turns (turn_id, session_id, seq, user_content, user_timestamp,
+                                assistant_content, assistant_timestamp, status, tool_reports)
+             VALUES ('t1', ?1, 1, 'hi', 'now', 'yo', 'now', 'completed', ?2)",
+            rusqlite::params![DEFAULT_SESSION_ID, r#"["老报告"]"#],
+        )
+        .unwrap();
+
+        run_migrations(&mut conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), LATEST_VERSION);
+        let reports: String = conn
+            .query_row(
+                "SELECT tool_reports FROM turns WHERE turn_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reports, r#"["老报告"]"#, "老报告被动过了");
+        let child_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turn_tool_reports", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(child_rows, 0, "v25 不该回填");
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]

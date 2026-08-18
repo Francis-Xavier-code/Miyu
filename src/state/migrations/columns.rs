@@ -18,7 +18,12 @@ pub(in crate::state) fn apply_v11_session_model_override(conn: &Connection) -> R
 /// history replay stays a byte-exact extension of what the provider already
 /// cached ("注入了就别删"). JSON array of ChatMessage values; '[]' when none.
 pub(in crate::state) fn apply_v12_turn_context_messages(conn: &Connection) -> Result<()> {
-    add_column_if_missing(conn, "turns", "context_messages", "TEXT NOT NULL DEFAULT '[]'")
+    add_column_if_missing(
+        conn,
+        "turns",
+        "context_messages",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
 }
 
 /// Compact tail retention: a summary turn no longer swallows every visible

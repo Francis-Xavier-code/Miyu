@@ -1,8 +1,7 @@
 //! 重做与它的回滚。
 
-use crate::state::*;
 use super::shared::*;
-
+use crate::state::*;
 
 #[test]
 fn initial_prompt_redo_reuses_the_turn_with_a_new_revision() {
@@ -222,4 +221,81 @@ fn cancelled_redo_restores_artifact_versions() {
     assert_eq!(restored.asset.tool_id.as_deref(), Some("tool-old"));
     assert_eq!(restored.bytes, b"old artifact");
     assert_eq!(std::fs::read_to_string(path).unwrap(), "old artifact");
+}
+
+/// redo 认领时旧报告必须消失，不能活着接在 prefix 后面。
+///
+/// v25 把报告挪进了子表，而 redo 是通过**重置 `turns.tool_reports` 列**来回到
+/// prefix 的。只重置列的话，上一次尝试写进子表的报告一条都没被清掉，读回来就
+/// 成了「prefix + 上一轮全部报告」——模型会看到自己还没做过的工具输出。
+#[test]
+fn redo_clears_the_reports_from_the_previous_attempt() {
+    let (_temp, store) = test_store();
+    store
+        .start_turn("t1", "initial", std::process::id())
+        .unwrap();
+    store
+        .append_persisted_context("t1", "上一轮的报告")
+        .unwrap();
+    store.complete_turn("t1", "old answer", None).unwrap();
+    assert_eq!(
+        store.load_turns().unwrap()[0].tool_reports,
+        ["上一轮的报告"]
+    );
+
+    let candidate = store.redo_candidate().unwrap().unwrap();
+    store
+        .begin_redo(
+            "t1",
+            "t1",
+            RedoInputKind::Initial,
+            candidate.revision,
+            "edited",
+            "edited",
+            std::process::id(),
+        )
+        .unwrap();
+
+    let turn = store.load_turns().unwrap().remove(0);
+    assert!(
+        turn.tool_reports.is_empty(),
+        "上一轮的报告复活了：{:?}",
+        turn.tool_reports
+    );
+}
+
+/// redo 被取消回退时，本轮产生的报告必须原样回来。
+///
+/// 备份只读列的话，子表里那部分——恰恰是本次回合刚产生的全部报告——会永久
+/// 丢失，而用户看到的是「撤销成功了」。
+#[test]
+fn cancelled_redo_brings_back_the_reports_it_replaced() {
+    let (_temp, store) = test_store();
+    store
+        .start_turn("t1", "initial", std::process::id())
+        .unwrap();
+    store.append_persisted_context("t1", "报告甲").unwrap();
+    store.append_persisted_context("t1", "报告乙").unwrap();
+    store.complete_turn("t1", "old answer", None).unwrap();
+
+    let candidate = store.redo_candidate().unwrap().unwrap();
+    let redo = store
+        .begin_redo(
+            "t1",
+            "t1",
+            RedoInputKind::Initial,
+            candidate.revision,
+            "edited",
+            "edited",
+            std::process::id(),
+        )
+        .unwrap();
+    store.interrupt_turn_revision("t1", redo.revision).unwrap();
+
+    let restored = store.load_turns().unwrap().remove(0);
+    assert_eq!(
+        restored.tool_reports,
+        ["报告甲", "报告乙"],
+        "回退后报告没回来"
+    );
 }

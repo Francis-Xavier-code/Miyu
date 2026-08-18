@@ -269,7 +269,9 @@ pub(in crate::state) fn apply_v2_sessions(conn: &Connection) -> Result<()> {
 /// Platform session bindings include the persona and optional participant so
 /// chat history can remain isolated, while plugin state deliberately excludes
 /// both dimensions and is shared by every persona in the external conversation.
-pub(in crate::state) fn apply_v3_platform_sessions_and_plugin_state(conn: &Connection) -> Result<()> {
+pub(in crate::state) fn apply_v3_platform_sessions_and_plugin_state(
+    conn: &Connection,
+) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE platform_session_bindings (
             platform          TEXT NOT NULL,
@@ -563,6 +565,35 @@ pub(in crate::state) fn create_turn_redo_backup_tables(conn: &Connection) -> Res
             created_at TEXT NOT NULL,
             PRIMARY KEY (turn_id, asset_id)
         );",
+    )?;
+    Ok(())
+}
+
+/// v25: 工具报告改成追加型子表。
+///
+/// `turns.tool_reports` 是一个 JSON 数组列，每追加一条报告都要「读整列 → 解析
+/// → push → 整个序列化 → 写回」。一个回合里第 k 次工具调用写回的是当前全部
+/// k 条，所以总写入是 O(N²)：实测 80 条 2 KB 的报告，理想写入 160 KB，实际
+/// **6.5 MB（40.5×）**，耗时 210.7 ms。
+///
+/// 这跟 v10 的取舍完全是同一件事——那条注释写得很清楚：让运行中的回合「永远
+/// 不必重写一个越长越大的 JSON 值」。工具报告当时漏了。
+///
+/// **不回填、不删列**：老回合的 JSON 原样留着，新追加进子表，读的时候先取列
+/// 再接上子表（`attach_tool_reports_locked`）。这样迁移是纯增量的，出问题回滚
+/// 也只是丢掉新表，老数据一个字节没动。
+///
+/// `report_id` 用 INTEGER PRIMARY KEY 自增：插入顺序就是报告顺序，所以追加时
+/// **一次读都不用做**（不必查 MAX(seq)）——那正是要消掉的东西。
+pub(in crate::state) fn apply_v25_tool_reports_child_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS turn_tool_reports (
+            report_id INTEGER PRIMARY KEY,
+            turn_id   TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+            report    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_tool_reports_turn
+            ON turn_tool_reports(turn_id, report_id);",
     )?;
     Ok(())
 }

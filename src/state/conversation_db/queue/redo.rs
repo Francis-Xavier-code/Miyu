@@ -225,6 +225,20 @@ impl ConversationDb {
                 ))
             },
         )?;
+        // v25：报告分两处（老的在列里，新的在子表）。备份只收列的话，redo 失败
+        // 回退时子表那部分就永久没了——而那恰恰是本次回合刚产生的全部报告。
+        let tool_reports = {
+            let column: String = tool_reports;
+            let mut all: Vec<String> = serde_json::from_str(&column).unwrap_or_default();
+            let mut stmt = tx.prepare(
+                "SELECT report FROM turn_tool_reports WHERE turn_id = ?1 ORDER BY report_id ASC",
+            )?;
+            let child = stmt
+                .query_map(params![turn_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            all.extend(child);
+            serde_json::to_string(&all)?
+        };
         let followup = if input_kind == RedoInputKind::Followup {
             tx.query_row(
                 "SELECT content, display_content, context_content
@@ -472,6 +486,12 @@ impl ConversationDb {
             .map(|checkpoint| checkpoint.prefix_question_count)
             .unwrap_or(0);
         let now = Utc::now().to_rfc3339();
+        // 列被重置回 prefix 了，子表行也必须一起清——否则上一次尝试产生的报告
+        // 会活下来，读回来变成「prefix + 上一轮的全部报告」。
+        tx.execute(
+            "DELETE FROM turn_tool_reports WHERE turn_id = ?1",
+            params![turn_id],
+        )?;
         let affected = tx.execute(
             "UPDATE turns SET
                 assistant_content = ?1,

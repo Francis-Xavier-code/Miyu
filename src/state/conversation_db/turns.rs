@@ -144,31 +144,26 @@ impl ConversationDb {
         Ok(())
     }
 
+    /// 批量追加。见 [`Self::append_tool_report`]——同样一条读都不做。
     pub fn append_tool_reports(&self, turn_id: &str, reports: &[String]) -> Result<()> {
         if reports.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
-        let existing: String = conn.query_row(
-            "SELECT tool_reports FROM turns WHERE turn_id = ?1",
-            params![turn_id],
-            |row| row.get(0),
-        )?;
-        let mut all: Vec<String> = serde_json::from_str(&existing).unwrap_or_default();
-        all.extend(reports.iter().cloned());
-        conn.execute(
-            "UPDATE turns SET tool_reports = ?1 WHERE turn_id = ?2",
-            params![serde_json::to_string(&all)?, turn_id],
-        )?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO turn_tool_reports (turn_id, report) VALUES (?1, ?2)")?;
+            for report in reports {
+                stmt.execute(params![turn_id, report])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
     /// Stores the fossilized transient tail for a turn (v7 append-only).
-    pub fn set_turn_context_messages(
-        &self,
-        turn_id: &str,
-        messages: &[ChatMessage],
-    ) -> Result<()> {
+    pub fn set_turn_context_messages(&self, turn_id: &str, messages: &[ChatMessage]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE turns SET context_messages = ?1 WHERE turn_id = ?2",
@@ -410,9 +405,8 @@ impl ConversationDb {
     ) -> Result<ToolFootprint> {
         let conn = self.conn.lock().unwrap();
         let mut merged = ToolFootprint::default();
-        let mut stmt = conn.prepare(
-            "SELECT tool_footprint FROM turns WHERE session_id = ?1 AND turn_id = ?2",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT tool_footprint FROM turns WHERE session_id = ?1 AND turn_id = ?2")?;
         for turn_id in turn_ids {
             let value: Option<Option<String>> = stmt
                 .query_row(params![session_id, turn_id], |row| row.get(0))
@@ -440,24 +434,17 @@ impl ConversationDb {
         Ok(value.flatten())
     }
 
+    /// 追加一条工具报告（v25 起走 `turn_tool_reports` 子表）。
+    ///
+    /// 一次 INSERT，**没有读**。原来是「读整列 → 解析 → push → 整个序列化 →
+    /// 写回」，第 k 次追加要写回当前全部 k 条，总写入 O(N²)。
+    ///
+    /// 顺序由 `report_id` 自增保证，所以连 `MAX(seq)` 都不用查。
     pub fn append_tool_report(&self, turn_id: &str, report: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT tool_reports FROM turns WHERE turn_id = ?1",
-                params![turn_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let mut reports: Vec<String> = existing
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        reports.push(report.to_string());
-        let encoded = serde_json::to_string(&reports)?;
         conn.execute(
-            "UPDATE turns SET tool_reports = ?1 WHERE turn_id = ?2",
-            params![encoded, turn_id],
+            "INSERT INTO turn_tool_reports (turn_id, report) VALUES (?1, ?2)",
+            params![turn_id, report],
         )?;
         Ok(())
     }

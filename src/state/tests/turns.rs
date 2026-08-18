@@ -648,29 +648,78 @@ fn interrupted_turn_is_evictable_but_summary_and_running_turn_are_not() {
 
 /// 量尺：`cargo test --lib state::tests::turns::tool_report_write_amplification -- --ignored --nocapture`
 ///
-/// `append_tool_report` 每追加一条都要「读整列 → 解析 → push → 整个序列化 →
-/// 写回」。一个回合里 N 次工具调用，写回字节数是 O(N²)。
+/// 改前 `append_tool_report` 每追加一条都要「读整列 → 解析 → push → 整个序列化
+/// → 写回」：第 k 次写回的是当前全部 k 条，总写入 O(N²)。v25 之后是往
+/// `turn_tool_reports` 子表 INSERT 一行，**一次读都没有**。
+///
+/// 两种算法都在这里真跑一遍（不是套公式），量的是耗时和实际写出去的字节。
 #[test]
 #[ignore]
 fn tool_report_write_amplification() {
-    println!("\n  报告数  理论写入KB  实际写入KB   放大   耗时(ms)");
-    for count in [10usize, 20, 40, 80] {
-        let (_temp, store) = test_store();
-        store
-            .start_turn("probe", "hello", std::process::id())
+    use rusqlite::{params, Connection};
+
+    /// 改前：JSON 列的读-改-写。
+    fn append_by_rewriting(conn: &Connection, turn_id: &str, report: &str) -> usize {
+        let existing: String = conn
+            .query_row(
+                "SELECT tool_reports FROM t WHERE turn_id = ?1",
+                params![turn_id],
+                |row| row.get(0),
+            )
             .unwrap();
-        let report = "x".repeat(2 * 1024);
-        let start = std::time::Instant::now();
-        for _ in 0..count {
-            store.append_persisted_context("probe", &report).unwrap();
+        let mut reports: Vec<String> = serde_json::from_str(&existing).unwrap_or_default();
+        reports.push(report.to_string());
+        let encoded = serde_json::to_string(&reports).unwrap();
+        let written = encoded.len();
+        conn.execute(
+            "UPDATE t SET tool_reports = ?1 WHERE turn_id = ?2",
+            params![encoded, turn_id],
+        )
+        .unwrap();
+        written
+    }
+
+    /// 改后：子表 INSERT。
+    fn append_by_inserting(conn: &Connection, turn_id: &str, report: &str) -> usize {
+        conn.execute(
+            "INSERT INTO c (turn_id, report) VALUES (?1, ?2)",
+            params![turn_id, report],
+        )
+        .unwrap();
+        report.len()
+    }
+
+    println!("\n  报告数    改前 写入/耗时          改后 写入/耗时        放大比");
+    let report = "x".repeat(2 * 1024);
+    for count in [10usize, 20, 40, 80] {
+        let mut measured = Vec::new();
+        for rewriting in [true, false] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(turn_id TEXT PRIMARY KEY, tool_reports TEXT NOT NULL);
+                 CREATE TABLE c(report_id INTEGER PRIMARY KEY, turn_id TEXT NOT NULL,
+                                report TEXT NOT NULL);
+                 CREATE INDEX ix ON c(turn_id, report_id);
+                 INSERT INTO t VALUES('probe', '[]');",
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for _ in 0..count {
+                bytes += if rewriting {
+                    append_by_rewriting(&conn, "probe", &report)
+                } else {
+                    append_by_inserting(&conn, "probe", &report)
+                };
+            }
+            measured.push((bytes, started.elapsed().as_secs_f64() * 1000.0));
         }
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let ideal = count * 2;
-        // 第 k 次写回的是「当前全部 k 条」→ 总量 = 2KB × (1+2+…+N)
-        let actual = 2 * count * (count + 1) / 2;
+        let ((before_bytes, before_ms), (after_bytes, after_ms)) = (measured[0], measured[1]);
         println!(
-            "  {count:>6}  {ideal:>10}  {actual:>11}  {:>5.1}×  {ms:>9.1}",
-            actual as f64 / ideal as f64
+            "  {count:>6}  {:>8.0} KB {before_ms:>7.1} ms   {:>8.0} KB {after_ms:>7.2} ms  {:>6.1}×",
+            before_bytes as f64 / 1024.0,
+            after_bytes as f64 / 1024.0,
+            before_bytes as f64 / after_bytes as f64,
         );
     }
 }
@@ -737,4 +786,158 @@ fn prune_rereads_archived_turns() {
         println!("  {turns:>6}   {first_ms:>13.2}   {second_ms:>13.2}   {wasted_kb:>18}");
         let _ = (first, second);
     }
+}
+
+// ── v25：工具报告子表 ────────────────────────────────────────────
+
+/// 追加进去的顺序必须原样读回来。子表用 `report_id` 自增排序，写入端不查
+/// `MAX(seq)`——顺序全靠这个，所以得钉死。
+#[test]
+fn tool_reports_come_back_in_the_order_they_were_appended() {
+    let (_temp, store) = test_store();
+    store.start_turn("t1", "hello", std::process::id()).unwrap();
+    for index in 0..25 {
+        store
+            .append_persisted_context("t1", &format!("报告 {index}"))
+            .unwrap();
+    }
+    store.complete_turn("t1", "done", None).unwrap();
+
+    let turns = store.load_visible_turns().unwrap();
+    let turn = turns.iter().find(|turn| turn.turn_id == "t1").unwrap();
+    let expected: Vec<String> = (0..25).map(|index| format!("报告 {index}")).collect();
+    assert_eq!(turn.tool_reports, expected);
+}
+
+/// 批量追加跟单条追加混着来，顺序照样是调用顺序。
+#[test]
+fn batched_and_single_appends_keep_one_order() {
+    let (_temp, store) = test_store();
+    store.start_turn("t1", "hello", std::process::id()).unwrap();
+    store.append_persisted_context("t1", "a").unwrap();
+    store
+        .append_persisted_contexts("t1", &["b".to_string(), "c".to_string()])
+        .unwrap();
+    store.append_persisted_context("t1", "d").unwrap();
+    store.complete_turn("t1", "done", None).unwrap();
+
+    let turns = store.load_visible_turns().unwrap();
+    let turn = turns.iter().find(|turn| turn.turn_id == "t1").unwrap();
+    assert_eq!(turn.tool_reports, ["a", "b", "c", "d"]);
+}
+
+/// 跨升级的回合：老报告在 JSON 列里，新报告在子表里，读回来必须**先列后子表**
+/// ——那正是它们真实发生的顺序。v25 不回填不删列，所以这种回合确实存在。
+#[test]
+fn legacy_column_reports_come_before_child_table_ones() {
+    let (temp, store) = test_store();
+    store.start_turn("t1", "hello", std::process::id()).unwrap();
+    // 直接写列，模拟 v25 之前写下的报告
+    {
+        let conn = rusqlite::Connection::open(temp.path().join("state/conversation.db")).unwrap();
+        conn.execute(
+            "UPDATE turns SET tool_reports = ?1 WHERE turn_id = 't1'",
+            rusqlite::params![r#"["老报告1","老报告2"]"#],
+        )
+        .unwrap();
+    }
+    store.append_persisted_context("t1", "新报告").unwrap();
+    store.complete_turn("t1", "done", None).unwrap();
+
+    let turns = store.load_visible_turns().unwrap();
+    let turn = turns.iter().find(|turn| turn.turn_id == "t1").unwrap();
+    assert_eq!(turn.tool_reports, ["老报告1", "老报告2", "新报告"]);
+}
+
+/// 删回合要连带删掉子表行，不能留孤儿。靠 `ON DELETE CASCADE` + 打开时的
+/// `PRAGMA foreign_keys = ON`。
+#[test]
+fn deleting_a_turn_takes_its_reports_with_it() {
+    let (temp, store) = test_store();
+    store.start_turn("t1", "hello", std::process::id()).unwrap();
+    store
+        .append_persisted_context("t1", "会被一起删掉")
+        .unwrap();
+    store.complete_turn("t1", "done", None).unwrap();
+
+    let db = temp.path().join("state/conversation.db");
+    let count = |path: &std::path::Path| -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM turn_tool_reports", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count(&db), 1);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("DELETE FROM turns WHERE turn_id = 't1'", [])
+            .unwrap();
+    }
+    assert_eq!(count(&db), 0, "回合删了但报告还留着");
+}
+
+/// 裁剪必须把**两处**的报告一起折叠，归档里也得两处都有。
+///
+/// 这是 v25 最容易出错的地方：只看 JSON 列的话，子表里那些报告一条都发现不了
+/// ——裁剪报告「省了 0 字节」，而上下文该多大还多大。反过来只删列不删子表行，
+/// 读回来就是「占位符 + 原文全接在后面」，等于白折叠。
+#[test]
+fn pruning_folds_both_the_column_and_the_child_table() {
+    let (temp, store) = test_store();
+    let db = temp.path().join("state/conversation.db");
+    let old_report = "老".repeat(2048);
+    let new_report = "新".repeat(2048);
+
+    for id in ["t1", "t2", "t3", "t4"] {
+        store.start_turn(id, id, 999_999).unwrap();
+        // 一半写进 JSON 列（模拟 v25 之前），一半走子表
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE turns SET tool_reports = ?1 WHERE turn_id = ?2",
+                rusqlite::params![serde_json::to_string(&vec![&old_report]).unwrap(), id],
+            )
+            .unwrap();
+        }
+        store.append_persisted_context(id, &new_report).unwrap();
+        store.complete_turn(id, "reply", None).unwrap();
+    }
+
+    let before = store.load_visible_turns().unwrap();
+    assert_eq!(
+        before[0].tool_reports,
+        [old_report.clone(), new_report.clone()]
+    );
+
+    let stats = store.prune_stale_tool_reports(2, 1024).unwrap();
+    assert_eq!(stats.turns, 2, "最老的两个回合该被折叠");
+
+    let after = store.load_visible_turns().unwrap();
+    // 折叠后只剩占位符——子表行必须已经删掉，否则原文会接在后面
+    assert_eq!(after[0].tool_reports.len(), 1, "子表行没删干净");
+    assert!(after[0].tool_reports[0].contains("已折叠"));
+    assert!(
+        after[0].tool_reports[0].contains('2'),
+        "占位符该说折了 2 条"
+    );
+    // 受保护的两个原样不动
+    assert_eq!(
+        after[2].tool_reports,
+        [old_report.clone(), new_report.clone()]
+    );
+
+    // 归档里两处都得在，不能凭空丢数据
+    let archive: String = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row(
+            "SELECT tool_reports_archive FROM turns WHERE turn_id = 't1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let archived: Vec<String> = serde_json::from_str(&archive).unwrap();
+    assert_eq!(archived, [old_report, new_report], "归档漏了子表那部分");
 }

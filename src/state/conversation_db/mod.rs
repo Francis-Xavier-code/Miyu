@@ -555,6 +555,12 @@ fn restore_redo_backup_locked(tx: &Transaction<'_>, turn_id: &str, revision: i64
          FROM turn_redo_artifact_backups WHERE turn_id = ?1",
         params![turn_id],
     )?;
+    // 备份里的 tool_reports 已经是「列 + 子表」合并后的全部（见 redo.rs 的
+    // 备份构造），还原时整份写回列，所以子表必须清空，不能两边都留。
+    tx.execute(
+        "DELETE FROM turn_tool_reports WHERE turn_id = ?1",
+        params![turn_id],
+    )?;
     tx.execute(
         "DELETE FROM session_loaded_items WHERE session_id = ?1",
         params![session_id],
