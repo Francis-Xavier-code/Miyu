@@ -588,18 +588,15 @@ impl<'a> ProviderBrowser<'a> {
             .saturating_sub(mid_w)
             .saturating_sub(2)
             .max(18);
+        // 不再给 active_provider 打星号。这个菜单只回答「有哪些供应商、各自有
+        // 哪些模型可用」;「现在用谁」由「配置文本模型」那个池子决定。星号标的
+        // 是 `active_provider`——它现在只是 `provider(None)` 的兜底,在这里显示
+        // 会让人以为在这一列按一下就能换模型。
         let providers = self
             .config
             .providers
             .iter()
-            .map(|provider| {
-                let active = if provider.id == self.config.active_provider {
-                    "* "
-                } else {
-                    "  "
-                };
-                format!("{active}{}", provider.display_name)
-            })
+            .map(|provider| format!("  {}", provider.display_name))
             .collect::<Vec<_>>();
         let models = self
             .models

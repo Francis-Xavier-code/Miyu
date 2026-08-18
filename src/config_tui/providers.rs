@@ -603,10 +603,9 @@ pub(in crate::config_tui) fn edit_provider_form(
             provider.api_key.clone().unwrap_or_default(),
         )
         .sensitive(),
-        Field::new(
-            t("Current model", "当前模型"),
-            provider.default_model.clone(),
-        ),
+        // 「当前模型」不在这张表里。这张表只管「这个供应商怎么连」——地址、
+        // 协议、密钥、超时;「用哪个模型」是模型菜单的事(模型列的 [*] 勾选与
+        // 「配置文本模型」的池子)。两处都能改一个值,用户改完哪边生效说不清。
         Field::new(
             t("Timeout (seconds)", "超时秒数"),
             provider.timeout_seconds.to_string(),
@@ -624,11 +623,10 @@ pub(in crate::config_tui) fn edit_provider_form(
         }
 
         // 温度与上下文窗口都是按模型的事,归模型菜单管;供应商表单
-        // 不再放这两项(验收:曾牵连全部模型)。
-        let default_model = fields[5].value.trim().to_string();
-        let timeout = fields[6].value.trim().parse().unwrap_or(60);
+        // 不再放这两项(验收:曾牵连全部模型)。当前模型同理,已移走。
+        let timeout = fields[5].value.trim().parse().unwrap_or(60);
 
-        let extra_body = match parse_extra_body(&fields[7].value) {
+        let extra_body = match parse_extra_body(&fields[6].value) {
             Ok(extra_body) => extra_body,
             Err(error) => {
                 message(stdout, &error)?;
@@ -636,11 +634,10 @@ pub(in crate::config_tui) fn edit_provider_form(
             }
         };
 
-        let mut models = provider.models.clone();
-        if !default_model.trim().is_empty() && !models.iter().any(|item| item == &default_model) {
-            models.push(default_model.clone());
-        }
-
+        // models 原样带过去。以前这里有一段「把表单里填的模型补进 models」——
+        // 表单不再收模型,它就只剩「保存时顺手改一下模型列表」这个与用户操作
+        // 无关的副作用了。真要修 default_model ∉ models,那是
+        // `prune_model_references` 的活。
         // 所有验证通过，返回新的 ProviderConfig
         return Ok(Some(ProviderConfig {
             id: fields[0].value.trim().to_string(),
@@ -648,12 +645,12 @@ pub(in crate::config_tui) fn edit_provider_form(
             base_url: normalize_base_url(&fields[2].value),
             protocol: fields[3].value.trim().to_string(),
             api_key: Some(fields[4].value.trim().to_string()).filter(|value| !value.is_empty()),
-            models,
+            models: provider.models.clone(),
             model_context_window: provider.model_context_window.clone(),
             model_temperature: provider.model_temperature.clone(),
             model_modalities: provider.model_modalities.clone(),
             model_costs: provider.model_costs.clone(),
-            default_model,
+            default_model: provider.default_model.clone(),
             timeout_seconds: timeout,
             temperature: provider.temperature,
             anthropic_max_tokens: provider.anthropic_max_tokens,
