@@ -52,16 +52,19 @@ fn register_with_resolver(
     resolver: ReferenceResolver,
 ) {
     let resolver = Arc::new(resolver);
-    registry.register(ToolSpec::new_with_progress(
-        "generate_image",
-        DESCRIPTION,
-        parameters(),
-        move |args, progress| {
-            let config = config.clone();
-            let resolver = resolver.clone();
-            async move { generate_image(args, config, resolver, progress).await }
-        },
-    ).writes());
+    registry.register(
+        ToolSpec::new_with_progress(
+            "generate_image",
+            DESCRIPTION,
+            parameters(),
+            move |args, progress| {
+                let config = config.clone();
+                let resolver = resolver.clone();
+                async move { generate_image(args, config, resolver, progress).await }
+            },
+        )
+        .writes(),
+    );
 }
 
 async fn generate_image(
@@ -281,6 +284,15 @@ async fn request_image(
     extract_image(&client, data).await
 }
 
+/// 下载「生成好的图」的字节上限。
+///
+/// 这条路是**跟着第三方返回的 URL 走**的：API 说图在哪就去哪拿，长度完全由
+/// 对面说了算。原先是 `bytes().await?.to_vec()`，一个字节的上限都没有。
+///
+/// 32 MiB 的依据：本工具能请求到的最大分辨率是 2048×2048（见 `resolution`
+/// 那张表），这个尺寸的 PNG 常见在 3-8 MB，32 MiB 是 4 倍以上余量。
+const MAX_GENERATED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
 fn payload(
     plugin: &ImageGenerationPluginConfig,
     prompt: &str,
@@ -336,7 +348,9 @@ async fn extract_image(client: &Client, response: Value) -> Result<Vec<u8>> {
         if !status.is_success() {
             bail!("failed to download generated image ({status})")
         }
-        return Ok(response.bytes().await?.to_vec());
+        return crate::tools::http_response::read_bytes(response, MAX_GENERATED_IMAGE_BYTES)
+            .await
+            .context("generated image is too large");
     }
     bail!("image response contains neither b64_json nor url")
 }

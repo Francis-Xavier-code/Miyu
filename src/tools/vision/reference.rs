@@ -128,10 +128,12 @@ pub(crate) async fn download_reference_image(url: &str) -> Result<ReferenceImage
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
         .filter(|value| value.starts_with("image/"))
         .unwrap_or_else(|| "image/png".to_string());
-    let data = response.bytes().await?.to_vec();
-    if data.len() > MAX_IMAGE_BYTES {
-        bail!("reference image too large: {} bytes", data.len())
-    }
+    // 边读边卡上限，而不是「整读进内存再看 len()」——后者对一个声称自己有
+    // 2 GB 的响应会先老老实实缓冲完 2 GB 才判超限，护栏形同虚设。上面本地
+    // 文件那条路一直是对的（先 `metadata.len()` 再读），HTTP 这条补齐。
+    let data = crate::tools::http_response::read_bytes(response, MAX_IMAGE_BYTES)
+        .await
+        .context("reference image too large")?;
     Ok((data, mime))
 }
 
@@ -255,4 +257,70 @@ pub(crate) async fn resolve_context_image(
 pub(crate) fn image_data_url(mime: &str, data: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     format!("data:{mime};base64,{encoded}")
+}
+
+#[cfg(test)]
+mod download_limit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 一个只会往外倒数据、永远不停的「图片」服务器。
+    ///
+    /// 不发 `Content-Length`——正是这种不声明长度的响应最能说明问题：靠读完
+    /// 再看 `len()` 的写法在这里没有任何刹车点。返回它实际吐出去了多少字节。
+    async fn serve_endless_image(cap: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = sent.clone();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 1024];
+            let _ = socket.read(&mut scratch).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n")
+                .await;
+            let block = vec![0u8; 64 * 1024];
+            while counter.load(Ordering::Relaxed) < cap {
+                if socket.write_all(&block).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(block.len(), Ordering::Relaxed);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/endless.png"), sent)
+    }
+
+    /// 上限要在**读的过程中**生效。服务器最多准备吐 64 MiB（上限的 6.4 倍），
+    /// 我们要在远早于此处就断开。
+    #[tokio::test]
+    async fn download_stops_before_buffering_everything() {
+        let cap = 64 * 1024 * 1024;
+        let (url, sent) = serve_endless_image(cap).await;
+        let result = download_reference_image(&url).await;
+        assert!(result.is_err(), "无限流不该成功返回");
+
+        let pushed = sent.load(Ordering::Relaxed);
+        println!(
+            "  上限 {} MiB：服务器准备吐 {} MiB，实际推出 {:.1} MiB 就被切断",
+            MAX_IMAGE_BYTES / 1048576,
+            cap / 1048576,
+            pushed as f64 / 1048576.0
+        );
+        assert!(
+            pushed < cap,
+            "服务器把准备的 {cap} 字节全吐完了，说明没有中途刹车"
+        );
+        // 留一倍余量给 TCP 缓冲和分块边界：卡在 10 MiB 上限的读取端，
+        // 不该让对面推出去 20 MiB 以上。
+        assert!(
+            pushed <= MAX_IMAGE_BYTES * 2,
+            "服务器吐了 {pushed} 字节，远超上限 {MAX_IMAGE_BYTES} 的合理范围"
+        );
+    }
 }
