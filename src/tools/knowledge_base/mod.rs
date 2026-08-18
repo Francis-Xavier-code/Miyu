@@ -3,6 +3,7 @@ mod store;
 pub(crate) use search::embed_text;
 mod files;
 mod index;
+#[cfg(test)]
 use index::keyword_search_blocking;
 
 use search::*;
