@@ -162,6 +162,7 @@
     "run.failed",
     "conversation.reset",
     "conversation.pop",
+    "conversation.compacted",
     "session.created",
     "session.renamed",
     "session.deleted",
@@ -274,6 +275,7 @@
     promptGrid: document.getElementById("promptGrid"),
     jumpBottomButton: document.getElementById("jumpBottomButton"),
     composerDock: document.getElementById("composerDock"),
+    composerRunIndicator: document.getElementById("composerRunIndicator"),
     jobsStrip: document.getElementById("jobsStrip"),
     liveStopRail: document.getElementById("liveStopRail"),
     questionDock: document.getElementById("questionDock"),
@@ -347,6 +349,10 @@
     viewLoadGeneration: 0,
     viewSyncTimer: null,
     runsBySession: new Map(),
+    // 跑完了、但用户还没切进去看过的会话。
+    // 「完成」不是能持续的状态（否则每个会话都会永远挂着「已完成」），
+    // 「未读」才是——产生于回合结束，消失于用户切进那个会话。
+    unreadSessions: new Set(),
     liveRuns: new Map(),
     sessionMenuFor: null,
     sessionRenaming: null,
@@ -395,6 +401,14 @@
     artifactMaximized: false,
     artifactWidthRatio: 0.5,
     artifactSourceCache: new Map(),
+    // artifact 列表有两个来源：回合产出的 `turn.artifacts`（每次同步重建），
+    // 和用户手动送进来的（气泡上点「在预览工作区打开」）。后者不在任何回合的
+    // artifacts 里，光靠重建会在下一个回合到达时被整体覆盖掉——图片刚打开就
+    // 没了。所以手动那批单独留一份，同步时并进去。
+    pinnedArtifacts: new Map(),
+    // 用户删掉的那些。回合产出的 artifact 每次同步都会从库里重新长出来，
+    // 不记下来就删不掉。
+    dismissedArtifactIds: new Set(),
     colorScheme: null,
     matugenAvailable: null,
     reasoningExpanded: false,
@@ -3238,7 +3252,9 @@
     // 菜单只留「清空对话」;其余会话不再提供「设为默认」。
     const actions = [];
     if (!isDefault) actions.push({ label: "重命名", handler: () => beginSessionRename(id) });
-    if (isDefault) actions.push({ label: "清空对话", handler: requestClearConversation });
+    // 清空对本来只给默认会话（它不能改名/删除，拿这个顶位），可普通会话一样
+    // 需要「留着会话、只丢历史」——删掉重建会连模型/工作目录覆盖一起丢。
+    actions.push({ label: "清空对话", handler: requestClearConversation });
     if (!isDefault) actions.push({ label: "删除", danger: true, handler: () => deleteSession(id) });
     for (const action of actions) {
       const button = document.createElement("button");
@@ -3254,6 +3270,13 @@
       menu.appendChild(button);
     }
     return menu;
+  }
+
+  // 终端集成会话（固定 id "default"）不在侧栏列出：它是 shellhook 那条车道，
+  // 由终端驱动，在 WebUI 的会话列表里既不该被误点进去、更不该被误删。真要看
+  // 它的历史，用 REPL 的 /session 切过去。
+  function isTerminalSession(sessionId) {
+    return String(sessionId || "") === "default";
   }
 
   function buildSessionItem(session) {
@@ -3336,10 +3359,18 @@
     const trailing = document.createElement("span");
     trailing.className = "session-trailing";
 
+    // 两个状态语义不同，形式也要不同：动效表「正在发生」，静态绿点表
+    // 「有你没看过的新内容」。共用一个点的话，跑完瞬间点消失，用户完全
+    // 不知道那边已经出结果了。
     if (sessionHasRuns(id)) {
+      const spinner = document.createElement("span");
+      spinner.className = "session-run-spinner";
+      spinner.title = "有回复正在运行";
+      trailing.appendChild(spinner);
+    } else if (state.unreadSessions.has(id)) {
       const dot = document.createElement("span");
-      dot.className = "session-run-dot";
-      dot.title = "有回复正在运行";
+      dot.className = "session-unread-dot";
+      dot.title = "有未读的新回复";
       trailing.appendChild(dot);
     }
 
@@ -3404,13 +3435,15 @@
       elements.sessionItems.appendChild(buildFallbackSessionItem());
       return;
     }
-    // 侧栏三段:终端集成会话置顶,其余按会话模式分组(创建时定死)。
-    const terminal = state.sessions.filter((session) => String(session?.session_id) === "default");
+    // 侧栏按会话模式分组(创建时定死)。终端集成会话不列出——它是 shellhook
+    // 那条车道,由终端驱动,WebUI 里既不该被误点进去也不该被误删;要看它的
+    // 历史用 REPL 的 /session 切过去。
     const normal = state.sessions.filter(
-      (session) => String(session?.session_id) !== "default" && session?.mode !== "dev"
+      (session) => !isTerminalSession(session?.session_id) && session?.mode !== "dev"
     );
-    const dev = state.sessions.filter((session) => session?.mode === "dev");
-    for (const session of terminal) elements.sessionItems.appendChild(buildSessionItem(session));
+    const dev = state.sessions.filter(
+      (session) => !isTerminalSession(session?.session_id) && session?.mode === "dev"
+    );
     if (normal.length) {
       elements.sessionItems.appendChild(buildSessionGroupHeader("普通模式"));
       for (const session of normal) elements.sessionItems.appendChild(buildSessionItem(session));
@@ -3481,6 +3514,9 @@
 
   async function loadSessionView(sessionId, { quiet = false, userInitiated = false } = {}) {
     if (!sessionId || (quiet && sessionId !== state.viewSessionId) || (state.viewLoading && !userInitiated)) return;
+    // 命令回执是会话内的临时记录，换会话就清掉——否则会串到别的会话里。
+    if (sessionId !== state.viewSessionId) window.MiyuCommands?.clearNotices();
+    if (state.unreadSessions.delete(sessionId)) renderSessionList();
     const generation = ++state.viewLoadGeneration;
     state.viewLoading = true;
     try {
@@ -3991,6 +4027,7 @@
   }
 
   function updateControlState() {
+    syncRunIndicator();
     const running = conversationRunning();
     const busy = state.adminBusy || state.submitting;
     const locked = state.blocked || state.adminBusy || state.modeChooserOpen;
@@ -4976,6 +5013,8 @@
   function registerArtifact(source, { autoOpen = false } = {}) {
     const artifact = normalizeArtifact(source, source?.kind || "file");
     if (!artifact) return;
+    state.pinnedArtifacts.set(artifact.id, artifact);
+    state.dismissedArtifactIds.delete(artifact.id);
     const index = state.artifacts.findIndex((item) => item.id === artifact.id);
     if (index >= 0) state.artifacts[index] = artifact;
     else state.artifacts.push(artifact);
@@ -4992,14 +5031,24 @@
   }
 
   function syncArtifactsFromTurns(turns) {
-    const artifacts = [];
+    let artifacts = [];
     for (const turn of turns) {
-      for (const source of [...(Array.isArray(turn?.assets) ? turn.assets : []), ...(Array.isArray(turn?.artifacts) ? turn.artifacts : [])]) {
+      // 只收真正的 artifact。`turn.assets` 是对话里内联显示的图片（打印/生成
+      // 的图），它们已经在气泡里画出来了，再塞进 artifact 面板等于同一张图占
+      // 两个位置，还会把面板自动切到图片上、盖住用户正在看的东西。
+      // 要把图当 artifact 展示，走 present_artifact/create_artifact —— 那条
+      // 路产出的就是 turn.artifacts。
+      for (const source of Array.isArray(turn?.artifacts) ? turn.artifacts : []) {
         const artifact = normalizeArtifact(source, "file");
         if (artifact && !artifacts.some((item) => item.id === artifact.id)) artifacts.push(artifact);
       }
     }
-    state.artifacts = artifacts;
+    // 手动送进来的补在后面：它们不属于任何回合，只活在这份 state 里。
+    for (const artifact of state.pinnedArtifacts.values()) {
+      if (!artifacts.some((item) => item.id === artifact.id)) artifacts.push(artifact);
+    }
+    state.artifacts = artifacts.filter((item) => !state.dismissedArtifactIds.has(item.id));
+    artifacts = state.artifacts;
     if (!artifacts.some((item) => item.id === state.selectedArtifactId)) {
       state.selectedArtifactId = artifacts.at(-1)?.id || null;
       state.artifactMode = defaultArtifactMode(artifacts.at(-1));
@@ -5035,17 +5084,6 @@
     if (artifact?.kind === "pdf") return "PDF";
     if (artifact?.kind === "image") return String(artifact.mime || "IMAGE").split("/").pop().toUpperCase();
     return "FILE";
-  }
-
-  function artifactIconButton(icon, label, handler) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "icon-button";
-    button.title = label;
-    button.setAttribute("aria-label", label);
-    button.appendChild(makeIconSlot(icon));
-    button.addEventListener("click", handler);
-    return button;
   }
 
   function renderArtifactImage(artifact) {
@@ -5191,6 +5229,8 @@
   function renderArtifactResourceMenu(artifact) {
     elements.artifactResourceMenu.replaceChildren();
     for (const item of state.artifacts) {
+      const row = document.createElement("div");
+      row.className = "artifact-resource-row";
       const button = document.createElement("button");
       button.type = "button";
       button.role = "menuitem";
@@ -5210,9 +5250,46 @@
         closeArtifactResourceMenu();
         renderArtifactWorkspace();
       });
-      elements.artifactResourceMenu.appendChild(button);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon-button artifact-resource-remove";
+      remove.title = "从列表移除";
+      remove.setAttribute("aria-label", `从列表移除 ${item.name}`);
+      remove.appendChild(makeIconSlot("x"));
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        dismissArtifact(item.id);
+      });
+      row.append(button, remove);
+      elements.artifactResourceMenu.appendChild(row);
     }
     elements.artifactTitleButton.disabled = state.artifacts.length <= 1;
+  }
+
+  /// 从列表里拿掉一个 artifact。回合产出的那些下次同步会重新长出来，所以
+  /// 得把 id 记进 dismissed 才删得掉。
+  function dismissArtifact(id) {
+    state.dismissedArtifactIds.add(id);
+    state.pinnedArtifacts.delete(id);
+    state.artifactSourceCache.delete(id);
+    state.artifacts = state.artifacts.filter((item) => item.id !== id);
+    if (state.selectedArtifactId === id) {
+      const next = state.artifacts.at(-1);
+      state.selectedArtifactId = next?.id || null;
+      state.artifactMode = defaultArtifactMode(next);
+      state.artifactZoom = 1;
+      state.artifactPanX = 0;
+      state.artifactPanY = 0;
+    }
+    if (!state.artifacts.length) {
+      closeArtifactResourceMenu();
+      setArtifactWorkspaceOpen(false);
+      elements.artifactToggleButton.hidden = true;
+      elements.artifactToggleButton.classList.remove("has-new-artifact");
+      return;
+    }
+    renderArtifactWorkspace();
+    renderArtifactResourceMenu(state.artifacts.find((item) => item.id === state.selectedArtifactId));
   }
 
   function renderArtifactWorkspace() {
@@ -5311,18 +5388,6 @@
     return Number.isInteger(number) && number > 0 && number <= 100_000 ? number : null;
   }
 
-  function createAssetAction(iconName, label, href, download = false) {
-    const link = document.createElement("a");
-    link.href = href;
-    link.title = label;
-    link.setAttribute("aria-label", label);
-    link.rel = "noopener noreferrer";
-    if (download) link.setAttribute("download", "");
-    else link.target = "_blank";
-    link.appendChild(makeIconSlot(iconName));
-    return link;
-  }
-
   function createConversationMedia(asset, { eager = false } = {}) {
     const source = asset && typeof asset === "object" ? asset : {};
     const url = safeAssetUrl(source.url);
@@ -5331,7 +5396,6 @@
     const width = validAssetDimension(source.width);
     const height = validAssetDimension(source.height);
     const alt = String(source.alt || "").trim() || "Miyu 生成的图片";
-    const hideCaption = Boolean(source.hide_caption);
 
     const figure = document.createElement("figure");
     figure.className = "conversation-media";
@@ -5373,31 +5437,33 @@
       visual.appendChild(fallback);
     }
 
-    const caption = document.createElement("figcaption");
-    caption.className = "conversation-media-caption";
-    if (!hideCaption) {
-      const captionText = document.createElement("span");
-      captionText.textContent = alt;
-      captionText.title = alt;
-      caption.appendChild(captionText);
-    } else {
-      caption.classList.add("is-actions-only");
-    }
-    if (url) {
-      const actions = document.createElement("span");
-      actions.className = "conversation-media-actions";
-      actions.append(
-        artifactIconButton("panel-right", "在预览工作区打开", () => {
-          registerArtifact({ ...source, url, name: alt, kind: "image" });
-          setArtifactWorkspaceOpen(true);
-        }),
-        createAssetAction("external-link", "在新窗口打开图片", url),
-        createAssetAction("download", "下载图片", url, true)
-      );
-      caption.appendChild(actions);
+    // 图下面既不挂文件名也不挂按钮——每张图多占一行、还把气泡撑得很吵。
+    // 名字(表情包是描述)和那三个按钮都跟着灯箱走(web/lightbox.js)。
+    // `alt` 仍然写在 img 上,读屏和图裂时靠它。
+    if (url && imageMime) {
+      visual.classList.add("is-zoomable");
+      visual.tabIndex = 0;
+      visual.setAttribute("role", "button");
+      visual.setAttribute("aria-label", `放大预览 ${alt}`);
+      const openLightbox = () => {
+        window.MiyuLightbox?.open({
+          url,
+          name: alt,
+          onOpenInWorkspace: () => {
+            registerArtifact({ ...source, url, name: alt, kind: "image" });
+            setArtifactWorkspaceOpen(true);
+          },
+        });
+      };
+      visual.addEventListener("click", openLightbox);
+      visual.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openLightbox();
+        }
+      });
     }
     figure.appendChild(visual);
-    if (caption.childElementCount) figure.appendChild(caption);
     return figure;
   }
 
@@ -5491,6 +5557,9 @@
     content = "",
     reasoning = "",
     reasoningTitle = "已思考",
+    // 工具轮次（持久化回合用）。实时那份由事件流按到达顺序往 blocks 里插，
+    // 推理、正文、工具卡是交错的；这里从 turn.tool_flow 重建同样的顺序。
+    toolRounds = [],
     assets = [],
     timestamp = null,
     tokenTotal = 0,
@@ -5528,6 +5597,29 @@
     assistantContent.className = "assistant-content";
     const blocks = document.createElement("div");
     blocks.className = "assistant-blocks";
+    // 逐轮重建:每一轮是「思考 → 正文 → 这轮调的工具」,轮次之间按顺序排,
+    // 最后才是本回合的最终思考与回答。把所有工具堆到最前面是错的——那样
+    // 一个十轮的回合会先甩出二十个工具卡,中间说了什么全看不见了。
+    //
+    // 卡片必须挂在 blocks 里:样式表是 `.assistant-blocks > .tool-card`,
+    // 挂在外面选择器不命中,会退化成一行裸文本。
+    for (const round of Array.isArray(toolRounds) ? toolRounds : []) {
+      const roundReasoning = String(round?.assistant_reasoning || "");
+      if (roundReasoning.trim() && !reasoningHidden()) {
+        const parsed = splitReasoningText(roundReasoning);
+        blocks.appendChild(createReasoningBlock(parsed.body, "已思考", false).element);
+      }
+      const roundContent = String(round?.assistant_content || "");
+      if (roundContent.trim()) {
+        const markdown = document.createElement("div");
+        markdown.className = "markdown-body";
+        renderMarkdown(markdown, roundContent);
+        blocks.appendChild(markdown);
+      }
+      for (const call of Array.isArray(round?.calls) ? round.calls : []) {
+        blocks.appendChild(createPersistedToolCard(call));
+      }
+    }
     if (String(reasoning || "").trim() && !reasoningHidden()) {
       const parsed = splitReasoningText(reasoning);
       blocks.appendChild(createReasoningBlock(parsed.body, "已思考", false).element);
@@ -5721,6 +5813,13 @@
     let leftoverSegment;
     while ((leftoverSegment = takeStash("segment"))) elements.timeline.appendChild(leftoverSegment);
 
+    // 这一轮调过的工具。`stash` 存在说明刚在本端实时渲染过，实时卡片还在
+    // 原位，不要再画一遍。卡片要交给助手消息放进它的 `assistant-blocks`
+    // 里——挂在外面样式选择器不命中，会退化成一行裸文本。
+    const persistedToolRounds = stash
+      ? []
+      : (Array.isArray(turn?.tool_flow) ? turn.tool_flow : []);
+
     const assistantContent = String(turn?.assistant_content || "");
     const assistantReasoning = String(turn?.assistant_reasoning || "");
     const assets = turn?.status === "running" ? [] : (Array.isArray(turn?.assets) ? turn.assets : []);
@@ -5730,10 +5829,16 @@
       stashedFinal.dataset.segmentKind = "final";
       setAssistantRedoAction(stashedFinal, candidate);
       elements.timeline.appendChild(stashedFinal);
-    } else if (assistantContent.trim() || assistantReasoning.trim() || assets.length) {
+    } else if (
+      assistantContent.trim()
+      || assistantReasoning.trim()
+      || assets.length
+      || persistedToolRounds.length
+    ) {
       elements.timeline.appendChild(createAssistantMessage({
         content: assistantContent,
         reasoning: assistantReasoning,
+        toolRounds: persistedToolRounds,
         providerId: turn?.provider_id,
         model: turn?.model,
         assets,
@@ -5788,6 +5893,8 @@
         renderPersistedTurn(turn);
       }
     }
+    // 命令回执不是回合，不在 state.turns 里；timeline 每次重建都要补回来。
+    window.MiyuCommands?.renderNotices(elements.timeline);
     state.nearBottom = true;
     state.followOutput = true;
     elements.jumpBottomButton.hidden = true;
@@ -5989,51 +6096,58 @@
     return indicator;
   }
 
-  /* 发送后、第一个内容 part 到达前:气泡内三点弹跳等待动画 */
+  /* 运行指示器挪到了输入框那一排（`composerRunIndicator`）：气泡内那份只在
+     「第一个块到达前」出现（`childElementCount > 0` 就直接 return），推理块或
+     工具卡一出来就没了——而那两个阶段恰恰是最需要「它还在动」的时候。
+     现在由回合状态统一驱动，见 `syncRunIndicator`。 */
   function showTypingIndicator(live) {
-    if (!live || live.ended || live.typing) return;
+    if (!live || live.ended) return;
     ensureLiveArticle(live);
-    if (live.blocks.childElementCount > 0) return;
+    syncRunIndicator();
+    // 气泡里这份只管「还没开口」这一段:等待期给个落点,不然气泡是空的。
+    // 整个回合期间的指示由输入框那排负责(推理、工具阶段它也在转)。
+    if (live.typing || live.blocks.childElementCount > 0) return;
     const indicator = createTypingIndicator();
     live.blocks.appendChild(indicator);
     live.typing = indicator;
     contentAdded();
   }
 
+  // 只要这个视图里有回合在跑就转，与是正文、推理还是工具无关。
+  function syncRunIndicator() {
+    const indicator = elements.composerRunIndicator;
+    if (!indicator) return;
+    indicator.hidden = !conversationRunning();
+  }
+
+  // 三点已挪到输入框那排，这里只保留 `is-streaming` 状态位（正文流式时的
+  // 样式还靠它），不再往气泡里塞节点、也不再做那段位移补间。
   function promoteTypingIndicator(live) {
     if (!live || live.ended) return;
     ensureLiveArticle(live);
-    let indicator = live.typing;
-    if (indicator?.classList.contains("is-streaming")) return;
-    const start = indicator?.getBoundingClientRect() || null;
-    if (!indicator) {
-      indicator = createTypingIndicator();
-      live.typing = indicator;
+    // 开口了就撤掉气泡里那份等待动画,它的语义只有「还没开口」。
+    if (live.typing) {
+      live.typing.remove();
+      live.typing = null;
     }
-    live.streamRail.hidden = false;
-    live.streamRail.appendChild(indicator);
-    indicator.classList.add("is-streaming");
     live.article.classList.add("is-streaming");
-    if (start && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      const finish = indicator.getBoundingClientRect();
-      live.typingAnimation?.cancel();
-      live.typingAnimation = indicator.animate([
-        { transform: `translate(${visualPixelsToLayout(start.left - finish.left)}px, ${visualPixelsToLayout(start.top - finish.top)}px)` },
-        { transform: "translate(0, 0)" }
-      ], { duration: 260, easing: "cubic-bezier(0.2, 0, 0, 1)" });
-    }
-    contentAdded();
+    syncRunIndicator();
   }
 
   function clearTypingIndicator(live, { waitingOnly = false } = {}) {
-    if (!live?.typing) return;
-    if (waitingOnly && live.typing.classList.contains("is-streaming")) return;
-    live.typingAnimation?.cancel();
-    live.typingAnimation = null;
-    live.typing.remove();
-    live.typing = null;
+    if (!live) return;
+    // 气泡里那份是「还没开口」的占位，有任何内容落进来就撤。
+    if (live.typing) {
+      live.typing.remove();
+      live.typing = null;
+    }
+    if (waitingOnly) {
+      syncRunIndicator();
+      return;
+    }
     if (live.streamRail) live.streamRail.hidden = true;
     live.article?.classList.remove("is-streaming");
+    syncRunIndicator();
   }
 
   /* 完成态保时序:live 渲染出的 article 按 turn 存档,重渲染时原样复用 */
@@ -6462,6 +6576,86 @@
     return `[较早输出已省略]\n${combined.slice(combined.length - MAX_TOOL_OUTPUT_CHARS)}`;
   }
 
+  // 持久化回合里的工具卡片（只读）。
+  //
+  // 不复用 `createTool`：那个和实时流状态强耦合（往 live.tools 注册、跟踪
+  // 分块输出、进度更新），拿持久化数据去喂它要伪造一个 live 对象，很脆。
+  // 这里只画「调了什么、给了什么参数、返回了什么」，CSS 类沿用同一套，
+  // 所以看起来和实时那份一致。
+  //
+  // 数据来自 `turn.tool_flow`，库里一直有——以前 API 不发，于是 WebUI 的
+  // 工具信息只在事件流里活过一次，切走再回来就没了。
+  function createPersistedToolCard(call) {
+    const card = document.createElement("section");
+    card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
+    const name = String(call?.name || "");
+    if (name === "run_command") card.classList.add("is-command");
+    if (name === "task") card.classList.add("is-task");
+    // 图标配色来自 is-success（金）/ is-failure（红）。两个都不加会退回默认色，
+    // 看起来就是「颜色不对」。
+    //
+    // 成败没有单独落库，但也不需要：运行时那个 ok 本来就是从输出文本算的
+    // （`tool_output_succeeded`：输出是 JSON 且 success/ok 为 false 才算失败，
+    // 其余一律成功），这里照抄同一条规则，两边判定必然一致。
+    // 成败由后端算好（`web::dto::tool_call_succeeded`）：规则有两条——硬失败
+    // 看 `tool error:` 前缀，业务失败看输出 JSON 的 success/ok。抄到这里就成
+    // 了第二份真相，改一条忘另一条，同一次调用实时是红的、刷新变绿的。
+    const ok = call?.ok !== false;
+    card.classList.add(ok ? "is-success" : "is-failure");
+
+    const head = document.createElement("button");
+    head.className = "tool-head";
+    head.type = "button";
+    head.setAttribute("aria-expanded", String(Boolean(state.toolExpanded)));
+    const icon = document.createElement("span");
+    icon.className = "tool-icon";
+    icon.appendChild(makeIconSlot(toolIconName(name)));
+    // 与实时同构的三段：友好名（粗体）/ 技术名（小字）/ 主语摘要。
+    // 只画技术名的话，用户看到的就是 archlinux_official_package_query 这种。
+    const title = document.createElement("span");
+    title.className = "tool-title";
+    const displayName = document.createElement("strong");
+    displayName.textContent = String(call?.display_name || name || "工具");
+    const realName = document.createElement("small");
+    realName.className = "tool-technical-name";
+    realName.textContent = name;
+    const summary = document.createElement("small");
+    summary.className = "tool-summary";
+    summary.textContent = toolSubject(name, call?.arguments) || "";
+    title.append(displayName, realName, summary);
+    // 与实时那份同构：head 是 icon / title / status / chevron 四段。少了
+    // status 这段，回看时卡片会比实时的窄一块，右边空一片。
+    const status = document.createElement("span");
+    status.className = "tool-status";
+    const statusText = document.createElement("span");
+    statusText.textContent = ok ? "完成" : "失败";
+    status.append(makeIconSlot(ok ? "check" : "circle-alert"), statusText);
+    head.append(icon, title, status, makeIconSlot("chevron-down", "tool-chevron"));
+    head.addEventListener("click", () => {
+      const collapsed = card.classList.toggle("collapsed");
+      head.setAttribute("aria-expanded", String(!collapsed));
+    });
+
+    const body = document.createElement("div");
+    body.className = "tool-body";
+    const argumentText = prettyArguments(call?.arguments);
+    if (argumentText) {
+      const detail = createToolDetail("参数", true);
+      detail.content.textContent = argumentText;
+      detail.wrapper.hidden = false;
+      body.appendChild(detail.wrapper);
+    }
+    const output = String(call?.output || "");
+    if (output) {
+      const detail = createToolDetail("结果", true);
+      detail.content.textContent = output;
+      detail.wrapper.hidden = false;
+      body.appendChild(detail.wrapper);
+    }
+    card.append(head, body);
+    return card;
+  }
+
   function createToolDetail(labelText, preformatted = false) {
     const wrapper = document.createElement("div");
     wrapper.className = "tool-detail";
@@ -6750,7 +6944,9 @@
           live.contextOperation = null;
           live.assets.push(asset);
           live.blocks.appendChild(createConversationMedia(asset, { eager: true }));
-          registerArtifact({ ...asset, name: String(asset.alt || "生成的图片"), kind: "image" }, { autoOpen: true });
+          // 不自动进 artifact:图片已经在气泡里画出来了,再塞进面板等于同一张
+          // 图占两个位置,还会把面板自动切过去盖住用户正在看的东西——表情包
+          // 也会。要在工作区看，气泡上有「在预览工作区打开」按钮。
           syncBubbleWidth(live.article);
           tool.imageCount += 1;
         }
@@ -7878,6 +8074,13 @@
     const sessionId = typeof data?.session_id === "string" && data.session_id ? data.session_id : runSessionId(runId);
     const terminal = name === "run.completed" || name === "run.cancelled" || name === "run.failed";
     if (name === "run.started" && sessionId) trackRun(sessionId, runId);
+    // 正在看的会话不算未读——用户就在现场看着它跑完。
+    if (terminal && sessionId && sessionId !== state.viewSessionId) {
+      if (!state.unreadSessions.has(sessionId)) {
+        state.unreadSessions.add(sessionId);
+        renderSessionList();
+      }
+    }
 
     let live = state.liveRuns.get(runId);
     if (!live && !terminal && !state.terminalRunIds.has(runId) && sessionId && sessionId === state.viewSessionId) {
@@ -8030,7 +8233,7 @@
       }
       return;
     }
-    if (name === "conversation.reset" || name === "conversation.pop") {
+    if (name === "conversation.reset" || name === "conversation.pop" || name === "conversation.compacted") {
       const sessionId = typeof data?.session_id === "string" ? data.session_id : "";
       if (sessionId && sessionId !== state.viewSessionId) {
         refreshSessions();
@@ -8344,8 +8547,18 @@
         apiRequest,
         sessionId: state.viewSessionId,
         mode: viewSessionEntry()?.mode === "dev" ? "dev" : "normal",
-        notify: showToast,
-        confirm: async (message) => window.confirm(message)
+        redraw: renderConversation,
+        // 命令改了服务端状态（/reset 清空历史）时用它重拉，光重绘不够。
+        reload: async () => {
+          if (state.viewSessionId && state.viewSessionId !== state.currentSessionId) {
+            await loadSessionView(state.viewSessionId, { quiet: true });
+          } else {
+            await loadBootstrap();
+          }
+        },
+        // 敲命令那一刻排在最后的回合。回执插在它之后，之后来的新回合就不会
+        // 把回执顶下去。
+        anchorTurnId: state.turns.length ? String(state.turns[state.turns.length - 1]?.id || "") : ""
       });
       if (handled) {
         elements.composerInput.value = "";
@@ -9617,6 +9830,8 @@
     // 命令目录从服务端拉，前端不维护第二份清单。拉失败就当没有命令，
     // 所有 / 开头的输入照常发给模型。
     window.MiyuCommands?.load(apiRequest);
+    // 灯箱自己不会画图标（图标集在这边），把工厂函数递过去。
+    window.MiyuLightbox?.init({ makeIconSlot });
     loadBootstrap();
   }
 

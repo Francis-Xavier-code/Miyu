@@ -70,13 +70,14 @@ async fn web_memory_reset_clears_the_mode_it_was_asked_for() {
     assert!(recalled(&normal).contains("普通模式"));
     assert!(recalled(&dev).contains("开发模式"));
 
-    reset_memory_http(
+    let response = reset_memory_http(
         axum::extract::State(state.clone()),
         HeaderMap::new(),
         axum::Json(serde_json::from_value(serde_json::json!({ "mode": "dev" })).unwrap()),
     )
     .await
     .unwrap();
+    assert_eq!(response.0["ok"], true);
 
     assert!(
         !recalled(&dev).contains("开发模式"),
@@ -85,5 +86,47 @@ async fn web_memory_reset_clears_the_mode_it_was_asked_for() {
     assert!(
         recalled(&normal).contains("普通模式"),
         "只该清 dev，普通模式的记忆被误伤了"
+    );
+}
+
+/// 回合的工具记录必须出现在发给 WebUI 的 payload 里。
+///
+/// 以前不发：`tool_flow` 一直躺在库里，但 DTO 没这个字段，于是 WebUI 的工具
+/// 信息只在实时事件流里活过一次——切走再切回来就没了，而库里明明有。
+#[test]
+fn turn_payload_carries_the_tools_that_ran() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let store = StateStore::new(&paths).unwrap();
+    store.init_files().unwrap();
+    store
+        .start_turn("t1", "跑一下 ls", std::process::id())
+        .unwrap();
+    store
+        .set_turn_tool_flow(
+            "t1",
+            &[crate::state::ToolFlowRound {
+                assistant_content: String::new(),
+                assistant_reasoning: None,
+                calls: vec![crate::state::ToolFlowCall {
+                    id: "call_1".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                    output: "a.txt\nb.txt".to_string(),
+                }],
+            }],
+        )
+        .unwrap();
+    store.complete_turn("t1", "跑完了", None).unwrap();
+
+    let turn = store.load_turns().unwrap().remove(0);
+    let payload = serde_json::to_value(SafeTurn::from_turn(turn, Vec::new(), Vec::new())).unwrap();
+    let calls = payload["tool_flow"][0]["calls"].as_array().unwrap();
+    assert_eq!(calls[0]["name"], "run_command");
+    assert!(
+        calls[0]["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("a.txt")),
+        "工具输出没进 payload，切回会话就看不到了"
     );
 }

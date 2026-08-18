@@ -77,6 +77,68 @@ pub(in crate::web) struct SafeModel {
     pub(in crate::web) active: bool,
 }
 
+/// 一次工具调用，给 WebUI 看的形态。
+///
+/// 比库里的 `ToolFlowCall` 多一个 `display_name`：友好名是注册表算出来的
+/// （`tools::readable_tool_name`），不落库——落了就得跟着人格/语言变，而且
+/// 同一条记录换个语言看就不对了。事件流那侧本来也是现算的
+/// （`event_map.rs:164`），这里保持一致。
+#[derive(Serialize)]
+pub(in crate::web) struct SafeToolCall {
+    pub(in crate::web) id: String,
+    pub(in crate::web) name: String,
+    pub(in crate::web) display_name: String,
+    pub(in crate::web) arguments: String,
+    pub(in crate::web) output: String,
+    /// 这次调用成没成。判定放在这里、不放前端：规则有两条，抄到 JS 里就成了
+    /// 第二份真相，改一条忘另一条，同一次调用在实时和回看里会显示成不同颜色。
+    pub(in crate::web) ok: bool,
+}
+
+/// 从落库的输出反推成败。
+///
+/// 成败没有单独落库（`ToolFlowCall` 只有 id/name/arguments/output），但信号全
+/// 在输出里，分两层：
+///
+/// 1. **硬失败**——工具压根没跑起来或被拦下（未加载、ask_question 越限、执行
+///    报错）。这些路径产出的文本一律以 `tool error:` 开头，仓库里 14 处都是。
+/// 2. **业务失败**——工具跑了但结果是失败，靠 `tool_output_succeeded` 那条：
+///    输出是 JSON 且 `success`/`ok` 为 false。
+///
+/// 只做第 2 层的话，「工具未加载」这种会被判成成功——刷新一下红的变绿的。
+fn tool_call_succeeded(output: &str) -> bool {
+    !output.trim_start().starts_with("tool error:") && crate::agent::tool_output_succeeded(output)
+}
+
+#[derive(Serialize)]
+pub(in crate::web) struct SafeToolRound {
+    pub(in crate::web) assistant_content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::web) assistant_reasoning: Option<String>,
+    pub(in crate::web) calls: Vec<SafeToolCall>,
+}
+
+impl From<crate::state::ToolFlowRound> for SafeToolRound {
+    fn from(round: crate::state::ToolFlowRound) -> Self {
+        Self {
+            assistant_content: round.assistant_content,
+            assistant_reasoning: round.assistant_reasoning,
+            calls: round
+                .calls
+                .into_iter()
+                .map(|call| SafeToolCall {
+                    display_name: crate::tools::readable_tool_name(&call.name),
+                    ok: tool_call_succeeded(&call.output),
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    output: call.output,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(in crate::web) struct SafeTurn {
     pub(in crate::web) id: String,
@@ -95,6 +157,13 @@ pub(in crate::web) struct SafeTurn {
     pub(in crate::web) token_cache_read: u64,
     pub(in crate::web) token_usage_estimated: bool,
     pub(in crate::web) question_exchanges: Vec<crate::question::QuestionExchange>,
+    /// 这一轮调过哪些工具、拿到什么结果。
+    ///
+    /// 以前不发：WebUI 的工具信息只在实时事件流里存在过，切走再回来就没了
+    /// ——而库里一直有。空数组的回合（没调工具）跳过序列化，别给每个回合都
+    /// 塞一个 `"tool_flow": []`。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::web) tool_flow: Vec<SafeToolRound>,
     pub(in crate::web) followups: Vec<SafeFollowup>,
     pub(in crate::web) assets: Vec<SafeImageAsset>,
     pub(in crate::web) artifacts: Vec<SafeArtifactAsset>,
@@ -219,7 +288,11 @@ pub(in crate::web) fn safe_multimodal_models(config: &AppConfig) -> Vec<SafeMode
 }
 
 impl SafeTurn {
-    pub(in crate::web) fn from_turn(turn: Turn, assets: Vec<ImageAsset>, artifacts: Vec<ArtifactAsset>) -> Self {
+    pub(in crate::web) fn from_turn(
+        turn: Turn,
+        assets: Vec<ImageAsset>,
+        artifacts: Vec<ArtifactAsset>,
+    ) -> Self {
         let assets = assets
             .into_iter()
             .map(|asset| {
@@ -250,6 +323,11 @@ impl SafeTurn {
             token_cache_read: turn.token_cache_read,
             token_usage_estimated: turn.token_usage_estimated,
             question_exchanges: turn.question_exchanges,
+            tool_flow: turn
+                .tool_flow
+                .into_iter()
+                .map(SafeToolRound::from)
+                .collect(),
             followups: turn.followups.into_iter().map(SafeFollowup::from).collect(),
             assets,
             artifacts: artifacts.into_iter().map(SafeArtifactAsset::from).collect(),

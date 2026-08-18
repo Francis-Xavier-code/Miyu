@@ -398,6 +398,22 @@ pub(in crate::web) async fn actor_loop(
                     }))
                 }
                 .await;
+                // 压缩重写了消息数组,已经打开这个会话的界面必须重新拉一次,
+                // 否则屏幕上还是压缩前那串回合——用户会以为命令没生效。
+                // 只在**真压缩了**的时候发:上下文没到水位时 compact_now 什么
+                // 也不做,那种情况下发事件会让所有前端白刷一次。
+                if result
+                    .as_ref()
+                    .ok()
+                    .and_then(|data| data.get("compacted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    events.publish(
+                        "conversation.compacted",
+                        json!({ "session_id": &*session_id }),
+                    );
+                }
                 release_admin(&manager);
                 let _ = reply.send(result);
             }

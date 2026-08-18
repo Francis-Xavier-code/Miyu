@@ -11,8 +11,6 @@
 //! 渲染归 CLI：`print_repl_help` 与 `repl_command_suggestions_line` 要 println
 //! 和终端宽度，留在 `cli::repl::commands`。
 
-use crate::i18n::text as t;
-
 pub(crate) fn split_repl_command(input: &str) -> (&str, &str) {
     let Some((command, args)) = input.split_once(char::is_whitespace) else {
         return (input, "");
@@ -188,7 +186,7 @@ pub(crate) const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "",
         help_en: "start this conversation over",
         help_zh: "重新开始当前会话",
-        web: false,
+        web: true,
     },
     ReplCommandSpec {
         name: "/reset-memory",

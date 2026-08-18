@@ -64,6 +64,10 @@ pub(in crate::web) async fn index_asset(headers: HeaderMap) -> Response {
                 concat!("src=\"/commands.js?v=", env!("MIYU_BUILD_ID"), "\""),
             )
             .replace(
+                "src=\"/lightbox.js\"",
+                concat!("src=\"/lightbox.js?v=", env!("MIYU_BUILD_ID"), "\""),
+            )
+            .replace(
                 "href=\"/vendor/katex/katex.min.css\"",
                 concat!("href=\"/vendor/katex/katex.min.css?v=", env!("MIYU_BUILD_ID"), "\""),
             )
@@ -87,6 +91,14 @@ pub(in crate::web) async fn commands_js_asset(headers: HeaderMap) -> Response {
     embedded_asset(
         &headers,
         COMMANDS_JS.as_bytes(),
+        "application/javascript; charset=utf-8",
+    )
+}
+
+pub(in crate::web) async fn lightbox_js_asset(headers: HeaderMap) -> Response {
+    embedded_asset(
+        &headers,
+        LIGHTBOX_JS.as_bytes(),
         "application/javascript; charset=utf-8",
     )
 }

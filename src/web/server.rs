@@ -252,6 +252,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         .route("/theme.css", get(theme_css))
         .route("/app.js", get(app_asset))
         .route("/commands.js", get(commands_js_asset))
+        .route("/lightbox.js", get(lightbox_js_asset))
         .route("/vendor/katex/katex.min.js", get(katex_js_asset))
         .route("/vendor/katex/katex.min.css", get(katex_css_asset))
         .route("/vendor/katex/fonts/{font}", get(katex_font_asset))

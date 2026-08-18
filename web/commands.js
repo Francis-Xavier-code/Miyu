@@ -142,38 +142,131 @@ window.MiyuCommands = (() => {
   async function tryRun(input, ctx) {
     const spec = match(input);
     if (!spec) return false;
-    const [, args] = split(String(input).trim());
-    if (!spec.arg_hint && args.trim()) {
-      ctx.notify(`${spec.name} 不接受参数`, "error");
+    const line = String(input).trim();
+    const [, args] = split(line);
+    const done = (text, tone) => {
+      note(line, text, tone, ctx.anchorTurnId);
+      ctx.redraw();
       return true;
+    };
+    if (!spec.arg_hint && args.trim()) {
+      return done(`${spec.name} 不接受参数`, "error");
     }
     try {
       if (spec.name === "/compact") {
-        await ctx.apiRequest("/api/conversation/compact", {
+        const response = await ctx.apiRequest("/api/conversation/compact", {
           method: "POST",
           body: JSON.stringify({ session_id: ctx.sessionId }),
         });
-        ctx.notify("已压缩当前会话上下文");
-        return true;
+        // compact_now 返回 Option。它**不是**被水位线拦着——手动 /compact
+        // 已经是 force（agent/mod.rs 跳过了「折叠够不够本」那道闸）。真正的
+        // None 出口在 compact.rs 的 `cut == 0`：压缩是把**比保留尾巴更老**的
+        // 回合折成摘要，整段对话都还在尾巴以内时，没有更老的可折。
+        // 尾巴预算 = min(16384, 窗口/4)，1M 窗口下就是 16k。
+        const compacted = (await response.json())?.result?.compacted === true;
+        return done(compacted ? "上下文已压缩" : "当前上下文过少");
+      }
+      if (spec.name === "/reset") {
+        await ctx.apiRequest("/api/conversation/reset", {
+          method: "POST",
+          body: JSON.stringify({ session_id: ctx.sessionId }),
+        });
+        // 清空之后对话流整段作废，让调用方重新拉一次；回执本身靠锚点回合定位，
+        // 而那个回合刚被删掉，anchorOf 找不到就退回末尾，正好。
+        await ctx.reload();
+        return done("已清空当前会话");
       }
       if (spec.name === "/reset-memory") {
-        if (!(await ctx.confirm("清空当前模式的长期记忆？此操作不可撤销。"))) return true;
         await ctx.apiRequest("/api/memory/reset", {
           method: "POST",
           body: JSON.stringify({ mode: ctx.mode }),
         });
-        ctx.notify("已清空长期记忆");
-        return true;
+        return done("已清空长期记忆");
       }
     } catch (error) {
-      ctx.notify(error?.message || "命令执行失败", "error");
-      return true;
+      return done(error?.message || "命令执行失败", "error");
     }
     // 目录里有、这里却没实现：说明服务端开了 web 标记但前端没接上。
     // 当成命令吃掉并报错，比静默发给模型强——后者会让用户以为命令生效了。
-    ctx.notify(`${spec.name} 在 WebUI 里还没有实现`, "error");
-    return true;
+    return done(`${spec.name} 在 WebUI 里还没有实现`, "error");
   }
 
-  return { load, split, match, suggestions, onInput, handleKey, hide, tryRun };
+  // ── 命令回执：像消息一样留在对话流里 ─────────────────────────────
+  //
+  // 命令不是回合，不能落库、更不能进模型上下文（它是客户端操作）。但只弹一个
+  // 转瞬即逝的 toast 也不对：用户敲了字、按了回车，对话流里却什么都没发生，
+  // 看起来就像没生效。REPL 那边是 `repl_note` 写进滚动区，这里对齐。
+  //
+  // 存成数组而不是直接往 DOM 里塞：`renderConversation` 每次都从 state.turns
+  // 重建整个 timeline，直接塞的节点会被冲掉——而 /compact 成功后正好会触发
+  // 一次重建。换会话时清空（`clearNotices`），与 REPL 滚动区同寿命。
+  const notices = [];
+
+  // `anchorTurnId` = 敲这条命令时对话流里最后一个回合。渲染时插到那个回合
+  // **之后**，而不是无脑 append 到末尾——否则之后来的新回合会把回执顶下去，
+  // 看起来像是「先说话后执行的命令」，时间顺序全乱。
+  function note(command, text, tone, anchorTurnId) {
+    notices.push({
+      command,
+      text,
+      tone: tone || "info",
+      anchorTurnId: anchorTurnId ? String(anchorTurnId) : "",
+    });
+  }
+
+  function clearNotices() {
+    notices.length = 0;
+  }
+
+  function renderNotices(timeline) {
+    if (!timeline || !notices.length) return;
+    // 锚点回合的最后一个 DOM 节点；找不到（回合被 undo/pop 掉了，或者当时
+    // 对话是空的）就退回末尾。
+    const anchorOf = (turnId) => {
+      if (!turnId) return null;
+      const nodes = timeline.querySelectorAll(`[data-turn-id="${CSS.escape(turnId)}"]`);
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    };
+    for (const entry of notices) {
+      const echo = document.createElement("article");
+      echo.className = "message user-message commandEcho";
+      echo.dataset.role = "user";
+      const bubble = document.createElement("div");
+      bubble.className = "user-bubble";
+      const line = document.createElement("p");
+      line.textContent = entry.command;
+      bubble.appendChild(line);
+      echo.appendChild(bubble);
+
+      // 复用系统事件那套（后台任务完成用的就是它）：居中、带底色的小条，
+      // 而不是一行裸文字——它不是谁说的话，是一次操作的回执。
+      const reply = document.createElement("div");
+      reply.className = "system-event is-command-result";
+      if (entry.tone === "error") reply.classList.add("is-error");
+      const label = document.createElement("span");
+      label.textContent = entry.text;
+      reply.appendChild(label);
+
+      const anchor = anchorOf(entry.anchorTurnId);
+      if (anchor) {
+        anchor.after(echo, reply);
+      } else {
+        timeline.append(echo, reply);
+      }
+    }
+    timeline.hidden = false;
+  }
+
+  return {
+    load,
+    split,
+    match,
+    suggestions,
+    onInput,
+    handleKey,
+    hide,
+    tryRun,
+    renderNotices,
+    clearNotices,
+  };
 })();

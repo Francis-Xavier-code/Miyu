@@ -12,6 +12,9 @@ mod reports;
 mod setup;
 mod tool_report;
 use artifacts::*;
+// dto 要按同一条规则判定工具成败(见 web::dto::tool_call_succeeded),
+// 规则只能有一份。
+pub(crate) use artifacts::tool_output_succeeded;
 use context::*;
 use control::*;
 // agent 之外要用的几样：CLI、web、runtime、platforms 都会拿回合控制与模式，

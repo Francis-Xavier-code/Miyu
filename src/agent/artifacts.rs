@@ -6,7 +6,7 @@
 
 use crate::agent::*;
 
-pub(in crate::agent) fn tool_output_succeeded(output: &str) -> bool {
+pub(crate) fn tool_output_succeeded(output: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(output)
         .ok()
         .and_then(|value| {

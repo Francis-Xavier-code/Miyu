@@ -144,6 +144,15 @@ pub fn readable_tool_name(name: &str) -> String {
     if let Some(display_name) = builtin_readable_tool_name(name) {
         return display_name.to_string();
     }
+    // `use_meme:search` / `task:xxx` 这类带 action 后缀的事件名，按基名取友好名。
+    // 漏了这一步就一路落到最后的 `name.to_string()`，UI 上显示成裸的
+    // `use_meme:search`——同一个工具有没有后缀，显示名不该差这么远。
+    let base = crate::render::tool_event_base_name(name);
+    if base != name {
+        if let Some(display_name) = builtin_readable_tool_name(base) {
+            return display_name.to_string();
+        }
+    }
     if let Ok(guard) = SCRIPT_DISPLAY_NAMES.read() {
         if let Some(map) = guard.as_ref() {
             if let Some(dn) = map.get(name) {

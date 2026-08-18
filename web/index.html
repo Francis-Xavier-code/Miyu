@@ -13,6 +13,7 @@
   <script defer src="/vendor/katex/katex.min.js"></script>
   <!-- 命令层要先于 app.js 就位:app.js 初始化时就会调 MiyuCommands.load -->
   <script defer src="/commands.js"></script>
+  <script defer src="/lightbox.js"></script>
   <script defer src="/app.js"></script>
 </head>
 <body data-theme="graphite">
@@ -176,6 +177,7 @@
                   <span class="icon-slot brain-icon" data-icon="brain" aria-hidden="true"><span class="icon-fallback">B</span></span>
                   <span class="icon-slot thinking-chevron" data-icon="chevron-down" aria-hidden="true"><span class="icon-fallback">⌄</span></span>
                 </button>
+                <span class="typing-indicator is-composer" id="composerRunIndicator" aria-hidden="true" hidden><i></i><i></i><i></i></span>
                 <span class="composer-state" id="composerState">正在载入</span>
               </div>
               <div class="composer-submit">

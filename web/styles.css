@@ -534,26 +534,46 @@ textarea:disabled {
   line-height: 15px;
 }
 
-.session-run-dot {
+/* 运行中:转圈。动效表达「正在发生」——静态点和「有未读」看不出区别。 */
+.session-run-spinner {
   display: inline-block;
-  width: 7px;
-  height: 7px;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid color-mix(in srgb, var(--online) 28%, transparent);
+  border-top-color: var(--online);
   border-radius: 50%;
-  background: var(--online);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--online) 18%, transparent);
-  animation: session-run-pulse 1.6s ease-in-out infinite;
+  animation: session-run-spin 0.8s linear infinite;
 }
 
-@keyframes session-run-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
+/* 未读绿点。生命周期是「回合结束 → 用户切进来」，不是「已完成」。
+   呼吸动画复用侧栏在线点那条（`status-pulse`），两处都是「这里有动静」的
+   语义，视觉语言要一致。 */
+.session-unread-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  /* 外框与 spinner 同宽，两者互换时整行不抖；真正的点靠 radial-gradient 居中 */
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  color: var(--online);
+  background: radial-gradient(circle, currentcolor 0 3.5px, transparent 3.5px);
+  animation: status-pulse 2.4s ease-in-out infinite;
+}
 
-  50% {
-    opacity: 0.45;
+@keyframes session-run-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .session-run-spinner {
+    animation-duration: 2.4s;
+  }
+}
+
 
 .session-copy strong,
 .session-copy small,
@@ -595,11 +615,13 @@ textarea:disabled {
 
 .session-trailing {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  justify-content: center;
+  /* 横排:指示器与菜单按钮并排,各自垂直居中。竖排时指示器被顶到按钮上方,
+     看着就是偏上的。 */
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
   padding: 5px 6px 5px 0;
-  gap: 2px;
+  gap: 4px;
 }
 
 .session-time {
@@ -2185,54 +2207,127 @@ textarea:disabled {
   color: var(--accent);
 }
 
-.conversation-media-caption {
-  display: flex;
-  min-width: 0;
-  min-height: 28px;
-  align-items: center;
-  justify-content: space-between;
-  color: var(--text-faint);
-  font-size: 11px;
-  gap: 10px;
+/* 图片是入口:点开灯箱。原先那三个按钮铺在图下面一行,现在跟着浮层走。 */
+.conversation-media-visual.is-zoomable {
+  cursor: zoom-in;
 }
 
-.conversation-media-caption > span:first-child {
-  min-width: 0;
+.conversation-media-visual.is-zoomable::after {
+  position: absolute;
+  border-radius: inherit;
+  content: "";
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+  background: rgb(0 0 0 / 18%);
+}
+
+.conversation-media-visual.is-zoomable:hover::after {
+  opacity: 1;
+}
+
+.conversation-media-visual.is-zoomable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.lightbox {
+  position: fixed;
+  z-index: 90;
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  padding: clamp(16px, 4vw, 48px);
+  inset: 0;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.lightbox.is-open {
+  opacity: 1;
+}
+
+.lightbox-scrim {
+  position: absolute;
+  border: 0;
+  cursor: zoom-out;
+  inset: 0;
+  background: rgb(0 0 0 / 68%);
+  backdrop-filter: blur(3px);
+}
+
+.lightbox-frame {
+  position: relative;
+  display: grid;
+  max-width: 100%;
+  max-height: 100%;
+  justify-items: center;
+  gap: 10px;
+  transform: scale(0.97);
+  transition: transform 140ms ease;
+}
+
+.lightbox.is-open .lightbox-frame {
+  transform: scale(1);
+}
+
+.lightbox-image {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100dvh - clamp(96px, 12vw, 160px));
+  border-radius: 8px;
+  object-fit: contain;
+  box-shadow: 0 18px 48px rgb(0 0 0 / 45%);
+}
+
+.lightbox-bar {
+  display: flex;
+  max-width: 100%;
+  align-items: center;
+  padding: 5px 6px 5px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  gap: 4px;
+  background: var(--surface-1);
+  box-shadow: var(--artifact-shadow);
+}
+
+.lightbox-caption {
   overflow: hidden;
+  max-width: min(46vw, 420px);
+  margin-right: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.conversation-media-caption.is-actions-only {
-  justify-content: flex-end;
+.lightbox-caption:empty {
+  display: none;
 }
 
-.conversation-media-actions {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 3px;
-}
-
-.conversation-media-actions button,
-.conversation-media-actions a {
+.lightbox-action {
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   place-items: center;
-  border-radius: 4px;
+  border-radius: 999px;
   color: var(--text-faint);
 }
 
-.conversation-media-actions button:hover,
-.conversation-media-actions a:hover {
+.lightbox-action:hover {
   background: var(--surface-2);
   color: var(--text);
 }
 
-.conversation-media-actions .icon-slot {
-  width: 14px;
-  height: 14px;
+.lightbox-action .icon-slot {
+  width: 15px;
+  height: 15px;
+}
+
+body.has-lightbox {
+  overflow: hidden;
 }
 
 /* 工具签:气泡内小签。身份用字形色(⚙/$ 金),底色只表状态——
@@ -3169,6 +3264,20 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   padding: 4px 2px;
 }
 
+/* 输入框那排的运行指示器。原来它在气泡左下角，且只在「第一个块到达前」出现
+   ——推理和工具阶段反而没有，而那两段恰恰最需要「它还在动」。现在整个回合
+   期间都在，位置固定，不随气泡内容跳来跳去。 */
+.typing-indicator.is-composer {
+  padding: 0 2px;
+  gap: 4px;
+  align-self: center;
+}
+
+.typing-indicator.is-composer i {
+  width: 5px;
+  height: 5px;
+}
+
 .typing-indicator.is-streaming i {
   width: 5px;
   height: 5px;
@@ -3389,6 +3498,17 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   box-shadow: var(--artifact-shadow);
 }
 
+.artifact-resource-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.artifact-resource-row > button:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .artifact-resource-menu button {
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr) auto 14px;
@@ -3435,6 +3555,36 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
 
 .artifact-resource-menu .icon-slot:last-child {
   color: var(--accent);
+}
+
+/* 删除按钮要压过上面那批 `.artifact-resource-menu button` 的网格布局，
+   所以写在后面并带上菜单前缀。上面那条 `.icon-slot:last-child` 是给「当前
+   项」的对勾用的，叉正好也是最后一个 icon-slot，会被染成强调色。 */
+.artifact-resource-menu .artifact-resource-remove {
+  display: flex;
+  flex: 0 0 auto;
+  width: 26px;
+  min-height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 5px;
+  color: var(--text-faint);
+  opacity: 0;
+}
+
+.artifact-resource-row:hover .artifact-resource-remove,
+.artifact-resource-menu .artifact-resource-remove:focus-visible {
+  opacity: 1;
+}
+
+.artifact-resource-menu .artifact-resource-remove:hover {
+  color: var(--danger, #e5484d);
+  background: var(--artifact-highlight-hover);
+}
+
+.artifact-resource-menu .artifact-resource-remove .icon-slot:last-child {
+  color: inherit;
 }
 
 .artifact-actions {
@@ -6566,24 +6716,28 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
    上方弹出——往下弹会被输入框自己盖住。 */
 .commandMenu {
   position: absolute;
-  bottom: calc(100% - 6px);
+  /* 贴着输入框会看不出这是两个东西；留一段间距，并收窄到内容宽度， */
+  /* 免得一条两行的菜单横贯整个对话区，比输入框还显眼。 */
+  bottom: calc(100% - 2px);
   left: max(18px, calc((100% - 940px) / 2));
-  right: max(18px, calc((100% - 940px) / 2));
   z-index: 40;
+  width: min(520px, calc(100% - 2 * max(18px, calc((100% - 940px) / 2))));
   max-height: min(320px, 50vh);
+  margin-bottom: 10px;
   overflow-y: auto;
-  padding: 5px;
-  border-radius: 8px;
+  padding: 6px;
+  border: 1px solid var(--border-1, rgba(128, 128, 128, 0.22));
+  border-radius: 10px;
   background: var(--surface-1);
   box-shadow: var(--float-shadow);
 }
 
 .commandMenuItem {
   display: flex;
-  gap: 12px;
+  gap: 14px;
   align-items: baseline;
   width: 100%;
-  padding: 7px 10px;
+  padding: 8px 10px;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -6611,4 +6765,22 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
   font-size: 0.86em;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 命令回执：复用系统事件那条居中小条（后台任务完成同款）。差别只有一点——
+   系统事件是一行短标签，可以 nowrap + 省略号；命令回执常常是一句要读完的
+   解释，截断了等于没说，所以允许换行。 */
+.system-event.is-command-result > span {
+  max-width: min(560px, 80%);
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 1.5;
+  padding: 6px 12px;
+  text-align: center;
+}
+
+.system-event.is-command-result.is-error > span {
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface-2));
+  color: var(--danger);
 }
