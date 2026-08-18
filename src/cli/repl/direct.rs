@@ -274,21 +274,10 @@ pub(in crate::cli) async fn run_direct_repl(
     } else {
         config.active_persona_scope()
     };
-    if let Ok(Some(session_id)) = state.repl_session(&persona) {
-        state.adopt_session(&session_id);
-    } else if initial_mode == AgentMode::Dev {
-        // dev 无「终端会话」可退:自举一个 dev 会话并钉住指针。
-        let record = state.create_session(
-            crate::state::DEV_PERSONA,
-            "",
-            crate::state::USER_SESSION_KIND,
-            None,
-        )?;
-        state.adopt_session(&record.session_id);
-        let _ = state.set_repl_session(&persona, &record.session_id);
-    } else {
-        let _ = state.set_repl_session(&persona, &state.session_id());
-    }
+    // 与远端 `GetReplSession` 同一条语义（见 `ensure_repl_session`）：指针缺失
+    // 就自举本车道的会话，绝不退到终端集成那条。
+    let repl_session_id = state.ensure_repl_session(&persona)?;
+    state.adopt_session(&repl_session_id);
     apply_session_model_override(&state, &mut config);
     let memory_organizer = MemoryOrganizer::spawn()?;
     let memory_organizer_handle = memory_organizer.handle();
