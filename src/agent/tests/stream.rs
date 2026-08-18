@@ -546,3 +546,53 @@ async fn dropping_the_agent_stops_the_keepalive_loop() {
         "Agent 被丢掉之后 keepalive 必须停——否则它会继续发请求计费"
     );
 }
+
+/// 量尺：`cargo test --lib agent::tests::stream::keepalive_snapshot_cost -- --ignored --nocapture`
+///
+/// 方案 M3 说「keepalive 快照持有整段会话（含 base64 图片）常驻，ping 和工具
+/// 轮多次全量 clone」。量两件事：快照多大、克隆一次多贵。
+#[test]
+#[ignore]
+fn keepalive_snapshot_cost() {
+    use std::time::Instant;
+    println!("\n  会话形态                    快照KB   单次clone(µs)   20次ping合计(ms)");
+    let image = "A".repeat(100 * 1024); // 约 100KB 的 base64 图片
+    for (label, turns, images) in [
+        ("40 轮纯文本", 40usize, 0usize),
+        ("40 轮 + 1 张图", 40, 1),
+        ("40 轮 + 5 张图", 40, 5),
+    ] {
+        let mut messages = vec![ChatMessage::system("系统提示词".repeat(50))];
+        for index in 0..turns {
+            messages.push(ChatMessage::plain(
+                "user",
+                format!("问题 {index} ").repeat(20),
+            ));
+            messages.push(ChatMessage::assistant(
+                format!("回答 {index} ").repeat(60),
+                None,
+            ));
+        }
+        for _ in 0..images {
+            messages.push(ChatMessage::user_with_image(
+                "看图",
+                format!("data:image/png;base64,{image}"),
+            ));
+        }
+        let bytes = serde_json::to_string(&messages).unwrap().len();
+        for _ in 0..50 {
+            std::hint::black_box(messages.clone());
+        }
+        let rounds = 500;
+        let start = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(messages.clone());
+        }
+        let each_us = start.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+        println!(
+            "  {label:<24}  {:>7}  {each_us:>13.1}  {:>16.2}",
+            bytes / 1024,
+            each_us * 20.0 / 1000.0
+        );
+    }
+}
