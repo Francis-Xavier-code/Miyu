@@ -299,7 +299,7 @@ pub(in crate::cli) async fn run_direct_repl(
     let mut prefill = None::<String>;
     let mut live_repl = None::<LiveReplTail>;
 
-    crate::default_kb::check_update_if_due(paths).ok();
+    crate::default_kb::check_update_if_due(paths).await.ok();
     if let Ok(Some(message)) = crate::default_kb::notice_if_update_available(paths) {
         println!("\x1b[2m{message}\x1b[0m");
     }
