@@ -84,7 +84,12 @@ pub(in crate::cli) fn job_wake_headline(headline: &str) -> &str {
 ///
 /// `focused` is `None` when there is no live tail — a one-shot `miyu ask` has
 /// no window to be away from, so it stays quiet.
-pub(in crate::cli) fn notify_if_unfocused(config: &AppConfig, focused: Option<bool>, title: &str, body: &str) {
+pub(in crate::cli) fn notify_if_unfocused(
+    config: &AppConfig,
+    focused: Option<bool>,
+    title: &str,
+    body: &str,
+) {
     if !config.notifications.enabled || focused != Some(false) {
         return;
     }
@@ -127,11 +132,12 @@ pub(in crate::cli) struct BackgroundReport {
 
 /// Session isolation for the strip: keep only `session`'s jobs (sessionless
 /// jobs stay visible as a legacy fallback; `None` session shows everything).
-pub(in crate::cli) fn retain_session_jobs(jobs: &mut Vec<crate::tools::jobs::JobOverview>, session: Option<&str>) {
+pub(in crate::cli) fn retain_session_jobs(
+    jobs: &mut Vec<crate::tools::jobs::JobOverview>,
+    session: Option<&str>,
+) {
     if let Some(session) = session {
-        jobs.retain(|job| {
-            job.session_id.is_none() || job.session_id.as_deref() == Some(session)
-        });
+        jobs.retain(|job| job.session_id.is_none() || job.session_id.as_deref() == Some(session));
     }
 }
 
@@ -139,15 +145,21 @@ pub(in crate::cli) fn retain_session_jobs(jobs: &mut Vec<crate::tools::jobs::Job
 pub(in crate::cli) enum JobsFeed {
     /// Remote REPL: snapshots pushed by the IPC poll thread.
     Shared(std::sync::Arc<SharedJobsFeed>),
-    /// Direct REPL: read the in-process registry.
-    Local,
+    /// Direct REPL: read the in-process registry, scoped to this REPL's
+    /// session. 直连道以前直接读整张表不过滤——远端道在 poll 线程里过滤了，
+    /// 两条路语义不一致，直连 REPL 会看到别的会话的后台命令。
+    Local(Option<String>),
 }
 
 impl JobsFeed {
     pub(in crate::cli) fn current(&self) -> Vec<crate::tools::jobs::JobOverview> {
         match self {
             JobsFeed::Shared(shared) => shared.jobs.lock().unwrap().clone(),
-            JobsFeed::Local => crate::tools::jobs::overview(),
+            JobsFeed::Local(session) => {
+                let mut jobs = crate::tools::jobs::overview();
+                retain_session_jobs(&mut jobs, session.as_deref());
+                jobs
+            }
         }
     }
 
@@ -156,7 +168,7 @@ impl JobsFeed {
     pub(in crate::cli) fn cumulative(&self) -> Option<TurnTokens> {
         match self {
             JobsFeed::Shared(shared) => *shared.cumulative.lock().unwrap(),
-            JobsFeed::Local => None,
+            JobsFeed::Local(_) => None,
         }
     }
 
@@ -171,7 +183,7 @@ impl JobsFeed {
                     .collect();
                 taken
             }
-            JobsFeed::Local => Vec::new(),
+            JobsFeed::Local(_) => Vec::new(),
         }
     }
 

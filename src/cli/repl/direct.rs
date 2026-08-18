@@ -319,7 +319,8 @@ pub(in crate::cli) async fn run_direct_repl(
         footer.update_thinking_variant(thinking_summary.as_deref());
         let next_input = if let Some(live) = live_repl.as_mut() {
             live.set_footer(footer.clone());
-            let input = match read_live_repl_input(live, paths, &JobsFeed::Local, None)? {
+            let jobs_feed = JobsFeed::Local(Some(state.session_id().to_string()));
+            let input = match read_live_repl_input(live, paths, &jobs_feed, None)? {
                 LiveReplOutcome::Exit | LiveReplOutcome::FollowWake { .. } => None,
                 // Direct mode owns its jobs in-process, so stop them here
                 // rather than through the daemon.
