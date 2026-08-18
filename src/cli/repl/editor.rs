@@ -460,20 +460,27 @@ pub(in crate::cli) fn repl_input_lines(input: &str) -> Vec<String> {
     lines
 }
 
+/// 判定一行输入是命令还是聊天。**只认完整命令名**——不命中就是聊天。
+///
+/// 两条边界都是踩出来的：
+///
+/// 一、回车不做前缀展开。以前 `/n 什么的` 唯一前缀命中 `/new [name]`，静默建
+/// 了个叫「什么的」的会话；`/d 3` 命中 `/delete [name|index]`，静默删掉 3 号
+/// 会话。用户想说的只是普通句子，代价却是数据没了。前缀展开留给 Tab
+/// （`complete_repl_command`）——那里用户看得见展开结果，能反悔。
+///
+/// 二、不命中回落聊天而不是报「未知命令」。`/home/shorin/x 这是什么` 是完全
+/// 正常的一句话，以前整行被丢弃、输入框也被清空。平台侧早就是这个语义
+/// （`platforms/commands.rs`：未注册名返回 `None`，继续当普通聊天），REPL 现在
+/// 对齐。代价是打错的命令（`/rest`）会发给模型，可接受——模型会告诉你。
 pub(in crate::cli) fn parse_repl_input(input: &str) -> ReplInput<'_> {
     if !input.starts_with('/') {
         return ReplInput::Chat;
     }
     let (name, args) = split_repl_command(input);
     let lowered = name.to_ascii_lowercase();
-    if let Some(spec) = REPL_COMMAND_TABLE.iter().find(|spec| spec.name == lowered) {
-        return ReplInput::Slash(spec.command, args);
-    }
-    let mut matches = REPL_COMMAND_TABLE
-        .iter()
-        .filter(|spec| spec.name.starts_with(&lowered));
-    match (matches.next(), matches.next()) {
-        (Some(spec), None) => ReplInput::Slash(spec.command, args),
-        _ => ReplInput::UnknownSlash(name),
+    match REPL_COMMAND_TABLE.iter().find(|spec| spec.name == lowered) {
+        Some(spec) => ReplInput::Slash(spec.command, args),
+        None => ReplInput::Chat,
     }
 }

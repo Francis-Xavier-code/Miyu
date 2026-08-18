@@ -8,7 +8,7 @@ fn variant_is_a_repl_command_with_arguments() {
     assert!(repl_commands().contains(&"/variant"));
     assert_eq!(split_repl_command("/variant high"), ("/variant", "high"));
     assert_eq!(split_repl_command("/reset all"), ("/reset", "all"));
-    assert_eq!(resolve_repl_command("/var"), "/variant");
+    assert_eq!(complete_repl_command("/var"), Some("/variant"));
 }
 
 #[test]

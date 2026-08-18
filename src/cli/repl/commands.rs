@@ -280,10 +280,11 @@ pub(in crate::cli) fn repl_command_spec(command: ReplSlashCommand) -> &'static R
 
 /// Parsed REPL input: plain chat, a resolved slash command with its argument
 /// string, or an unknown/ambiguous slash command.
+/// 一行输入的归类。**没有「未知命令」这一类**——`/` 开头但不命中命令表的输入
+/// 就是聊天（见 `parse_repl_input` 的文档）。
 pub(in crate::cli) enum ReplInput<'a> {
     Chat,
     Slash(ReplSlashCommand, &'a str),
-    UnknownSlash(&'a str),
 }
 
 pub(in crate::cli) fn repl_commands() -> Vec<&'static str> {
@@ -309,13 +310,12 @@ pub(in crate::cli) fn complete_repl_command(input: &str) -> Option<&'static str>
     }
 }
 
-pub(in crate::cli) fn resolve_repl_command<'a>(input: &'a str) -> &'a str {
-    if input.starts_with('/') {
-        if let Some(command) = complete_repl_command(input) {
-            return command;
-        }
-    }
-    input
+/// 命令表里有没有这个**完整**名字。执行前的唯一判定入口——直连道的 if 链和
+/// 泄漏守门都问它，不再走前缀展开（理由见 `parse_repl_input`）。
+pub(in crate::cli) fn is_repl_command(name: &str) -> bool {
+    REPL_COMMAND_TABLE
+        .iter()
+        .any(|spec| spec.name.eq_ignore_ascii_case(name))
 }
 
 pub(in crate::cli) fn repl_command_suggestions_line(suggestions: &[&str], max_width: usize) -> String {

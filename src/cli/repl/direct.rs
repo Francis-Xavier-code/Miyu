@@ -372,8 +372,9 @@ pub(in crate::cli) async fn run_direct_repl(
             None => break,
         };
         let input = input.trim();
-        let (command_input, command_args) = split_repl_command(input);
-        let command = resolve_repl_command(command_input);
+        // 只按完整命令名比对:前缀展开已从执行路径撤走(见 `parse_repl_input`),
+        // 否则 `/d 3` 会静默删掉 3 号会话。
+        let (command, command_args) = split_repl_command(input);
         let command_args_empty = command_args.trim().is_empty();
         if input.eq_ignore_ascii_case("exit")
             || input.eq_ignore_ascii_case("quit")
@@ -638,21 +639,17 @@ pub(in crate::cli) async fn run_direct_repl(
         // 落到这里的表内命令(如 /new /session)以前会原文发给模型当聊天
         // ——人格实验冒烟时实锤过。现在一律拦下提示,绝不进对话;完整的
         // 双 dispatch 后端归一记为技术债,此守门先消灭整个 bug 类。
-        if input.starts_with('/') {
-            let known = REPL_COMMAND_TABLE
-                .iter()
-                .any(|spec| spec.name.eq_ignore_ascii_case(&command));
-            if known {
-                println!(
-                    "{}",
-                    t(
-                        "this command needs the full (daemon) REPL; start without MIYU_DIRECT to use it",
-                        "该命令需要完整(daemon)REPL;不带 MIYU_DIRECT 启动即可使用"
-                    )
-                );
-            } else {
-                println!("{}: {command_input}", t("unknown command", "未知命令"));
-            }
+        //
+        // 只拦**表里有**的:不在表里的 `/xxx` 不是命令,是普通消息
+        // (`/home/shorin/x 这是什么`),照常发给模型。
+        if is_repl_command(command) {
+            println!(
+                "{}",
+                t(
+                    "this command needs the full (daemon) REPL; start without MIYU_DIRECT to use it",
+                    "该命令需要完整(daemon)REPL;不带 MIYU_DIRECT 启动即可使用"
+                )
+            );
             continue;
         }
         if input.is_empty() {
