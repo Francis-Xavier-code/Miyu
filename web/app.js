@@ -24,19 +24,9 @@
   const DEFAULT_BOARD_TITLE = "今天想聊些什么？";
   const DEFAULT_BOARD_SUBTITLE = "从一个问题、计划或此刻的想法开始。";
   const DEFAULT_STARTER_PROMPTS = ["查询今天的天气", "分析一个问题", "发表情包打个招呼吧", "搜索一张图片"];
-  const THINKING_VARIANT_LABELS = Object.freeze({
-    default: "默认",
-    none: "关闭",
-    minimal: "最小",
-    low: "低",
-    medium: "中",
-    high: "高",
-    xhigh: "极高",
-    max: "最大",
-    on: "开启",
-    off: "关闭",
-    auto: "自动"
-  });
+  // 档位一律用供应商原值(max/high/minimal…),不翻译:译名和文档、和模型
+  // 实际认的参数值对不上,查起来反而费劲。"没设"这一档没有原值,只好写字。
+  const THINKING_VARIANT_DEFAULT_LABEL = "default";
 
   function layoutViewportWidth() {
     return (window.innerWidth || document.documentElement.clientWidth || 0) / UI_SCALE;
@@ -198,6 +188,7 @@
     contextTrack: document.getElementById("contextTrack"),
     contextBar: document.getElementById("contextBar"),
     consoleButton: document.getElementById("consoleButton"),
+    sidebarSettingsButton: document.getElementById("sidebarSettingsButton"),
     consoleView: document.getElementById("consoleView"),
     consoleBack: document.getElementById("consoleBack"),
     conRailToggle: document.getElementById("conRailToggle"),
@@ -219,22 +210,10 @@
     sidebarThemeButton: document.getElementById("sidebarThemeButton"),
     brandAvatar: document.getElementById("brandAvatar"),
     brandName: document.getElementById("brandName"),
-    conversationTitle: document.getElementById("conversationTitle"),
-    conversationMeta: document.getElementById("conversationMeta"),
-    modeBadge: document.getElementById("modeBadge"),
-    thinkingVariantButton: document.getElementById("thinkingVariantButton"),
-    thinkingVariantPopover: document.getElementById("thinkingVariantPopover"),
-    thinkingModelList: document.getElementById("thinkingModelList"),
-    thinkingLevelList: document.getElementById("thinkingLevelList"),
-    thinkingModelName: document.getElementById("thinkingModelName"),
-    thinkingModelProvider: document.getElementById("thinkingModelProvider"),
     modelMenuWrap: document.getElementById("modelMenuWrap"),
     modelButton: document.getElementById("modelButton"),
-    modelMark: document.getElementById("modelMark"),
     modelLabel: document.getElementById("modelLabel"),
     modelMenu: document.getElementById("modelMenu"),
-    themeButton: document.getElementById("themeButton"),
-    topbarSettingsButton: document.getElementById("topbarSettingsButton"),
     artifactToggleButton: document.getElementById("artifactToggleButton"),
     artifactWorkspace: document.getElementById("artifactWorkspace"),
     artifactResizeHandle: document.getElementById("artifactResizeHandle"),
@@ -275,6 +254,7 @@
     promptGrid: document.getElementById("promptGrid"),
     jumpBottomButton: document.getElementById("jumpBottomButton"),
     composerDock: document.getElementById("composerDock"),
+    modelLevelMenu: document.getElementById("modelLevelMenu"),
     composerRunIndicator: document.getElementById("composerRunIndicator"),
     jobsStrip: document.getElementById("jobsStrip"),
     liveStopRail: document.getElementById("liveStopRail"),
@@ -288,9 +268,6 @@
     composerState: document.getElementById("composerState"),
     characterCount: document.getElementById("characterCount"),
     sendButton: document.getElementById("sendButton"),
-    drawerScrim: document.getElementById("drawerScrim"),
-    settingsDrawer: document.getElementById("settingsDrawer"),
-    settingsClose: document.getElementById("settingsClose"),
     settingsNav: document.querySelector(".settings-nav"),
     settingsPanels: Array.from(document.querySelectorAll("[data-settings-panel]")),
     settingsModelMark: document.getElementById("settingsModelMark"),
@@ -379,6 +356,8 @@
     modelSelectionSubmitting: false,
     stagedModelKeys: null,
     stagedFollowGlobal: false,
+    stagedVariants: null,
+    expandedLevelKey: null,
     modelMenuTouched: false,
     modelMenuError: "",
     sessionModelOverride: null,
@@ -405,10 +384,12 @@
     // 和用户手动送进来的（气泡上点「在预览工作区打开」）。后者不在任何回合的
     // artifacts 里，光靠重建会在下一个回合到达时被整体覆盖掉——图片刚打开就
     // 没了。所以手动那批单独留一份，同步时并进去。
+    //
+    // 两份都按会话分。回合产出的天然分会话（同步喂进来的就是当前会话的
+    // turns），这两份要是全局的，A 会话置顶的图会出现在 B 会话的列表里，
+    // 在 A 里删掉的也会连累 B。
     pinnedArtifacts: new Map(),
-    // 用户删掉的那些。回合产出的 artifact 每次同步都会从库里重新长出来，
-    // 不记下来就删不掉。
-    dismissedArtifactIds: new Set(),
+    dismissedArtifactIds: new Map(),
     colorScheme: null,
     matugenAvailable: null,
     reasoningExpanded: false,
@@ -421,6 +402,7 @@
     scrollRequestId: 0,
     programmaticScroll: false,
     settingsOpener: null,
+    consolePanel: "usage",
     sidebarOpener: null,
     sidebarCollapsed: false,
     sidebarAutoCollapsed: false,
@@ -429,13 +411,9 @@
     healthTimer: null,
     terminalRunIds: new Set(),
     thinkingVariantModels: [],
-    thinkingVariantActiveKey: null,
     thinkingVariantLoading: false,
     thinkingVariantLoadGeneration: 0,
     thinkingVariantError: "",
-    thinkingVariantConfirmed: new Map(),
-    thinkingVariantRevisions: new Map(),
-    thinkingVariantWriteChain: Promise.resolve(),
     composing: false,
     settingsView: "interface",
     configLoaded: false,
@@ -523,7 +501,7 @@
       button.setAttribute("aria-pressed", String(button.dataset.themeChoice === selected));
     });
     const nextIcon = selected === "graphite" ? "sun" : "moon";
-    for (const button of [elements.themeButton, elements.sidebarThemeButton]) {
+    for (const button of [elements.sidebarThemeButton]) {
       const slot = button.querySelector(".icon-slot");
       slot.replaceChildren(createIcon(nextIcon));
       button.title = selected === "graphite" ? "切换到晨光主题" : "切换到夜阑主题";
@@ -604,9 +582,8 @@
   }
 
   function thinkingVariantLabel(variant, short = false) {
-    if (variant == null) return short ? "默认" : "模型默认";
-    const value = String(variant);
-    return THINKING_VARIANT_LABELS[value.toLowerCase()] || value;
+    if (variant == null) return short ? THINKING_VARIANT_DEFAULT_LABEL : "模型默认";
+    return String(variant);
   }
 
   function normalizeThinkingVariantModels(value) {
@@ -627,165 +604,13 @@
     });
   }
 
-  function thinkingVariantModel(key = state.thinkingVariantActiveKey) {
-    return state.thinkingVariantModels.find((model) => modelKey(model) === key) || null;
-  }
 
-  function thinkingVariantDisplay(model) {
-    const configured = state.models.find((candidate) => modelKey(candidate) === modelKey(model));
-    return {
-      name: String(configured?.model || model?.model || ""),
-      provider: String(configured?.provider_name || configured?.provider_id || model?.provider_id || "")
-    };
-  }
 
-  function updateThinkingVariantTrigger() {
-    const models = state.thinkingVariantModels;
-    const hasOverride = models.some((model) => model.selected != null);
-    elements.thinkingVariantButton.classList.toggle("has-override", hasOverride);
-    if (state.thinkingVariantError && models.length === 0) {
-      elements.thinkingVariantButton.title = state.thinkingVariantError;
-      elements.thinkingVariantButton.setAttribute("aria-label", `思考程度暂不可用：${state.thinkingVariantError}`);
-      return;
-    }
-    const summary = models.length === 1
-      ? thinkingVariantLabel(models[0].selected)
-      : `${models.length} 个模型`;
-    elements.thinkingVariantButton.title = models.length ? `思考程度：${summary}` : "当前模型没有可配置的思考档位";
-    elements.thinkingVariantButton.setAttribute("aria-label", elements.thinkingVariantButton.title);
-  }
 
-  function renderThinkingVariantModels() {
-    const models = state.thinkingVariantModels;
-    if (!models.some((model) => modelKey(model) === state.thinkingVariantActiveKey)) {
-      state.thinkingVariantActiveKey = models.length ? modelKey(models[0]) : null;
-    }
-    const fragment = document.createDocumentFragment();
-    for (const model of models) {
-      const key = modelKey(model);
-      const selected = key === state.thinkingVariantActiveKey;
-      const display = thinkingVariantDisplay(model);
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "thinking-model-option";
-      button.dataset.modelKey = key;
-      button.setAttribute("role", "option");
-      button.setAttribute("aria-selected", String(selected));
-      button.tabIndex = selected ? 0 : -1;
-      button.title = `${display.provider} / ${model.model}`;
-      const name = document.createElement("span");
-      name.className = "thinking-model-option-name";
-      name.textContent = display.name;
-      const level = document.createElement("span");
-      level.className = "thinking-model-option-level";
-      level.textContent = thinkingVariantLabel(model.selected, true);
-      button.append(name, level);
-      button.addEventListener("click", () => {
-        state.thinkingVariantActiveKey = key;
-        renderThinkingVariantMenu();
-        Array.from(elements.thinkingModelList.querySelectorAll(".thinking-model-option"))
-          .find((option) => option.dataset.modelKey === key)?.focus();
-      });
-      fragment.appendChild(button);
-    }
-    if (!models.length) {
-      const empty = document.createElement("div");
-      empty.className = "thinking-variant-empty";
-      empty.textContent = "当前模型没有可配置的思考档位";
-      fragment.appendChild(empty);
-    }
-    elements.thinkingModelList.replaceChildren(fragment);
-  }
 
-  function renderThinkingVariantLevels() {
-    const model = thinkingVariantModel();
-    elements.thinkingLevelList.replaceChildren();
-    if (!model) {
-      elements.thinkingModelName.textContent = "";
-      elements.thinkingModelProvider.textContent = "";
-      return;
-    }
-    const display = thinkingVariantDisplay(model);
-    elements.thinkingModelName.textContent = display.name;
-    elements.thinkingModelName.title = model.model;
-    elements.thinkingModelProvider.textContent = `${display.provider} / ${model.model}`;
-    elements.thinkingModelProvider.title = elements.thinkingModelProvider.textContent;
-    const fragment = document.createDocumentFragment();
-    for (const variant of [null, ...model.variants]) {
-      const selected = model.selected === variant;
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "thinking-level-option";
-      button.setAttribute("role", "radio");
-      button.setAttribute("aria-checked", String(selected));
-      button.tabIndex = selected ? 0 : -1;
-      button.title = variant == null ? "使用模型默认设置" : String(variant);
-      const check = document.createElement("span");
-      check.className = "thinking-level-check";
-      check.setAttribute("aria-hidden", "true");
-      const label = document.createElement("span");
-      label.className = "thinking-level-name";
-      label.textContent = thinkingVariantLabel(variant);
-      button.append(check, label);
-      button.addEventListener("click", () => selectThinkingVariant(modelKey(model), variant));
-      fragment.appendChild(button);
-    }
-    elements.thinkingLevelList.appendChild(fragment);
-  }
 
-  function renderThinkingVariantMenu() {
-    renderThinkingVariantModels();
-    renderThinkingVariantLevels();
-    // 单模型（非混合池）没有可选的模型，跳过模型栏，点开即是档位单选。
-    const singleModel = state.thinkingVariantModels.length <= 1;
-    const modelPane = elements.thinkingModelList.closest(".thinking-model-pane");
-    if (modelPane) {
-      modelPane.hidden = singleModel;
-      modelPane.closest(".thinking-variant-layout")?.classList.toggle("single-model", singleModel);
-    }
-    updateThinkingVariantTrigger();
-    positionThinkingVariantPopover();
-  }
 
-  function positionThinkingVariantPopover() {
-    const popover = elements.thinkingVariantPopover;
-    if (popover.hidden) return;
-    const trigger = elements.thinkingVariantButton.getBoundingClientRect();
-    const margin = 9;
-    const gap = 8;
-    const availableWidth = Math.max(180, window.innerWidth - margin * 2);
-    popover.style.maxWidth = `${visualPixelsToLayout(availableWidth)}px`;
-    popover.style.minWidth = `${Math.min(286, visualPixelsToLayout(availableWidth))}px`;
-    popover.style.maxHeight = `${visualPixelsToLayout(Math.max(150, trigger.top - margin - gap))}px`;
-    const measuredWidth = popover.offsetWidth * UI_SCALE;
-    const measuredHeight = popover.offsetHeight * UI_SCALE;
-    const left = Math.min(
-      Math.max(margin, trigger.left),
-      window.innerWidth - measuredWidth - margin
-    );
-    const top = Math.max(margin, trigger.top - measuredHeight - gap);
-    popover.style.left = `${visualPixelsToLayout(left)}px`;
-    popover.style.top = `${visualPixelsToLayout(top)}px`;
-  }
 
-  function openThinkingVariantPopover() {
-    if (elements.thinkingVariantButton.disabled || !state.thinkingVariantModels.length) return;
-    closeModelMenu();
-    renderThinkingVariantMenu();
-    elements.thinkingVariantPopover.hidden = false;
-    elements.thinkingVariantButton.setAttribute("aria-expanded", "true");
-    window.requestAnimationFrame(() => {
-      positionThinkingVariantPopover();
-      elements.thinkingLevelList.querySelector('[aria-checked="true"]')?.focus();
-    });
-  }
-
-  function closeThinkingVariantPopover({ restoreFocus = false } = {}) {
-    if (elements.thinkingVariantPopover.hidden) return;
-    elements.thinkingVariantPopover.hidden = true;
-    elements.thinkingVariantButton.setAttribute("aria-expanded", "false");
-    if (restoreFocus) elements.thinkingVariantButton.focus();
-  }
 
   async function loadThinkingVariants() {
     const generation = ++state.thinkingVariantLoadGeneration;
@@ -797,16 +622,10 @@
       const payload = await response.json();
       if (generation !== state.thinkingVariantLoadGeneration) return;
       state.thinkingVariantModels = normalizeThinkingVariantModels(payload?.options);
-      state.thinkingVariantConfirmed = new Map(
-        state.thinkingVariantModels.map((model) => [modelKey(model), model.selected])
-      );
-      state.thinkingVariantRevisions.clear();
-      renderThinkingVariantMenu();
+      updateCurrentModelDisplay();
     } catch (error) {
       if (generation !== state.thinkingVariantLoadGeneration) return;
       state.thinkingVariantError = error.message || "无法载入思考档位";
-      if (!state.thinkingVariantModels.length) closeThinkingVariantPopover();
-      updateThinkingVariantTrigger();
     } finally {
       if (generation === state.thinkingVariantLoadGeneration) {
         state.thinkingVariantLoading = false;
@@ -815,85 +634,8 @@
     }
   }
 
-  function selectThinkingVariant(key, variant) {
-    const model = thinkingVariantModel(key);
-    if (!model || model.selected === variant) return;
-    model.selected = variant;
-    state.thinkingVariantRevisions.set(key, (state.thinkingVariantRevisions.get(key) || 0) + 1);
-    renderThinkingVariantMenu();
-    elements.thinkingLevelList.querySelector('[aria-checked="true"]')?.focus();
-    state.thinkingVariantWriteChain = state.thinkingVariantWriteChain
-      .catch(() => {})
-      .then(() => persistLatestThinkingVariant(key));
-  }
 
-  async function persistLatestThinkingVariant(key) {
-    const model = thinkingVariantModel(key);
-    if (!model) return;
-    const desired = model.selected;
-    const confirmed = state.thinkingVariantConfirmed.has(key)
-      ? state.thinkingVariantConfirmed.get(key)
-      : null;
-    if (desired === confirmed) return;
-    const revision = state.thinkingVariantRevisions.get(key) || 0;
-    try {
-      const response = await apiRequest("/api/models/thinking-variants", {
-        method: "PUT",
-        body: JSON.stringify({
-          updates: [{
-            provider_id: model.provider_id,
-            model: model.model,
-            selected: desired
-          }]
-        })
-      });
-      const payload = await response.json();
-      const returned = normalizeThinkingVariantModels(payload?.options)
-        .find((candidate) => modelKey(candidate) === key);
-      const applied = returned ? returned.selected : desired;
-      state.thinkingVariantConfirmed.set(key, applied);
-      const current = thinkingVariantModel(key);
-      if (current && state.thinkingVariantRevisions.get(key) === revision && current.selected !== applied) {
-        current.selected = applied;
-        renderThinkingVariantMenu();
-      } else {
-        updateThinkingVariantTrigger();
-      }
-    } catch (error) {
-      const current = thinkingVariantModel(key);
-      if (current && state.thinkingVariantRevisions.get(key) === revision) {
-        current.selected = confirmed;
-        renderThinkingVariantMenu();
-        showToast(error.message || "思考程度未保存", "error");
-      }
-    }
-  }
 
-  function handleThinkingVariantKeydown(event) {
-    const inModels = event.target.closest("#thinkingModelList");
-    const inLevels = event.target.closest("#thinkingLevelList");
-    const container = inModels || inLevels;
-    if (!container) return;
-    const selector = inModels ? ".thinking-model-option" : ".thinking-level-option";
-    const items = Array.from(container.querySelectorAll(selector));
-    const index = items.indexOf(document.activeElement);
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      const direction = event.key === "ArrowDown" ? 1 : -1;
-      items[(index + direction + items.length) % items.length]?.focus();
-    } else if (event.key === "Home" || event.key === "End") {
-      event.preventDefault();
-      items[event.key === "Home" ? 0 : items.length - 1]?.focus();
-    } else if (event.key === "ArrowRight" && inModels) {
-      event.preventDefault();
-      (elements.thinkingLevelList.querySelector('[aria-checked="true"]')
-        || elements.thinkingLevelList.querySelector(".thinking-level-option"))?.focus();
-    } else if (event.key === "ArrowLeft" && inLevels) {
-      event.preventDefault();
-      (elements.thinkingModelList.querySelector('[aria-selected="true"]')
-        || elements.thinkingModelList.querySelector(".thinking-model-option"))?.focus();
-    }
-  }
 
   function closeSidebar() {
     elements.sidebar.classList.remove("open");
@@ -940,43 +682,62 @@
       .filter((node) => !node.hidden && node.getClientRects().length > 0);
   }
 
+  // 设置以前是从右侧滑出来的抽屉,自带遮罩和焦点陷阱。现在它是控制台的一个
+  // 标签页——控制台本来就是个整页视图,设置这么大一坨挂在抽屉里,和「数据统计」
+  // 各占一套导航,没道理。这两个函数保留下来当入口,内部转成开控制台。
   function openSettings(opener = document.activeElement) {
     state.settingsOpener = opener;
     closeModelMenu();
-    closeThinkingVariantPopover();
-    elements.settingsDrawer.classList.add("open");
-    elements.settingsDrawer.setAttribute("aria-hidden", "false");
-    elements.drawerScrim.classList.add("visible");
-    elements.drawerScrim.tabIndex = 0;
-    window.requestAnimationFrame(() => elements.settingsClose.focus());
-    if (!state.configLoaded && !state.configLoading) loadConfigDraft();
+    consoleOpen("settings");
   }
 
   function closeSettings({ restoreFocus = true } = {}) {
-    if (!elements.settingsDrawer.classList.contains("open")) return;
-    elements.settingsDrawer.classList.remove("open");
-    elements.settingsDrawer.setAttribute("aria-hidden", "true");
-    elements.drawerScrim.classList.remove("visible");
-    elements.drawerScrim.tabIndex = -1;
+    if (!settingsIsOpen()) return;
+    consoleClose();
     if (restoreFocus && state.settingsOpener instanceof HTMLElement) state.settingsOpener.focus();
     state.settingsOpener = null;
   }
 
+  function settingsIsOpen() {
+    return consoleIsOpen() && state.consolePanel === "settings";
+  }
+
   function openModelMenu() {
     if (elements.modelButton.disabled || state.models.length === 0) return;
-    closeThinkingVariantPopover();
     resetModelMenuStaging();
     renderModelMenu();
     elements.modelMenu.hidden = false;
     elements.modelButton.setAttribute("aria-expanded", "true");
+    positionModelMenu();
     refreshSessionModelOverride();
     const selected = elements.modelMenu.querySelector(".model-menu-item.selected:not(:disabled)");
     const first = elements.modelMenu.querySelector(".model-menu-item:not(:disabled)");
     window.requestAnimationFrame(() => (selected || first)?.focus());
   }
 
+  /// 菜单不在按钮的父元素里(`.composer` 会把它裁掉,见 index.html),所以
+  /// 位置得自己算：贴按钮左边、浮在按钮上方,再夹回 dock 的可视范围内。
+  function positionModelMenu() {
+    if (elements.modelMenu.hidden) return;
+    const dock = elements.composerDock.getBoundingClientRect();
+    const button = elements.modelButton.getBoundingClientRect();
+    const gap = 8;
+    const margin = 8;
+    const width = elements.modelMenu.offsetWidth * UI_SCALE;
+    const left = Math.min(
+      Math.max(margin, button.left),
+      Math.max(margin, window.innerWidth - width - margin)
+    );
+    elements.modelMenu.style.left = `${visualPixelsToLayout(left - dock.left)}px`;
+    elements.modelMenu.style.bottom = `${visualPixelsToLayout(dock.bottom - button.top + gap)}px`;
+    // 上方剩多少就开多高,顶不出视口。
+    const room = visualPixelsToLayout(Math.max(160, button.top - gap - margin));
+    elements.modelMenu.style.maxHeight = `${Math.min(420, room)}px`;
+  }
+
   function closeModelMenu({ restoreFocus = false, discard = true } = {}) {
     if (elements.modelMenu.hidden) return;
+    closeLevelMenu();
     elements.modelMenu.hidden = true;
     elements.modelButton.setAttribute("aria-expanded", "false");
     if (discard) {
@@ -2921,21 +2682,21 @@
     const pool = override ? override.map(describeOverrideModel) : active;
     const scope = override ? "本会话固定" : "跟随全局";
     if (pool.length === 0) {
-      elements.modelMark.textContent = "--";
       elements.modelLabel.textContent = state.models.length ? "未选择模型" : "未配置模型";
       elements.modelLabel.title = `${elements.modelLabel.textContent}（${scope}）`;
       return;
     }
     if (pool.length > 1) {
       const title = pool.map((model) => `${model.provider_name || model.provider_id || ""} · ${model.model || ""}`).join("\n");
-      elements.modelMark.textContent = "MX";
       elements.modelLabel.textContent = `混合模型 · ${pool.length}`;
       elements.modelLabel.title = `${scope}\n${title}`;
       return;
     }
     const selected = pool[0];
-    elements.modelMark.textContent = modelMark(selected);
-    elements.modelLabel.textContent = String(selected.model || "");
+    // 档位并进按钮文字——它原本有自己的按钮,合并后这里是唯一能看到它的地方。
+    const level = state.thinkingVariantModels.find((model) => modelKey(model) === modelKey(selected))?.selected;
+    const name = String(selected.model || "");
+    elements.modelLabel.textContent = level == null ? name : `${name} · ${thinkingVariantLabel(level, true)}`;
     elements.modelLabel.title = `${selected.provider_name || selected.provider_id || ""} · ${selected.model || ""}（${scope}）`;
   }
 
@@ -2951,8 +2712,29 @@
     const override = viewSessionModelOverride();
     state.stagedFollowGlobal = !override;
     state.stagedModelKeys = new Set((override || []).map(modelKey));
+    // 思考档位以前是另一个按钮、另一个浮层,即点即写。现在它和模型选择合成
+    // 一个面板,就得跟模型选择一样先暂存,由同一个「确认」一起提交——否则同一
+    // 个面板里一半改动立刻生效、一半要按确认,「取消」也说不清取消的是什么。
+    state.stagedVariants = new Map(
+      state.thinkingVariantModels.map((model) => [modelKey(model), model.selected ?? null])
+    );
+    state.expandedLevelKey = null;
     state.modelMenuTouched = false;
     state.modelMenuError = "";
+  }
+
+  /// 某个模型可选的档位;没有可配置档位的模型返回空数组(那一行就不长小片)。
+  function variantOptionsFor(key) {
+    const entry = state.thinkingVariantModels.find((model) => modelKey(model) === key);
+    return entry ? entry.variants : [];
+  }
+
+  function stagedVariantFor(key) {
+    if (state.stagedVariants instanceof Map && state.stagedVariants.has(key)) {
+      return state.stagedVariants.get(key);
+    }
+    const entry = state.thinkingVariantModels.find((model) => modelKey(model) === key);
+    return entry ? entry.selected ?? null : null;
   }
 
   function modelMenuStaging() {
@@ -2964,6 +2746,9 @@
   }
 
   function renderModelMenu() {
+    // 重画整张列表会把滚动位置清零。展开档位、选档位都要重画,不记住就
+    // 每次都弹回顶部,而用户正看着列表中间某一行。
+    const scrollTop = elements.modelMenu.querySelector(".model-menu-list")?.scrollTop ?? 0;
     elements.modelMenu.replaceChildren();
     const staging = modelMenuStaging();
     const globalKeys = new Set(activeModels().map(modelKey));
@@ -2978,9 +2763,6 @@
     follow.setAttribute("role", "menuitemcheckbox");
     follow.setAttribute("aria-checked", String(staging.follow));
     follow.classList.toggle("selected", staging.follow);
-    const followMark = document.createElement("span");
-    followMark.className = "model-mark";
-    followMark.textContent = "全";
     const followCopy = document.createElement("span");
     followCopy.className = "model-menu-copy";
     const followName = document.createElement("strong");
@@ -2992,7 +2774,7 @@
     followCheck.className = "icon-slot check-slot";
     followCheck.setAttribute("aria-hidden", "true");
     if (staging.follow) followCheck.appendChild(createIcon("check"));
-    follow.append(followMark, followCopy, followCheck);
+    follow.append(followCopy, followCheck);
     follow.addEventListener("click", chooseFollowGlobal);
     list.appendChild(follow);
 
@@ -3009,9 +2791,6 @@
       button.classList.toggle("selected", selected);
       button.classList.toggle("from-global", checked && staging.follow);
 
-      const mark = document.createElement("span");
-      mark.className = "model-mark";
-      mark.textContent = modelMark(model);
       const copy = document.createElement("span");
       copy.className = "model-menu-copy";
       const name = document.createElement("strong");
@@ -3023,9 +2802,34 @@
       check.className = "icon-slot check-slot";
       check.setAttribute("aria-hidden", "true");
       if (checked) check.appendChild(createIcon("check"));
-      button.append(mark, copy, check);
+      button.append(copy, check);
       button.addEventListener("click", () => toggleStagedModel(button.dataset.modelKey));
-      list.appendChild(button);
+
+      // 档位小片和展开的档位行都得在这个按钮外面——按钮里套按钮是非法嵌套,
+      // 浏览器会把内层拎出去,点击就落到外层的「选中模型」上。
+      const key = button.dataset.modelKey;
+      const variants = variantOptionsFor(key);
+      if (!variants.length) {
+        list.appendChild(button);
+        continue;
+      }
+      const row = document.createElement("div");
+      row.className = "model-menu-row";
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "model-level-chip";
+      chip.setAttribute("aria-expanded", String(state.expandedLevelKey === key));
+      chip.title = `思考程度：${thinkingVariantLabel(stagedVariantFor(key))}`;
+      const chipText = document.createElement("span");
+      chipText.textContent = thinkingVariantLabel(stagedVariantFor(key), true);
+      chip.append(chipText, makeIconSlot("chevron-down"));
+      chip.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (state.expandedLevelKey === key) closeLevelMenu();
+        else openLevelMenu(key, chip, model.model);
+      });
+      row.append(button, chip);
+      list.appendChild(row);
     }
 
     const footer = document.createElement("footer");
@@ -3049,6 +2853,9 @@
     confirm.addEventListener("click", confirmModelSelection);
     footer.append(feedback, cancel, confirm);
     elements.modelMenu.append(list, footer);
+    if (scrollTop) list.scrollTop = scrollTop;
+    // 展开/收起档位会改变菜单高度，位置要跟着重算。
+    positionModelMenu();
     updateModelMenuState();
     updateCurrentModelDisplay();
     refreshLiveEndpointVisibility();
@@ -3094,6 +2901,78 @@
     state.modelMenuTouched = true;
     state.modelMenuError = "";
     updateModelMenuState();
+  }
+
+  /// 档位选项做成独立浮层,挂在 composer-dock 上。
+  ///
+  /// 内联铺开会把下面的模型整体往下顶,列表本来就长,一展开就更难找；浮层
+  /// 又不能放进 `.model-menu`——那个为了圆角开了 overflow: hidden,列表自己
+  /// 还滚动,浮层会被切掉。所以和模型菜单平级,自己算位置。
+  function openLevelMenu(key, chip, modelName) {
+    const variants = variantOptionsFor(key);
+    if (!variants.length) return;
+    state.expandedLevelKey = key;
+    const menu = elements.modelLevelMenu;
+    menu.replaceChildren();
+    menu.setAttribute("aria-label", `${modelName} 的思考程度`);
+    for (const variant of [null, ...variants]) {
+      const staged = stagedVariantFor(key) === variant;
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "model-level-option";
+      option.setAttribute("role", "radio");
+      option.setAttribute("aria-checked", String(staged));
+      option.classList.toggle("selected", staged);
+      option.textContent = thinkingVariantLabel(variant);
+      option.title = variant == null ? "使用模型默认设置" : String(variant);
+      option.addEventListener("click", (event) => {
+        event.stopPropagation();
+        stageVariant(key, variant);
+      });
+      menu.appendChild(option);
+    }
+    menu.hidden = false;
+    chip.setAttribute("aria-expanded", "true");
+    positionLevelMenu(chip);
+  }
+
+  function positionLevelMenu(chip) {
+    const menu = elements.modelLevelMenu;
+    if (menu.hidden) return;
+    const dock = elements.composerDock.getBoundingClientRect();
+    const anchor = chip.getBoundingClientRect();
+    const margin = 8;
+    const width = menu.offsetWidth * UI_SCALE;
+    const height = menu.offsetHeight * UI_SCALE;
+    // 贴小片右缘往左展开,竖直方向和小片对齐;上下都夹回视口。
+    const left = Math.min(
+      Math.max(margin, anchor.right - width),
+      Math.max(margin, window.innerWidth - width - margin)
+    );
+    const top = Math.min(
+      Math.max(margin, anchor.top - 4),
+      Math.max(margin, window.innerHeight - height - margin)
+    );
+    menu.style.left = `${visualPixelsToLayout(left - dock.left)}px`;
+    menu.style.top = `${visualPixelsToLayout(top - dock.top)}px`;
+  }
+
+  function closeLevelMenu() {
+    if (elements.modelLevelMenu.hidden) return;
+    elements.modelLevelMenu.hidden = true;
+    state.expandedLevelKey = null;
+    elements.modelMenu
+      .querySelectorAll('.model-level-chip[aria-expanded="true"]')
+      .forEach((chip) => chip.setAttribute("aria-expanded", "false"));
+  }
+
+  function stageVariant(key, variant) {
+    if (!(state.stagedVariants instanceof Map) || state.modelSelectionSubmitting) return;
+    state.stagedVariants.set(key, variant);
+    closeLevelMenu();
+    state.modelMenuTouched = true;
+    state.modelMenuError = "";
+    renderModelMenu();
   }
 
   function toggleStagedModel(key) {
@@ -3727,20 +3606,10 @@
     }
   }
 
+  // 顶栏没了,会话标题和「正在回复 · 工作区」那行副标题跟着没了——侧栏里
+  // 本来就高亮着当前会话,标题是第二份;运行状态现在由侧栏的转圈和输入框那排
+  // 的指示器表达,比一行小字显眼。剩下的是让侧栏重画。
   function updateConversationChrome() {
-    updateModeBadge();
-    const details = deriveConversationDetails();
-    const current = multiSessionEnabled() ? viewSessionEntry() : null;
-    const title = current ? sessionDisplayName(current) : details.title;
-    elements.conversationTitle.textContent = title;
-    elements.conversationTitle.title = title;
-    const workspace = String(current?.workspace || "").trim();
-    let meta;
-    if (conversationRunning()) {
-      meta = state.liveRuns.size > 1 ? `${formatInteger(state.liveRuns.size)} 路回复进行中` : "正在回复";
-    } else meta = details.timestamp ? formatRelativeTime(details.timestamp) : "尚未开始";
-    elements.conversationMeta.textContent = workspace ? `${meta} · ${workspace}` : meta;
-    elements.conversationMeta.title = workspace;
     renderSessionList();
   }
 
@@ -4042,10 +3911,6 @@
     elements.newChatButton.disabled = state.blocked || busy || state.sessionBusy || state.viewLoading;
     // 会话级模型覆盖允许在回复进行中调整，下一轮生效。
     elements.modelButton.disabled = state.blocked || state.models.length === 0;
-    elements.thinkingVariantButton.disabled = state.blocked || running || busy
-      || state.thinkingVariantLoading || state.thinkingVariantModels.length === 0;
-    if (elements.thinkingVariantButton.disabled) closeThinkingVariantPopover();
-    updateThinkingVariantTrigger();
     elements.promptGrid.querySelectorAll("button").forEach((button) => {
       button.disabled = state.blocked || running || busy;
     });
@@ -5010,11 +4875,36 @@
     }
   }
 
+  /// artifact 的归属会话。预览面板永远只画当前正在看的那个会话。
+  function artifactScope() {
+    return String(state.viewSessionId || state.currentSessionId || "");
+  }
+
+  function pinnedArtifactsForScope() {
+    const scope = artifactScope();
+    let pinned = state.pinnedArtifacts.get(scope);
+    if (!pinned) {
+      pinned = new Map();
+      state.pinnedArtifacts.set(scope, pinned);
+    }
+    return pinned;
+  }
+
+  function dismissedArtifactsForScope() {
+    const scope = artifactScope();
+    let dismissed = state.dismissedArtifactIds.get(scope);
+    if (!dismissed) {
+      dismissed = new Set();
+      state.dismissedArtifactIds.set(scope, dismissed);
+    }
+    return dismissed;
+  }
+
   function registerArtifact(source, { autoOpen = false } = {}) {
     const artifact = normalizeArtifact(source, source?.kind || "file");
     if (!artifact) return;
-    state.pinnedArtifacts.set(artifact.id, artifact);
-    state.dismissedArtifactIds.delete(artifact.id);
+    pinnedArtifactsForScope().set(artifact.id, artifact);
+    dismissedArtifactsForScope().delete(artifact.id);
     const index = state.artifacts.findIndex((item) => item.id === artifact.id);
     if (index >= 0) state.artifacts[index] = artifact;
     else state.artifacts.push(artifact);
@@ -5044,10 +4934,11 @@
       }
     }
     // 手动送进来的补在后面：它们不属于任何回合，只活在这份 state 里。
-    for (const artifact of state.pinnedArtifacts.values()) {
+    for (const artifact of pinnedArtifactsForScope().values()) {
       if (!artifacts.some((item) => item.id === artifact.id)) artifacts.push(artifact);
     }
-    state.artifacts = artifacts.filter((item) => !state.dismissedArtifactIds.has(item.id));
+    const dismissed = dismissedArtifactsForScope();
+    state.artifacts = artifacts.filter((item) => !dismissed.has(item.id));
     artifacts = state.artifacts;
     if (!artifacts.some((item) => item.id === state.selectedArtifactId)) {
       state.selectedArtifactId = artifacts.at(-1)?.id || null;
@@ -5263,14 +5154,16 @@
       row.append(button, remove);
       elements.artifactResourceMenu.appendChild(row);
     }
-    elements.artifactTitleButton.disabled = state.artifacts.length <= 1;
+    // 只有一个 artifact 时也要能开这个菜单——删除按钮在菜单里，禁掉就等于
+    // 「最后一个删不掉」。当初禁它是因为菜单只用来切换，一个项目没得切。
+    elements.artifactTitleButton.disabled = state.artifacts.length === 0;
   }
 
   /// 从列表里拿掉一个 artifact。回合产出的那些下次同步会重新长出来，所以
   /// 得把 id 记进 dismissed 才删得掉。
   function dismissArtifact(id) {
-    state.dismissedArtifactIds.add(id);
-    state.pinnedArtifacts.delete(id);
+    dismissedArtifactsForScope().add(id);
+    pinnedArtifactsForScope().delete(id);
     state.artifactSourceCache.delete(id);
     state.artifacts = state.artifacts.filter((item) => item.id !== id);
     if (state.selectedArtifactId === id) {
@@ -6409,6 +6302,7 @@
       // 惰性创建:只记状态,签等第一段真实思考文本(reasoning.delta)到达才出现,
       // 避免不输出思考的模型挂着空的「正在思考」签和空面板
       finalizeLiveReasoning(live);
+      resetPreparingWindow(live);
       live.reasoningStarted = true;
       live.reasoningClockStart = performance.now();
       breakLiveText(live);
@@ -6653,6 +6547,9 @@
       body.appendChild(detail.wrapper);
     }
     card.append(head, body);
+    // 待办列表挂在签外面,收起态也看得见——那是给人看的产出,不是调试信息。
+    const todos = window.MiyuTodos?.isTodoTool(name) ? window.MiyuTodos.render(output) : null;
+    if (todos) card.appendChild(todos);
     return card;
   }
 
@@ -6898,7 +6795,38 @@
     if (!live?.preparingTool) return;
     live.preparingTool.remove();
     live.preparingTool = null;
+    stopPreparingTimer(live);
     contentAdded();
+  }
+
+  function stopPreparingTimer(live) {
+    if (!live?.preparingTimer) return;
+    window.clearInterval(live.preparingTimer);
+    live.preparingTimer = null;
+  }
+
+  /// 准备窗口结束：秒表归零，下一批重新计。
+  ///
+  /// 只在**工具真的跑完**或新一轮思考开始时调用,不在 `tool.started` 时调用
+  /// ——批量调用里第二个工具的准备提示紧接着第一个的开工到来,那还是同一个
+  /// 等待窗口,归零的话屏幕上的秒数来回横跳(与 REPL 的
+  /// `tool_preparing_since` 同一套语义)。
+  function resetPreparingWindow(live) {
+    if (!live) return;
+    live.preparingSince = null;
+    clearPreparingTool(live);
+  }
+
+  function renderPreparingLabel(live) {
+    const tag = live?.preparingTool;
+    if (!tag) return;
+    const label = tag.querySelector(".tool-preparing-label");
+    if (!label) return;
+    const base = tag.dataset.phaseLabel || "";
+    const elapsed = live.preparingSince == null
+      ? ""
+      : formatToolDuration(performance.now() - live.preparingSince);
+    label.textContent = elapsed ? `${base} · ${elapsed}` : base;
   }
 
   function handleToolPreparing(live, data) {
@@ -6907,16 +6835,21 @@
     ensureLiveArticle(live);
     clearTypingIndicator(live, { waitingOnly: true });
     finalizeLiveReasoning(live);
+    // 窗口起点只认第一次——批量里换了工具不重新计时。
+    if (live.preparingSince == null) live.preparingSince = performance.now();
     if (live.preparingTool?.dataset.toolName === name) return;
     clearPreparingTool(live);
     const tag = document.createElement("div");
     tag.className = "tool-preparing-tag";
     tag.dataset.toolName = name;
+    tag.dataset.phaseLabel = preparingToolLabel(name, data?.phase);
     const label = document.createElement("span");
-    label.textContent = preparingToolLabel(name, data?.phase);
+    label.className = "tool-preparing-label";
     tag.append(makeIconSlot("loader-circle", "is-spinning"), label);
     live.blocks.appendChild(tag);
     live.preparingTool = tag;
+    renderPreparingLabel(live);
+    live.preparingTimer = window.setInterval(() => renderPreparingLabel(live), 200);
     syncBubbleWidth(live.article);
     contentAdded();
   }
@@ -6927,6 +6860,8 @@
       return;
     }
     if (name === "tool.started") {
+      // 只撤标签,不清 `preparingSince`：同一批里下一个工具的准备提示紧接着
+      // 到来,那还是同一个等待窗口。
       clearPreparingTool(live);
       createTool(live, data);
       return;
@@ -7039,6 +6974,14 @@
       tool.resultDetail.content.textContent = tool.resultDetail.raw;
       tool.resultDetail.wrapper.hidden = !tool.resultDetail.raw;
       const ok = Boolean(data?.ok);
+      resetPreparingWindow(live);
+      // 与回看那份同构（`createPersistedToolCard`）：待办列表挂在签外面。
+      // 只在这里画会让实时和刷新后长得不一样,那正是工具签之前踩过的坑。
+      if (ok && window.MiyuTodos?.isTodoTool(tool.name)) {
+        const todos = window.MiyuTodos.render(output);
+        tool.card.querySelector(".todo-panel")?.remove();
+        if (todos) tool.card.appendChild(todos);
+      }
       scheduleCommandOutputPreview(tool, data?.preview);
       updateToolStatus(tool, ok ? "完成" : "失败", ok ? "check" : "circle-alert", ok ? "is-success" : "is-failure");
       updateToolSummary(tool);
@@ -7971,7 +7914,7 @@
     contentAdded();
     if (state.liveRuns.size === 0) {
       window.requestAnimationFrame(() => {
-        if (!state.blocked && !elements.settingsDrawer.classList.contains("open")) focusComposerIfDesktop();
+        if (!state.blocked && !consoleIsOpen()) focusComposerIfDesktop();
       });
       window.setTimeout(() => {
         if (state.liveRuns.size === 0) refreshViewSnapshot();
@@ -8481,6 +8424,28 @@
     }
   }
 
+  /// 把面板里改过的思考档位一次写回。档位是**全局按模型**存的偏好,和会话
+  /// 的模型选择不是一个作用域,所以是两次请求;这里先写档位——它失败了就整个
+  /// 确认中止,不会出现「模型换了但档位没跟上」的半套状态。
+  async function commitStagedVariants() {
+    if (!(state.stagedVariants instanceof Map)) return;
+    const updates = [];
+    for (const model of state.thinkingVariantModels) {
+      const key = modelKey(model);
+      if (!state.stagedVariants.has(key)) continue;
+      const desired = state.stagedVariants.get(key);
+      if (desired === (model.selected ?? null)) continue;
+      updates.push({ provider_id: model.provider_id, model: model.model, selected: desired });
+    }
+    if (!updates.length) return;
+    const response = await apiRequest("/api/models/thinking-variants", {
+      method: "PUT",
+      body: JSON.stringify({ updates })
+    });
+    const payload = await response.json();
+    state.thinkingVariantModels = normalizeThinkingVariantModels(payload?.options);
+  }
+
   async function confirmModelSelection() {
     if (!(state.stagedModelKeys instanceof Set) || state.modelSelectionSubmitting) return;
     const sessionId = String(state.viewSessionId || state.currentSessionId || "");
@@ -8502,6 +8467,7 @@
     updateModelMenuState();
     let applied = false;
     try {
+      await commitStagedVariants();
       const response = await apiRequest(`/api/sessions/${encodeURIComponent(sessionId)}/models`, {
         method: "PUT",
         body: JSON.stringify({
@@ -8757,15 +8723,6 @@
     return session?.mode === "dev" ? "dev" : "normal";
   }
 
-  function updateModeBadge() {
-    if (!elements.modeBadge) return;
-    const mode = activeSessionMode();
-    elements.modeBadge.dataset.mode = mode;
-    const label = elements.modeBadge.querySelector(".mode-label");
-    if (label) label.textContent = mode === "dev" ? "开发" : "普通";
-    elements.modeBadge.title = mode === "dev" ? "开发模式会话（创建时定死）" : "普通模式会话（创建时定死）";
-  }
-
   function requestNewConversation() {
     if (multiSessionEnabled()) {
       openModeChooser();
@@ -8819,23 +8776,6 @@
   }
 
   function handleGlobalKeydown(event) {
-    if (elements.settingsDrawer.classList.contains("open") && event.key === "Tab") {
-      const focusable = getFocusable(elements.settingsDrawer);
-      if (!focusable.length) {
-        event.preventDefault();
-        elements.settingsDrawer.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
     if (event.key === "Escape") {
       if (elements.resetDialog.open) return;
       if (!elements.artifactResourceMenu.hidden) {
@@ -8849,17 +8789,12 @@
         closeSessionMenu();
         return;
       }
-      if (!elements.thinkingVariantPopover.hidden) {
-        event.preventDefault();
-        closeThinkingVariantPopover({ restoreFocus: true });
-        return;
-      }
       if (!elements.modelMenu.hidden) {
         event.preventDefault();
         closeModelMenu({ restoreFocus: true });
         return;
       }
-      if (elements.settingsDrawer.classList.contains("open")) {
+      if (settingsIsOpen()) {
         event.preventDefault();
         closeSettings();
         return;
@@ -9045,12 +8980,10 @@
     return rate.toFixed(2);
   }
 
-  function consoleOpen() {
+  function consoleOpen(panel = "usage") {
     elements.consoleView.hidden = false;
     elements.consoleView.setAttribute("aria-hidden", "false");
-    updateChartColors();
-    loadUsageStats();
-    loadUsageRecords();
+    setConsolePanel(panel);
   }
   function consoleClose() {
     elements.consoleView.hidden = true;
@@ -9059,6 +8992,26 @@
   }
   function consoleIsOpen() {
     return !elements.consoleView.hidden;
+  }
+
+  /// 切控制台标签页。数据统计的图表要等真正显示了才量得到尺寸,配置也是进了
+  /// 设置页才拉——都放在这里,免得开个控制台把两边的请求都打出去。
+  function setConsolePanel(panel) {
+    state.consolePanel = panel;
+    for (const item of elements.consoleView.querySelectorAll(".con-rail-item[data-console-panel]")) {
+      item.classList.toggle("active", item.dataset.consolePanel === panel);
+    }
+    for (const pane of elements.consoleView.querySelectorAll(".con-panel[data-console-panel]")) {
+      pane.hidden = pane.dataset.consolePanel !== panel;
+    }
+    if (panel === "usage") {
+      updateChartColors();
+      loadUsageStats();
+      loadUsageRecords();
+    } else {
+      usageTipHide();
+    }
+    if (panel === "settings" && !state.configLoaded && !state.configLoading) loadConfigDraft();
   }
 
   async function loadUsageStats() {
@@ -9531,6 +9484,9 @@
     elements.consoleBack.addEventListener("click", () => consoleClose());
     elements.conRailToggle.addEventListener("click", () =>
       elements.consoleView.classList.toggle("rail-collapsed"));
+    for (const item of elements.consoleView.querySelectorAll(".con-rail-item[data-console-panel]")) {
+      item.addEventListener("click", () => setConsolePanel(item.dataset.consolePanel));
+    }
     elements.usageRangeSeg.addEventListener("click", (event) => {
       const button = event.target.closest("button");
       if (!button) return;
@@ -9564,7 +9520,7 @@
     elements.sidebarScrim.addEventListener("click", closeSidebar);
     elements.sidebarCollapseButton?.addEventListener("click", () => setSidebarCollapsed(true));
     elements.sidebarExpandButton?.addEventListener("click", () => setSidebarCollapsed(false));
-    elements.topbarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
+    elements.sidebarSettingsButton.addEventListener("click", (event) => openSettings(event.currentTarget));
     elements.artifactToggleButton.addEventListener("click", () => setArtifactWorkspaceOpen(!state.artifactOpen));
     elements.artifactCloseButton.addEventListener("click", () => setArtifactWorkspaceOpen(false));
     elements.artifactPreviewButton.addEventListener("click", () => setArtifactMode("preview"));
@@ -9614,8 +9570,6 @@
       elements.artifactResizeHandle.addEventListener("pointerup", finish);
       elements.artifactResizeHandle.addEventListener("pointercancel", finish);
     });
-    elements.settingsClose.addEventListener("click", () => closeSettings());
-    elements.drawerScrim.addEventListener("click", () => closeSettings());
     elements.settingsNav.querySelectorAll("[data-settings-view]").forEach((button) => {
       button.addEventListener("click", () => setSettingsView(button.dataset.settingsView));
     });
@@ -9642,18 +9596,12 @@
     elements.reloadConfigButton.addEventListener("click", loadConfigDraft);
     elements.saveConfigButton.addEventListener("click", saveConfigDraft);
     elements.applyAdvancedConfigButton.addEventListener("click", applyAdvancedConfig);
-    elements.themeButton.addEventListener("click", () => setTheme(elements.body.dataset.theme === "graphite" ? "linen" : "graphite"));
     elements.sidebarThemeButton.addEventListener("click", () => setTheme(elements.body.dataset.theme === "graphite" ? "linen" : "graphite"));
     document.querySelectorAll("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => setTheme(button.dataset.themeChoice)));
     document.querySelectorAll("[data-scheme-choice]").forEach((button) => button.addEventListener("click", () => setColorScheme(button.dataset.schemeChoice)));
     document.querySelectorAll("[data-chat-font]").forEach((button) => button.addEventListener("click", () => setChatFontSize(button.dataset.chatFont)));
     elements.reasoningExpandToggle?.addEventListener("click", () => setReasoningExpanded(!state.reasoningExpanded));
     elements.toolExpandToggle?.addEventListener("click", () => setToolExpanded(!state.toolExpanded));
-    elements.thinkingVariantButton.addEventListener("click", () => {
-      if (elements.thinkingVariantPopover.hidden) openThinkingVariantPopover();
-      else closeThinkingVariantPopover({ restoreFocus: true });
-    });
-    elements.thinkingVariantPopover.addEventListener("keydown", handleThinkingVariantKeydown);
     elements.modelButton.addEventListener("click", (event) => {
       event.stopPropagation();
       if (elements.modelMenu.hidden) openModelMenu();
@@ -9675,14 +9623,17 @@
       }
     });
     document.addEventListener("pointerdown", (event) => {
-      if (!elements.thinkingVariantPopover.hidden
-        && !event.target.closest("#thinkingVariantPopover")
-        && !event.target.closest("#thinkingVariantButton")) {
-        closeThinkingVariantPopover();
-      }
     });
     document.addEventListener("click", (event) => {
-      if (!elements.modelMenu.hidden && !event.target.closest("#modelMenuWrap")) closeModelMenu();
+      if (!elements.modelLevelMenu.hidden && !event.target.closest("#modelLevelMenu")) {
+        closeLevelMenu();
+      }
+      if (!elements.modelMenu.hidden
+        && !event.target.closest("#modelMenuWrap")
+        && !event.target.closest("#modelMenu")
+        && !event.target.closest("#modelLevelMenu")) {
+        closeModelMenu();
+      }
       if (state.sessionMenuFor && !event.target.closest(".session-menu") && !event.target.closest(".session-menu-button")) closeSessionMenu();
       if (!elements.artifactResourceMenu.hidden && !event.target.closest(".artifact-resource-wrap")) closeArtifactResourceMenu();
     });
@@ -9789,13 +9740,11 @@
     window.addEventListener("resize", () => {
       updateJumpButtonOffset();
       syncArtifactLayout();
-      positionThinkingVariantPopover();
+      positionModelMenu();
     }, { passive: true });
     new ResizeObserver(syncArtifactLayout).observe(elements.mainStage);
     if (window.visualViewport) {
       window.visualViewport.addEventListener("resize", syncAppHeight, { passive: true });
-      window.visualViewport.addEventListener("resize", positionThinkingVariantPopover, { passive: true });
-      window.visualViewport.addEventListener("scroll", positionThinkingVariantPopover, { passive: true });
       syncAppHeight();
     }
     document.addEventListener("keydown", handleGlobalKeydown);

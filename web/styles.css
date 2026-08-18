@@ -753,8 +753,13 @@ textarea:disabled {
 .sidebar-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   margin-top: 11px;
+  gap: 2px;
+}
+
+.sidebar-actions > .sidebar-action:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .sidebar-action {
@@ -790,90 +795,27 @@ textarea:disabled {
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   background: var(--app-bg);
   container-type: inline-size;
 }
 
-.main-stage > .topbar {
-  grid-column: 1 / -1;
-  grid-row: 1;
-}
-
-.topbar {
-  position: relative;
+/* 顶栏没了,侧栏控制浮在正文左上角。正文有自己的左右留白,这两个按钮压在
+   留白上,不占版面高度。 */
+.stage-float {
+  position: absolute;
   z-index: 15;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  min-width: 0;
-  min-height: 58px;
-  align-items: center;
-  padding: 0 16px;
-  background: var(--topbar-bg);
-}
-
-.topbar-leading,
-.topbar-actions {
+  top: 10px;
+  left: 12px;
   display: flex;
-  min-width: 0;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
-.topbar-actions {
-  justify-content: flex-end;
-}
-
-.conversation-heading {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.conversation-heading strong,
-.conversation-heading span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.conversation-heading strong {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.conversation-heading span {
-  color: var(--text-soft);
-  font-size: var(--fs-micro);
-}
-
-.mode-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 8px;
-  background: var(--accent-soft);
-  color: var(--md-sys-color-on-primary-container);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
-  user-select: none;
-}
-
-.mode-badge[data-mode="dev"] {
-  background: color-mix(in srgb, var(--md-sys-color-tertiary) 18%, transparent);
-  color: var(--md-sys-color-tertiary);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--md-sys-color-tertiary) 30%, transparent);
-}
-
-.mode-badge .mode-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
+.stage-float:not(:has(button:not([hidden]))) {
+  display: none;
 }
 
 .session-group-header {
@@ -952,9 +894,6 @@ textarea:disabled {
   font-size: 11px;
 }
 
-  100% { opacity: 1; transform: translateY(0) scale(1); }
-}
-
 .model-menu-wrap {
   position: relative;
 }
@@ -963,21 +902,27 @@ textarea:disabled {
 .model-button {
   display: inline-flex;
   min-width: 0;
-  height: 31px;
+  height: 28px;
   align-items: center;
   padding: 0 11px;
   border: 0;
   border-radius: 8px;
-  background: var(--gold-soft);
-  color: var(--md-sys-color-on-secondary-container);
+  background: var(--surface-2);
+  color: var(--text-soft);
   cursor: pointer;
   gap: 7px;
-  transition: filter 180ms ease;
+  transition: background 180ms ease, color 180ms ease;
 }
 
 .model-button:hover:not(:disabled),
 .model-button[aria-expanded="true"] {
-  filter: brightness(1.04);
+  background: var(--surface-3, var(--surface-2));
+  color: var(--text);
+}
+
+/* 菜单开着的时候箭头翻过来——不翻的话按钮看不出自己是开是关。 */
+.model-button[aria-expanded="true"] > .icon-slot {
+  transform: rotate(180deg);
 }
 
 .model-button:disabled {
@@ -990,6 +935,7 @@ textarea:disabled {
   height: 12px;
   flex-basis: 12px;
   opacity: 0.7;
+  transition: transform 160ms ease;
 }
 
 .model-label {
@@ -1001,7 +947,8 @@ textarea:disabled {
   font-weight: 600;
 }
 
-/* 模型标识:7px 金点(语义圆形) */
+/* 设置页摘要那颗小圆点。模型菜单和输入框那个按钮上的都去掉了——颜色不
+   表达任何信息,纯噪点;这里留着是因为摘要行没有别的图形锚点。 */
 .model-mark {
   display: inline-grid;
   width: 7px;
@@ -1016,15 +963,15 @@ textarea:disabled {
   font-style: normal;
 }
 
+/* 模型按钮从顶栏搬到了输入框那排,菜单往上开(往下开会掉出视口)。
+   left/bottom/max-height 由 positionModelMenu() 写在 style 上:菜单挂在
+   composer-dock 上而不是按钮旁边,纯 CSS 算不出按钮的位置。 */
 .model-menu {
   position: absolute;
-  top: calc(100% + 7px);
-  right: 0;
   z-index: 40;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   width: min(286px, calc(calc(100vw / var(--ui-scale)) - 24px));
-  max-height: min(420px, 61.8182vh);
   overflow: hidden;
   border: 0;
   border-radius: 8px;
@@ -1042,7 +989,7 @@ textarea:disabled {
 
 .model-menu-item {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) 16px;
+  grid-template-columns: minmax(0, 1fr) 16px;
   min-height: 46px;
   width: 100%;
   align-items: center;
@@ -1053,10 +1000,6 @@ textarea:disabled {
   cursor: pointer;
   gap: 8px;
   text-align: left;
-}
-
-.model-menu-item .model-mark {
-  justify-self: center;
 }
 
 .model-menu-item:hover:not(:disabled),
@@ -1168,7 +1111,7 @@ textarea:disabled {
 .conversation-stage {
   position: relative;
   display: grid;
-  grid-row: 2;
+  grid-row: 1;
   grid-column: 1;
   grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
@@ -2330,6 +2273,100 @@ body.has-lightbox {
   overflow: hidden;
 }
 
+/* 任务列表:AI 列的待办是给人看的产出,所以挂在工具签外面,收起态也可见。 */
+.todo-panel {
+  margin-top: 5px;
+  padding: 9px 11px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-1);
+}
+
+.todo-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  gap: 8px;
+}
+
+.todo-panel-head strong {
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.todo-panel-head small {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.todo-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: 3px;
+  list-style: none;
+}
+
+.todo-item {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr) auto;
+  align-items: baseline;
+  font-size: 12px;
+  gap: 7px;
+}
+
+.todo-mark {
+  width: 9px;
+  height: 9px;
+  align-self: center;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 50%;
+}
+
+.todo-text {
+  min-width: 0;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.todo-status {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.todo-item.is-in_progress .todo-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.todo-item.is-in_progress .todo-text {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.todo-item.is-in_progress .todo-status {
+  color: var(--accent);
+}
+
+.todo-item.is-completed .todo-mark {
+  border-color: var(--gold);
+  background: var(--gold);
+}
+
+.todo-item.is-completed .todo-text {
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+
+.todo-item.is-cancelled .todo-text {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
 /* 工具签:气泡内小签。身份用字形色(⚙/$ 金),底色只表状态——
    运行中浅紫(默认态)、成功中性、失败浅红。 */
 .tool-card {
@@ -3304,7 +3341,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   --artifact-highlight: color-mix(in srgb, var(--artifact-bg) 84%, var(--md-sys-color-surface-container-highest) 16%);
   --artifact-highlight-hover: color-mix(in srgb, var(--artifact-highlight) 84%, white 16%);
   position: absolute;
-  top: 66px;
+  top: 10px;
   right: 10px;
   bottom: 10px;
   z-index: 12;
@@ -3798,7 +3835,7 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   right: auto;
   bottom: auto;
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 1;
   width: var(--artifact-width);
   margin: 8px 10px 10px 16px;
   box-shadow: var(--artifact-shadow);
@@ -3813,6 +3850,12 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
 }
 
 @media (max-width: 836px) {
+  .stage-float {
+    top: max(8px, env(safe-area-inset-top));
+    left: 8px;
+    gap: 4px;
+  }
+
   :root {
     --ui-scale: 1;
   }
@@ -4456,291 +4499,116 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   gap: 9px;
 }
 
-.thinking-variant-button {
-  display: inline-flex;
-  width: 38px;
-  height: 26px;
-  flex: 0 0 38px;
+/* 思考档位并进了模型菜单：每行模型右边一个小片,点开就地铺开档位选项。
+   原先它是独立按钮 + 独立浮层,和模型按钮并排占两个位置,而两者常常要一起
+   调(换了模型往往就要换档位)。 */
+.model-menu-row {
+  position: relative;
+  display: flex;
   align-items: center;
-  justify-content: center;
-  border-radius: 8px;
+  padding-right: 9px;
+  border-radius: 6px;
+  gap: 3px;
+}
+
+/* 高亮由行来画,行内那个按钮不再自己上色——否则背景在按钮右缘就断了,
+   档位小片被甩在高亮之外,一行看着是两块。 */
+.model-menu-row > .model-menu-item {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+}
+
+.model-menu-row:hover,
+.model-menu-row:has(> .model-menu-item.selected) {
   background: var(--surface-2);
+}
+
+.model-menu-row:hover > .model-menu-item,
+.model-menu-row > .model-menu-item.selected {
+  color: var(--text);
+}
+
+/* 行内的档位控件。行已经有整块底色了,静息态只要比它高一档就看得出来;
+   点上去/展开时才转成强调色。 */
+.model-level-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  height: 24px;
+  padding: 0 6px 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--surface-3);
   color: var(--text-soft);
   cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
   gap: 2px;
-  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+  white-space: nowrap;
 }
 
-.thinking-variant-button:hover:not(:disabled),
-.thinking-variant-button[aria-expanded="true"] {
-  background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
-  color: var(--accent);
+.model-level-chip:hover,
+.model-level-chip[aria-expanded="true"] {
+  background: var(--accent);
+  color: var(--md-sys-color-on-primary);
 }
 
-.thinking-variant-button.has-override {
-  color: var(--accent);
+.model-level-chip .icon-slot {
+  width: 11px;
+  height: 11px;
+  opacity: 0.7;
+  transition: transform 160ms ease;
 }
 
-.thinking-variant-button:active:not(:disabled) {
-  transform: scale(0.95);
-}
-
-.thinking-variant-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.42;
-}
-
-.thinking-variant-button .brain-icon {
-  width: 14px;
-  height: 14px;
-  flex-basis: 14px;
-}
-
-.thinking-variant-button .thinking-chevron {
-  width: 9px;
-  height: 9px;
-  flex-basis: 9px;
-  transition: transform 180ms ease;
-}
-
-.thinking-variant-button[aria-expanded="true"] .thinking-chevron {
+.model-level-chip[aria-expanded="true"] .icon-slot {
   transform: rotate(180deg);
 }
 
-.thinking-variant-popover {
-  position: fixed;
-  z-index: 70;
-  width: max-content;
-  min-width: 286px;
-  max-width: min(374px, calc(100vw - 20px));
-  height: 247px;
-  max-height: calc(100dvh - 20px);
-  overflow: hidden;
+.model-level-menu {
+  position: absolute;
+  z-index: 41;
+  display: grid;
+  min-width: 132px;
+  padding: 4px;
   border: 1px solid var(--line-strong);
-  border-radius: 8px;
+  border-radius: 7px;
+  gap: 1px;
   background: var(--surface-1);
-  color: var(--text);
   box-shadow: var(--float-shadow);
-  transform-origin: bottom left;
-  animation: thinking-popover-in 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
-.thinking-variant-popover[hidden] {
+.model-level-menu[hidden] {
   display: none;
 }
 
-.thinking-variant-layout {
-  display: grid;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  grid-template-columns: minmax(112px, max-content) minmax(158px, max-content);
-}
-
-/* 单模型时模型栏被隐藏，布局收成一列档位。 */
-.thinking-variant-layout.single-model {
-  grid-template-columns: minmax(158px, max-content);
-}
-
-.thinking-model-pane,
-.thinking-level-pane {
-  min-width: 0;
-  min-height: 0;
-}
-
-.thinking-model-pane {
-  overflow: hidden;
-  border-right: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface-2) 70%, var(--surface-1));
-}
-
-.thinking-model-list {
-  display: grid;
-  align-content: start;
-  height: 100%;
-  padding: 6px 5px;
-  gap: 2px;
-  overflow-y: auto;
-  scrollbar-color: var(--line-strong) transparent;
-  scrollbar-width: thin;
-}
-
-.thinking-model-option {
-  display: grid;
-  position: relative;
-  width: 100%;
-  min-width: 0;
-  height: 31px;
+.model-level-option {
+  display: flex;
+  min-height: 28px;
   align-items: center;
-  padding: 0 7px 0 9px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  border-radius: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 5px;
   background: transparent;
   color: var(--text-soft);
   cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
   text-align: left;
-  gap: 6px;
 }
 
-.thinking-model-option::before {
-  position: absolute;
-  top: 6px;
-  bottom: 6px;
-  left: 0;
-  width: 2px;
-  border-radius: 2px;
-  background: transparent;
-  content: "";
-}
-
-.thinking-model-option:hover {
+.model-level-option:hover {
   background: var(--surface-2);
   color: var(--text);
 }
 
-.thinking-model-option[aria-selected="true"] {
-  background: color-mix(in srgb, var(--accent-soft) 54%, transparent);
-  color: var(--text);
-}
-
-.thinking-model-option[aria-selected="true"]::before {
+.model-level-option.selected {
   background: var(--accent);
-}
-
-.thinking-model-option-name,
-.thinking-model-option-level {
-  overflow: hidden;
-  min-width: 0;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.thinking-model-option-name {
-  font-size: 10.5px;
+  color: var(--md-sys-color-on-primary);
   font-weight: 600;
 }
 
-.thinking-model-option-level {
-  max-width: 36px;
-  color: var(--text-faint);
-  font-size: 9px;
-  font-weight: 600;
-}
-
-.thinking-model-option[aria-selected="true"] .thinking-model-option-level {
-  color: var(--accent);
-}
-
-.thinking-level-pane {
-  display: grid;
-  overflow: hidden;
-  max-width: 255px;
-  grid-template-rows: auto minmax(0, 1fr);
-  background: var(--surface-1);
-}
-
-.thinking-model-detail {
-  display: grid;
-  min-width: 0;
-  padding: 12px 13px 8px;
-  gap: 2px;
-}
-
-.thinking-model-detail strong,
-.thinking-model-detail small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.thinking-model-detail strong {
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.thinking-model-detail small {
-  color: var(--text-faint);
-  font-size: 9.5px;
-}
-
-.thinking-level-list {
-  display: grid;
-  align-content: start;
-  min-height: 0;
-  padding: 3px 7px 7px;
-  overflow-y: auto;
-  gap: 3px;
-  scrollbar-color: var(--line-strong) transparent;
-  scrollbar-width: thin;
-}
-
-.thinking-level-option {
-  display: flex;
-  width: 100%;
-  min-width: 148px;
-  min-height: 30px;
-  align-items: center;
-  padding: 0 8px;
-  border-radius: 6px;
-  background: transparent;
-  color: color-mix(in srgb, var(--text) 74%, var(--text-soft));
-  cursor: pointer;
-  text-align: left;
-  gap: 8px;
-}
-
-.thinking-level-option:hover {
-  background: var(--surface-2);
-  color: var(--text);
-}
-
-.thinking-level-option[aria-checked="true"] {
-  background: color-mix(in srgb, var(--accent-soft) 48%, transparent);
-  color: var(--text);
-}
-
-.thinking-level-name {
-  overflow: hidden;
-  min-width: 0;
-  font-size: 10.5px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.thinking-level-check {
-  display: grid;
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
-  place-items: center;
-  border: 1px solid var(--line-strong);
-  border-radius: 50%;
-}
-
-.thinking-level-option[aria-checked="true"] .thinking-level-check {
-  border-color: var(--accent);
-}
-
-.thinking-level-option[aria-checked="true"] .thinking-level-check::after {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  content: "";
-}
-
-.thinking-variant-empty {
-  padding: 20px 13px;
-  color: var(--text-faint);
-  font-size: 10.5px;
-  line-height: 1.5;
-}
-
-@keyframes thinking-popover-in {
-  from { opacity: 0; transform: translateY(4px) scale(0.98); }
-  to { opacity: 1; transform: none; }
-}
 
 .composer-submit {
   min-width: 0;
@@ -4945,55 +4813,17 @@ body[data-color-scheme="matugen"] .tool-card.is-command {
   display: block;
 }
 
-.drawer-scrim {
-  z-index: 49;
+/* 设置进了控制台,原来那个从右侧滑出的抽屉和它的遮罩都没了。
+   `.settings-layout` / `.settings-nav` / `.settings-content` 本来就没绑在
+   抽屉上,搬进控制台面板后原样生效。 */
+.con-panel {
+  min-height: 0;
 }
 
-.settings-drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 50;
+.con-panel[data-console-panel="settings"] {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  width: min(1040px, calc(98vw / var(--ui-scale)));
-  border-left: 0;
-  background: var(--app-bg);
-  box-shadow: var(--float-shadow);
-  transform: translateX(102%);
-  transition: transform 260ms cubic-bezier(0.2, 0, 0, 1);
-}
-
-.settings-drawer.open {
-  transform: translateX(0);
-}
-
-.settings-drawer > header {
-  display: flex;
-  min-height: 66px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 20px;
-}
-
-.settings-drawer > header > div {
-  display: grid;
-  gap: 1px;
-}
-
-.settings-drawer > header small {
-  color: var(--gold);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.24em;
-}
-
-.settings-drawer > header strong {
-  font-family: var(--serif);
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
+  height: 100%;
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .settings-content {
@@ -6073,18 +5903,10 @@ textarea.config-input {
     --sidebar-width: 224px;
   }
 
-  .topbar {
-    grid-template-columns: minmax(0, 1fr) auto;
-    padding: 0 10px;
-  }
-
   .model-label {
     max-width: 96px;
   }
 
-  .settings-drawer {
-    width: min(900px, calc(98vw / var(--ui-scale)));
-  }
 }
 
 @media (max-width: 836px) {
@@ -6125,6 +5947,12 @@ textarea.config-input {
     display: inline-grid;
   }
 
+  /* 窄屏上侧栏是抽屉,只有「关掉」一个语义。「收起」是宽屏那套(收成一条窄
+     轨),两个一起出现就是两个长得不一样的关闭按钮。 */
+  .sidebar-collapse-button {
+    display: none;
+  }
+
   .sidebar-close,
   .mobile-menu-button {
     width: 36px;
@@ -6135,32 +5963,6 @@ textarea.config-input {
   .main-stage {
     width: 100%;
     height: var(--app-height, calc(100dvh / var(--ui-scale)));
-  }
-
-  .topbar {
-    grid-template-areas: "leading actions";
-    grid-template-columns: minmax(0, 1fr) auto;
-    min-height: 58px;
-    align-content: center;
-    padding: max(7px, env(safe-area-inset-top)) 8px 7px;
-  }
-
-  .topbar-leading {
-    grid-area: leading;
-    gap: 5px;
-  }
-
-  .topbar-actions {
-    grid-area: actions;
-    gap: 4px;
-  }
-
-  .conversation-heading strong {
-    font-size: 13px;
-  }
-
-  .conversation-heading span {
-    font-size: 10px;
   }
 
   .model-button {
@@ -6174,11 +5976,8 @@ textarea.config-input {
   }
 
   .model-menu {
-    position: fixed;
-    top: calc(62px + env(safe-area-inset-top));
-    right: 8px;
     width: min(286px, calc(calc(100vw / var(--ui-scale)) - 16px));
-    max-height: min(430px, calc(calc(100dvh / var(--ui-scale)) - 82px));
+    max-height: min(430px, calc(calc(100dvh / var(--ui-scale)) - 140px));
   }
 
   .timeline {
@@ -6302,11 +6101,6 @@ textarea.config-input {
     margin-top: 17px;
   }
 
-  .settings-drawer {
-    width: min(720px, calc(100vw / var(--ui-scale)));
-    padding-top: env(safe-area-inset-top);
-  }
-
   .settings-layout {
     grid-template-columns: 1fr;
   }
@@ -6358,20 +6152,10 @@ textarea.config-input {
 }
 
 @media (max-width: 473px) {
-  .topbar .icon-button {
+  .stage-float .icon-button {
     width: 32px;
     height: 32px;
     flex-basis: 32px;
-  }
-
-  .topbar .mobile-menu-button {
-    width: 35px;
-    height: 35px;
-    flex-basis: 35px;
-  }
-
-  .conversation-heading strong {
-    max-width: 150px;
   }
 
   .tool-title strong,
@@ -6399,8 +6183,9 @@ textarea.config-input {
     max-width: 100px;
   }
 
-  .thinking-variant-popover {
-    max-width: calc(100vw - 18px);
+  /* 窄屏上进度条挤在一排控件中间,细得看不出刻度,数字本身已经说明问题。 */
+  .composer-context .context-track {
+    display: none;
   }
 
   .composer-context {

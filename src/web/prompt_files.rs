@@ -5,6 +5,13 @@
 
 use crate::web::*;
 
+/// 每个**已配置**模型的思考档位。
+///
+/// 以前只返回全局激活的那批，因为档位有自己的按钮和浮层，浮层只谈"当前在用的
+/// 模型"。现在档位挂在模型菜单的每一行上，而那张菜单列的是全部已配置模型——
+/// 只给激活的那批发档位，其余行就永远显示不出档位，哪怕它们支持。
+///
+/// 没有推理元数据的模型 `variants` 是空的，前端据此不画档位小片。
 pub(in crate::web) fn active_thinking_variant_options(
     config: &AppConfig,
     paths: &MiyuPaths,
@@ -12,7 +19,7 @@ pub(in crate::web) fn active_thinking_variant_options(
     crate::models_cache::ensure_active_metadata(paths, config);
     let preferences = ThinkingVariantPreferences::load(paths);
     config
-        .active_provider_model_choices()
+        .provider_model_choices()
         .into_iter()
         .map(|choice| {
             let provider = config.provider(Some(&choice.provider_id))?;

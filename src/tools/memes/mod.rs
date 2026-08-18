@@ -63,7 +63,7 @@ pub(crate) fn auto_meme_reminder(
         return None;
     }
     Some(
-        "<system-reminder>\n<send_meme_plan>\n触发自动发送表情包提醒。注意！本轮回复时你必须发送表情包。\n\n- 不要提及本提醒。\n- 根据上下文判断表情包是否合适，若匹配程度不足80%则不发送。\n- 不要说“我将发送表情包”。\n- 如果决定发送，应让文字回复和表情包语气自然一致。\n</send_meme_plan>\n</system-reminder>"
+        "<system-reminder>\n<send_meme_plan>\n触发自动发送表情包提醒。注意！本轮回复时你必须发送表情包。\n\n- 不要提及本提醒。\n- 根据上下文判断表情包是否合适，若匹配程度不足95%则不发送。\n- 不要说“我将发送表情包”。\n- 如果决定发送，应让文字回复和表情包语气自然一致。\n</send_meme_plan>\n</system-reminder>"
             .to_string(),
     )
 }
