@@ -3,8 +3,8 @@ mod history;
 mod platform;
 mod queue;
 mod rows;
-pub use rows::{interrupted_text, pending_placeholder};
 pub(crate) use rows::*;
+pub use rows::{interrupted_text, pending_placeholder};
 mod sessions;
 mod turns;
 mod types;
@@ -66,6 +66,37 @@ impl std::fmt::Debug for ConversationDb {
     }
 }
 
+/// 把删掉的行占的页真正还给磁盘。
+///
+/// SQLite 删行只是把页挂进 freelist，文件本身**不会变小**，那些页也不会还给
+/// 操作系统。本机实测：conversation.db 76 MB，其中 **90%（67.9 MB）是空闲页**，
+/// 存活数据只有 7.4 MB——清理过的旧会话、旧图片全躺在那儿占着地方。
+///
+/// 同仓库的 message_history 库一直是对的（`auto_vacuum = INCREMENTAL` +
+/// 每次清理跑一段有界的 `incremental_vacuum`），只有这个库漏了。
+///
+/// 两条路：
+///
+/// - **老库**（`auto_vacuum` 读出来是 0）：`open` 里那句 PRAGMA 对已有数据的
+///   库是空转——实测设完立刻读回来还是 0，必须**紧跟一次完整 VACUUM** 才落地。
+///   VACUUM 的代价只随存活数据长（实测约 2.6 ms/MB：存活 5.6 MB→15 ms、
+///   22.5 MB→58 ms、67.5 MB→175 ms），跟文件多大无关。而且只会发生一次：
+///   转换完 `auto_vacuum` 就是 2 了。
+/// - **已转换的库**：只回收有界的一小段，照抄 message_history 的 256 页
+///   （4 KB 页面下是 1 MB）。不在启动路径上跑完整 VACUUM。
+///
+/// 全程 `let _ =`：回收空间失败不该让人打不开自己的会话库。
+fn reclaim_free_pages(conn: &Connection) {
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .unwrap_or(0);
+    if mode == 0 {
+        let _ = conn.execute_batch("VACUUM;");
+        return;
+    }
+    let _ = conn.execute_batch("PRAGMA incremental_vacuum(256);");
+}
+
 impl ConversationDb {
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)?;
@@ -73,7 +104,10 @@ impl ConversationDb {
         let mut conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open conversation db: {}", db_path.display()))?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            // auto_vacuum 必须在建表**之前**设，新库才认。老库这句是空转，
+            // 由下面的 `reclaim_free_pages` 补一次 VACUUM 来落地。
+            "PRAGMA auto_vacuum = INCREMENTAL;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;",
@@ -92,6 +126,7 @@ impl ConversationDb {
             }
         }
         super::migrations::run_migrations(&mut conn)?;
+        reclaim_free_pages(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -105,7 +140,6 @@ impl ConversationDb {
         )?;
         Ok(next_seq)
     }
-
 }
 
 fn delete_visible_turns_in_transaction(
@@ -688,3 +722,139 @@ impl ConversationDb {
     }
 }
 
+#[cfg(test)]
+mod reclaim_tests_support {
+    use super::*;
+
+    pub(super) fn page_stats(path: &Path) -> (i64, i64, i64) {
+        let conn = Connection::open(path).unwrap();
+        let get = |pragma: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+                .unwrap()
+        };
+        (get("auto_vacuum"), get("page_count"), get("freelist_count"))
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::reclaim_tests_support::*;
+    use super::*;
+
+    /// 造一个「老库」：`auto_vacuum = 0`（SQLite 的默认），塞一堆数据再删掉，
+    /// 留下一屁股空闲页。这正是本机那个 76 MB / 90% 空闲的库的来历。
+    fn write_legacy_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = NONE;
+             PRAGMA journal_mode = DELETE;
+             CREATE TABLE junk(id INTEGER PRIMARY KEY, body TEXT);",
+        )
+        .unwrap();
+        let mut insert = conn.prepare("INSERT INTO junk(body) VALUES(?1)").unwrap();
+        let filler = "x".repeat(2048);
+        for _ in 0..2_000 {
+            insert.execute(params![filler]).unwrap();
+        }
+        drop(insert);
+        conn.execute_batch("DELETE FROM junk;").unwrap();
+    }
+
+    /// 老库打开时要被转换并回收：文件真的变小，`auto_vacuum` 从 0 变 2。
+    #[test]
+    fn opening_a_legacy_database_reclaims_free_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.db");
+        write_legacy_database(&path);
+
+        let (mode, pages, free) = page_stats(&path);
+        assert_eq!(mode, 0, "构造出来的应该是老库");
+        assert!(free * 2 > pages, "构造出来的库应该大半是空闲页");
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let db = ConversationDb::open(dir.path()).unwrap();
+        drop(db);
+
+        let (mode, pages, free) = page_stats(&path);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(mode, 2, "应该已经转成 INCREMENTAL");
+        assert!(after < before / 2, "文件没缩水：{before} → {after} 字节");
+        assert!(
+            free * 10 < pages,
+            "回收后不该还剩大量空闲页：{free}/{pages}"
+        );
+    }
+
+    /// 新库开箱就是 INCREMENTAL——`auto_vacuum` 只有在建表**之前**设才管用，
+    /// 这条防的是有人把那句 PRAGMA 挪到 `run_migrations` 后面。
+    #[test]
+    fn a_fresh_database_is_created_with_incremental_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ConversationDb::open(dir.path()).unwrap();
+        drop(db);
+        let (mode, _, _) = page_stats(&dir.path().join("conversation.db"));
+        assert_eq!(mode, 2);
+    }
+
+    /// 转换只发生一次：第二次打开不该再跑完整 VACUUM。
+    #[test]
+    fn the_conversion_does_not_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.db");
+        write_legacy_database(&path);
+        drop(ConversationDb::open(dir.path()).unwrap());
+        let (mode, _, _) = page_stats(&path);
+        assert_eq!(mode, 2);
+        drop(ConversationDb::open(dir.path()).unwrap());
+        let (mode, _, _) = page_stats(&path);
+        assert_eq!(mode, 2);
+    }
+}
+
+#[cfg(test)]
+mod reclaim_probe {
+    use super::reclaim_tests_support::*;
+
+    /// 量尺：把一份**真实**的 conversation.db 复制到临时目录，用真实的 `open`
+    /// 路径跑一遍，看能还回去多少磁盘。
+    ///
+    /// ```
+    /// cp ~/.miyu/state/conversation.db /tmp/probe/
+    /// MIYU_RECLAIM_PROBE_DIR=/tmp/probe \
+    ///   cargo test --lib reclaim_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// 不读默认路径、只认显式给的目录：量尺不该顺手打开用户正在用的库。
+    #[test]
+    #[ignore]
+    fn reclaim_on_a_real_database() {
+        let Some(dir) = std::env::var_os("MIYU_RECLAIM_PROBE_DIR") else {
+            println!("\n  跳过：没给 MIYU_RECLAIM_PROBE_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let path = dir.join("conversation.db");
+        let (mode, pages, free) = page_stats(&path);
+        let before = std::fs::metadata(&path).unwrap().len();
+        println!(
+            "\n  改前  {:.1} MB  auto_vacuum={mode}  页 {pages}（空闲 {free}，{:.0}%）",
+            before as f64 / 1048576.0,
+            100.0 * free as f64 / pages as f64
+        );
+
+        let started = std::time::Instant::now();
+        drop(super::ConversationDb::open(&dir).unwrap());
+        let elapsed = started.elapsed();
+
+        let (mode, pages, free) = page_stats(&path);
+        let after = std::fs::metadata(&path).unwrap().len();
+        println!(
+            "  改后  {:.1} MB  auto_vacuum={mode}  页 {pages}（空闲 {free}）\n  \
+             还回 {:.1} MB（{:.0}%），open 用时 {:.0} ms",
+            after as f64 / 1048576.0,
+            (before - after) as f64 / 1048576.0,
+            100.0 * (before - after) as f64 / before as f64,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
