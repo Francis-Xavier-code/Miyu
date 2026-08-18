@@ -247,11 +247,15 @@ fn stat_parse_survives_hostile_comm() {
 /// 端读出来 ③ 进程死后判定翻假。覆盖 /proc 探测和 tty 写入两段真实内核路径。
 #[test]
 fn origin_tty_gates_and_writeback_against_real_pty() {
+    // 这段 Python 的缩进是语义的一部分。拆分模块时被重排过一次(缩进全被
+    // 抹平),脚本变成 IndentationError 秒死、无 stdout,下面 `lines.next()`
+    // 拿到 None 就 panic —— 报错指向 Rust 侧,真凶却在字符串里。改这里之后
+    // 务必单独跑一遍本用例。
     let script = r#"
 import os, pty, signal, sys
 pid, master = pty.fork()
 if pid == 0:
-os.execvp("sleep", ["sleep", "60"])
+    os.execvp("sleep", ["sleep", "60"])
 # 子进程是会话首进程,ctty=slave,前台进程组=自己 —— 正是 shell 停在提示符的形状。
 # slave 路径从 /proc/child/fd/0 反查,不依赖 ptsname。
 slave = os.readlink(f"/proc/{pid}/fd/0")
@@ -259,10 +263,10 @@ print(pid, slave, flush=True)
 sys.stdin.readline()  # 等 Rust 侧写完
 data = b""
 try:
-while b"MIYU-E2E-END" not in data:
-    data += os.read(master, 4096)
+    while b"MIYU-E2E-END" not in data:
+        data += os.read(master, 4096)
 except OSError:
-pass
+    pass
 print("DATA:" + data.hex(), flush=True)
 os.kill(pid, signal.SIGKILL)
 os.waitpid(pid, 0)
@@ -282,7 +286,16 @@ sys.stdin.readline()  # 等 Rust 侧完成死后判定
     };
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let head = lines.next().unwrap().unwrap();
+    // 「一行都没读到」几乎只有一个成因:上面那段 Python 没跑起来(语法/缩进坏
+    // 了,解释器在 stderr 上报错后立刻退出)。裸 unwrap 只会说 `None`,把人引到
+    // Rust 侧去查 —— 这里直接把真正的怀疑对象说出来。
+    let head = lines
+        .next()
+        .expect(
+            "python3 produced no stdout: the embedded pty script failed to start \
+             (check its indentation — it is a raw string and reformatting has broken it before)",
+        )
+        .unwrap();
     let (pid, slave) = head.split_once(' ').unwrap();
     let origin = crate::ipc::OriginTty {
         path: std::path::PathBuf::from(slave),

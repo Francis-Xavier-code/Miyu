@@ -21,20 +21,34 @@ pub(crate) const SUBAGENT_RESULT_MARKER: &str = "===== 子代理结果 =====";
 
 pub(crate) const SUBAGENT_ERROR_MARKER: &str = "===== 子代理失败 =====";
 
-pub(crate) fn read_log_slice(path: &PathBuf, offset: u64, budget: usize) -> (String, u64, u64, bool) {
-    let Ok(bytes) = std::fs::read(path) else {
+pub(crate) fn read_log_slice(
+    path: &PathBuf,
+    offset: u64,
+    budget: usize,
+) -> (String, u64, u64, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    // 原来是 `std::fs::read(path)` 整读再切:长跑任务的日志有多大就读多大,
+    // 而返回的只有 budget 那几 KB。实测 64MB 日志下,一次「没有新内容」的
+    // 增量轮询也要 25.7ms。改成 seek 到 offset 只读 budget。
+    let Ok(mut file) = std::fs::File::open(path) else {
         return (String::new(), offset, 0, false);
     };
-    let size = bytes.len() as u64;
-    let start = offset.min(size) as usize;
-    let mut end = bytes.len();
-    let mut truncated = false;
-    if end - start > budget {
-        end = start + budget;
-        truncated = true;
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return (String::new(), offset, 0, false);
+    };
+    let start = offset.min(size);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (String::new(), offset, size, false);
     }
-    let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-    (slice, end as u64, size, truncated)
+    let remaining = (size - start) as usize;
+    let truncated = remaining > budget;
+    let mut bytes = vec![0u8; remaining.min(budget)];
+    if file.read_exact(&mut bytes).is_err() {
+        return (String::new(), offset, size, false);
+    }
+    let end = start + bytes.len() as u64;
+    let slice = String::from_utf8_lossy(&bytes).into_owned();
+    (slice, end, size, truncated)
 }
 
 /// 日志尾部的最后 `lines` 行,给列表模式用。
@@ -46,23 +60,53 @@ pub(crate) fn read_log_slice(path: &PathBuf, offset: u64, budget: usize) -> (Str
 /// 单行超过 `MAX_TAIL_LINE_CHARS` 会被截断,免得某行是一整坨 JSON 就把
 /// 整条任务的额度吃光。前面还有内容时开头补一个 `…`。
 pub(crate) fn read_log_tail(path: &PathBuf, lines: usize) -> (String, u64) {
-    let Ok(bytes) = std::fs::read(path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    // 同样别整读:只从尾部取一个够用的窗口。窗口不够(读到的完整行数还不到
+    // 要求)就翻倍再来,上限是整个文件——所以输出和整读版逐字节一致,只是
+    // 绝大多数情况下第一次就够了。
+    let Ok(mut file) = std::fs::File::open(path) else {
         return (String::new(), 0);
     };
-    let size = bytes.len() as u64;
-    let text = String::from_utf8_lossy(&bytes);
-    let all = text.lines().collect::<Vec<_>>();
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return (String::new(), 0);
+    };
+    let mut window = 64 * 1024u64;
+    let (text, from_start) = loop {
+        let start = size.saturating_sub(window);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return (String::new(), size);
+        }
+        let mut bytes = vec![0u8; (size - start) as usize];
+        if file.read_exact(&mut bytes).is_err() {
+            return (String::new(), size);
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let from_start = start == 0;
+        // 窗口不是从头开始时,第一行多半是被切断的半行,不算数
+        let complete = text
+            .lines()
+            .count()
+            .saturating_sub(usize::from(!from_start));
+        if from_start || complete >= lines {
+            break (text, from_start);
+        }
+        window = window.saturating_mul(2);
+    };
+    let mut all = text.lines().collect::<Vec<_>>();
+    if !from_start && !all.is_empty() {
+        all.remove(0);
+    }
     let start = all.len().saturating_sub(lines);
+    // 「省略号」与「从第几行开始」是两件事:窗口没从头读 = 前面一定还有内容,
+    // 即便窗口内恰好只剩 `lines` 行（start == 0）也该补省略号。整读版靠
+    // `start > 0` 判断，是因为它手里就是全文。
     let mut out = String::new();
-    if start > 0 {
+    if start > 0 || !from_start {
         out.push_str("…\n");
     }
     for line in &all[start..] {
         if line.chars().count() > MAX_TAIL_LINE_CHARS {
-            let clipped = line
-                .chars()
-                .take(MAX_TAIL_LINE_CHARS)
-                .collect::<String>();
+            let clipped = line.chars().take(MAX_TAIL_LINE_CHARS).collect::<String>();
             out.push_str(&clipped);
             out.push('…');
         } else {
@@ -79,7 +123,11 @@ pub(crate) fn read_log_tail(path: &PathBuf, lines: usize) -> (String, u64) {
 /// 这次任务的交付物,**不截断**——截了模型还得回头读日志,等于没给);后台命令
 /// 没有结论,日志尾部就是结果,失败时给得比成功时多,因为报错的根因常常要往上
 /// 翻十几行。
-pub fn completion_result(log_path: &PathBuf, is_subagent: bool, ok: bool) -> Option<(String, String)> {
+pub fn completion_result(
+    log_path: &PathBuf,
+    is_subagent: bool,
+    ok: bool,
+) -> Option<(String, String)> {
     if is_subagent {
         let text = std::fs::read_to_string(log_path).ok()?;
         for marker in [SUBAGENT_RESULT_MARKER, SUBAGENT_ERROR_MARKER] {
@@ -204,9 +252,8 @@ pub(crate) async fn job_status(args: Value) -> Result<String> {
     };
 
     ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
-    let job = job_snapshot(job_id).with_context(|| {
-        format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空")
-    })?;
+    let job = job_snapshot(job_id)
+        .with_context(|| format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空"))?;
 
     // Single id keeps the flat shape it always had.
     let mut detail = job_detail_json(&job, offset, MAX_STATUS_OUTPUT_CHARS);
@@ -222,4 +269,141 @@ pub(crate) fn truncate_command(command: &str) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    /// 改之前的整读实现，逐字抄下来当预言机。
+    fn reference_read_log_slice(
+        path: &PathBuf,
+        offset: u64,
+        budget: usize,
+    ) -> (String, u64, u64, bool) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return (String::new(), offset, 0, false);
+        };
+        let size = bytes.len() as u64;
+        let start = offset.min(size) as usize;
+        let mut end = bytes.len();
+        let mut truncated = false;
+        if end - start > budget {
+            end = start + budget;
+            truncated = true;
+        }
+        let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+        (slice, end as u64, size, truncated)
+    }
+
+    fn reference_read_log_tail(path: &PathBuf, lines: usize) -> (String, u64) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return (String::new(), 0);
+        };
+        let size = bytes.len() as u64;
+        let text = String::from_utf8_lossy(&bytes);
+        let all = text.lines().collect::<Vec<_>>();
+        let start = all.len().saturating_sub(lines);
+        let mut out = String::new();
+        if start > 0 {
+            out.push_str("…\n");
+        }
+        for line in &all[start..] {
+            if line.chars().count() > MAX_TAIL_LINE_CHARS {
+                let clipped = line.chars().take(MAX_TAIL_LINE_CHARS).collect::<String>();
+                out.push_str(&clipped);
+                out.push('…');
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        (out, size)
+    }
+
+    fn write_log(dir: &std::path::Path, name: &str, body: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// 各种形状的日志上，seek 版与整读版必须逐字节一致。
+    #[test]
+    fn seek_readers_match_the_whole_file_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let long_line = "J".repeat(MAX_TAIL_LINE_CHARS * 3);
+        let big = "一行中文输出 abc\n".repeat(20_000); // 远超 64KB 首窗
+        let bodies: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("one_line", b"only\n".to_vec()),
+            ("no_trailing_newline", b"a\nb\nc".to_vec()),
+            ("exactly_20", "line\n".repeat(20).into_bytes()),
+            ("just_over_20", "line\n".repeat(21).into_bytes()),
+            ("long_line", format!("{long_line}\nshort\n").into_bytes()),
+            ("cjk_big", big.into_bytes()),
+            (
+                "invalid_utf8",
+                vec![b'a', b'\n', 0xff, 0xfe, b'\n', b'z', b'\n'],
+            ),
+            ("blank_lines", b"\n\n\n\na\n".to_vec()),
+        ];
+        for (name, body) in &bodies {
+            let path = write_log(temp.path(), name, body);
+            for lines in [1usize, 5, 20, 100] {
+                assert_eq!(
+                    read_log_tail(&path, lines),
+                    reference_read_log_tail(&path, lines),
+                    "tail 不一致：{name} lines={lines}"
+                );
+            }
+            let size = body.len() as u64;
+            for offset in [0u64, 1, size / 2, size, size + 10] {
+                for budget in [1usize, 16, 4096, 1 << 20] {
+                    assert_eq!(
+                        read_log_slice(&path, offset, budget),
+                        reference_read_log_slice(&path, offset, budget),
+                        "slice 不一致：{name} offset={offset} budget={budget}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scaling_probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// 量尺：`cargo test --lib jobs::output::scaling_probe -- --ignored --nocapture`
+    ///
+    /// 两个读日志的函数都 `std::fs::read(path)` 整读，再切一小段。长跑任务
+    /// 的日志越大，每次轮询/查看的代价越高——而返回的内容是固定几 KB。
+    #[test]
+    #[ignore]
+    fn log_read_scaling() {
+        println!("\n  日志大小MB   增量读(ms)   取尾部(ms)");
+        for mb in [1usize, 4, 16, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("job.log");
+            let line = "2026-08-18T00:00:00Z 一行普通的任务输出，带点中文和数字 12345\n";
+            std::fs::write(&path, line.repeat(mb * 1024 * 1024 / line.len())).unwrap();
+            let size = std::fs::metadata(&path).unwrap().len();
+
+            // 追新输出：从末尾往后读，正常情况几乎没有新内容
+            let start = Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(read_log_slice(&path, size, 8 * 1024));
+            }
+            let slice_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
+
+            let start = Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(read_log_tail(&path, 20));
+            }
+            let tail_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
+
+            println!("  {mb:>10}   {slice_ms:>10.2}   {tail_ms:>10.2}");
+        }
+    }
 }
