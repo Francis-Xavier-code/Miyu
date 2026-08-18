@@ -37,7 +37,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
             }
         });
     }
-    let context = cold_context(&config, &state_store)?;
+    let context = cold_context(&config, &paths, &state_store)?;
 
     // Default binds all interfaces so the WebUI is reachable from the LAN;
     // `--bind 127.0.0.1` restricts it to this machine. Access URLs matching

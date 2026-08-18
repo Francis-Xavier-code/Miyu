@@ -126,7 +126,10 @@ pub(in crate::web) fn rebuild_for_models(
     };
     let context = next_agent
         .as_ref()
-        .map_or_else(|| cold_context(&next_config, state_store), current_context)
+        .map_or_else(
+            || cold_context(&next_config, paths, state_store),
+            current_context,
+        )
         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
     next_config
         .save(paths)

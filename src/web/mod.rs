@@ -209,7 +209,7 @@ impl DaemonState {
     ) -> Result<(Self, std::thread::JoinHandle<Result<()>>)> {
         let state_store = StateStore::new(&paths)?;
         let config = AppConfig::default();
-        let context = cold_context(&config, &state_store)?;
+        let context = cold_context(&config, &paths, &state_store)?;
         let manager = Arc::new(Mutex::new(ManagerState {
             config: config.clone(),
             active_runs: HashMap::new(),

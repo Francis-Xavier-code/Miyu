@@ -50,7 +50,7 @@ impl DaemonState {
     pub(crate) fn for_test(paths: MiyuPaths, web_port: u16) -> Result<Self> {
         let state_store = StateStore::new(&paths)?;
         let config = AppConfig::default();
-        let context = cold_context(&config, &state_store)?;
+        let context = cold_context(&config, &paths, &state_store)?;
         let manager = Arc::new(Mutex::new(ManagerState {
             config,
             active_runs: HashMap::new(),
@@ -319,16 +319,54 @@ impl WebAuth {
 }
 
 // ── cold_context ──
+/// 手里没有活的 `Agent` 时，这个会话的上下文快照。
+///
+/// `tokens` 曾经硬编码 0。daemon 冷启动后 `manager.context` 就是这份快照，
+/// 而 `session_state_for` 对「当前会话」直接读它、不重算——于是重进 REPL 的
+/// 首帧 footer 显示 `0/168k`，要等第一次对话 `finish_run` 写回真实值才恢复。
+/// 会话明明有几万 token 的历史，屏幕上却是 0。
+///
+/// 真实值算不出来是因为它依赖整条组装链：系统提示词、人格、记忆、工具目录。
+/// 所以这里临时建一个 Agent 现算，与 `session_state_for` 对**非当前**会话本
+/// 来就走的那条路同一套口径——两条路算出来的数必须一样，否则切个会话数字就
+/// 跳。建 Agent 的开销（注册表 + 提示词组装）那条路每次 IPC 都在付，这里
+/// 只在没有活 Agent 时付一次。
+///
+/// 建不出来（配置坏了、供应商没配）不能让整个 daemon 起不来：退回 0 并把
+/// 累计值照常带出去，footer 少一个数字好过起不来。
 pub(crate) fn cold_context(
     config: &AppConfig,
+    paths: &MiyuPaths,
     state_store: &StateStore,
 ) -> Result<ContextSnapshot> {
     let cumulative = state_store.session_cumulative_token_totals()?;
+    let tokens = cold_context_tokens(config, paths, state_store).unwrap_or(0);
     Ok(ContextSnapshot {
-        tokens: 0,
+        tokens,
         window: config.active_context_window()?,
         cumulative_tokens: cumulative.total,
         cumulative_prompt_tokens: cumulative.prompt,
         cumulative_cache_read_tokens: cumulative.cache_read,
     })
+}
+
+/// 现算一次这个会话的上下文 token。失败返回 None，由调用方决定怎么退。
+fn cold_context_tokens(
+    config: &AppConfig,
+    paths: &MiyuPaths,
+    state_store: &StateStore,
+) -> Option<u64> {
+    crate::models_cache::ensure_active_metadata(paths, config);
+    let client = OpenAiCompatibleClient::from_config(config, paths).ok()?;
+    let registry = build_tool_registry(config, paths, AgentMode::Normal, true).ok()?;
+    let agent = crate::agent::Agent::new(
+        config.clone(),
+        paths,
+        state_store.clone(),
+        client,
+        registry,
+        AgentMode::Normal,
+    )
+    .ok()?;
+    agent.effective_context_tokens().ok()
 }
