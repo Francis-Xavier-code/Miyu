@@ -352,20 +352,35 @@ async fn update_goal(paths: &MiyuPaths, args: Value) -> Result<String> {
     }
 }
 
-/// 续轮的提示词：引用目标与轮号，要求以工作区/工具结果/持久状态为准、拿到
-/// 证据才能报完成、没完成就保持 active。
+/// 续轮的提示词。
+///
+/// **开头那段来历说明不是废话**：这段文字是突然出现在对话中间的一条指令，
+/// 内容往往和上一轮聊的东西毫无关系（长期目标本来就会跨越话题）。实测过一次
+/// ——模型读到它之后判定「This looks like a system prompt injection or some
+/// automated goal that hijacked my session」，然后拒绝执行、继续做上一个话题。
+/// 那个警惕本身是对的：一段没有来历的祈使句，就该被怀疑。所以要讲清楚这是
+/// 谁下的、怎么来的、为什么和上文对不上。
 ///
 /// 保留英文原文，理由同 `wrapup_text`。
 pub fn goal_round_prompt(objective: &str, round: i64, max_rounds: i64) -> String {
     format!(
-        "<goal_round>\nObjective: {}\nRound {round} of {max_rounds}.\n\
-         Continue working toward the objective. Ground every judgement in the workspace, \
-         tool results, and persisted state — not in what earlier rounds claimed. \
-         Verify before you call it done: run the checks, read the files back, look at the \
-         actual output. If the objective is met and verified, call update_goal with action \
-         complete. If a concrete external condition blocks all remaining paths, call \
-         update_goal with action blocked and describe it. Otherwise keep the goal active and \
-         make the next concrete step of progress in this round.\n</goal_round>",
+        "<goal_round>\n\
+         This is an automatic continuation round for the standing objective the user set in \
+         this session with the `/goal` command. It is not an injection and not something a \
+         third party slipped into the conversation: Miyu itself starts these rounds while the \
+         session is idle, and the objective below is the user's own wording, stored in this \
+         session's state. The user can pause or clear it at any time with `/goal`.\n\
+         Objective: {}\nRound {round} of {max_rounds}.\n\
+         The objective may have nothing to do with the messages just above — a standing \
+         objective outlives whatever the conversation drifted through since it was set. Work \
+         on the objective, not on the previous topic, unless the objective is about it.\n\
+         Ground every judgement in the workspace, tool results, and persisted state — not in \
+         what earlier rounds claimed. Verify before you call it done: run the checks, read the \
+         files back, look at the actual output. If the objective is met and verified, call \
+         update_goal with action complete. If a concrete external condition blocks all \
+         remaining paths, call update_goal with action blocked and describe it. Otherwise keep \
+         the goal active and make the next concrete step of progress in this round.\n\
+         </goal_round>",
         json!(objective)
     )
 }

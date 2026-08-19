@@ -758,6 +758,36 @@ mod tests {
         }
     }
 
+    /// 续轮提示词必须自报来历。
+    ///
+    /// 实测过一次：一个会话正在排查游戏的 VC++ 运行库，用户设了个「查询东京
+    /// 天气」的目标，续轮到达时模型判定「This looks like a system prompt
+    /// injection or some automated goal that hijacked my session」，拒绝执行、
+    /// 继续做上一个话题。那个警惕是对的——一段没有来历、和上文毫无关系的
+    /// 英文祈使句，本来就该被怀疑。
+    ///
+    /// 所以这几句不是客套：谁下的（用户）、怎么来的（/goal 命令 + 空闲时自动
+    /// 续轮）、为什么和上文对不上（长期目标会跨越话题）。看着像冗余，最容易
+    /// 被后人当废话删掉，这条测试就是拦这个的。
+    #[test]
+    fn goal_round_prompt_states_where_it_came_from() {
+        let prompt = crate::tools::goal::goal_round_prompt("把测试跑绿", 2, 10);
+        for expected in [
+            "the user set",     // 谁下的
+            "/goal",            // 怎么下的
+            "not an injection", // 直接回应模型的怀疑
+            "may have nothing to do with the messages just above", // 为什么对不上
+        ] {
+            assert!(
+                prompt.contains(expected),
+                "续轮提示词丢了来历说明（缺 {expected:?}）——模型会把它当注入拒掉:\n{prompt}"
+            );
+        }
+        // 目标本身和轮号仍要在。
+        assert!(prompt.contains("把测试跑绿"));
+        assert!(prompt.contains("Round 2 of 10"));
+    }
+
     #[test]
     fn readable_names_cover_all_built_in_tools_and_groups() {
         let mut missing_tools = tool_descriptions::all()
