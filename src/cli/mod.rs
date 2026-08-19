@@ -29,23 +29,23 @@ mod alarm_worker;
 mod daemon_log;
 mod data_cmds;
 mod footer;
-mod model_cmds;
 mod migrate_cmds;
+mod model_cmds;
 mod pop_cmds;
+mod repl;
 mod select;
 mod shell_bridge;
-mod repl;
 
 // 日志读取与格式化已拆到 daemon_log。
 use alarm_worker::*;
 use daemon_log::*;
 use data_cmds::*;
-use migrate_cmds::*;
-use shell_bridge::*;
 use footer::*;
+use migrate_cmds::*;
+use model_cmds::*;
 use pop_cmds::*;
 use select::*;
-use model_cmds::*;
+use shell_bridge::*;
 #[cfg(test)]
 mod tests;
 
@@ -55,15 +55,15 @@ pub(in crate::cli) use repl::{commands::*, jobs::*, layout::*, placeholder::*, s
 // 命令表已上提到 crate 级与 WebUI 共用；这里再导出一次，cli 内的调用点不变。
 pub(in crate::cli) use crate::slash_commands::*;
 use repl::direct::{run_chat_with_images, run_chat_with_options, run_direct_repl};
-use repl::editor::{
-    load_repl_input_history, repl_input_lines,
-};
+use repl::editor::{load_repl_input_history, repl_input_lines};
 use repl::input::render_repl_input_with_footer;
-use repl::live_turn::{handle_live_agent_event, handle_live_post_turn_overflow, run_live_agent_turn};
+use repl::live_turn::{
+    handle_live_agent_event, handle_live_post_turn_overflow, run_live_agent_turn,
+};
 use repl::remote::{run_remote_repl, try_run_remote_chat};
 use repl::tail::{
-    cursor_col_or, cursor_row_or, synchronized_terminal_update, LiveRawMode,
-    LiveReplTail, TerminalFrameLayout, TerminalFrameTracker,
+    cursor_col_or, cursor_row_or, synchronized_terminal_update, LiveRawMode, LiveReplTail,
+    TerminalFrameLayout, TerminalFrameTracker,
 };
 use repl::wake::follow_wake_run;
 use repl::width::{truncate_visible_width, visible_width, wrap_visible_width};
@@ -83,8 +83,7 @@ use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcomm
 use crossterm::cursor::{self, Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
@@ -192,7 +191,8 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,
         Some(Command::Ask(args)) => {
-            let session = one_shot_session(&paths, session_arg.as_deref(), continue_session).await?;
+            let session =
+                one_shot_session(&paths, session_arg.as_deref(), continue_session).await?;
             run_chat_with_options(
                 &paths,
                 join_message(args.message),
@@ -322,16 +322,6 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 async fn run_repl(paths: &MiyuPaths, initial_mode: AgentMode) -> Result<()> {
     if direct_mode_requested() {
@@ -535,9 +525,12 @@ fn session_replay_frame(
     use crate::state::ReplayEntry;
     let mut frame = Vec::new();
     for replay in replays {
-        if replay.is_job_wake {
-            // A background job woke the session; live rendering shows a dim
-            // `⚙` notice, never a user bubble. Mirror that.
+        if replay.display_content.starts_with("[目标续轮]") {
+            // 目标续轮什么都不画——实时渲染也不打表头。一个长任务几十轮，
+            // 每轮一行只会把真正的输出挤散。
+        } else if replay.is_synthetic {
+            // daemon 自己合成的轮：实时渲染画的是一条暗色 `⚙` 提示，回放要
+            // 对齐，不能变成用户气泡。
             frame.extend_from_slice(
                 format!(
                     "\n\x1b[2m⚙ {}\x1b[0m\n\n",
@@ -675,7 +668,12 @@ impl Drop for ReplCursorRestore {
     fn drop(&mut self) {
         // 1. 会话级兜底：恢复括号粘贴与光标
         // 2. 再关闭 raw mode；键盘增强由 LiveRawMode / 局部输入作用域负责 Pop
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange, Show);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            Show
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -726,7 +724,11 @@ pub(crate) fn spawn_hangup_watchdog() {
 }
 
 fn terminal_hangup() -> bool {
-    let mut pollfd = libc::pollfd { fd: libc::STDIN_FILENO, events: 0, revents: 0 };
+    let mut pollfd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: 0,
+        revents: 0,
+    };
     let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
     ready == 1 && (pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
@@ -740,7 +742,10 @@ enum LiveReplOutcome {
     ),
     /// A daemon-initiated wake turn is running in this session; the caller
     /// should attach and render it live.
-    FollowWake { run_id: String, label: String },
+    FollowWake {
+        run_id: String,
+        label: String,
+    },
     /// Ctrl+C on an empty line while this session has background work: stop
     /// the work and stay in the REPL. Pressing it again then exits.
     StopJobs,
@@ -923,4 +928,3 @@ fn handle_agent_event(renderer: &mut render::StreamRenderer, event: AgentEvent) 
         }
     }
 }
-

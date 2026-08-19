@@ -468,7 +468,7 @@ pub struct TurnReplay {
     pub display_content: String,
     pub assistant_content: String,
     pub entries: Vec<ReplayEntry>,
-    /// Daemon-synthesized follow-up to a finished background job, not a
-    /// prompt anybody typed.
-    pub is_job_wake: bool,
+    /// daemon 自己合成的轮，不是任何人敲的：后台任务唤醒、目标续轮。
+    /// 回放时画成一条居中提示，而不是用户气泡。
+    pub is_synthetic: bool,
 }

@@ -308,9 +308,9 @@ pub(in crate::web) async fn actor_loop(
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     if &*state_store.session_id() == &*session_id {
                         manager.lock().unwrap().context =
-                            actor_context(&agent, &config, &paths, &state_store).map_err(|error| {
-                                AdminFailure::Internal(safe_error_message(&error))
-                            })?;
+                            actor_context(&agent, &config, &paths, &state_store).map_err(
+                                |error| AdminFailure::Internal(safe_error_message(&error)),
+                            )?;
                     }
                     Ok(json!({ "removed": removed, "prompt": prompt }))
                 })();
@@ -345,9 +345,9 @@ pub(in crate::web) async fn actor_loop(
                         .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?;
                     if &*state_store.session_id() == &*session_id {
                         manager.lock().unwrap().context =
-                            actor_context(&agent, &config, &paths, &state_store).map_err(|error| {
-                                AdminFailure::Internal(safe_error_message(&error))
-                            })?;
+                            actor_context(&agent, &config, &paths, &state_store).map_err(
+                                |error| AdminFailure::Internal(safe_error_message(&error)),
+                            )?;
                     }
                     let data = json!({
                         "turns": selected.len(),
@@ -480,6 +480,12 @@ pub(in crate::web) fn reset_actor_conversation(
         store.reset_conversation_usage()?;
         // 待办存在库外面，`clear_session_content` 够不到它。
         tools::clear_session_todos(paths, session_id)?;
+        // 目标也一起清：重置就是从头来过。留着的话，armed 的旧目标会在重置后
+        // 第一个回合结束时把驱动器重新拉起来，对着空历史推进一个被清掉的话题。
+        if let Ok(Some(goal)) = store.goal(session_id) {
+            let _ = store.clear_goal(session_id, &goal.goal_id, goal.revision);
+        }
+        tools::goal::forget_session(session_id);
         let memory = MemoryStore::new(config, paths);
         memory.clear_evicted_context()?;
         memory.clear_pending_events()?;
@@ -578,7 +584,7 @@ pub(in crate::web) fn build_actor_agent(
     paths: &MiyuPaths,
     state: &StateStore,
 ) -> Result<Agent> {
-    let mut agent = build_session_agent(config, paths, state)?;
+    let mut agent = build_session_agent(config, paths, state, AgentMode::Normal)?;
     agent.prepare_for_turn()?;
     Ok(agent)
 }

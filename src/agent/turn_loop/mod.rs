@@ -913,13 +913,12 @@ impl Agent {
             // 「调过哪些工具、拿到什么结果」,丢了它模型下一轮只看到半截文字,会把
             // 已经跑过的命令、读过的文件原样再来一遍。
             self.checkpoint_tool_flow(current_turn_id, messages, replay_start);
-            // 自主轮里报了完成/受阻之后,让模型再面向用户说一次。
-            //
-            // 不这么做的话,一个跑了十几轮的目标就在一次 update_goal 之后无声
-            // 停住:工具返回了 JSON,模型没有理由再说什么,用户看到的是回复戛然
-            // 而止。这段指令由 `tools::goal` 在报完成的那一刻挂起,这里取走。
+            // goal 侧挂起的步间指令在这里取走注入:自主轮报了完成/受阻之后的
+            // 收尾指令(不注入的话,工具返回了 JSON,模型没有理由再说什么,
+            // 一个跑了十几轮的目标就无声停住);以及人在续轮中途 `/goal edit`
+            // 之后的目标变更通知(不注入的话,模型整轮都在推进旧目标)。
             if let Some(session) = crate::tools::workspace::try_session() {
-                if let Some(wrapup) = crate::tools::goal::take_pending_wrapup(&session) {
+                if let Some(wrapup) = crate::tools::goal::take_turn_notices(&session) {
                     // `turn_context` 而不是 `system`：中途插一条 system 会把
                     // 提供方模板里的 system 前置块整体挪位，前缀缓存全废
                     // （`ChatMessage::turn_context` 的注释里有实测数据）。
@@ -1008,12 +1007,7 @@ impl Agent {
     /// **失败只告警不中断回合**:这是一次耐久性检查点,不是回合的产出。为了它
     /// 把一个正在跑的回合掐掉,比丢掉这份检查点糟得多——回合结束时那次写入仍然
     /// 是 `?`,真有持久化问题跑不掉。
-    fn checkpoint_tool_flow(
-        &self,
-        turn_id: &str,
-        messages: &[ChatMessage],
-        replay_start: usize,
-    ) {
+    fn checkpoint_tool_flow(&self, turn_id: &str, messages: &[ChatMessage], replay_start: usize) {
         let mut tool_flow = derive_tool_flow(messages, replay_start);
         prune_tool_flow(&mut tool_flow, &self.config.context);
         if tool_flow.is_empty() {

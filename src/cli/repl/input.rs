@@ -116,6 +116,20 @@ pub(in crate::cli) fn read_live_repl_input(
                     })?
                 }
                 LiveEditorAction::Submit(submission) => {
+                    // `/goal edit`（无参数）在提交前原地变身成可编辑的
+                    // 「/goal edit <当前目标>」，不回显、不产生任何输出。
+                    if submission.content.trim() == "/goal edit"
+                        && crate::cli::repl::session::prefill_goal_edit_input(
+                            paths,
+                            repl_session,
+                            live,
+                        )
+                    {
+                        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+                            live.redraw()
+                        })?;
+                        continue;
+                    }
                     let mode = live.mode();
                     synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
                         live.commit_submission(&submission)
@@ -827,4 +841,3 @@ pub(in crate::cli) fn replace_repl_input_with_user_echo(
     stdout.flush()?;
     Ok(())
 }
-

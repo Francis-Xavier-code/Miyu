@@ -151,10 +151,20 @@ pub(in crate::cli) async fn run_shell_intercept(
         run_chat_with_images(paths, clean_message, pasted_images).await
     };
     drain_stdin();
-    if let Err(err) = &result {
-        println!("\x1b[31m{}: {err}\x1b[0m", t("error", "错误"));
+    match result {
+        // Ctrl+C 不是故障：暗一行「已取消」就够了，别顶着红色的「错误」。
+        Err(err)
+            if err
+                .downcast_ref::<crate::cli::repl::session::RemoteTurnCancelled>()
+                .is_some() =>
+        {
+            println!("\x1b[2m{}\x1b[0m", t("cancelled", "已取消"));
+            Ok(())
+        }
+        // 其余错误这里不打印：往上返回后 `main.rs` 会打一次。以前这里先打
+        // 一遍再返回 Err，同一句「错误: …」就会出现两次。
+        other => other,
     }
-    result
 }
 
 pub(in crate::cli) fn expand_shell_pasted_text_placeholders(

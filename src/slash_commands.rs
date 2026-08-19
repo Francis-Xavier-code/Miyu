@@ -171,7 +171,8 @@ pub(crate) const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "[count]",
         help_en: "pop selected turns or the oldest count from active context",
         help_zh: "从当前上下文弹出所选轮次或最旧的指定轮数",
-        web: false,
+        // WebUI 只有按数量的形态（交互式挑选依赖终端）。
+        web: true,
     },
     ReplCommandSpec {
         name: "/compact",
@@ -184,9 +185,9 @@ pub(crate) const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
     ReplCommandSpec {
         name: "/goal",
         command: ReplSlashCommand::Goal,
-        arg_hint: "[objective|clear|edit <objective>|pause|resume]",
-        help_en: "set or steer the session's long-running goal",
-        help_zh: "设定或调整本会话的长任务目标",
+        arg_hint: "[目标|edit <新目标>|pause|resume|clear]",
+        help_en: "give the session a long task and let it keep working on it by itself",
+        help_zh: "交代一件长活，之后它会自己一轮轮做下去；不带参数看进度",
         web: true,
     },
     ReplCommandSpec {

@@ -4,10 +4,9 @@
 //! [`super::remote`] 的远端泵是两条独立的分发表——08-17 那次「回合中途 footer
 //! 不刷新」正是因为只有一边接了 `chat.round_usage`，加事件时两边都要过一遍。
 
-use crate::cli::*;
 use crate::cli::repl::editor::*;
 use crate::cli::repl::tail::*;
-
+use crate::cli::*;
 
 pub(in crate::cli) async fn handle_live_post_turn_overflow(
     live: &mut LiveReplTail,
@@ -196,19 +195,9 @@ pub(in crate::cli) async fn run_live_agent_turn(
                         parse_repl_input(live.editor.input.trim_start()),
                         ReplInput::Slash(..)
                     ) {
-                        if live.external_output_active {
-                            continue;
-                        }
-                        let mut renderer = renderer_cell.borrow_mut();
-                        live.flush_pending_chunks(&mut renderer)?;
-                        renderer.write_system_message(t(
-                            "REPL commands are available after the current reply finishes",
-                            "当前回复结束后才能执行 REPL 命令",
-                        ))?;
-                        // write_system_message tears down the wait spinner;
-                        // restart it so progress keeps rendering.
-                        renderer.start_waiting()?;
-                        live.apply_renderer_frame(&mut renderer)?;
+                        // 静默吞掉这次回车：流式渲染中间插系统消息会写坏终端
+                        // 帧。输入原样留着，这一轮结束后再回车即可。直连模式
+                        // 没有续轮驱动器，`/goal` 也没有运行中执行的意义。
                         continue;
                     }
                     let mode_before = live.mode();

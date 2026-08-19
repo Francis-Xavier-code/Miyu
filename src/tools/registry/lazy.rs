@@ -35,9 +35,9 @@ pub(crate) fn coerce_declared_shapes(parameters: &Value, args: &mut Value) {
         };
         let text = text.trim();
         let restored = match declared {
-            "array" if text.starts_with('[') => {
-                serde_json::from_str::<Value>(text).ok().filter(Value::is_array)
-            }
+            "array" if text.starts_with('[') => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_array),
             "object" if text.starts_with('{') => serde_json::from_str::<Value>(text)
                 .ok()
                 .filter(Value::is_object),
@@ -82,10 +82,17 @@ pub(crate) fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
     // 后缀只留标记:整套"先 load_tools 取契约再调用"的说明在 load_tools
     // 自己的 description 里统一给一次,N 个 stub 各背一遍纯属重复计费
     // (验收 08-16:每条省 ~55B)。
+    //
+    // 例外是 stub_example:参数壳是空的,模型没取契约就调用时只能猜字段名,
+    // 声明了示例的工具在这里补上。示例并进同一对括号,不额外占一对。
+    let note = match &tool.stub_example {
+        Some(example) => format!("精简条目，例：{example}"),
+        None => "精简条目".to_string(),
+    };
     let description = if summary.is_empty() {
-        "（精简条目：契约经 load_tools 获取）".to_string()
+        format!("（{note}：契约经 load_tools 获取）")
     } else {
-        format!("{summary}（精简条目）")
+        format!("{summary}（{note}）")
     };
     ToolDefinition {
         kind: "function",
@@ -176,4 +183,46 @@ pub(crate) fn xml_escape(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(description: &str) -> ToolSpec {
+        ToolSpec::new("t", description, json!({"type": "object"}), |_| async {
+            Ok(String::new())
+        })
+    }
+
+    #[test]
+    fn stub_without_example_is_unchanged() {
+        let stub = stub_definition(&spec("查询某个游戏在 Linux 上的兼容性。"));
+        assert_eq!(
+            stub.function.description,
+            "查询某个游戏在 Linux 上的兼容性。（精简条目）"
+        );
+    }
+
+    #[test]
+    fn stub_example_joins_the_existing_parenthetical() {
+        // 示例并进同一对括号,不额外占一对。
+        let stub = stub_definition(
+            &spec("查询某个游戏在 Linux 上的兼容性。")
+                .with_stub_example(r#"{"query":"艾尔登法环"}"#),
+        );
+        assert_eq!(
+            stub.function.description,
+            r#"查询某个游戏在 Linux 上的兼容性。（精简条目，例：{"query":"艾尔登法环"}）"#
+        );
+    }
+
+    #[test]
+    fn stub_example_survives_an_empty_summary() {
+        let stub = spec("").with_stub_example(r#"{"query":"x"}"#);
+        assert_eq!(
+            stub_definition(&stub).function.description,
+            r#"（精简条目，例：{"query":"x"}：契约经 load_tools 获取）"#
+        );
+    }
 }

@@ -617,13 +617,7 @@ pub(in crate::web) async fn handle_ipc_connection(
             }
         }
         IpcCommand::Cancel { run_id } => {
-            let cancelled = {
-                let manager = state.manager.lock().unwrap();
-                manager.active_runs.get(&run_id).map(|run| {
-                    run.request_cancel();
-                })
-            };
-            if cancelled.is_some() {
+            if cancel_run_and_disarm_goal(&state, &run_id) {
                 ipc::send(&mut stream, &IpcFrame::Ack).await?;
             } else {
                 ipc::send(&mut stream, &IpcFrame::error("active run not found")).await?;

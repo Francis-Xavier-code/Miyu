@@ -158,6 +158,17 @@ pub struct ToolSpec {
     pub groups: Vec<String>,
     /// 按工具超时（秒）。None=吃 registry 默认兜底；Some(0)=豁免。
     pub timeout_seconds: Option<u64>,
+    /// 附在 stub 上的一行调用示例，例如 `{"query":"艾尔登法环"}`。
+    ///
+    /// stub 的参数壳是空的 `{"type":"object"}`，模型没取契约就调用时只能猜
+    /// 字段名。给一个示例比让它猜便宜——也比事后用 `coerce_declared_shapes`
+    /// 之类的补丁去修猜错的形状可靠。
+    ///
+    /// 判据是「猜错概率高，但契约又短到能塞进一行」，不是「形状简单」：单参数
+    /// 工具本来就不容易猜错，加了也没收益；而 action 分发型（十来个参数、
+    /// 按 action 条件必填）一行装不下，给半个示例比不给更危险——模型会以为
+    /// 那就是全部形状。那类工具就该老实走 `load_tools`。
+    pub stub_example: Option<String>,
     pub(crate) handler: ToolHandler,
 }
 
@@ -190,6 +201,7 @@ impl ToolSpec {
             load_policy: LoadPolicy::Summary,
             groups: Vec::new(),
             timeout_seconds: None,
+            stub_example: None,
             handler: Arc::new(move |args, _progress| Box::pin(handler(args))),
         }
     }
@@ -215,6 +227,7 @@ impl ToolSpec {
             load_policy: LoadPolicy::Summary,
             groups: Vec::new(),
             timeout_seconds: None,
+            stub_example: None,
             handler: Arc::new(move |args, progress| Box::pin(handler(args, progress))),
         }
     }
@@ -236,6 +249,11 @@ impl ToolSpec {
 
     pub fn with_always_loaded(mut self, always_loaded: bool) -> Self {
         self.always_loaded = always_loaded;
+        self
+    }
+
+    pub fn with_stub_example(mut self, example: impl Into<String>) -> Self {
+        self.stub_example = Some(example.into());
         self
     }
 

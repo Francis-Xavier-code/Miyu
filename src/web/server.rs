@@ -224,7 +224,13 @@ pub(in crate::web) async fn follow_run(
         if data.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
             // The run may have finished before we saw a frame; stop when it
             // is no longer active and nothing more will arrive for it.
-            if !state.manager.lock().unwrap().active_runs.contains_key(&run_id) {
+            if !state
+                .manager
+                .lock()
+                .unwrap()
+                .active_runs
+                .contains_key(&run_id)
+            {
                 break;
             }
             continue;
@@ -310,6 +316,15 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         )
         .route("/api/sessions/{session_id}/turns", get(session_turns_http))
         .route("/api/sessions/{session_id}/todos", get(session_todos_http))
+        .route("/api/sessions/{session_id}/goal", get(session_goal_http))
+        .route(
+            "/api/sessions/{session_id}/context",
+            get(session_context_http),
+        )
+        .route(
+            "/api/sessions/{session_id}/poppable",
+            get(poppable_turns_http),
+        )
         .route(
             "/api/sessions/{session_id}/models",
             get(get_session_models_http).put(set_session_models_http),
@@ -335,6 +350,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         .route("/api/conversation/reset", post(reset_conversation))
         .route("/api/commands", get(list_commands))
         .route("/api/conversation/compact", post(compact_conversation))
+        .route("/api/conversation/pop", post(pop_conversation))
         .route("/api/memory/reset", post(reset_memory_http))
         .route("/api/goal", post(goal_command_http))
         .route("/api/jobs", get(list_jobs_http))

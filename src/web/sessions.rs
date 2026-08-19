@@ -646,18 +646,12 @@ pub(in crate::web) fn build_session_agent(
     config: &AppConfig,
     paths: &MiyuPaths,
     state: &StateStore,
+    mode: AgentMode,
 ) -> Result<Agent> {
     crate::models_cache::ensure_active_metadata(paths, config);
     let client = OpenAiCompatibleClient::from_config(config, paths)?;
-    let registry = build_tool_registry(config, paths, AgentMode::Normal, true)?;
-    Agent::new(
-        config.clone(),
-        paths,
-        state.clone(),
-        client,
-        registry,
-        AgentMode::Normal,
-    )
+    let registry = build_tool_registry(config, paths, mode, true)?;
+    Agent::new(config.clone(), paths, state.clone(), client, registry, mode)
 }
 
 pub(in crate::web) fn session_state(
@@ -683,6 +677,26 @@ pub(in crate::web) fn session_state(
     })
 }
 
+/// 会话上下文占用快照，给输入框角落的上下文条用。
+///
+/// 切到非当前会话时 `session_state_for` 会冷装配一次该会话的上下文，有成本，
+/// 但只在切换那一下发生；之后靠 run 事件携带的增量刷新。没有它，切换会话后
+/// 上下文条一直显示上一个会话的数字，直到跑完一轮才纠正。
+pub(in crate::web) async fn session_context_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
+    let snapshot = session_state_for(&state, &session_id).map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "context_tokens": snapshot.context_tokens,
+        "context_window": snapshot.context_window,
+        "context_window_assumed": snapshot.context_window_assumed,
+    })))
+}
+
 pub(in crate::web) fn session_state_for(
     state: &DaemonState,
     session_id: &str,
@@ -696,8 +710,15 @@ pub(in crate::web) fn session_state_for(
         state.manager.lock().unwrap().context
     } else {
         let config = state.manager.lock().unwrap().config.clone();
+        // dev 会话按 dev 装配估算：系统提示词、工具表、记忆钥匙都跟着模式
+        // 走，拿 Normal 硬算的话，dev 空会话和普通空会话永远是同一个数。
+        let (config, mode) = if record.persona == crate::state::DEV_PERSONA {
+            (config.dev_scoped(), AgentMode::Dev)
+        } else {
+            (config, AgentMode::Normal)
+        };
         let store = state.state_store.pinned(session_id);
-        current_context(&build_session_agent(&config, &state.paths, &store)?)?
+        current_context(&build_session_agent(&config, &state.paths, &store, mode)?)?
     };
     Ok(ipc::SessionState {
         context_tokens: context.tokens,

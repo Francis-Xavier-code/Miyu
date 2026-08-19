@@ -701,11 +701,13 @@ impl ConversationDb {
         }
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            // The `LIKE` marks daemon-synthesized background-job wake turns.
-            // They are not user prompts and must not be replayed as one — same
-            // test the wake-report poller uses.
+            // 这个 LIKE 标出 daemon 自己合成的轮：后台任务唤醒和目标续轮。
+            // 它们不是用户输入，回放时不能画成用户气泡——判据取 `user_content`
+            // 的开头标签，因为那是模型真正收到的东西，而 `display_content`
+            // 是给人看的、随时可能改文案。
             "SELECT display_content, assistant_content, replay_journal,
-                    user_content LIKE '<background-job-report>%'
+                    (user_content LIKE '<background-job-report>%'
+                     OR user_content LIKE '<goal_round>%')
                FROM turns
               WHERE session_id = ?1 AND hidden = 0 AND is_summary = 0
                 AND status = 'completed'
@@ -721,7 +723,7 @@ impl ConversationDb {
                         .get::<_, Option<String>>(2)?
                         .and_then(|json| serde_json::from_str(&json).ok())
                         .unwrap_or_default(),
-                    is_job_wake: row.get::<_, i64>(3)? != 0,
+                    is_synthetic: row.get::<_, i64>(3)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
