@@ -46,6 +46,9 @@ window.MiyuCommands = (() => {
       const response = await apiRequest("/api/commands");
       const payload = await response.json();
       catalog = Array.isArray(payload?.commands) ? payload.commands : [];
+      // /stop 是纯前端命令（取消当前 run 的 HTTP 调用就在本页），REPL 没有
+      // 对应物（那边是 Ctrl+C），所以不进服务端那张表，在这里补进目录。
+      catalog.push({ name: "/stop", arg_hint: "", help: "停止当前正在运行的回复" });
     } catch (_) {
       // 拿不到目录就退化成「没有命令」：所有 / 开头的输入照常发给模型。
       catalog = [];
@@ -144,13 +147,25 @@ window.MiyuCommands = (() => {
     if (!spec) return false;
     const line = String(input).trim();
     const [, args] = split(line);
+    // 先占位再执行：命令要等服务端干完活，这中间对话流里必须有个东西告诉
+    // 用户「收到了，在跑」。原来是跑完才出现回执，看着就像回车丢了。
+    const pending = note(line, "执行中…", "pending", ctx.anchorTurnId, ctx.sessionId);
+    ctx.redraw();
     const done = (text, tone) => {
-      note(line, text, tone, ctx.anchorTurnId);
+      pending.text = text;
+      pending.tone = tone || "info";
       ctx.redraw();
       return true;
     };
     if (!spec.arg_hint && args.trim()) {
       return done(`${spec.name} 不接受参数`, "error");
+    }
+    // 与 REPL 同一条规矩：会重排上下文的命令不插在运行中的回合上
+    // （/compact 折叠消息、/reset 清库、/pop 弹轮次，正在跑的回合手里那份
+    // 消息数组会成悬空引用）。后端也会 409，这里提前拦下给出中文说法。
+    const blockedWhileRunning = ["/compact", "/reset", "/pop"];
+    if (blockedWhileRunning.includes(spec.name) && ctx.isRunning?.()) {
+      return done("命令要在两轮之间执行，等这一轮跑完再试", "error");
     }
     try {
       if (spec.name === "/compact") {
@@ -171,20 +186,27 @@ window.MiyuCommands = (() => {
           method: "POST",
           body: JSON.stringify({ session_id: ctx.sessionId }),
         });
-        // 清空之后对话流整段作废，让调用方重新拉一次；回执本身靠锚点回合定位，
-        // 而那个回合刚被删掉，anchorOf 找不到就退回末尾，正好。
+        // 回执连同对话一起作废：它们锚在已经被删掉的回合上，留着就是一堆
+        // 无主的旧提示，而且每次重画都会原样再来一遍——清空之后满屏「本会话
+        // 已有未完成的目标」正是这么来的。占位回执也一起撤：清空后的空白本身
+        // 就是最清楚的反馈，再挂一条「已清空」和一个 /reset 的回显反而是垃圾。
+        clearNotices(ctx.sessionId);
         await ctx.reload();
-        return done("已清空当前会话");
+        ctx.toast?.("已清空当前会话");
+        return true;
       }
       if (spec.name === "/goal") {
         const response = await ctx.apiRequest("/api/goal", {
           method: "POST",
           body: JSON.stringify({ session_id: ctx.sessionId, input: args }),
         });
-        // 服务端把整段人类可读的回执拼好（和 REPL 同一份实现），这里原样贴出，
+        // 服务端把整段人类可读的文本拼好（和 REPL 同一份实现），这里原样贴出，
         // 不在前端二次拼装——两边分叉的话，同一个 /goal 在两个界面说法不一样。
         const text = (await response.json())?.text || "";
-        return done(text || "目标命令已执行");
+        ctx.reloadGoal?.();
+        // 服务端把「拒绝」也当成 HTTP 200 + 一段说明文字，只能按开头判断
+        // 是不是出错——与 app.js 的 runGoalAction 同一套启发式。
+        return done(text, /^(用法|\/goal |本会话)/.test(text) ? "error" : undefined);
       }
       if (spec.name === "/reset-memory") {
         await ctx.apiRequest("/api/memory/reset", {
@@ -192,6 +214,54 @@ window.MiyuCommands = (() => {
           body: JSON.stringify({ mode: ctx.mode }),
         });
         return done("已清空长期记忆");
+      }
+      if (spec.name === "/pop") {
+        // /pop 全程不在对话流里留任何东西（回显和回执都不留）：
+        // 无参数时选择器本身就是交互，按数量时结果走居中 toast。
+        const dropEcho = () => {
+          notices.splice(notices.indexOf(pending), 1);
+          ctx.redraw();
+        };
+        const trimmed = args.trim();
+        if (!trimmed) {
+          dropEcho();
+          ctx.openPopPicker?.();
+          return true;
+        }
+        const count = Number.parseInt(trimmed, 10);
+        if (!Number.isFinite(count) || count < 1) {
+          dropEcho();
+          ctx.toast?.("用法：/pop [数量]（不带数量打开多选列表）");
+          return true;
+        }
+        let response;
+        try {
+          response = await ctx.apiRequest("/api/conversation/pop", {
+            method: "POST",
+            body: JSON.stringify({ session_id: ctx.sessionId, count }),
+          });
+        } catch (error) {
+          dropEcho();
+          // 409 = 没有可弹出的轮次（服务端文案是英文的，翻一下）。
+          ctx.toast?.(
+            error?.status === 409 ? "当前上下文没有可弹出的轮次" : error?.message || "弹出失败"
+          );
+          return true;
+        }
+        const removed = (await response.json())?.result?.turns || 0;
+        dropEcho();
+        await ctx.reload();
+        ctx.toast?.(`已从上下文弹出最旧的 ${removed} 轮`);
+        return true;
+      }
+      if (spec.name === "/stop") {
+        // 和点停止按钮完全一致：不留命令回显、不留回执（按钮也不留）。
+        // 只有「其实没有在跑」这种落空才用 toast 提一句。
+        notices.splice(notices.indexOf(pending), 1);
+        ctx.redraw();
+        const outcome = await ctx.stopRun?.();
+        if (!outcome) ctx.toast?.("当前没有正在运行的回复");
+        return true;
       }
     } catch (error) {
       return done(error?.message || "命令执行失败", "error");
@@ -209,27 +279,47 @@ window.MiyuCommands = (() => {
   //
   // 存成数组而不是直接往 DOM 里塞：`renderConversation` 每次都从 state.turns
   // 重建整个 timeline，直接塞的节点会被冲掉——而 /compact 成功后正好会触发
-  // 一次重建。换会话时清空（`clearNotices`），与 REPL 滚动区同寿命。
+  // 一次重建。按会话记账、按会话渲染：切走再切回来回执还在原位（页面刷新
+  // 才消失——它们本来就不落库）。
   const notices = [];
 
   // `anchorTurnId` = 敲这条命令时对话流里最后一个回合。渲染时插到那个回合
   // **之后**，而不是无脑 append 到末尾——否则之后来的新回合会把回执顶下去，
   // 看起来像是「先说话后执行的命令」，时间顺序全乱。
-  function note(command, text, tone, anchorTurnId) {
-    notices.push({
+  function note(command, text, tone, anchorTurnId, sessionId) {
+    const entry = {
       command,
       text,
       tone: tone || "info",
       anchorTurnId: anchorTurnId ? String(anchorTurnId) : "",
-    });
+      sessionId: sessionId ? String(sessionId) : "",
+    };
+    notices.push(entry);
+    return entry;
   }
 
-  function clearNotices() {
-    notices.length = 0;
+  // 只清一个会话的回执（/reset 用）；不传就全清。
+  function clearNotices(sessionId) {
+    if (!sessionId) {
+      notices.length = 0;
+      return;
+    }
+    const scope = String(sessionId);
+    for (let index = notices.length - 1; index >= 0; index -= 1) {
+      if (notices[index].sessionId === scope) notices.splice(index, 1);
+    }
   }
 
-  function renderNotices(timeline) {
-    if (!timeline || !notices.length) return;
+  // 非命令来源的系统回执：没有命令回显气泡，只有一条结果小条。
+  function systemNote(text, anchorTurnId, sessionId) {
+    return note("", String(text || ""), "info", anchorTurnId, sessionId);
+  }
+
+  function renderNotices(timeline, sessionId) {
+    if (!timeline) return;
+    const scope = String(sessionId || "");
+    const visible = notices.filter((entry) => entry.sessionId === scope);
+    if (!visible.length) return;
     // 锚点回合的最后一个 DOM 节点；找不到（回合被 undo/pop 掉了，或者当时
     // 对话是空的）就退回末尾。
     const anchorOf = (turnId) => {
@@ -237,31 +327,50 @@ window.MiyuCommands = (() => {
       const nodes = timeline.querySelectorAll(`[data-turn-id="${CSS.escape(turnId)}"]`);
       return nodes.length ? nodes[nodes.length - 1] : null;
     };
-    for (const entry of notices) {
-      const echo = document.createElement("article");
-      echo.className = "message user-message commandEcho";
-      echo.dataset.role = "user";
-      const bubble = document.createElement("div");
-      bubble.className = "user-bubble";
-      const line = document.createElement("p");
-      line.textContent = entry.command;
-      bubble.appendChild(line);
-      echo.appendChild(bubble);
+    for (const entry of visible) {
+      const parts = [];
+      // systemNote 没有命令原文，只画结果小条。
+      if (entry.command) {
+        const echo = document.createElement("article");
+        echo.className = "message user-message commandEcho";
+        echo.dataset.role = "user";
+        const bubble = document.createElement("div");
+        bubble.className = "user-bubble";
+        const line = document.createElement("p");
+        line.textContent = entry.command;
+        bubble.appendChild(line);
+        echo.appendChild(bubble);
+        parts.push(echo);
+      }
 
       // 复用系统事件那套（后台任务完成用的就是它）：居中、带底色的小条，
       // 而不是一行裸文字——它不是谁说的话，是一次操作的回执。
       const reply = document.createElement("div");
       reply.className = "system-event is-command-result";
       if (entry.tone === "error") reply.classList.add("is-error");
+      // 「执行中」要和结果长得不一样，否则用户分不清是跑完了还是还在跑。
+      if (entry.tone === "pending") reply.classList.add("is-pending");
       const label = document.createElement("span");
-      label.textContent = entry.text;
+      // 服务端回执按行组织（REPL 直接多行打印）；小条里换行显示不开，
+      // 折成 `目标已设定 · <目标> · 进行中` 这样的一行。
+      label.textContent = entry.text.replace(/\n+/g, " · ");
       reply.appendChild(label);
+      parts.push(reply);
 
       const anchor = anchorOf(entry.anchorTurnId);
       if (anchor) {
-        anchor.after(echo, reply);
+        anchor.after(...parts);
+      } else if (entry.anchorTurnId) {
+        // 锚点回合被 undo/pop 掉了：退回末尾。
+        timeline.append(...parts);
       } else {
-        timeline.append(echo, reply);
+        // 敲命令时对话还是空的：它是时间线上最早的事件，插在第一个回合
+        // 之前（日期分隔条之后，分隔条属于那一天的回合）。append 的话，
+        // 之后出现的每个回合都会把它一路顶到最后。多条无锚回执都插在同一
+        // 参照点前，先后顺序自然保持。
+        const firstTurn = timeline.querySelector("[data-turn-id]");
+        if (firstTurn) firstTurn.before(...parts);
+        else timeline.append(...parts);
       }
     }
     timeline.hidden = false;
@@ -278,5 +387,6 @@ window.MiyuCommands = (() => {
     tryRun,
     renderNotices,
     clearNotices,
+    systemNote,
   };
 })();
