@@ -307,17 +307,28 @@ impl OpenAiCompatibleClient {
         }
         // Reaching here means the socket closed without `[DONE]` — the loop
         // above returns early on that marker. A provider that ends this way
-        // still has to have said it was finished somewhere, and `finish_reason`
-        // is the only other place it can say so (llama.cpp's Responses
-        // endpoint, for one, never sends `[DONE]`). With neither signal the
-        // response is a truncated fragment, and returning it as a completed
-        // turn is how an empty reply reaches the user with nothing logged.
+        // still has to have said it was finished somewhere, and two places
+        // count as saying it.
+        //
+        // `finish_reason` is the obvious one (llama.cpp's Responses endpoint,
+        // for one, never sends `[DONE]`). A usage frame is the other: gateways
+        // only know the token counts once generation is over, so they append
+        // that frame at the end and nowhere else. A stream cut mid-generation
+        // cannot carry one. 08-19 实测 opencode zen 的
+        // muse-spark-1.2-contributor 就是这么收尾的:全程 `finish_reason:
+        // null`,末尾一个 usage 帧然后直接断开,没有 `[DONE]`——同网关的
+        // deepseek-v4-flash / mimo-v2.5 都照发 `[DONE]`,所以这不是端点坏了,
+        // 是这一条链路的收尾方言。
+        //
+        // With neither signal the response is a truncated fragment, and
+        // returning it as a completed turn is how an empty reply reaches the
+        // user with nothing logged.
         //
         // Reported as a transport failure so the existing machinery retries it
         // across endpoints and resets the partial reasoning already streamed.
         // Retrying is safe here: tool calls execute after this returns, so a
         // truncated turn has run nothing yet.
-        if finish_reason.is_none() {
+        if finish_reason.is_none() && usage.is_none() {
             return Err(anyhow::anyhow!(t(
                 "the response stream ended before the model said it was done",
                 "模型还没说完，响应流就提前结束了"

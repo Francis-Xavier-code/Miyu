@@ -318,6 +318,49 @@ async fn a_stream_that_ends_on_finish_reason_alone_is_a_completion() {
 }
 
 #[tokio::test]
+async fn a_stream_that_ends_on_a_usage_frame_alone_is_a_completion() {
+    // 08-19 实测 opencode zen 的 muse-spark-1.2-contributor:正文发完,
+    // `finish_reason` 全程 null,末尾补一个 usage 帧和一个非标准的 cost 帧,
+    // 然后直接断开,`[DONE]` 一次没有。usage 只有生成结束后才算得出来,所以
+    // 它就是这条链路说「我说完了」的方式。此前这里被判成截断,而正文已经流
+    // 给用户了,端点切换被抑制,整轮连同工具调用一起废掉。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_headers(&mut stream).await;
+        write_truncated_sse_response(
+            &mut stream,
+            concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好呀！\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":362,\"total_tokens\":371}}\n\n",
+                "data: {\"choices\":[],\"cost\":\"0\"}\n\n"
+            ),
+        )
+        .await;
+    });
+
+    let mut provider = test_provider("usage-tail-test", &url);
+    provider.protocol = "openai-chat".to_string();
+    provider.default_model = "test-model".to_string();
+    let client = test_client(provider);
+
+    let result = client
+        .chat_stream(vec![ChatMessage::plain("user", "hi")], Vec::new(), |_| {
+            Ok(())
+        })
+        .await
+        .expect("a usage frame without [DONE] or finish_reason is a normal completion");
+    assert_eq!(result.content, "你好呀！");
+    assert_eq!(
+        result.usage.as_ref().map(|usage| usage.total_tokens),
+        Some(371)
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn endpoint_accepts_reasoning_only_completion() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
