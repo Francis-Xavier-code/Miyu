@@ -48,6 +48,27 @@ pub struct PluginsConfig {
     pub api_quota: ApiQuotaPluginConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub file_sharing: FileSharingPluginConfig,
+}
+
+/// WebUI 文件分享（`share_file` 工具与 `/api/shared` 路由）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSharingPluginConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 单文件大小上限（字节）。0 = 不限制；快照复制前另做磁盘余量检查。
+    #[serde(default)]
+    pub max_shared_file_bytes: u64,
+}
+
+impl Default for FileSharingPluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_shared_file_bytes: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +419,7 @@ impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             weather: PluginEnabledConfig::default(),
+            file_sharing: FileSharingPluginConfig::default(),
             web: WebPluginConfig::default(),
             web_images: WebImagesPluginConfig::default(),
             deep_research: DeepResearchPluginConfig::default(),

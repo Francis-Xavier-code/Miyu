@@ -6,7 +6,6 @@ pub(crate) use reference::*;
 use super::{ToolRegistry, ToolSpec};
 use crate::clipboard::write_image_cache_file;
 use crate::config::{AppConfig, PrintImagePluginConfig};
-use crate::i18n::agent_text as t;
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
 use crate::platform_types::{PlatformContextImageRef, PlatformImageData};
@@ -38,12 +37,12 @@ pub fn register(
     }
     registry.register(ToolSpec::new(
         "vision_analyze",
-        t("Analyze an image using the current multimodal model or a configured vision provider. Supports local image paths and http(s) image URLs.", "使用当前多模态模型或配置的视觉 provider 分析图片。支持本地图片路径和 http(s) 图片 URL。"),
+        "Analyze an image using the current multimodal model or a configured vision provider. Supports local image paths and http(s) image URLs.",
         json!({
             "type": "object",
             "properties": {
-                "image": { "type": "string", "description": t("Local image path or http(s) image URL.", "本地图片路径或 http(s) 图片 URL。") },
-                "prompt": { "type": "string", "description": t("Question or instruction for image analysis. Defaults to a concise description.", "图片分析问题或指令。默认简洁描述图片。") }
+                "image": { "type": "string", "description": "Local image path or http(s) image URL." },
+                "prompt": { "type": "string", "description": "Question or instruction for image analysis. Defaults to a concise description." }
             },
             "required": ["image"],
             "additionalProperties": false
@@ -146,12 +145,12 @@ fn register_scoped(
     }
     registry.register(ToolSpec::new(
         "vision_analyze",
-        "分析图片。image 可以是本轮提示中的图片路径或 context_image_N；历史上下文图片会按需获取。",
+        "Analyze an image. image can be an image path from this turn's prompt or context_image_N; historical context images are fetched on demand.",
         json!({
             "type": "object",
             "properties": {
-                "image": { "type": "string", "description": "本轮图片提示中列出的路径或历史图片 ID（如 context_image_1）。" },
-                "prompt": { "type": "string", "description": "图片分析问题或指令。默认简洁描述图片。" }
+                "image": { "type": "string", "description": "A path listed in this turn's image prompt, or a historical image ID such as context_image_1." },
+                "prompt": { "type": "string", "description": "Question or instruction for the image analysis. Defaults to a concise description." }
             },
             "required": ["image"],
             "additionalProperties": false
@@ -166,9 +165,9 @@ fn register_scoped(
     registry.amend_description(
         "vision_analyze",
         if allow_general_access {
-            " 本轮历史图片 ID（context_image_N）会按需获取；也可继续使用普通本地路径或 URL。"
+            " Historical image IDs from this turn (context_image_N) are fetched on demand; plain local paths and URLs still work as well."
         } else {
-            " 仅可分析当前消息、引用消息中的本轮路径，此前群聊记录里明确列出的 context_image_N，或群查询工具返回的 avatar_url 头像链接；不得使用其他路径或 URL。"
+            " Only these images may be analyzed: this turn's paths from the current or quoted message, context_image_N IDs explicitly listed in earlier group-chat history, or avatar_url links returned by the group query tools. No other paths or URLs are allowed."
         },
     );
 }
@@ -190,7 +189,7 @@ async fn analyze_image(args: Value, config: AppConfig, paths: MiyuPaths) -> Resu
         .get("prompt")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("请简洁描述这张图片，并指出重要细节。")
+        .unwrap_or("Describe this image concisely and point out the important details.")
         .trim();
     let image_url = if image.starts_with("http://") || image.starts_with("https://") {
         image.to_string()
@@ -221,7 +220,7 @@ async fn analyze_scoped_image(
         .get("prompt")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("请简洁描述这张图片，并指出重要细节。")
+        .unwrap_or("Describe this image concisely and point out the important details.")
         .trim();
     if state.context_images.contains_key(image) {
         let resolved = resolve_context_image(&paths, &state, image).await?;
@@ -286,7 +285,7 @@ pub async fn analyze_image_url_with_prompt(
     let endpoint_count = client.endpoint_count();
     let request = client.chat_stream(
         vec![
-            ChatMessage::system("请基于图片内容回答，不要编造看不见的信息。"),
+            ChatMessage::system("Answer based on the image content; do not make up details you cannot see."),
             ChatMessage::user_with_image(prompt, image_url.to_string()),
         ],
         Vec::new(),

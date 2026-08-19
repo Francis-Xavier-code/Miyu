@@ -8,7 +8,6 @@ use super::store::{
     HistoryStore, RecentQuery, SearchQuery,
 };
 use crate::config::QqMessageHistoryPluginSettings;
-use crate::i18n::agent_text as t;
 use crate::platforms::access_control::{is_effective_admin, ONEBOT_PLATFORM};
 use crate::platforms::{
     ConversationKind, PlatformGroupMember, PlatformInboundEventKind, PlatformTurnContext,
@@ -51,10 +50,7 @@ fn register_activity_ranking(
     registry.register(
         ToolSpec::new(
             "get_real_chat_activity_ranking",
-            t(
-                "Rank speakers in the current QQ group using aggregate persisted message counts. This tool never returns chat content. Use days for a recent window, or start_time/end_time for an explicit local-time range.",
-                "按持久化消息数量统计当前 QQ 群发言排行，不返回聊天原文。可用 days 查询最近范围，或用 start_time/end_time 指定本地时间范围。",
-            ),
+            "Rank speakers in the current QQ group using aggregate persisted message counts. This tool never returns chat content. Use days for a recent window, or start_time/end_time for an explicit local-time range.",
             json!({
                 "type": "object",
                 "properties": {
@@ -72,7 +68,7 @@ fn register_activity_ranking(
                 async move { activity_ranking(arguments, context, store).await }
             },
         )
-        .with_display_name(t("Rank group activity", "群消息排行榜")),
+        .with_display_name("Rank group activity"),
     );
 }
 
@@ -219,10 +215,7 @@ fn register_search(
     registry.register(
         ToolSpec::new(
             "search_real_chat_history",
-            t(
-                "Read persisted QQ text history. Give query to search by keyword, or omit it to replay recent messages; sender_id narrows either to one sender. Defaults to the current conversation; administrators may select another group/private QQ conversation or all conversations.",
-                "读取持久化的 QQ 纯文字历史。给 query 就按关键词检索，不给就回放近期消息；sender_id 可把两者都限定到某个发送者。默认当前会话；管理员可指定其他群聊/私聊 QQ 会话或全部会话。",
-            ),
+            "Read persisted QQ text history. Give query to search by keyword, or omit it to replay recent messages; sender_id narrows either to one sender. Defaults to the current conversation; administrators may select another group/private QQ conversation or all conversations.",
             json!({
                 "type": "object",
                 "properties": {
@@ -260,7 +253,7 @@ fn register_search(
                 }
             },
         )
-        .with_display_name(t("Search real chat history", "搜索真实聊天历史")),
+        .with_display_name("Search real chat history"),
     );
 }
 
@@ -382,10 +375,7 @@ pub(super) fn register_group_members(
     registry.register(
         ToolSpec::new(
             "get_group_members_info",
-            t(
-                "Search members of the current QQ group by full or partial QQ ID, group card, or nickname. You must choose how many matches to return with limit. This tool cannot target another group.",
-                "按完整或部分 QQ 号、群名片或昵称搜索当前 QQ 群成员。必须使用 limit 指定返回多少条匹配结果，不能查询其他群。",
-            ),
+            "Search members of the current QQ group by full or partial QQ ID, group card, or nickname. You must choose how many matches to return with limit. This tool cannot target another group.",
             json!({
                 "type": "object",
                 "properties": {
@@ -464,7 +454,7 @@ pub(super) fn register_group_members(
                 }
             },
         )
-        .with_display_name(t("Query group members", "查询群成员")),
+        .with_display_name("Query group members"),
     );
 }
 
@@ -475,10 +465,7 @@ pub(super) fn register_avatar(registry: &mut ToolRegistry, context: Arc<Platform
     registry.register(
         ToolSpec::new_with_progress(
             "get_avatar",
-            t(
-                "Get a QQ avatar. Omit user_id for the current group's avatar, or pass a member's QQ id. By default it returns avatar_url only — feed that to vision_analyze to see the image. Set download=true to fetch it and emit it as an image; the host delivers emitted images automatically with your reply, so do not resend the same image with send_message_to_user.",
-                "获取 QQ 头像。省略 user_id 取当前群头像，传成员 QQ 号取该成员头像。默认只返回 avatar_url，交给 vision_analyze 即可查看内容。download=true 才会下载并发布为图片；宿主会随回复自动投递已发布的图片，不要再用 send_message_to_user 重发。",
-            ),
+            "Get a QQ avatar. Omit user_id for the current group's avatar, or pass a member's QQ id. By default it returns avatar_url only — feed that to vision_analyze to see the image. Set download=true to fetch it and emit it as an image; the host delivers emitted images automatically with your reply, so do not resend the same image with send_message_to_user.",
             json!({
                 "type": "object",
                 "properties": {
@@ -540,7 +527,7 @@ pub(super) fn register_avatar(registry: &mut ToolRegistry, context: Arc<Platform
                 }
             },
         )
-        .with_display_name(t("QQ avatar", "QQ 头像")),
+        .with_display_name("QQ avatar"),
     );
 }
 

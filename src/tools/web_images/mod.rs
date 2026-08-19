@@ -7,7 +7,7 @@ use ranking::*;
 
 use super::{vision, ToolProgress, ToolRegistry, ToolSpec};
 use crate::config::{AppConfig, ProviderConfig, VisionPluginConfig};
-use crate::i18n::{agent_text, text as t};
+use crate::i18n::{text as t};
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
@@ -42,18 +42,15 @@ pub fn register(
 ) {
     registry.register(ToolSpec::new_with_progress(
         "search_web_images",
-        agent_text(
-            "Search web images with parallel multi-source retrieval, ranking, deduplication, and optional vision review. Sources adapt to global or mainland connectivity and can include SearXNG, DuckDuckGo, Bing CN, Baidu, and 360.",
-            "并行使用多个来源搜索网络图片，统一排序、去重并可进行视觉审核。搜索来源会适配全球或中国大陆网络，可包括 SearXNG、DuckDuckGo、必应中国、百度和 360。",
-        ),
+        "Search web images with parallel multi-source retrieval, ranking, deduplication, and optional vision review. Sources adapt to global or mainland connectivity and can include SearXNG, DuckDuckGo, Bing CN, Baidu, and 360.",
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": agent_text("Image search query.", "图片搜索关键词。") },
-                "count": { "type": "integer", "description": agent_text("Required. Exact number of images to return. Match the user's requested quantity: one/a/an/一张/一幅 means 1; a few/几张 means 3; several/多张 means 5 unless the user gives another number. Do not use the configured maximum as the default.", "必填。最终返回图片的精确数量。必须匹配用户要求的数量：一张/一幅/one/a/an 填 1；几张填 3；多张填 5，除非用户给了其他数字。不要把配置上限当默认值。") },
-                "preview": { "type": "boolean", "description": agent_text("Download and preview images with chafa when terminal image printing is enabled.", "在终端图片打印启用时，下载并用 chafa 预览图片。") },
-                "preview_count": { "type": "integer", "description": agent_text("Maximum images to preview with chafa.", "最多用 chafa 预览几张图片。") },
-                "safe_search": { "type": "boolean", "description": agent_text("Enable safe image search. Defaults to plugin config.", "启用安全搜图。默认使用插件配置。") }
+                "query": { "type": "string", "description": "Image search query." },
+                "count": { "type": "integer", "description": "Required. Exact number of images to return. Match the user's requested quantity: one/a/an/一张/一幅 means 1; a few/几张 means 3; several/多张 means 5 unless the user gives another number. Do not use the configured maximum as the default." },
+                "preview": { "type": "boolean", "description": "Download and preview images with chafa when terminal image printing is enabled." },
+                "preview_count": { "type": "integer", "description": "Maximum images to preview with chafa." },
+                "safe_search": { "type": "boolean", "description": "Enable safe image search. Defaults to plugin config." }
             },
             "required": ["query", "count"],
             "additionalProperties": false

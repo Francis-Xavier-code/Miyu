@@ -1,7 +1,6 @@
 use super::subagent_runner::{ProgressMode, SubagentProgress, SubagentRunner, SubagentStats};
 use super::{ToolRegistry, ToolSpec};
 use crate::config::{AppConfig, ModelTier};
-use crate::i18n::agent_text as t;
 use crate::llm::OpenAiCompatibleClient;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Result};
@@ -55,37 +54,34 @@ pub fn register(
     };
     registry.register(ToolSpec::new_with_progress(
         "task",
-        t(
-            "Launch a subagent to handle a complex task independently. The subagent has its own system prompt, tool set, and LLM loop, and returns its final text to the main agent.",
-            "启动子代理独立处理复杂任务。子代理有独立的系统提示、工具集和 LLM 循环，完成后返回最终文本给主 agent。",
-        ),
+        "Launch a subagent to handle a complex task independently. The subagent has its own system prompt, tool set, and LLM loop, and returns its final text to the main agent.",
         json!({
             "type": "object",
             "properties": {
                 "description": {
                     "type": "string",
-                    "description": t("Short task description for progress display.", "简短任务描述，用于进度展示。")
+                    "description": "Short task description for progress display."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": t("Detailed task prompt. Must include full context, goals, and output requirements since the subagent has no access to the main agent's conversation history.", "详细任务提示。必须包含完整的上下文、目标和输出要求，因为子代理无法访问主 agent 的对话历史。")
+                    "description": "Detailed task prompt. Must include full context, goals, and output requirements since the subagent has no access to the main agent's conversation history."
                 },
                 "max_steps": {
                     "type": "integer",
-                    "description": t("Optional tool-call budget. Unlimited by default: the subagent ends when the task is done. Set a number only when you want a hard cap.", "可选的工具调用步数预算。默认不限，子代理完成任务即自然结束；仅在需要硬性约束时设置。")
+                    "description": "Optional tool-call budget. Unlimited by default: the subagent ends when the task is done. Set a number only when you want a hard cap."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": t("Run the subagent detached in the background: returns a job_id immediately; check with job(action=status) (its log holds live progress) and you are woken automatically on completion. Use for long research/tasks that should not block the conversation.", "后台分离运行子代理：立即返回 job_id，用 job(action=status) 查询（日志即实时进度），完成后自动唤起你跟进。适合不应阻塞对话的长任务。")
+                    "description": "Run the subagent detached in the background: returns a job_id immediately; check with job(action=status) (its log holds live progress) and you are woken automatically on completion. Use for long research/tasks that should not block the conversation."
                 },
                 "resume_id": {
                     "type": "string",
-                    "description": t("Optional. When a previous task failed with a resume_id in its error, pass it here to continue that subagent from its last completed tool round instead of starting over (process-local; lost on restart).", "可选。当上一次 task 因连接中断失败并在错误中给出 resume_id 时，携带它可让该子代理从最后一个已完成的工具轮继续，而不是从头开始（仅本进程有效，重启后失效）。")
+                    "description": "Optional. When a previous task failed with a resume_id in its error, pass it here to continue that subagent from its last completed tool round instead of starting over (process-local; lost on restart)."
                 },
                 "tier": {
                     "type": "string",
                     "enum": ["cheap", "balanced", "strong"],
-                    "description": t("Optional model tier, picked by task complexity: cheap for simple lookups/mechanical steps, balanced for typical multi-step work, strong for hard reasoning. Defaults to balanced; unconfigured tiers fall back to the main model.", "可选模型档位，按任务复杂度选择：cheap 适合简单查询/机械步骤，balanced 适合常规多步任务，strong 适合高难度推理。默认 balanced；未配置的档位回退主模型。")
+                    "description": "Optional model tier, picked by task complexity: cheap for simple lookups/mechanical steps, balanced for typical multi-step work, strong for hard reasoning. Defaults to balanced; unconfigured tiers fall back to the main model."
                 }
             },
             "required": ["description", "prompt"],
@@ -125,7 +121,7 @@ fn tier_pool_status(config: &AppConfig) -> String {
     if cheap.is_empty() && balanced.is_empty() && strong.is_empty() {
         return String::new();
     }
-    let fallback = t("main pool", "主池");
+    let fallback = "main pool";
     let show = |pool: &str| -> String {
         if pool.is_empty() {
             fallback.to_string()
@@ -135,7 +131,7 @@ fn tier_pool_status(config: &AppConfig) -> String {
     };
     format!(
         "{}cheap=[{}]; balanced=[{}]; strong=[{}]",
-        t(" Current tier pools: ", " 当前档位池状态："),
+        " Current tier pools: ",
         show(&cheap),
         show(&balanced),
         show(&strong),

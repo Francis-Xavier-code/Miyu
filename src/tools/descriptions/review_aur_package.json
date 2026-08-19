@@ -1,7 +1,7 @@
 {
   "name": "review_aur_package",
   "display_name": "审查 AUR 包",
-  "description": "拉取 AUR 构建文件并做 PKGBUILD 安全审查。\nFetch AUR build files and prepare a PKGBUILD security review. After review, stop and ask the user whether to install; do not call install_aur_package in the same turn.",
+  "description": "Fetch AUR build files and prepare a PKGBUILD security review. After review, stop and ask the user whether to install; do not call install_aur_package in the same turn.",
   "parameters": {
     "type": "object",
     "properties": {

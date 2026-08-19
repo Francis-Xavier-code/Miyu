@@ -72,6 +72,10 @@ pub(in crate::web) async fn index_asset(headers: HeaderMap) -> Response {
                 concat!("src=\"/todos.js?v=", env!("MIYU_BUILD_ID"), "\""),
             )
             .replace(
+                "src=\"/shared.js\"",
+                concat!("src=\"/shared.js?v=", env!("MIYU_BUILD_ID"), "\""),
+            )
+            .replace(
                 "href=\"/vendor/katex/katex.min.css\"",
                 concat!("href=\"/vendor/katex/katex.min.css?v=", env!("MIYU_BUILD_ID"), "\""),
             )
@@ -111,6 +115,14 @@ pub(in crate::web) async fn todos_js_asset(headers: HeaderMap) -> Response {
     embedded_asset(
         &headers,
         TODOS_JS.as_bytes(),
+        "application/javascript; charset=utf-8",
+    )
+}
+
+pub(in crate::web) async fn shared_js_asset(headers: HeaderMap) -> Response {
+    embedded_asset(
+        &headers,
+        SHARED_JS.as_bytes(),
         "application/javascript; charset=utf-8",
     )
 }
@@ -418,10 +430,17 @@ pub(in crate::web) async fn image_asset(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+pub(in crate::web) struct ArtifactQuery {
+    #[serde(default)]
+    download: Option<String>,
+}
+
 pub(in crate::web) async fn artifact_asset(
     State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(asset_id): Path<String>,
+    Query(query): Query<ArtifactQuery>,
 ) -> std::result::Result<Response, ApiError> {
     require_auth(&headers, &state)?;
     if asset_id.len() > 96
@@ -439,10 +458,14 @@ pub(in crate::web) async fn artifact_asset(
     else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "artifact not found"));
     };
-    let inline = matches!(
-        artifact.asset.kind.as_str(),
-        "markdown" | "text" | "code" | "json" | "pdf" | "html"
-    );
+    // `?download=1` 强制 attachment:预览按钮走 inline,下载按钮拿到的必须
+    // 是真下载,不能又弹一个预览页。
+    let force_download = query.download.as_deref() == Some("1");
+    let inline = !force_download
+        && matches!(
+            artifact.asset.kind.as_str(),
+            "markdown" | "text" | "code" | "json" | "pdf" | "html"
+        );
     let disposition = format!(
         "{}; filename*=UTF-8''{}",
         if inline { "inline" } else { "attachment" },

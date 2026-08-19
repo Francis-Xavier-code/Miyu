@@ -224,7 +224,7 @@ pub(in crate::platforms::plugins::real_context) fn format_history_internal(
             })
             .collect::<Vec<_>>();
         let sender = if message.is_bot {
-            "[你]".to_string()
+            "[you]".to_string()
         } else if show_user_ids {
             format!(
                 "{}(QQ:{})",
@@ -242,7 +242,7 @@ pub(in crate::platforms::plugins::real_context) fn format_history_internal(
             content.push_str(&media.join(" "));
         }
         if content.is_empty() {
-            content.push_str("[无文字内容]");
+            content.push_str("[no text content]");
         }
         let mut line = format!(
             "[{}] {} [msg={}]: {}",
@@ -253,7 +253,7 @@ pub(in crate::platforms::plugins::real_context) fn format_history_internal(
         );
         if let Some(reply_to) = message.reply_to_message_id.as_ref() {
             line.push_str(&format!(
-                "\n  回复引用: msg={}",
+                "\n  reply-to: msg={}",
                 safe_prompt_field(reply_to)
             ));
         }
@@ -262,7 +262,7 @@ pub(in crate::platforms::plugins::real_context) fn format_history_internal(
             &message.content.mentioned_user_ids,
             show_user_ids,
         ) {
-            line.push_str(&format!("\n  @对象: {mentions}"));
+            line.push_str(&format!("\n  @mentions: {mentions}"));
         }
         line.push('\n');
         if used_bytes.saturating_add(line.len()) > maximum_bytes {
@@ -328,12 +328,12 @@ pub(in crate::platforms::plugins::real_context) fn format_history_time(timestamp
 
 pub(in crate::platforms::plugins::real_context) fn media_label(kind: MediaKind) -> &'static str {
     match kind {
-        MediaKind::Image => "图片",
-        MediaKind::Sticker => "表情",
-        MediaKind::File => "文件",
-        MediaKind::Audio => "语音",
-        MediaKind::Video => "视频",
-        MediaKind::Other => "媒体",
+        MediaKind::Image => "image",
+        MediaKind::Sticker => "sticker",
+        MediaKind::File => "file",
+        MediaKind::Audio => "audio",
+        MediaKind::Video => "video",
+        MediaKind::Other => "media",
     }
 }
 

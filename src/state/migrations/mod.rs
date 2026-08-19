@@ -157,10 +157,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "session_goals",
         apply: apply_v26_session_goals,
     },
+    Migration {
+        version: 27,
+        name: "shared_files",
+        apply: apply_v27_shared_files,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 26;
+pub const LATEST_VERSION: i64 = 27;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {

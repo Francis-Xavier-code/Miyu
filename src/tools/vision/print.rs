@@ -11,14 +11,14 @@ pub fn register_print(registry: &mut ToolRegistry, config: AppConfig) {
     }
     registry.register(ToolSpec::new_with_progress(
         "print_image",
-        t("Print/render a local image directly in the current terminal output. Use this when the user asks to show, print, render, or preview an image, or when you need to inspect an image visually in the terminal before answering.", "在当前终端输出中直接打印/渲染本地图片。当用户要求显示、打印、渲染、预览图片，或回答前需要在终端中目视检查图片时使用。"),
+        "Print/render a local image directly in the current terminal output. Use this when the user asks to show, print, render, or preview an image, or when you need to inspect an image visually in the terminal before answering.",
         json!({
             "type": "object",
             "properties": {
-                "image": { "type": "string", "description": t("Local image path.", "本地图片路径。") },
-                "size": { "type": "string", "description": t("Optional chafa size, e.g. 80x40. Use this or width/height to avoid oversized output.", "可选 chafa 尺寸，例如 80x40。用它或 width/height 避免输出过大。") },
-                "width": { "type": "integer", "description": t("Optional output width in terminal cells, e.g. 80.", "可选终端单元格输出宽度，例如 80。") },
-                "height": { "type": "integer", "description": t("Optional output height in terminal cells, e.g. 40.", "可选终端单元格输出高度，例如 40。") }
+                "image": { "type": "string", "description": "Local image path." },
+                "size": { "type": "string", "description": "Optional chafa size, e.g. 80x40. Use this or width/height to avoid oversized output." },
+                "width": { "type": "integer", "description": "Optional output width in terminal cells, e.g. 80." },
+                "height": { "type": "integer", "description": "Optional output height in terminal cells, e.g. 40." }
             },
             "required": ["image"],
             "additionalProperties": false
@@ -41,22 +41,13 @@ pub(crate) async fn print_image(
         .unwrap_or_default()
         .trim();
     if image.is_empty() {
-        bail!("{}", t("image is required", "缺少图片路径"))
+        bail!("{}", "image is required")
     }
     let path = expand_path(image);
-    let metadata = std::fs::metadata(&path).with_context(|| {
-        format!(
-            "{} {}",
-            t("failed to stat image", "无法读取图片元数据"),
-            path.display()
-        )
-    })?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("{} {}", "failed to stat image", path.display()))?;
     if !metadata.is_file() {
-        bail!(
-            "{}: {}",
-            t("image path is not a file", "图片路径不是文件"),
-            path.display()
-        )
+        bail!("{}: {}", "image path is not a file", path.display())
     }
     // 模型显式要的尺寸要随事件带走:daemon 模式下真正画图的是终端那一侧,
     // 这里 print_image_file 的参数它看不见。
@@ -72,7 +63,7 @@ pub(crate) async fn print_image(
     }
     Ok(format!(
         "{}: {}",
-        t("printed image in terminal", "已在终端打印图片"),
+        "printed image in terminal",
         path.display()
     ))
 }

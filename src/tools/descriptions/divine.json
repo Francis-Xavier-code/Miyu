@@ -1,7 +1,7 @@
 {
   "name": "divine",
   "display_name": "占卜",
-  "description": "随机占卜：method 选 zhouyi 周易起卦、tarot 塔罗牌、fortune 吉凶占、dice 掷骰子。工具只摇结果，解释由你来做。",
+  "description": "Random divination: method zhouyi casts an I Ching (Zhouyi) hexagram, tarot draws tarot cards, fortune gives a luck reading, dice rolls dice. The tool only produces the random result; the interpretation is up to you.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -13,19 +13,19 @@
           "fortune",
           "dice"
         ],
-        "description": "占卜方式。"
+        "description": "Divination method."
       },
       "count": {
         "type": "integer",
-        "description": "仅 dice：骰子数量，默认 1，最多 100。"
+        "description": "dice only: number of dice, default 1, max 100."
       },
       "sides": {
         "type": "integer",
-        "description": "仅 dice：每颗骰子面数，默认 6，最多 1000。"
+        "description": "dice only: sides per die, default 6, max 1000."
       },
       "modifier": {
         "type": "integer",
-        "description": "仅 dice：可选总和修正值。"
+        "description": "dice only: optional modifier added to the total."
       }
     },
     "required": [

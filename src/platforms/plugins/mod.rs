@@ -38,6 +38,7 @@ mod meme_collector;
 mod message_history;
 mod message_recall;
 pub(crate) mod real_context;
+pub(crate) mod scheduled_messages;
 mod renderer;
 mod reply_processor;
 
@@ -421,6 +422,7 @@ impl PlatformPluginRegistry {
             Arc::new(meme_collector::MemeCollectorPlugin::new()),
             Arc::new(Arc::new(group_management::GroupManagementPlugin::new())),
             Arc::new(reply_processor::ReplyProcessorPlugin::new()?),
+            Arc::new(scheduled_messages::ScheduledMessagesPlugin::new()),
         ]))
     }
 

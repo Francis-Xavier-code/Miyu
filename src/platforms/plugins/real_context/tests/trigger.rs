@@ -343,7 +343,7 @@ fn directly_triggered_image_is_a_primary_target() {
 
     let prompt = active_target_prompt(&context, &current, "（对方发送了 1 张图片）");
 
-    assert!(prompt.starts_with("[本轮新收到的消息]\n（对方发送了 1 张图片）"));
+    assert!(prompt.starts_with("[New messages received this turn]\n（对方发送了 1 张图片）"));
     assert!(!prompt.contains("无明确文字目标消息"));
     assert!(!prompt.contains("同一用户随后发送的补充材料"));
 }

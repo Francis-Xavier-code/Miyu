@@ -87,14 +87,10 @@ fn sort_json(value: &Value) -> Value {
 }
 
 fn gentle_reminder() -> &'static str {
-    crate::i18n::agent_text(
-        "You are repeating the exact same tool call with identical arguments. \
+    "You are repeating the exact same tool call with identical arguments. \
          Carefully analyze the previous result before calling again: if the task \
          is not complete, try a different approach or different arguments instead \
-         of repeating the call.",
-        "你正在用完全相同的参数重复同一个工具调用。再次调用前请仔细分析上一次\
-         的结果:如果任务还没完成,换一种思路或换参数,而不是原样重发。",
-    )
+         of repeating the call."
 }
 
 fn detailed_reminder(tool_name: &str, count: u32, canonical: &str) -> String {
@@ -105,20 +101,12 @@ fn detailed_reminder(tool_name: &str, count: u32, canonical: &str) -> String {
         let omitted = canonical.chars().count() - ARGUMENTS_PREVIEW_CHARS;
         format!("{head}… (+{omitted} more chars)")
     };
-    if crate::i18n::agent_is_zh() {
-        format!(
-            "检测到重复的工具调用:\n- 工具: {tool_name}\n- 连续次数: {count}\n- 参数: {preview}\n\
-             这些重复调用没有取得进展。不要再用这组参数调用这个工具了;检查最新结果,\
-             换一个动作、换一组参数,或者证据已够就直接收尾。"
-        )
-    } else {
-        format!(
-            "Repeated tool call detected:\n- tool: {tool_name}\n- consecutive_calls: {count}\n- arguments: {preview}\n\
-             The repeated calls are not making progress. Do not call this tool with these \
-             exact arguments again. Inspect the latest result and choose a different action, \
-             different arguments, or finish the task if enough evidence has been gathered."
-        )
-    }
+    format!(
+        "Repeated tool call detected:\n- tool: {tool_name}\n- consecutive_calls: {count}\n- arguments: {preview}\n\
+         The repeated calls are not making progress. Do not call this tool with these \
+         exact arguments again. Inspect the latest result and choose a different action, \
+         different arguments, or finish the task if enough evidence has been gathered."
+    )
 }
 
 #[cfg(test)]

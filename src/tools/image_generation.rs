@@ -95,6 +95,10 @@ async fn generate_image(
         .and_then(Value::as_str)
         .unwrap_or(&plugin.default_resolution)
         .trim();
+    // 平台回合的配额由代码承担,不写进 prompt 求模型自觉;本地会话无 task-local,天然放行。
+    if !crate::tools::workspace::try_allow_image() {
+        bail!("image generation limit reached: only one image per user request in messaging-platform conversations. Wait for the next user message before generating another.")
+    }
     let mut references = Vec::new();
     if let Some(value) = args.get("reference_images") {
         let wanted = reference_list(value)?;
@@ -102,7 +106,14 @@ async fn generate_image(
             references.push(resolver.resolve(item).await?);
         }
     }
-    let bytes = request_image(plugin, prompt, aspect_ratio, resolution, &references).await?;
+    let bytes = match request_image(plugin, prompt, aspect_ratio, resolution, &references).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // 失败退还配额:同一请求内允许重试,只有成功的生成才占额度。
+            crate::tools::workspace::refund_image_gen_allowance();
+            return Err(error);
+        }
+    };
     let path = save_image(plugin, prompt, &bytes)?;
     progress.report_image(path.clone(), prompt.to_string());
     let should_render_terminal = plugin.auto_print

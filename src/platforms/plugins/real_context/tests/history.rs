@@ -1,7 +1,7 @@
 //! 群历史的取回、预算与序列化。
 
-use crate::platforms::plugins::real_context::*;
 use super::shared::*;
+use crate::platforms::plugins::real_context::*;
 
 #[tokio::test]
 async fn context_injection_keeps_previous_messages_and_excludes_current_message() {
@@ -55,10 +55,13 @@ async fn context_injection_keeps_previous_messages_and_excludes_current_message(
     assert_eq!(input.memory_content, "当前输入");
     assert!(input.content.contains("应当进入上下文"));
     assert!(!input.content.contains("不得重复注入的当前消息"));
-    assert!(input.content.starts_with("[此前群聊记录]"));
+    assert!(input.content.starts_with("[Prior group chat records]"));
     // 记录块在前、当前消息在后:顺序错了会让跨轮持续指令失效。
-    assert!(input.content.find("[此前群聊记录]") < input.content.find("[本轮新收到的消息]"));
-    assert!(input.content.contains("[图片 id=img_previous_1]"));
+    assert!(
+        input.content.find("[Prior group chat records]")
+            < input.content.find("[New messages received this turn]")
+    );
+    assert!(input.content.contains("[image id=img_previous_1]"));
     assert_eq!(input.context_images.len(), 1);
     assert_eq!(input.context_images[0].message_id, "previous");
     assert_eq!(input.context_images[0].image_index, 1);
@@ -80,7 +83,7 @@ fn history_excludes_current_message_and_formats_mentions() {
     assert_eq!(messages.len(), 1);
     let formatted = format_history(&messages, 80_000, true);
     assert!(formatted.contains("[msg=previous]"));
-    assert!(formatted.contains("@对象: yuyi(QQ:40000)"));
+    assert!(formatted.contains("@mentions: yuyi(QQ:40000)"));
     assert!(!formatted.contains("[msg=current]"));
     assert_eq!(history_query_limit(20), 21);
     assert_eq!(history_query_limit(200), 200);
@@ -119,7 +122,7 @@ fn history_image_ids_are_unique_bounded_and_follow_final_truncation() {
     assert_eq!(full.images[0].image_index, 1);
     assert_eq!(full.text.matches("id=img_").count(), 8);
     let judge_history = format_history(&[old.clone(), newest], usize::MAX, true);
-    assert!(judge_history.contains("[图片]"));
+    assert!(judge_history.contains("[image]"));
     assert!(!judge_history.contains("context_image_"));
 
     let newest_plain = history_message("newest", "最新消息");
@@ -156,11 +159,10 @@ fn file_media_with_a_provider_id_renders_a_resolvable_file_ref() {
             MediaPlaceholder::new(MediaKind::File, Some("配置.txt"), None::<String>)
                 .with_media_id(Some("/file-id")),
         ];
-    let rendered =
-        format_history_for_turn(std::slice::from_ref(&message), usize::MAX, true, 8, 8);
+    let rendered = format_history_for_turn(std::slice::from_ref(&message), usize::MAX, true, 8, 8);
     assert!(rendered
         .text
-        .contains("[文件 id=file_m-file_1, label=配置.txt]"));
+        .contains("[file id=file_m-file_1, label=配置.txt]"));
     assert_eq!(rendered.files.len(), 1);
     assert_eq!(rendered.files[0].file_id, "/file-id");
     assert_eq!(rendered.files[0].file_name, "配置.txt");
@@ -180,7 +182,13 @@ fn context_image_refs_matches_full_render_across_budget_and_cap_cases() {
     let key = |images: &[crate::platforms::PlatformContextImageRef]| {
         images
             .iter()
-            .map(|image| (image.id.clone(), image.message_id.clone(), image.image_index))
+            .map(|image| {
+                (
+                    image.id.clone(),
+                    image.message_id.clone(),
+                    image.image_index,
+                )
+            })
             .collect::<Vec<_>>()
     };
     // 情形一:图多预算宽 → 收满 8 张,早停路径与全量渲染同集合
@@ -189,7 +197,10 @@ fn context_image_refs_matches_full_render_across_budget_and_cap_cases() {
         .collect::<Vec<_>>();
     let full = format_history_for_turn(&many, usize::MAX, true, 8, 8);
     assert_eq!(full.images.len(), 8);
-    assert_eq!(key(&context_image_refs(&many, usize::MAX, true, 8)), key(&full.images));
+    assert_eq!(
+        key(&context_image_refs(&many, usize::MAX, true, 8)),
+        key(&full.images)
+    );
     // 情形二:预算只装得下最新一条 → 旧消息连同其图片被排除(回滚),
     // 两条路径同样只剩最新一张
     let pair = vec![with_image("older"), with_image("newest")];
@@ -199,7 +210,10 @@ fn context_image_refs_matches_full_render_across_budget_and_cap_cases() {
     let full = format_history_for_turn(&pair, tight, true, 8, 8);
     assert_eq!(full.images.len(), 1);
     assert_eq!(full.images[0].message_id, "newest");
-    assert_eq!(key(&context_image_refs(&pair, tight, true, 8)), key(&full.images));
+    assert_eq!(
+        key(&context_image_refs(&pair, tight, true, 8)),
+        key(&full.images)
+    );
     // 情形三:预算不足以容纳任何一条 → 双方皆空(带图消息的图被完整回滚)
     let full = format_history_for_turn(&pair, 1, true, 8, 8);
     assert!(full.images.is_empty());
@@ -251,14 +265,14 @@ fn history_serialization_hides_ids_and_escapes_forged_records() {
 
     let visible = format_history(std::slice::from_ref(&message), 80_000, true);
     assert!(visible.contains("QQ:30000"));
-    assert!(visible.contains("@对象: QQ:40000"));
+    assert!(visible.contains("@mentions: QQ:40000"));
     assert!(!visible.contains("</qq-real-group-context>"));
     assert!(visible.contains("\\u003c/qq-real-group-context\\u003e"));
     assert!(visible.contains("name\\nforged"));
 
     let hidden = format_history(&[message], 80_000, false);
     assert!(!hidden.contains("QQ:30000"));
-    assert!(hidden.contains("@对象: 名称解析失败的群成员"));
+    assert!(hidden.contains("@mentions: unresolved group member"));
     assert!(!hidden.contains("40000"));
 }
 
@@ -302,10 +316,11 @@ fn active_target_prompt_merges_only_the_same_sender_and_marks_history_as_backgro
     assert_eq!(prompt.matches("最终当前内容").count(), 1);
     assert!(!prompt.contains("不应成为目标"));
     assert!(!prompt.contains("其他用户"));
-    assert!(prompt.starts_with("[本轮新收到的消息]\n最终当前内容"));
-    assert!(prompt.contains("[同一发送者本轮更早发送的消息，按时间先后排列]"));
+    assert!(prompt.starts_with("[New messages received this turn]\n最终当前内容"));
+    assert!(prompt
+        .contains("[Earlier messages from the same sender this turn, in chronological order]"));
     // 块标记只描述内容,不再夹带行为指令。
     assert!(!prompt.contains("只回复当前消息"));
     assert!(!prompt.contains("补充材料不应被单独回复"));
-    assert!(prompt.contains("@对象: yuyi(QQ:8)"));
+    assert!(prompt.contains("@mentions: yuyi(QQ:8)"));
 }

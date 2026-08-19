@@ -1,5 +1,4 @@
 use super::{ToolRegistry, ToolSpec};
-use crate::i18n::agent_text as t;
 use crate::paths::MiyuPaths;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -104,29 +103,26 @@ fn run_scoped(
 pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
     registry.register(ToolSpec::new(
         "todowrite",
-        t(
-            "Maintain the structured task list for the current session. Pass todos to create or replace the whole list; pass updates to apply small atomic changes (add, update, remove, clear) without resending everything. Exactly one of the two.",
-            "维护当前会话的结构化任务列表。传 todos 创建或替换整个列表；传 updates 做小范围原子变更（新增、修改、删除、清空），不必重传完整列表。二者必须且只能给一个。",
-        ),
+        "Maintain the structured task list for the current session. Pass todos to create or replace the whole list; pass updates to apply small atomic changes (add, update, remove, clear) without resending everything. Exactly one of the two.",
         json!({
             "type": "object",
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": t("The full todo list. This replaces the entire list.", "完整任务列表。此操作会替换整个列表。"),
+                    "description": "The full todo list. This replaces the entire list.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": { "type": "string", "description": t("Brief description of the task.", "任务简述。") },
+                            "content": { "type": "string", "description": "Brief description of the task." },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                "description": t("Current status of the task.", "任务当前状态。")
+                                "description": "Current status of the task."
                             },
                             "priority": {
                                 "type": "string",
                                 "enum": ["high", "medium", "low"],
-                                "description": t("Priority level of the task.", "任务优先级。")
+                                "description": "Priority level of the task."
                             }
                         },
                         "required": ["content", "status", "priority"]
@@ -134,33 +130,33 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
                 },
                 "updates": {
                     "type": "array",
-                    "description": t("Sequential todo mutations to apply atomically.", "按顺序原子应用的任务变更。"),
+                    "description": "Sequential todo mutations to apply atomically.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "action": {
                                 "type": "string",
                                 "enum": ["add", "update", "remove", "clear"],
-                                "description": t("Mutation type.", "变更类型。")
+                                "description": "Mutation type."
                             },
                             "index": {
                                 "type": "integer",
-                                "description": t("1-based target item index. For add, inserts at this position; omitted means append.", "目标任务序号，1 起始。新增时表示插入位置；省略则追加。")
+                                "description": "1-based target item index. For add, inserts at this position; omitted means append."
                             },
                             "match_content": {
                                 "type": "string",
-                                "description": t("Exact content used to find the target when index is omitted.", "省略 index 时，用于定位目标任务的完整内容。")
+                                "description": "Exact content used to find the target when index is omitted."
                             },
-                            "content": { "type": "string", "description": t("New task content for add or update.", "新增或修改后的任务内容。") },
+                            "content": { "type": "string", "description": "New task content for add or update." },
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "completed", "cancelled"],
-                                "description": t("Updated task status.", "更新后的任务状态。")
+                                "description": "Updated task status."
                             },
                             "priority": {
                                 "type": "string",
                                 "enum": ["high", "medium", "low"],
-                                "description": t("Updated task priority.", "更新后的任务优先级。")
+                                "description": "Updated task priority."
                             }
                         },
                         "required": ["action"],

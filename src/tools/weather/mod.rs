@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TOOL_NAME: &str = "get_weather";
-const TOOL_DESC: &str = "气象数据查询。query_type 默认 forecast，支持 forecast 当前天气和预报、air_quality 空气质量、historical 历史天气、marine 海洋天气、climate 气候趋势、elevation 海拔。location 可传城市、地点、邮编或机场码；仅 forecast 支持空字符串自动定位并 fallback 到 wttr.in。days 可选，默认 3。start_date/end_date 用于 historical 和 climate。country_code 可选，用 ISO-3166-1 alpha2 国家代码消除重名地点歧义，例如 CN、JP、US。";
+const TOOL_DESC: &str = "Weather data query. query_type defaults to forecast; supports forecast (current weather and forecast), air_quality, historical, marine, climate, and elevation. location is required: pass a city, place name, postal code, or airport code. Do not guess; ask the user when the location is missing. days is optional, default 3. start_date/end_date apply to historical and climate. country_code is an optional ISO-3166-1 alpha2 code (e.g. CN, JP, US) to disambiguate identically named places.";
 const OPEN_METEO_GEOCODING_URL: &str = "https://geocoding-api.open-meteo.com/v1/search";
 const OPEN_METEO_FORECAST_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const OPEN_METEO_AIR_QUALITY_URL: &str = "https://air-quality-api.open-meteo.com/v1/air-quality";
@@ -30,12 +30,12 @@ pub fn register(registry: &mut ToolRegistry) {
         json!({
             "type": "object",
             "properties": {
-                "location": { "type": "string", "description": "城市、地点、邮编或机场码；空字符串表示自动定位。" },
-                "query_type": { "type": "string", "enum": ["forecast", "air_quality", "historical", "marine", "climate", "elevation"], "description": "查询类型。forecast=当前天气和预报，air_quality=空气质量，historical=历史天气，marine=海洋天气，climate=气候趋势，elevation=海拔；默认 forecast。" },
-                "days": { "type": "integer", "description": "返回预报天数，默认 3，最大 7。" },
-                "start_date": { "type": "string", "description": "开始日期，格式 YYYY-MM-DD。用于 historical 和 climate。" },
-                "end_date": { "type": "string", "description": "结束日期，格式 YYYY-MM-DD。用于 historical 和 climate；省略时等于 start_date。" },
-                "country_code": { "type": "string", "description": "可选 ISO-3166-1 alpha2 国家代码，用于消除重名地点歧义，例如 CN、JP、US。" }
+                "location": { "type": "string", "description": "Required city, place name, postal code, or airport code. Do not guess; ask the user when it is missing." },
+                "query_type": { "type": "string", "enum": ["forecast", "air_quality", "historical", "marine", "climate", "elevation"], "description": "Query type. forecast=current weather and forecast, air_quality, historical, marine, climate=climate trends, elevation. Defaults to forecast." },
+                "days": { "type": "integer", "description": "Number of forecast days, default 3, max 7." },
+                "start_date": { "type": "string", "description": "Start date, format YYYY-MM-DD. Used by historical and climate." },
+                "end_date": { "type": "string", "description": "End date, format YYYY-MM-DD. Used by historical and climate; defaults to start_date when omitted." },
+                "country_code": { "type": "string", "description": "Optional ISO-3166-1 alpha2 country code to disambiguate identically named places, e.g. CN, JP, US." }
             },
             "additionalProperties": false
         }),
@@ -45,21 +45,15 @@ pub fn register(registry: &mut ToolRegistry) {
 
 async fn get_weather(args: Value) -> Result<String> {
     let request = WeatherRequest::from_args(&args);
+    if request.location.is_empty() {
+        bail!(
+            "location is required. Ask the user which city or place to query, then call get_weather again with that location."
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent("miyu-weather/0.1")
         .build()?;
-
-    if request.location.is_empty() && request.query_type == WeatherQueryType::Forecast {
-        return get_weather_wttr(&client, "", "auto_location").await;
-    }
-
-    if request.location.is_empty() {
-        bail!(
-            "location is required for {} query",
-            request.query_type.as_str()
-        );
-    }
 
     match request.query_type {
         WeatherQueryType::Forecast => match get_weather_open_meteo(&client, &request).await {
@@ -389,12 +383,13 @@ async fn get_weather_wttr(
     location: &str,
     fallback_reason: &str,
 ) -> Result<String> {
-    let path = if location.is_empty() {
-        String::new()
-    } else {
-        format!("/{}", urlencoding::encode(location))
-    };
-    let url = format!("https://wttr.in{path}?format=%C+%t+%w+%l");
+    if location.is_empty() {
+        bail!("wttr.in fallback requires a non-empty location");
+    }
+    let url = format!(
+        "https://wttr.in/{}?format=%C+%t+%w+%l",
+        urlencoding::encode(location)
+    );
     let text = client
         .get(url)
         .send()
@@ -503,6 +498,18 @@ mod tests {
         let cache = cache.lock().unwrap();
         assert!(!cache.contains_key("old"));
         assert!(cache.contains_key("new"));
+    }
+
+    /// 空 location 必须在发起任何网络请求前直接报错——不允许 IP 自动定位。
+    #[tokio::test]
+    async fn empty_location_errors_without_network() {
+        for args in [json!({}), json!({ "location": "  " }), json!({ "query_type": "air_quality" })] {
+            let error = get_weather(args).await.expect_err("empty location must fail");
+            assert!(
+                error.to_string().contains("location is required"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

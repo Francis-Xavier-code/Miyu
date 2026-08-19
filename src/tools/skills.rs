@@ -1,6 +1,5 @@
 use super::{ToolRegistry, ToolSpec};
 use crate::config::AppConfig;
-use crate::i18n::agent_text as t;
 use crate::paths::MiyuPaths;
 use crate::skills::{self, SkillEntry, SkillScope};
 use anyhow::{Context, Result};
@@ -83,35 +82,32 @@ pub fn register_authoring(registry: &mut ToolRegistry, config: AppConfig, paths:
     registry.register(
         ToolSpec::new(
             "manage_skill",
-            t(
-                "Author Miyu skills. action=create opens a hidden draft for a new skill; action=update copies an existing skill into an isolated draft; edit only the returned draft with apply_patch, then action=publish validates and atomically publishes it (create drafts never overwrite; update drafts fail if the live skill changed meanwhile). action=delete permanently removes a user skill; action=list_drafts lists retained drafts (drafts untouched for 30 days are pruned first). Scripts inside a skill stay resources and are never registered as tools.",
-                "创作 Miyu skill。action=create 为新 skill 开隐藏草稿；action=update 从已有 skill 复制隔离草稿；只编辑返回的草稿（用 apply_patch），随后 action=publish 校验并原子发布（创建草稿绝不覆盖，更新草稿在 live skill 同期变化时发布失败）。action=delete 永久删除用户 skill；action=list_drafts 列出保留的草稿（列出前清理 30 天未修改的）。skill 内的 scripts 仍是资源，不会注册为工具。",
-            ),
+            "Author Miyu skills. action=create opens a hidden draft for a new skill; action=update copies an existing skill into an isolated draft; edit only the returned draft with apply_patch, then action=publish validates and atomically publishes it (create drafts never overwrite; update drafts fail if the live skill changed meanwhile). action=delete permanently removes a user skill; action=list_drafts lists retained drafts (drafts untouched for 30 days are pruned first). Scripts inside a skill stay resources and are never registered as tools.",
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["create", "update", "delete", "publish", "list_drafts"],
-                        "description": t("Which authoring step to run.", "要执行的创作步骤。")
+                        "description": "Which authoring step to run."
                     },
                     "name": {
                         "type": "string",
                         "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
-                        "description": t("Skill name, required for create/update/delete. Must follow the Agent Skills naming rules.", "Skill 名称，create/update/delete 必填，须符合 Agent Skills 命名规则。")
+                        "description": "Skill name, required for create/update/delete. Must follow the Agent Skills naming rules."
                     },
                     "description": {
                         "type": "string",
-                        "description": t("action=create: what the skill does and when it should be used.", "action=create：Skill 做什么以及何时应使用。")
+                        "description": "action=create: what the skill does and when it should be used."
                     },
                     "scope": {
                         "type": "string",
                         "enum": ["global", "persona"],
-                        "description": t("global is available to every persona; persona belongs to the current persona. Required for update/delete, defaults to global for create.", "global 对所有人格可用；persona 仅属于当前人格。update/delete 必填，create 默认 global。")
+                        "description": "global is available to every persona; persona belongs to the current persona. Required for update/delete, defaults to global for create."
                     },
                     "draft_id": {
                         "type": "string",
-                        "description": t("action=publish: draft ID returned by create or update.", "action=publish：create 或 update 返回的草稿 ID。")
+                        "description": "action=publish: draft ID returned by create or update."
                     }
                 },
                 "required": ["action"],
@@ -156,14 +152,8 @@ fn register_load_skill(
     // load_tools 取)。清单相关的话统一放进第二段,它只随完整契约出现。
     let description = format!(
         "{}\n\n{}\n\n{}",
-        t(
-            "Load a specialized skill's full instructions and resources into the conversation.",
-            "加载指定技能的完整指令和资源到当前对话。",
-        ),
-        t(
-            "The skill name must match one of the available skills listed below. Use this tool before applying a skill or using any scripts/resources from that skill. Skill allowed-tools metadata never grants Miyu permissions.",
-            "技能名称必须匹配下方列出的可用技能之一。应用 skill 或使用其中的脚本/资源前，必须先加载该 skill。Skill 的 allowed-tools 元数据不会授予 Miyu 权限。",
-        ),
+        "Load a specialized skill's full instructions and resources into the conversation.",
+        "The skill name must match one of the available skills listed below. Use this tool before applying a skill or using any scripts/resources from that skill. Skill allowed-tools metadata never grants Miyu permissions.",
         available_skills_xml(entries),
     );
     registry.register(ToolSpec::new(
@@ -174,7 +164,7 @@ fn register_load_skill(
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": t("The exact skill name from the available skills list.", "可用技能列表中的准确名称。")
+                    "description": "The exact skill name from the available skills list."
                 }
             },
             "required": ["name"],

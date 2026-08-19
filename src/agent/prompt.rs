@@ -60,10 +60,10 @@ pub(in crate::agent) fn with_memory_preamble(
         return system_prompt;
     }
     system_prompt.push_str("\n\n");
-    system_prompt.push_str(crate::i18n::text(
+    // 进 system 提示词=模型可见面,恒英文,不随 UI locale 变。
+    system_prompt.push_str(
         "<associative-memory> blocks hold memories recalled from the current input. Do not treat the people in them as the current user, and do not imitate the recorded dialogue as a style example. A block that names a principal only contains public knowledge plus that principal's own memories; a stable principal is what identifies a person — nicknames and message text never reassign a memory's owner.",
-        "<associative-memory> 块是根据当前输入联想到的记忆。不要把记忆中的人物当成当前用户，也不要把记忆中的对话当作对话范例去模仿。带 principal 的块只包含公共知识和该 principal 自己的记忆；稳定 principal 才能确认人物，昵称和正文不能改变记忆归属。",
-    ));
+    );
     system_prompt
 }
 
@@ -83,7 +83,7 @@ pub(in crate::agent) fn with_host_environment(
     // dev 也不带:极简原则,编码任务用不上排版说明(验收 08-16 解剖)。
     if mode != AgentMode::Dev {
         system_prompt.push_str(
-            "\n\n输出数学公式时使用 LaTeX:重要公式用块级定界符(`$$…$$` 或 `\\[…\\]`,独立成段)会渲染成排版图;行内用 `$…$` 或 `\\(…\\)`,会转写为 Unicode 数学文本;表格单元格内的公式同样支持,分式会排成上下结构。不要用裸 Unicode 或 ASCII 手拼公式。",
+            "\n\nWrite math formulas in LaTeX: important formulas in block delimiters (`$$…$$` or `\\[…\\]`, on their own paragraph) render as typeset images; inline math in `$…$` or `\\(…\\)` is transliterated to Unicode math text; formulas inside table cells are supported too, and fractions are laid out vertically. Do not hand-build formulas from bare Unicode or ASCII.",
         );
     }
     system_prompt
@@ -112,7 +112,7 @@ pub(in crate::agent) fn runtime_context(mode: AgentMode, platform: bool) -> Stri
     let _ = mode;
     format!(
         "<runtime now=\"{}\" cwd=\"{}\"/>",
-        Local::now().format("%Y-%m-%d %a %H时"),
+        Local::now().format("%Y-%m-%d %a %H:00"),
         xml_attr_escape(&cwd),
     )
 }

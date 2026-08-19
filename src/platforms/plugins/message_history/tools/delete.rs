@@ -144,10 +144,7 @@ pub(crate) fn register_delete(
     registry.register(
         ToolSpec::new(
             "delete_real_chat_history",
-            t(
-                "Permanently delete QQ real-chat history with server-enforced two-step confirmation. First use action=request; then the same administrator must send the exact returned confirmation phrase in a new message before action=confirm can succeed.",
-                "通过服务端强制的两阶段确认永久删除 QQ 真实聊天历史。先使用 action=request；随后必须由同一管理员在下一条消息中原样发送返回的确认短语，action=confirm 才能成功。",
-            ),
+            "Permanently delete QQ real-chat history with server-enforced two-step confirmation. First use action=request; then the same administrator must send the exact returned confirmation phrase in a new message before action=confirm can succeed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -178,7 +175,7 @@ pub(crate) fn register_delete(
             },
         )
         .writes()
-        .with_display_name(t("Delete real chat history", "删除真实聊天历史")),
+        .with_display_name("Delete real chat history"),
     );
 }
 

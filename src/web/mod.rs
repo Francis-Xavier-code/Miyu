@@ -30,6 +30,7 @@ mod persona;
 mod prompt_files;
 mod security;
 mod server;
+mod shared_files;
 mod session_cmds;
 mod sessions;
 mod turns;
@@ -53,6 +54,7 @@ use config_api::*;
 use persona::*;
 use prompt_files::*;
 use security::*;
+use shared_files::*;
 pub(crate) use server::run;
 use server::*;
 use session_cmds::*;
@@ -123,6 +125,8 @@ const APP_JS: &str = include_str!("../../web/app.js");
 const COMMANDS_JS: &str = include_str!("../../web/commands.js");
 const LIGHTBOX_JS: &str = include_str!("../../web/lightbox.js");
 const TODOS_JS: &str = include_str!("../../web/todos.js");
+// 文件分享面板:独立文件,与 artifact 演示区无关。
+const SHARED_JS: &str = include_str!("../../web/shared.js");
 // KaTeX 0.18.4(vendored):公式渲染;字体只带 woff2(css 里 woff2 列首,
 // 现代浏览器不会去请求 woff/ttf 回退项)。
 const KATEX_JS: &str = include_str!("../../web/vendor/katex/katex.min.js");

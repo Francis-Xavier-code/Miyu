@@ -155,11 +155,9 @@ pub(in crate::tools) fn edit_file(args: Value, progress: ToolProgress) -> Result
 }
 
 pub(in crate::tools) fn trash_paths(args: Value, progress: ToolProgress) -> Result<String> {
-    trash_paths_with(
-        args,
-        &progress,
-        |path| trash::delete(path).map_err(|err| anyhow::anyhow!("failed to move to trash: {err}")),
-    )
+    trash_paths_with(args, &progress, |path| {
+        trash::delete(path).map_err(|err| anyhow::anyhow!("failed to move to trash: {err}"))
+    })
 }
 
 /// 一次处理整批路径。
@@ -214,8 +212,8 @@ pub(in crate::tools) fn trash_paths_with(
         "total": total,
         "moved_paths": moved_paths,
         "failures": failures,
-        "note": t("The paths were moved to Trash, not permanently deleted.", "这些路径已移入回收站，并未永久删除。"),
-        "restore_hint": t("Open the system Trash and restore an item if needed.", "如需恢复，请打开系统回收站并还原对应项目。"),
+        "note": "The paths were moved to Trash, not permanently deleted.",
+        "restore_hint": "Open the system Trash and restore an item if needed.",
     }))?)
 }
 
@@ -230,26 +228,14 @@ pub(in crate::tools) fn trash_one(
     let original_path = resolved.display().to_string();
     move_to_trash(&resolved)?;
     if std::fs::symlink_metadata(&resolved).is_ok() {
-        bail!(
-            "{}",
-            t(
-                "the path is still present after the move",
-                "移动之后该路径依然存在"
-            )
-        );
+        bail!("{}", "the path is still present after the move");
     }
     Ok(original_path)
 }
 
 pub(in crate::tools) fn paths_arg(args: &Value) -> Result<Vec<PathBuf>> {
     let Some(values) = args.get("paths").and_then(Value::as_array) else {
-        bail!(
-            "{}",
-            t(
-                "paths must be an array of path strings",
-                "paths 必须是一个路径字符串数组"
-            )
-        );
+        bail!("{}", "paths must be an array of path strings");
     };
     let paths = values
         .iter()
@@ -259,10 +245,7 @@ pub(in crate::tools) fn paths_arg(args: &Value) -> Result<Vec<PathBuf>> {
         .map(expand_path)
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        bail!(
-            "{}",
-            t("paths must contain at least one path", "paths 至少要有一条路径")
-        );
+        bail!("{}", "paths must contain at least one path");
     }
     Ok(paths)
 }

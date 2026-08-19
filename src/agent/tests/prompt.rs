@@ -37,7 +37,8 @@ fn a_platform_runtime_stamp_carries_nothing_a_chat_message_cannot_use() {
         .nth(1)
         .and_then(|rest| rest.split('"').next())
         .unwrap();
-    assert!(stamp.ends_with('时') && !stamp.contains(':'), "{stamp}");
+    // 终端面到小时:分钟位恒为 00,同一小时内整块字节不变。
+    assert!(stamp.ends_with(":00"), "{stamp}");
 }
 
 #[test]
@@ -215,7 +216,7 @@ async fn persona_reminder_fossilizes_on_interval_and_replays() {
         assert!(body["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("人格设定文件"));
+            .contains("persona definition file"));
         write_test_sse(
             &mut distill,
             concat!(

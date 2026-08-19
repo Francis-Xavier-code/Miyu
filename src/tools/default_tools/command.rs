@@ -10,9 +10,13 @@ use crate::tools::default_tools::*;
 
 pub(in crate::tools) const MAX_COMMAND_OUTPUT_CHARS: usize = 20_000;
 
-pub(in crate::tools) async fn run_command(args: Value, allowed: bool, progress: ToolProgress) -> Result<String> {
+pub(in crate::tools) async fn run_command(
+    args: Value,
+    allowed: bool,
+    progress: ToolProgress,
+) -> Result<String> {
     if !allowed {
-        bail!("{}", t("command execution is disabled; set skills.allow_command_execution=true in config.jsonc to enable run_command", "命令执行已禁用；请在 config.jsonc 中设置 skills.allow_command_execution=true 以启用 run_command"));
+        bail!("{}", "command execution is disabled; set skills.allow_command_execution=true in config.jsonc to enable run_command");
     }
     let command = required(&args, "command")?;
     if args
@@ -32,7 +36,11 @@ pub(in crate::tools) async fn run_command(args: Value, allowed: bool, progress: 
     execute_command(&command, timeout, progress).await
 }
 
-pub(in crate::tools) async fn execute_command(command: &str, timeout: u64, progress: ToolProgress) -> Result<String> {
+pub(in crate::tools) async fn execute_command(
+    command: &str,
+    timeout: u64,
+    progress: ToolProgress,
+) -> Result<String> {
     let mut command_process = Command::new("sh");
     command_process
         .arg("-lc")
@@ -168,13 +176,8 @@ pub(in crate::tools) async fn read_command_output(
         report(&progress, chunk);
     }
     if truncated {
-        output.extend_from_slice(
-            crate::i18n::text(
-                "\n[output truncated at the 8MB cap]",
-                "\n[输出超出 8MB 上限，已截断]",
-            )
-            .as_bytes(),
-        );
+        // 截断标记进入工具返回体（模型上下文），走 agent_text 恒英文。
+        output.extend_from_slice("\n[output truncated at the 8MB cap]".as_bytes());
     }
     Ok(output)
 }

@@ -101,7 +101,7 @@ async fn text_tool_followup_is_observed_and_queued_for_the_running_turn() {
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].display_content, "再检查一下");
     assert!(queued[0].content.starts_with("再检查一下"));
-    assert!(queued[0].content.contains("发送者 QQ=42; 消息 ID=123"));
+    assert!(queued[0].content.contains("sender QQ=42; message ID=123"));
 }
 
 #[tokio::test]

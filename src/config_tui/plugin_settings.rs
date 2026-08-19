@@ -125,6 +125,18 @@ pub(in crate::config_tui) fn select_platform_plugins(
         } else {
             t("disabled", "未启用")
         };
+        let scheduled_messages_enabled = config
+            .platforms
+            .qq
+            .plugins
+            .get(crate::config::QQ_SCHEDULED_MESSAGES_PLUGIN_ID)
+            .map(|plugin| plugin.enabled_or(false))
+            .unwrap_or(false);
+        let scheduled_messages_state = if scheduled_messages_enabled {
+            t("enabled", "已启用")
+        } else {
+            t("disabled", "未启用")
+        };
         let options = [
             format!("{}: {reply_state}", t("Reply processor", "回复处理")),
             format!(
@@ -142,6 +154,10 @@ pub(in crate::config_tui) fn select_platform_plugins(
             format!(
                 "{}: {group_join_approval_state}",
                 t("Group join approval", "入群审批")
+            ),
+            format!(
+                "{}: {scheduled_messages_state}",
+                t("Scheduled messages", "定时消息")
             ),
         ];
         draw_menu(
@@ -164,6 +180,7 @@ pub(in crate::config_tui) fn select_platform_plugins(
                 2 => edit_message_history(stdout, config)?,
                 3 => edit_meme_collector(stdout, config)?,
                 4 => edit_group_join_approval(stdout, config)?,
+                5 => edit_scheduled_messages(stdout, config)?,
                 _ => {}
             },
             _ => {}

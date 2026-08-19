@@ -355,11 +355,8 @@ pub(crate) fn description_from_script(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn select_script_description(descriptions: &ScriptDescriptions) -> Option<String> {
-    let preferred = if agent_is_zh() {
-        descriptions.zh.as_ref().or(descriptions.en.as_ref())
-    } else {
-        descriptions.en.as_ref().or(descriptions.zh.as_ref())
-    }?;
+    // 模型面恒英文:英文描述优先;用户脚本只写了中文时原样保留(用户内容)。
+    let preferred = descriptions.en.as_ref().or(descriptions.zh.as_ref())?;
     Some(preferred.clone())
 }
 
@@ -471,7 +468,7 @@ pub(crate) fn entry_to_spec(entry: &ScriptEntry, scripts_dir: &Path) -> Result<T
             "properties": {
                 "stdin": {
                     "type": "string",
-                    "description": t("Optional raw stdin input. If omitted, all arguments are sent as JSON via stdin.", "可选的原始 stdin 输入。省略时所有参数以 JSON 形式通过 stdin 传入。")
+                    "description": "Optional raw stdin input. If omitted, all arguments are sent as JSON via stdin."
                 }
             },
             "additionalProperties": true

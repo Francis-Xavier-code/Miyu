@@ -215,9 +215,8 @@ pub(in crate::platforms::onebot) async fn prepare_inbound_images(
 }
 
 pub(in crate::platforms::onebot) fn image_only_prompt(count: usize) -> String {
-    if crate::i18n::is_zh() {
-        format!("（对方发送了 {count} 张图片。请查看图片内容并自然回应。）")
-    } else if count == 1 {
+    // 该占位文本进模型上下文,恒英文;不随 UI locale 变。
+    if count == 1 {
         "(The user sent 1 image. Inspect it and respond naturally.)".to_string()
     } else {
         format!("(The user sent {count} images. Inspect them and respond naturally.)")

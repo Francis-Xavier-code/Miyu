@@ -1,13 +1,13 @@
 {
   "name": "search_knowledge_base",
   "display_name": "搜索知识库",
-  "description": "搜索本地知识库：by=content 搜内容（默认），by=name 按文件名/目录/扩展名/路径片段找文件。\n内容检索返回路径和原文片段，片段不够时用 read_knowledge_base_file 读全文；名称检索返回相对路径。只在有用或用户问起时才提路径。",
+  "description": "Search the local knowledge base: by=content searches file contents (default); by=name finds files by file name, directory, extension, or path fragment.\nContent search returns paths plus verbatim snippets; when a snippet is not enough, read the full file with read_knowledge_base_file. Name search returns relative paths. Only mention paths when useful or when the user asks.",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "搜索词、用户问题，或 by=name 时的文件名/目录/扩展名/路径片段。"
+        "description": "Search terms, the user's question, or — with by=name — a file name, directory, extension, or path fragment."
       },
       "by": {
         "type": "string",
@@ -15,11 +15,11 @@
           "content",
           "name"
         ],
-        "description": "content 搜内容，name 搜路径。默认 content。"
+        "description": "content searches contents, name searches paths. Defaults to content."
       },
       "max_results": {
         "type": "integer",
-        "description": "可选结果数量限制。"
+        "description": "Optional limit on the number of results."
       }
     },
     "required": [
