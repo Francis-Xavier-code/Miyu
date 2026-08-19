@@ -65,9 +65,11 @@ pub(in crate::web) async fn run_turn_task(
         .and_then(|profile| profile.platform.as_ref())
         .filter(|context| !context.image_generation_unlimited())
         .map(|_| crate::tools::workspace::ImageGenLimit::new(1));
+    // 巨型 future 装箱落堆:外层还有五层 with_* 泛型包装再 spawn_local,
+    // debug 构建下逐层栈拷贝会撞穿 actor 线程 16MB 栈(实测 SIGABRT)。
     crate::tools::workspace::with_image_gen_limit(
         image_limit,
-        run_turn_task_inner(
+        Box::pin(run_turn_task_inner(
             config,
             paths,
             store,
@@ -85,7 +87,7 @@ pub(in crate::web) async fn run_turn_task(
             resource_cache,
             turn_engine,
             memory_organizer,
-        ),
+        )),
     )
     .await
 }
