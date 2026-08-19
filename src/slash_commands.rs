@@ -33,6 +33,7 @@ pub(crate) enum ReplSlashCommand {
     Undo,
     Pop,
     Compact,
+    Goal,
     Reset,
     ResetMemory,
     Wipe,
@@ -178,6 +179,14 @@ pub(crate) const REPL_COMMAND_TABLE: &[ReplCommandSpec] = &[
         arg_hint: "",
         help_en: "compact current conversation context now",
         help_zh: "立即压缩当前会话上下文",
+        web: true,
+    },
+    ReplCommandSpec {
+        name: "/goal",
+        command: ReplSlashCommand::Goal,
+        arg_hint: "[objective|clear|edit <objective>|pause|resume]",
+        help_en: "set or steer the session's long-running goal",
+        help_zh: "设定或调整本会话的长任务目标",
         web: true,
     },
     ReplCommandSpec {

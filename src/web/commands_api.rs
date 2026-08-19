@@ -40,6 +40,30 @@ pub(in crate::web) async fn list_commands(
 /// `/compact`：立即压缩当前会话上下文。
 ///
 /// 请求体与 `/api/conversation/reset` 同形（只有一个可选 session_id），直接
+#[derive(Deserialize)]
+pub(in crate::web) struct GoalCommandRequest {
+    pub(in crate::web) session_id: String,
+    #[serde(default)]
+    pub(in crate::web) input: String,
+}
+
+/// `/goal ...` 的 WebUI 入口。
+///
+/// 和 REPL 走同一个 `execute_goal_command`——命令的语法、拒绝文案、以及
+/// 「armed 只在 daemon 内存里」这条，两个界面必须是同一份实现。
+pub(in crate::web) async fn goal_command_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<GoalCommandRequest>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_mutation(&headers, &state)?;
+    require_local_web_session(&state, &request.session_id)?;
+    let text =
+        crate::tools::goal::execute_goal_command(&state.paths, &request.session_id, &request.input);
+    crate::web::nudge_goal_driver(&state, &request.session_id);
+    Ok(Json(json!({ "text": text })))
+}
+
 /// 复用 `ResetConversationRequest`，不再造一个字段一样的类型。
 ///
 /// 与 `IpcCommand::Compact` 同一条 actor 路径，回合运行中一律拒绝——压缩会重

@@ -913,6 +913,19 @@ impl Agent {
             // 「调过哪些工具、拿到什么结果」,丢了它模型下一轮只看到半截文字,会把
             // 已经跑过的命令、读过的文件原样再来一遍。
             self.checkpoint_tool_flow(current_turn_id, messages, replay_start);
+            // 自主轮里报了完成/受阻之后,让模型再面向用户说一次。
+            //
+            // 不这么做的话,一个跑了十几轮的目标就在一次 update_goal 之后无声
+            // 停住:工具返回了 JSON,模型没有理由再说什么,用户看到的是回复戛然
+            // 而止。这段指令由 `tools::goal` 在报完成的那一刻挂起,这里取走。
+            if let Some(session) = crate::tools::workspace::try_session() {
+                if let Some(wrapup) = crate::tools::goal::take_pending_wrapup(&session) {
+                    // `turn_context` 而不是 `system`：中途插一条 system 会把
+                    // 提供方模板里的 system 前置块整体挪位，前缀缓存全废
+                    // （`ChatMessage::turn_context` 的注释里有实测数据）。
+                    messages.push(ChatMessage::turn_context(wrapup));
+                }
+            }
             if question_round_allowed {
                 tool_round = tool_round.saturating_sub(1);
             }

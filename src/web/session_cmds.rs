@@ -302,6 +302,16 @@ pub(in crate::web) async fn handle_session_command(
             );
             Ok(json!({}))
         }
+        IpcCommand::Goal { target, input } => {
+            let record = resolve_local_session_ref(state, &target)?;
+            let session_id = record.session_id;
+            let paths = &state.paths;
+            let text = crate::tools::goal::execute_goal_command(paths, &session_id, &input);
+            // 人刚改过目标，驱动器该重新看一眼：`/goal resume` 之后正是要它
+            // 立刻接着跑，而不是干等下一个事件把它唤醒。
+            crate::web::nudge_goal_driver(state, &session_id);
+            Ok(json!({ "text": text }))
+        }
         IpcCommand::DeleteSession { target } => {
             // Accepts `ask` too: a one-shot turn deletes its own session here.
             let record = resolve_local_session_ref_with_kinds(state, &target, TURN_TARGET_KINDS)?;

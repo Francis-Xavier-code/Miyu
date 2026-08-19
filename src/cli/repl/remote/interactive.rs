@@ -481,6 +481,30 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                         )?;
                     }
                 }
+                ReplSlashCommand::Goal => {
+                    // 走 IPC 而不是直连库：目标本身在库里，但「是否自动续跑」
+                    // 驻在 daemon 内存，REPL 进程自己设那个标记，续轮驱动器
+                    // 根本看不见。
+                    let Some((_, data)) = repl_ipc_admin(
+                        paths,
+                        &mut live_repl,
+                        IpcCommand::Goal {
+                            target: crate::ipc::SessionRef::Id {
+                                id: active_session_id.clone(),
+                            },
+                            input: command_args.to_string(),
+                        },
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    let text = data
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    repl_note(&mut live_repl, &format!("{text}\n\n"))?;
+                }
                 ReplSlashCommand::Usage => {
                     let snapshot = StateStore::new(paths)?.usage_snapshot()?;
                     let usage = footer.token_usage;

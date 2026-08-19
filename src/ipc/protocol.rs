@@ -125,6 +125,14 @@ pub enum Command {
     Compact {
         target: SessionRef,
     },
+    /// `/goal ...`：目标的读写都在 daemon 里做。
+    ///
+    /// 不在客户端直连库，是因为「是否自动续跑」（armed）驻在 daemon 内存——
+    /// REPL 进程自己设那个标记，续轮驱动器根本看不见。
+    Goal {
+        target: SessionRef,
+        input: String,
+    },
     StartTurn {
         content: String,
         mode: String,

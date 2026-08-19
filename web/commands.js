@@ -176,6 +176,16 @@ window.MiyuCommands = (() => {
         await ctx.reload();
         return done("已清空当前会话");
       }
+      if (spec.name === "/goal") {
+        const response = await ctx.apiRequest("/api/goal", {
+          method: "POST",
+          body: JSON.stringify({ session_id: ctx.sessionId, input: args }),
+        });
+        // 服务端把整段人类可读的回执拼好（和 REPL 同一份实现），这里原样贴出，
+        // 不在前端二次拼装——两边分叉的话，同一个 /goal 在两个界面说法不一样。
+        const text = (await response.json())?.text || "";
+        return done(text || "目标命令已执行");
+      }
       if (spec.name === "/reset-memory") {
         await ctx.apiRequest("/api/memory/reset", {
           method: "POST",

@@ -68,6 +68,14 @@ impl EventHub {
         self.inner.lock().unwrap().next_id.saturating_sub(1)
     }
 
+    /// 只订阅**此后**的事件，不要重放。
+    ///
+    /// 给的是后台驱动器用的：它们只关心「刚刚发生了什么」，重放历史既没用
+    /// 也会让它们对着早就结束的回合空转一遍。
+    pub(crate) fn subscribe_live(&self) -> broadcast::Receiver<EventRecord> {
+        self.sender.subscribe()
+    }
+
     pub(crate) fn subscribe_after(&self, after: u64) -> EventSubscription {
         let mut inner = self.inner.lock().unwrap();
         let receiver = self.sender.subscribe();

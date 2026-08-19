@@ -34,6 +34,7 @@ mod session_cmds;
 mod sessions;
 mod turns;
 mod event_map;
+mod goal_driver;
 #[cfg(test)]
 mod tests;
 // 叫 ipc_server 而不是 ipc：`web::ipc` 会把 `crate::ipc` 遮住，本文件里几十处
@@ -58,6 +59,7 @@ use session_cmds::*;
 use sessions::*;
 use turns::*;
 use event_map::*;
+use goal_driver::*;
 use ipc_server::*;
 
 use crate::runtime::{

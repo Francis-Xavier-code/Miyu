@@ -120,6 +120,10 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
         .commit();
     let (ipc_lease, ipc_task) = start_ipc_server(&state)?;
     install_background_job_hook(&state);
+    // 目标续轮驱动器。启动时故意**不**恢复任何自动续跑：目标还在库里，但
+    // 「是否自动跑」驻内存、重启即失，必须由人 `/goal resume` 重新授权。
+    // 不然一次崩溃重启就能让机器在无人看管的情况下继续自己开轮。
+    spawn_goal_round_driver(state.clone());
     let app = router(state.clone());
     let urls = ipc::web_access_urls_for(bind_ip, port);
     for url in &urls {
@@ -332,6 +336,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         .route("/api/commands", get(list_commands))
         .route("/api/conversation/compact", post(compact_conversation))
         .route("/api/memory/reset", post(reset_memory_http))
+        .route("/api/goal", post(goal_command_http))
         .route("/api/jobs", get(list_jobs_http))
         .route("/api/usage/stats", get(usage_stats_web))
         .route("/api/usage/details", get(usage_details_web))
