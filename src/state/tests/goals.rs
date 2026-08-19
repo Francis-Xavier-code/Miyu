@@ -34,7 +34,9 @@ fn goal_lifecycle_walks_the_phases() {
     assert_eq!(goal.max_rounds, DEFAULT_MAX_GOAL_ROUNDS);
 
     // 每次变更都推进 revision——模型手上的旧引用因此立刻失效。
-    let paused = db.pause_goal(&session, &goal.goal_id, goal.revision).unwrap();
+    let paused = db
+        .pause_goal(&session, &goal.goal_id, goal.revision)
+        .unwrap();
     assert_eq!(paused.phase, GoalPhase::Paused);
     assert_eq!(paused.revision, 2);
 
@@ -77,7 +79,9 @@ fn goal_lifecycle_walks_the_phases() {
 fn stale_revision_is_refused_with_the_current_one() {
     let (_t, db, session) = db_with_session();
     let goal = db.create_goal(&session, "把测试跑绿", None).unwrap();
-    let moved = db.pause_goal(&session, &goal.goal_id, goal.revision).unwrap();
+    let moved = db
+        .pause_goal(&session, &goal.goal_id, goal.revision)
+        .unwrap();
 
     let error = db
         .resume_goal(&session, &goal.goal_id, goal.revision)
@@ -86,9 +90,13 @@ fn stale_revision_is_refused_with_the_current_one() {
         GoalDenied::StaleRevision {
             current_goal_id,
             current_revision,
+            current_objective,
+            ..
         } => {
             assert_eq!(current_goal_id, &moved.goal_id);
             assert_eq!(*current_revision, moved.revision);
+            // 报错要直接带上现在的目标全文，模型不必再花一次 get_goal。
+            assert_eq!(current_objective, &moved.objective);
         }
         other => panic!("拒绝原因不对：{other:?}"),
     }
@@ -113,7 +121,11 @@ fn a_round_can_only_be_claimed_once() {
     let error = db
         .begin_goal_round(&session, &goal.goal_id, goal.revision, goal.rounds_started)
         .expect_err("同一轮被认领两次");
-    assert!(matches!(denied(&error), GoalDenied::StaleRevision { .. }));
+    // 撞轮号不是撞版本：revision 明明是对的，报 StaleRevision 会误导排查。
+    assert!(matches!(
+        denied(&error),
+        GoalDenied::RoundAlreadyClaimed { current_round: 1 }
+    ));
 }
 
 /// 轮数耗尽后不再认领，也不允许直接 resume。
@@ -131,7 +143,9 @@ fn exhausted_rounds_stop_the_driver() {
         .expect_err("没余量还能认领");
     assert!(matches!(denied(&error), GoalDenied::RoundsExhausted { .. }));
 
-    let paused = db.pause_goal(&session, &goal.goal_id, goal.revision).unwrap();
+    let paused = db
+        .pause_goal(&session, &goal.goal_id, goal.revision)
+        .unwrap();
     let error = db
         .resume_goal(&session, &paused.goal_id, paused.revision)
         .expect_err("没余量还能 resume");
@@ -167,7 +181,13 @@ fn block_codes_must_be_machine_readable() {
     let (_t, db, session) = db_with_session();
     let goal = db.create_goal(&session, "目标", None).unwrap();
 
-    for bad in ["Needs Credentials", "needs_credentials", "needs--creds", "creds-", ""] {
+    for bad in [
+        "Needs Credentials",
+        "needs_credentials",
+        "needs--creds",
+        "creds-",
+        "",
+    ] {
         let error = db
             .block_goal(&session, &goal.goal_id, goal.revision, bad, "说明")
             .unwrap_err();

@@ -70,6 +70,13 @@ pub enum GoalDenied {
     StaleRevision {
         current_goal_id: String,
         current_revision: i64,
+        current_objective: String,
+        current_phase: GoalPhase,
+    },
+    /// 驱动器并发认领同一轮时输家拿到的。和 `StaleRevision` 分开：撞轮号时
+    /// revision 明明是对的，报「版本过期」会把排查引向错误的方向。
+    RoundAlreadyClaimed {
+        current_round: i64,
     },
     InvalidTransition {
         from: GoalPhase,
@@ -90,13 +97,24 @@ impl std::fmt::Display for GoalDenied {
                 "a goal already exists with phase {}; edit or clear it before creating another",
                 phase.as_str()
             ),
+            // 把当前目标全文直接给出来:撞版本的模型下一步必然要问「现在的
+            // 目标是什么」,让它再花一次 get_goal 往返纯属浪费。
             Self::StaleRevision {
                 current_goal_id,
                 current_revision,
+                current_objective,
+                current_phase,
             } => write!(
                 f,
-                "stale goal ref; current is {current_goal_id} revision {current_revision} \
-                 — call get_goal and retry"
+                "stale goal ref; the goal was changed — it is now {current_goal_id} \
+                 revision {current_revision}, phase {}, objective {:?}. Retry with these \
+                 exact values",
+                current_phase.as_str(),
+                current_objective
+            ),
+            Self::RoundAlreadyClaimed { current_round } => write!(
+                f,
+                "this goal round was already claimed (rounds_started is {current_round})"
             ),
             Self::InvalidTransition { from, verb } => {
                 write!(f, "cannot {verb} a goal in phase {}", from.as_str())
@@ -251,6 +269,8 @@ impl ConversationDb {
             bail!(GoalDenied::StaleRevision {
                 current_goal_id: current.goal_id,
                 current_revision: current.revision,
+                current_objective: current.objective,
+                current_phase: current.phase,
             });
         }
         Ok(current)
@@ -361,7 +381,12 @@ impl ConversationDb {
         )
     }
 
-    pub fn resume_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<GoalRecord> {
+    pub fn resume_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<GoalRecord> {
         self.transition_goal(
             session_id,
             goal_id,
@@ -466,9 +491,8 @@ impl ConversationDb {
             });
         }
         if current.rounds_started != expected_round {
-            bail!(GoalDenied::StaleRevision {
-                current_goal_id: current.goal_id,
-                current_revision: current.revision,
+            bail!(GoalDenied::RoundAlreadyClaimed {
+                current_round: current.rounds_started,
             });
         }
         if current.rounds_started >= current.max_rounds {

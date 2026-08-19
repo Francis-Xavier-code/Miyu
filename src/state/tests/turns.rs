@@ -589,7 +589,7 @@ fn finished_turns_keep_a_replayable_transcript() {
     assert_eq!(replays[1].assistant_content, "好的。");
     // Oldest first, so the caller can print them top to bottom.
     assert_eq!(replays[0].display_content, "改一下 README");
-    assert!(replays.iter().all(|replay| !replay.is_job_wake));
+    assert!(replays.iter().all(|replay| !replay.is_synthetic));
 
     // A background-job wake turn is daemon-synthesized: the replay must be
     // able to tell it apart so it is not drawn as something the user typed.
@@ -605,7 +605,7 @@ fn finished_turns_keep_a_replayable_transcript() {
     store.complete_turn("t3", "跑完了。", None).unwrap();
     let replays = store.session_replay(5).unwrap();
     assert_eq!(replays.len(), 3);
-    assert!(replays[2].is_job_wake);
+    assert!(replays[2].is_synthetic);
     assert_eq!(
         replays[2].display_content,
         "[后台任务完成] 子代理完成 82bea3 · 后台测试A"

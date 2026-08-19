@@ -4,8 +4,8 @@ mod apply_patch;
 mod archlinux;
 mod artifact;
 mod ask_question;
-mod calculator;
 mod awacy_query;
+mod calculator;
 mod caniplayonlinux_query;
 mod clipboard;
 mod deep_research;
@@ -16,6 +16,7 @@ mod diagnostics;
 mod edit_replace;
 mod exchange_rate;
 mod fcitx_wiki;
+pub mod goal;
 mod hash_codec;
 mod html_conversion;
 mod http_response;
@@ -37,11 +38,10 @@ mod scripts;
 mod skills;
 mod subagent_runner;
 mod task;
-pub mod goal;
 mod todowrite;
 pub(crate) use todowrite::{clear_session_todos, session_todos};
-pub(crate) mod usage_query;
 pub mod tool_descriptions;
+pub(crate) mod usage_query;
 pub mod vision;
 mod weather;
 mod web;
@@ -339,7 +339,10 @@ pub fn clear_aur_review_state(paths: &MiyuPaths) -> anyhow::Result<()> {
 pub(crate) fn aur_review_install_guard() -> ToolGuard {
     std::sync::Arc::new(|tool, _args, ctx| {
         (tool.name == "install_aur_package"
-            && ctx.used_tools.iter().any(|name| name == "review_aur_package"))
+            && ctx
+                .used_tools
+                .iter()
+                .any(|name| name == "review_aur_package"))
         .then(|| {
             "install_aur_package cannot run in the same turn as review_aur_package; \
              ask the user to confirm installation first"
@@ -380,7 +383,11 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     install_builtin_guards(&mut registry, config);
     default_tools::register(&mut registry, config.skills.allow_command_execution);
     jobs::register_management(&mut registry);
-    usage_query::register(&mut registry, paths.state_dir.join("usage-history.jsonl"), config.clone());
+    usage_query::register(
+        &mut registry,
+        paths.state_dir.join("usage-history.jsonl"),
+        config.clone(),
+    );
     // 编辑器只留 apply_patch(聚合增/改/删,diff 渲染载体);write_file/
     // edit_file/edit_string 与 dev 同步退场(验收四轮:normal 也去冗余)。
     apply_patch::register(&mut registry);
@@ -680,7 +687,10 @@ mod tests {
         assert!(string_list(Some(&json!(""))).is_empty());
         assert!(string_list(Some(&json!(null))).is_empty());
         // 解不开的字符串按单条路径收下,不当成数组硬猜。
-        assert_eq!(string_list(Some(&json!("[not json"))), vec!["[not json".to_string()]);
+        assert_eq!(
+            string_list(Some(&json!("[not json"))),
+            vec!["[not json".to_string()]
+        );
     }
 
     /// 回归:dev 模式要有看图(vision_analyze),且随 vision 插件开关走。
@@ -772,16 +782,28 @@ mod tests {
     /// 被后人当废话删掉，这条测试就是拦这个的。
     #[test]
     fn goal_round_prompt_states_where_it_came_from() {
-        let prompt = crate::tools::goal::goal_round_prompt("把测试跑绿", 2, 10);
+        let goal = crate::state::GoalRecord {
+            session_id: "sess_x".to_string(),
+            goal_id: "goal_abc123".to_string(),
+            revision: 4,
+            objective: "把测试跑绿".to_string(),
+            phase: crate::state::GoalPhase::Active,
+            blocked_code: None,
+            blocked_message: None,
+            max_rounds: 10,
+            rounds_started: 2,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let prompt = crate::tools::goal::goal_round_prompt(&goal, true);
         // 断言按小写比，大小写不是这条测试要守的东西。
         let lowered = prompt.to_lowercase();
         for expected in [
-            "the user set",             // 谁下的
-            "/goal",                    // 怎么下的
-            "not an injection",         // 直接回应模型的怀疑
+            "set by the user",           // 谁下的
+            "/goal",                     // 怎么下的
             "unrelated to the messages", // 为什么和上文对不上
-            "get_goal",                 // 拿 goal_id/revision 的入口
-            "waiting",                  // 不许拿一整轮只说「我在等你」
+            "waiting",                   // 不许拿一整轮只说「我在等你」
+            "goal_abc123",               // CAS 凭证直接给它，省一次 get_goal
         ] {
             assert!(
                 lowered.contains(expected),
@@ -791,6 +813,42 @@ mod tests {
         // 目标本身和轮号仍要在。
         assert!(prompt.contains("把测试跑绿"));
         assert!(prompt.contains("Round 2 of 10"));
+        // 两条结束调用都要把 goal_id 和 revision 填好——让模型自己去读一遍
+        // 目标、或者为此加载一次工具，都是白跑的往返。
+        assert!(
+            prompt.contains(r#""revision":4"#),
+            "revision 没填进调用里：\n{prompt}"
+        );
+        assert!(
+            prompt.matches(r#""goal_id":"goal_abc123""#).count() == 2,
+            "complete 和 blocked 两条都要填好：\n{prompt}"
+        );
+        assert!(
+            prompt.contains("do not read the goal or load tools first"),
+            "要明说别为它加载工具，否则模型会先失败一次再去加载：\n{prompt}"
+        );
+
+        // 第二轮起发短版，但短版必须**自包含**：一行来历 + 目标全文 + 两条
+        // 填好的调用。早先短版只说「same objective and rules as above」，赌
+        // 完整版还躺在上下文里——压缩会把这个赌注折掉，目标被人改过它又指向
+        // 旧文案，为此还得维护一套「下轮重发完整版」的脏标记。
+        let short = crate::tools::goal::goal_round_prompt(&goal, false);
+        assert!(short.contains("Round 2 of 10"));
+        assert!(
+            short.contains("set by the user") && short.contains("把测试跑绿"),
+            "短版丢了来历或目标全文——压缩/编辑之后它就指向空气：\n{short}"
+        );
+        assert!(
+            short.contains(r#""revision":4"#) && short.matches("update_goal").count() == 2,
+            "短版仍要带两条填好的调用——revision 每轮可能变，不该让模型去回忆：\n{short}"
+        );
+        // 仍要比完整版短：短版逐轮追加，长散文只该在第一轮出现一次。
+        assert!(
+            short.len() < prompt.len(),
+            "短版没短下来（{} vs {}）：\n{short}",
+            short.len(),
+            prompt.len()
+        );
     }
 
     #[test]
@@ -833,7 +891,6 @@ mod tests {
 
         assert_eq!(english, chinese);
     }
-
 
     #[test]
     fn restricted_platform_registry_has_no_host_or_write_tools() {
@@ -884,16 +941,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let config = AppConfig::default();
-        let normal = build_tool_registry(
-            &config,
-            &paths,
-            crate::agent::AgentMode::Normal,
-            false,
-        )
-        .unwrap();
+        let normal =
+            build_tool_registry(&config, &paths, crate::agent::AgentMode::Normal, false).unwrap();
         let dev =
-            build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false)
-                .unwrap();
+            build_tool_registry(&config, &paths, crate::agent::AgentMode::Dev, false).unwrap();
 
         assert!(normal.contains("manage_skill"));
         assert!(!dev.contains("manage_skill"));

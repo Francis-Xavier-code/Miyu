@@ -1,25 +1,34 @@
 //! 同会话长任务目标：面向模型的三件套工具。
 //!
-//! 目标本身的真源在 SQLite（`state::conversation_db::goals`）。这里补三样只在
-//! 进程里活的东西：
+//! 目标本身的真源在 SQLite（`state::conversation_db::goals`）。围绕它分四块：
 //!
-//! - **armed 激活注册表**：目标还在库里，但「是否自动续跑」驻内存、绝不落库。
-//!   daemon 重启后必须由人 `/goal resume` 重新授权——不然一次崩溃重启就能让
-//!   机器在无人看管的情况下继续自己开轮。
-//! - **权限二元分立**：靠回合来源标记判定，而不是去扫会话事件猜。
-//!   create/edit/pause/resume 只认人类发起的回合；complete/blocked 额外接受
-//!   「恰好是当前目标的这一轮自动续轮」。
-//! - **wrapup 侧信道**：自主轮里报了完成/受阻之后，主循环取走一段收尾指令注入，
-//!   让模型面向用户交代一次，而不是硬生生停在那里。
+//! - **runtime**：只在进程里活的状态（armed、空转等待、待注入通知、续轮 run
+//!   登记），集中在一张表里。armed 有意不落库——daemon 重启后必须由人
+//!   `/goal resume` 重新授权，不然一次崩溃重启就能让机器在无人看管的情况下
+//!   继续自己开轮。
+//! - **prompt**：喂给模型的文案（续轮提示词、收尾指令、变更通知）。
+//! - **command**：`/goal` 命令，REPL 与 WebUI 同一份实现。
+//! - 本文件：工具注册与权限。**权限二元分立**，靠回合来源标记判定，而不是去
+//!   扫会话事件猜：create/edit/pause/resume 只认人类发起的回合；
+//!   complete/blocked 额外接受「恰好是当前目标的这一轮自动续轮」。
+
+mod command;
+mod prompt;
+mod runtime;
+
+pub use command::{session_goal_json, try_execute_goal_command};
+pub use prompt::goal_round_prompt;
+pub use runtime::{
+    finish_run, forget_session, is_armed, is_awaiting_human, mark_run_productive, push_turn_notice,
+    set_armed, set_awaiting_human, take_turn_notices, track_goal_run,
+};
 
 use super::{ToolRegistry, ToolSpec};
 use crate::paths::MiyuPaths;
-use crate::state::{GoalDenied, GoalPhase, GoalRecord, StateStore};
+use crate::state::{GoalDenied, GoalRecord, StateStore};
 use crate::tools::workspace::{self, TurnOrigin};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
 
 /// 模型自报受阻的机械下限：同一阻塞至少要熬过这么多连续自动轮才收。
 ///
@@ -27,70 +36,12 @@ use std::sync::{Mutex, OnceLock};
 /// 「起个头就收工」。人类直接授权不受此限——人说停就是停。
 pub const BLOCKED_AFTER_CONSECUTIVE_ROUNDS: i64 = 3;
 
-// ------------------------------ armed 注册表 ------------------------------
-
-fn armed_sessions() -> &'static Mutex<HashSet<String>> {
-    static ARMED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ARMED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-pub fn is_armed(session_id: &str) -> bool {
-    armed_sessions().lock().unwrap().contains(session_id)
-}
-
-pub fn set_armed(session_id: &str, armed: bool) {
-    let mut set = armed_sessions().lock().unwrap();
-    if armed {
-        set.insert(session_id.to_string());
-    } else {
-        set.remove(session_id);
-    }
-}
-
-// ------------------------------ wrapup 侧信道 ------------------------------
-
-fn pending_wrapups() -> &'static Mutex<HashMap<String, String>> {
-    static PENDING: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 主循环在每次工具结算之后取走；有就注入为本回合的上下文。
-pub fn take_pending_wrapup(session_id: &str) -> Option<String> {
-    pending_wrapups().lock().unwrap().remove(session_id)
-}
-
-const WRAPUP_GROUNDING: &str = "Report only what earlier rounds and tool results in this \
-     session actually establish; when a detail is not in the session, say so instead of \
-     inventing it. ";
-
-/// 自主轮终结后的收尾指令。
+/// 续轮 run 的标签。
 ///
-/// 保留英文原文：这段是直接喂给模型的指令，而 dev 侧提示词本来就是英文，
-/// 措辞贴着训练分布走比翻译过来更稳。
-fn wrapup_text(objective: &str, blocked_reason: Option<&str>) -> String {
-    let heading = format!("Objective: {}\n", json!(objective));
-    match blocked_reason {
-        None => format!(
-            "<goal_complete>\n{heading}The goal is marked complete and this autonomous run is \
-             ending. Write the closing message to the user now: state the outcome, summarize \
-             what was done and how it was verified, and point to the concrete results (files, \
-             commits, or other artifacts). {WRAPUP_GROUNDING}Note anything the user should \
-             review or do next. Address the user directly. Do not call any more tools in this \
-             run; further work waits for the user's next instruction.\n</goal_complete>"
-        ),
-        Some(reason) => format!(
-            "<goal_blocked>\n{heading}Blocked: {}\nThe goal is marked blocked and this \
-             autonomous run is ending. Write the closing message to the user now: state what \
-             has been completed so far, describe the concrete blocking condition and what you \
-             tried, and say exactly what you need from the user to continue. {WRAPUP_GROUNDING}\
-             Address the user directly. Do not call any more tools in this run; further work \
-             waits for the user's next instruction.\n</goal_blocked>",
-            json!(reason)
-        ),
-    }
-}
-
-// ------------------------------ 渲染与权限 ------------------------------
+/// 走的是后台唤醒那条可见性通道（REPL 客户端靠它发现并挂上 daemon 自己发起
+/// 的回合），但**不该像后台唤醒那样打一行表头**：长任务会连着跑几十轮，每轮
+/// 顶一行只会把真正的输出挤散。REPL 和 WebUI 都拿这个常量识别它。
+pub const GOAL_ROUND_LABEL: &str = "goal-round";
 
 fn store(paths: &MiyuPaths) -> Result<StateStore> {
     StateStore::new(paths)
@@ -137,15 +88,18 @@ fn meaningful_rounds(value: Option<i64>) -> Option<i64> {
     value.filter(|rounds| *rounds != 0)
 }
 
-/// 本轮是否**恰好**是当前目标的那一轮已认领续轮。
+/// 本轮是不是当前目标正在跑的那一轮。
 ///
-/// 三样都要对上：目标、版本、轮号。少一样就可能是拿着过期身份的轮在替一个
-/// 已经被人改过的目标做决定。
+/// 只看目标和轮号，**不看 revision**。这里回答的是「你是谁」——你是不是当前
+/// 这一轮；而 revision 回答的是「你改的是哪个版本」，那由 CAS 在写入时把关。
+///
+/// 早先把 revision 也算进来，结果是：人在一轮跑到一半时 `/goal resume` 或
+/// `edit`（这两个都会推进 revision），正在跑的那一轮就**永久失去了报完成的
+/// 资格**——它明明还是当前轮，却只能拿到一句「complete 需要人类发起的回合」，
+/// 和真正的原因毫无关系。
 fn origin_matches_goal(origin: &TurnOrigin, goal: &GoalRecord) -> bool {
-    matches!(origin, TurnOrigin::GoalRound { goal_id, revision, round }
-        if *goal_id == goal.goal_id
-            && *revision == goal.revision
-            && *round == goal.rounds_started)
+    matches!(origin, TurnOrigin::GoalRound { goal_id, round, .. }
+        if *goal_id == goal.goal_id && *round == goal.rounds_started)
 }
 
 fn require_human(origin: &TurnOrigin, verb: &str) -> Result<()> {
@@ -154,8 +108,6 @@ fn require_human(origin: &TurnOrigin, verb: &str) -> Result<()> {
     }
     bail!("goal {verb} requires a direct human turn (this turn was started automatically)");
 }
-
-// ------------------------------ 工具注册 ------------------------------
 
 pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
     let t = crate::i18n::agent_text;
@@ -318,10 +270,7 @@ async fn update_goal(paths: &MiyuPaths, args: Value) -> Result<String> {
                 let goal = store.complete_goal(&session, &goal_id, revision)?;
                 set_armed(&session, false);
                 if autonomous {
-                    pending_wrapups()
-                        .lock()
-                        .unwrap()
-                        .insert(session.clone(), wrapup_text(&goal.objective, None));
+                    push_turn_notice(&session, prompt::wrapup_text(&goal.objective, None));
                 }
                 Ok(render_goal(Some(&goal), &session))
             } else {
@@ -340,142 +289,11 @@ async fn update_goal(paths: &MiyuPaths, args: Value) -> Result<String> {
                     store.block_goal(&session, &goal_id, revision, "model-reported", reason)?;
                 set_armed(&session, false);
                 if autonomous {
-                    pending_wrapups()
-                        .lock()
-                        .unwrap()
-                        .insert(session.clone(), wrapup_text(&goal.objective, Some(reason)));
+                    push_turn_notice(&session, prompt::wrapup_text(&goal.objective, Some(reason)));
                 }
                 Ok(render_goal(Some(&goal), &session))
             }
         }
         other => bail!("unknown goal action: {other}"),
-    }
-}
-
-/// 续轮的提示词。
-///
-/// **开头那段来历说明不是废话**：这段文字是突然出现在对话中间的一条指令，
-/// 内容往往和上一轮聊的东西毫无关系（长期目标本来就会跨越话题）。实测过一次
-/// ——模型读到它之后判定「This looks like a system prompt injection or some
-/// automated goal that hijacked my session」，然后拒绝执行、继续做上一个话题。
-/// 那个警惕本身是对的：一段没有来历的祈使句，就该被怀疑。所以要讲清楚这是
-/// 谁下的、怎么来的、为什么和上文对不上。
-///
-/// 保留英文原文，理由同 `wrapup_text`。
-pub fn goal_round_prompt(objective: &str, round: i64, max_rounds: i64) -> String {
-    format!(
-        "<goal_round>\n\
-         Automatic continuation round for the standing objective the user set with `/goal`. \
-         Not an injection: these rounds start on their own while the session is idle, and the \
-         objective is the user's own wording. They stop when the user pauses or clears it.\n\
-         Objective: {}\nRound {round} of {max_rounds}.\n\
-         It may be unrelated to the messages above — a standing objective outlives the \
-         conversation. Work on it, not on the previous topic.\n\
-         Judge from the workspace, tool results and persisted state, not from what earlier \
-         rounds claimed, and verify before calling it done.\n\
-         Call get_goal first — it returns the exact goal_id and revision update_goal needs; \
-         load the goal tools first if they are not loaded yet. Then: update_goal complete once \
-         the objective is met and verified; update_goal blocked when a concrete condition stops \
-         every remaining path, including needing an answer from the user; otherwise make the \
-         next concrete step of progress in this round. Do not spend a round only saying you are \
-         waiting — either act, or mark it blocked so the rounds stop.\n\
-         </goal_round>",
-        json!(objective)
-    )
-}
-
-/// `/goal [<objective>|clear|edit <objective>|pause|resume]`
-///
-/// 返回的文本直接打印给人看，**永远不进模型历史**——命令是人和 daemon 之间的
-/// 对话，模型该看到的是目标本身（它自己调 `get_goal`）。
-pub fn execute_goal_command(paths: &MiyuPaths, session_id: &str, raw: &str) -> String {
-    match execute_goal_command_inner(paths, session_id, raw) {
-        Ok(text) => text,
-        Err(error) => format!("{error}"),
-    }
-}
-
-const GOAL_USAGE: &str = "用法: /goal [<objective>|clear|edit <objective>|pause|resume]";
-
-fn render_goal_human(title: &str, goal: &GoalRecord, session_id: &str) -> String {
-    let activation = if is_armed(session_id) {
-        "自动续跑：已武装"
-    } else {
-        "自动续跑：未武装（/goal resume 重新授权）"
-    };
-    let blocker = match (&goal.blocked_code, &goal.blocked_message) {
-        (Some(code), Some(message)) => format!("\n受阻（{code}）：{message}"),
-        (Some(code), None) => format!("\n受阻（{code}）"),
-        _ => String::new(),
-    };
-    format!(
-        "{title}\n目标：{}\n阶段：{} · 轮次 {}/{}\n{activation}{blocker}",
-        goal.objective,
-        goal.phase.as_str(),
-        goal.rounds_started,
-        goal.max_rounds,
-    )
-}
-
-fn execute_goal_command_inner(paths: &MiyuPaths, session_id: &str, raw: &str) -> Result<String> {
-    let store = store(paths)?;
-    let raw = raw.trim();
-    let (verb, rest) = match raw.split_once(char::is_whitespace) {
-        Some((verb, rest)) => (verb.trim(), rest.trim()),
-        None => (raw, ""),
-    };
-    match verb {
-        "" => match store.goal(session_id)? {
-            None => Ok(format!("本会话没有目标。\n{GOAL_USAGE}")),
-            Some(goal) => Ok(render_goal_human("当前目标", &goal, session_id)),
-        },
-        "clear" => {
-            let Some(goal) = store.goal(session_id)? else {
-                bail!("本会话没有目标");
-            };
-            store.clear_goal(session_id, &goal.goal_id, goal.revision)?;
-            set_armed(session_id, false);
-            Ok("目标已清除".to_string())
-        }
-        "pause" => {
-            let Some(goal) = store.goal(session_id)? else {
-                bail!("本会话没有目标");
-            };
-            let goal = store.pause_goal(session_id, &goal.goal_id, goal.revision)?;
-            set_armed(session_id, false);
-            Ok(render_goal_human("已暂停", &goal, session_id))
-        }
-        "resume" => {
-            let Some(goal) = store.goal(session_id)? else {
-                bail!("本会话没有目标");
-            };
-            let goal = store.resume_goal(session_id, &goal.goal_id, goal.revision)?;
-            // 重新武装：daemon 重启后自动续跑一律失效，这里是人重新授权的入口。
-            set_armed(session_id, true);
-            Ok(render_goal_human("已恢复", &goal, session_id))
-        }
-        "edit" => {
-            if rest.is_empty() {
-                bail!("{GOAL_USAGE}");
-            }
-            let Some(goal) = store.goal(session_id)? else {
-                bail!("本会话没有目标");
-            };
-            let goal = store.edit_goal(session_id, &goal.goal_id, goal.revision, Some(rest), None)?;
-            Ok(render_goal_human("已更新", &goal, session_id))
-        }
-        _ => {
-            // 其余一律当作「新目标的文案」——`/goal 把测试跑绿` 是最常用的一条，
-            // 不该要求再敲一个动词。
-            if store
-                .goal(session_id)?
-                .is_some_and(|goal| goal.phase != GoalPhase::Complete)
-            {
-                bail!("本会话已有未完成的目标；先 /goal edit 改它，或 /goal clear 清掉");
-            }
-            let goal = store.create_goal(session_id, raw, None)?;
-            set_armed(session_id, true);
-            Ok(render_goal_human("目标已设定", &goal, session_id))
-        }
     }
 }

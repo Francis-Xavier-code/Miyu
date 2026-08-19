@@ -65,13 +65,13 @@ fn replayed_job_wake_turns_are_not_drawn_as_user_prompts() {
         display_content: "[后台任务完成] 子代理完成 82bea3 · 后台测试A".to_string(),
         assistant_content: "跑完了。".to_string(),
         entries: Vec::new(),
-        is_job_wake: true,
+        is_synthetic: true,
     };
     let typed = crate::state::TurnReplay {
         display_content: "帮我改一下 README".to_string(),
         assistant_content: "改好了。".to_string(),
         entries: Vec::new(),
-        is_job_wake: false,
+        is_synthetic: false,
     };
 
     let frame = session_replay_frame(&[wake], AgentMode::Normal, &config, 80).unwrap();

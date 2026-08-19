@@ -38,6 +38,10 @@ pub(in crate::cli) async fn try_run_remote_chat(
     // Turns run in parallel daemon-side: a running turn in this session does
     // not block a new one (the old multi-process placeholder semantics).
     let state_probe = StateStore::new(paths)?;
+    // 这一轮跑在哪个会话上：流式渲染中途静默执行 `/goal` 需要它。
+    let turn_session_id = session_override
+        .clone()
+        .unwrap_or_else(|| state_probe.session_id().to_string());
     let state_probe = session_override
         .as_deref()
         .map(|session_id| state_probe.pinned(session_id))
@@ -149,23 +153,58 @@ pub(in crate::cli) async fn try_run_remote_chat(
                             kind,
                             ..
                         }) if *kind != KeyEventKind::Release
-                    ) && matches!(
-                        // 只拦真命令,理由同 live_turn.rs 的同一处判定。
-                        parse_repl_input(live_tail.editor.input.trim_start()),
-                        ReplInput::Slash(..)
                     ) {
-                        if live_tail.external_output_active {
-                            continue;
+                        // 斜杠命令在编辑器处理回车之前拦（编辑器一处理就会
+                        // 清空缓冲区）。流式渲染中间不打任何本地输出。
+                        let line = live_tail.editor.input.trim_start().to_string();
+                        match parse_repl_input(&line) {
+                            ReplInput::Slash(
+                                crate::slash_commands::ReplSlashCommand::Goal,
+                                args,
+                            ) => {
+                                let args = args.trim().to_string();
+                                if args == "edit" {
+                                    // 原地变身成「/goal edit <当前目标>」；
+                                    // 没有目标就静默吞掉这次回车。
+                                    if super::super::session::prefill_goal_edit_input(
+                                        paths,
+                                        Some(turn_session_id.as_str()),
+                                        live_tail,
+                                    ) && !live_tail.external_output_active
+                                    {
+                                        synchronized_terminal_update(
+                                            CursorAfterUpdate::Preserve,
+                                            || live_tail.redraw(),
+                                        )?;
+                                    }
+                                    continue;
+                                }
+                                // 静默执行；后果由 daemon 体现（edit/pause
+                                // 会掐掉正在跑的续轮）。
+                                let _ = super::super::session::send_ipc_admin(
+                                    paths,
+                                    IpcCommand::Goal {
+                                        target: crate::ipc::SessionRef::Id {
+                                            id: turn_session_id.clone(),
+                                        },
+                                        input: args,
+                                    },
+                                )
+                                .await;
+                                live_tail.editor.clear();
+                                if !live_tail.external_output_active {
+                                    synchronized_terminal_update(
+                                        CursorAfterUpdate::Preserve,
+                                        || live_tail.redraw(),
+                                    )?;
+                                }
+                                continue;
+                            }
+                            // 其余命令静默吞掉回车，输入原样留着，这一轮
+                            // 结束后再回车即可。
+                            ReplInput::Slash(..) => continue,
+                            ReplInput::Chat => {}
                         }
-                        renderer.write_system_message(t(
-                            "REPL commands are available after the current reply finishes",
-                            "当前回复结束后才能执行 REPL 命令",
-                        ))?;
-                        // write_system_message tears down the wait spinner;
-                        // restart it so progress keeps rendering.
-                        renderer.start_waiting()?;
-                        live_tail.apply_renderer_frame(&mut renderer)?;
-                        continue;
                     }
                     match live_tail.editor.handle_event(event, paths, true)? {
                         LiveEditorAction::None => {}
@@ -182,6 +221,8 @@ pub(in crate::cli) async fn try_run_remote_chat(
                         LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
                         LiveEditorAction::EmptySubmit => {}
                         LiveEditorAction::Submit(submission) => {
+                            // 斜杠命令到不了这里：回车闸在编辑器处理之前就
+                            // 拦下了。这里只剩普通消息，照常排队。
                             let Some(target_turn_id) = turn_id.as_deref() else {
                                 live_tail.editor.input = submission.display_content.clone();
                                 live_tail.editor.cursor = live_tail.editor.input.chars().count();

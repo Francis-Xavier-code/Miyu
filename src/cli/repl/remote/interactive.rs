@@ -150,6 +150,7 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     &mut live_repl,
                     &run_id,
                     &label,
+                    &active_session_id,
                     &jobs_feed,
                     &jobs_shared,
                 )
@@ -171,6 +172,10 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
             ReplInput::Slash(command, args) => (Some(command), args),
         };
         if let Some(command) = slash_command {
+            // 命令也进上方向键历史：`/goal 长长的目标` 打错一个字重敲一遍，
+            // 和重敲一条消息一样冤。落盘历史仍只收消息（命令是操作不是对话）。
+            push_history_capped(&mut history, input);
+            live_repl.editor.record_history(input);
             let spec = repl_command_spec(command);
             if spec.arg_hint.is_empty() && !command_args.trim().is_empty() {
                 repl_note(
@@ -499,11 +504,27 @@ pub(in crate::cli) async fn run_remote_repl(paths: &MiyuPaths, mut mode: AgentMo
                     else {
                         continue;
                     };
+                    // 终端里没有 WebUI 那条常驻状态行，所以这里必须回一句
+                    // ——设完目标到第一轮真正开跑之间有一段静默（驱动器要等
+                    // 会话空下来），一个字都不说的话，用户只会以为命令没生效。
+                    // 但也就一句：状态、轮次这些留给 `/goal` 自己去查。
                     let text = data
                         .get("text")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
-                    repl_note(&mut live_repl, &format!("{text}\n\n"))?;
+                    // 光敲 `/goal edit` 到不了这里：输入泵在提交前就原地变身
+                    // 成「/goal edit <当前目标>」（`prefill_goal_edit_input`），
+                    // 只有没目标时才落进来打提示。
+                    let summary = if command_args.trim().is_empty() {
+                        text.to_string()
+                    } else {
+                        // 多行的详情压成一句：命令回执不该占半屏。
+                        text.lines().next().unwrap_or_default().to_string()
+                    };
+                    // 暗色 + 图标：这是系统回执，不是模型正文，得和邻居们
+                    // （工作目录绑定、后台任务表头）长得一族。单个 \n 收尾，
+                    // 和它们一致——多一个就空两行。
+                    repl_note(&mut live_repl, &format!("\x1b[2m◎ {summary}\x1b[0m\n"))?;
                 }
                 ReplSlashCommand::Usage => {
                     let snapshot = StateStore::new(paths)?.usage_snapshot()?;

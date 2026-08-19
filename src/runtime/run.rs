@@ -119,6 +119,27 @@ impl ManagerState {
             first.audience == audience && runs.all(|info| info.audience == audience)
         })
     }
+
+    /// 这个会话正在跑的是不是目标续轮。
+    ///
+    /// 用户在续轮跑着的时候发消息，应当排进那一轮（回合循环在每个工具边界
+    /// 都会取排队的输入），而不是撞一个 409 让他自己重发——续轮是机器自己
+    /// 开的，人开口理应优先。续轮的 audience 是 `Owner`，和 WebUI 发消息走
+    /// 的 `External` 对不上，所以排队那条路要单独认它。
+    pub(crate) fn session_runs_are_goal_rounds(&self, session_id: &str) -> bool {
+        let mut runs = self
+            .active_runs
+            .values()
+            .filter(|info| &*info.session_id == session_id)
+            .peekable();
+        runs.peek().is_some()
+            && runs.all(|info| {
+                matches!(
+                    info.turn_origin,
+                    crate::tools::workspace::TurnOrigin::GoalRound { .. }
+                )
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

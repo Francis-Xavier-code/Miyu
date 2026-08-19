@@ -196,5 +196,8 @@ fn web_commands_are_a_subset_of_the_repl_table() {
     // 开了 web 的命令，WebUI 侧必须真有实现（commands.js 的 tryRun 里逐条分支）。
     // 这里钉住当前这批，加新命令时会红，提醒你两边一起改。
     let names = web.iter().map(|spec| spec.name).collect::<Vec<_>>();
-    assert_eq!(names, ["/compact", "/goal", "/reset", "/reset-memory"]);
+    assert_eq!(
+        names,
+        ["/pop", "/compact", "/goal", "/reset", "/reset-memory"]
+    );
 }

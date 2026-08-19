@@ -318,11 +318,17 @@ pub(in crate::cli) fn session_ref_from_index(
         })
 }
 
-pub(in crate::cli) fn session_entry_is_active(entry: &SessionListEntry, active_session_id: Option<&str>) -> bool {
+pub(in crate::cli) fn session_entry_is_active(
+    entry: &SessionListEntry,
+    active_session_id: Option<&str>,
+) -> bool {
     active_session_id.map_or(entry.is_current, |session_id| entry.id == session_id)
 }
 
-pub(in crate::cli) fn session_select_line(entry: &SessionListEntry, active_session_id: Option<&str>) -> String {
+pub(in crate::cli) fn session_select_line(
+    entry: &SessionListEntry,
+    active_session_id: Option<&str>,
+) -> String {
     let marker = if session_entry_is_active(entry, active_session_id) {
         "* "
     } else {
@@ -456,12 +462,11 @@ pub(in crate::cli) async fn resolve_repl_session_target(
         let entries = session_list_entries(&data);
         let target = match index {
             Some(index) => session_ref_from_index(&entries, index),
-            None => entries
-                .iter()
-                .find(|entry| entry.name == arg)
-                .map(|entry| crate::ipc::SessionRef::Id {
+            None => entries.iter().find(|entry| entry.name == arg).map(|entry| {
+                crate::ipc::SessionRef::Id {
                     id: entry.id.clone(),
-                }),
+                }
+            }),
         };
         let Some(target) = target else {
             repl_note(
@@ -481,7 +486,11 @@ pub(in crate::cli) async fn resolve_repl_session_target(
     }
 }
 
-pub(in crate::cli) fn reload_repl_queue(live: &mut LiveReplTail, paths: &MiyuPaths, session_id: &str) -> Result<()> {
+pub(in crate::cli) fn reload_repl_queue(
+    live: &mut LiveReplTail,
+    paths: &MiyuPaths,
+    session_id: &str,
+) -> Result<()> {
     let store = StateStore::new(paths)?.pinned(session_id);
     synchronized_terminal_update(CursorAfterUpdate::Shown, || live.reload_queue(&store))
 }
@@ -551,14 +560,8 @@ pub(in crate::cli) async fn repl_fallback_session_state(
         .await?
         .map(|(state, _)| state));
     }
-    let Some((_, data)) = repl_ipc_admin(
-        paths,
-        live,
-        IpcCommand::ListSessions {
-            mode: None,
-        },
-    )
-    .await?
+    let Some((_, data)) =
+        repl_ipc_admin(paths, live, IpcCommand::ListSessions { mode: None }).await?
     else {
         return Ok(None);
     };
@@ -692,14 +695,11 @@ pub(in crate::cli) async fn session_admin(
 /// numbers index into the visible session list, anything else is a name.
 /// Resolves a `--session` argument (name or list index) to a concrete
 /// session id, without moving the global current pointer.
-pub(in crate::cli) async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: &str) -> Result<String> {
-    let (_, data) = session_admin(
-        paths,
-        IpcCommand::ListSessions {
-            mode: None,
-        },
-    )
-    .await?;
+pub(in crate::cli) async fn resolve_session_id_for_turn(
+    paths: &MiyuPaths,
+    arg: &str,
+) -> Result<String> {
+    let (_, data) = session_admin(paths, IpcCommand::ListSessions { mode: None }).await?;
     let entries = session_list_entries(&data);
     if let Ok(index) = arg.parse::<usize>() {
         if let Some(entry) = index.checked_sub(1).and_then(|index| entries.get(index)) {
@@ -715,6 +715,33 @@ pub(in crate::cli) async fn resolve_session_id_for_turn(paths: &MiyuPaths, arg: 
         .find(|entry| entry.name.eq_ignore_ascii_case(arg) || entry.id == arg)
         .map(|entry| entry.id)
         .ok_or_else(|| anyhow::anyhow!("{}: {arg}", t("session not found", "找不到该会话")))
+}
+
+/// `/goal edit`（无参数）的编辑器内变身：把「/goal edit <当前目标>」放进
+/// 输入行，改几个字就能回车——终端里的「可编辑文本框」。
+///
+/// 必须在提交**之前**拦：提交会把原文回显成一条消息块，用户看到的是
+/// 「/goal edit 被当作消息发出去了」。返回 true 表示已变身（调用方跳过这次
+/// 提交并重绘输入行）；没有目标时返回 false，走正常提交让命令层去报错。
+pub(in crate::cli) fn prefill_goal_edit_input(
+    paths: &MiyuPaths,
+    session_id: Option<&str>,
+    live: &mut LiveReplTail,
+) -> bool {
+    let Some(session) = session_id else {
+        return false;
+    };
+    let Some(objective) = StateStore::new(paths)
+        .ok()
+        .and_then(|store| store.goal(session).ok().flatten())
+        .map(|goal| goal.objective)
+    else {
+        return false;
+    };
+    live.editor.input = format!("/goal edit {objective}");
+    live.editor.cursor = live.editor.input.chars().count();
+    live.editor.history_clean_index = None;
+    true
 }
 
 pub(in crate::cli) async fn send_ipc_admin(

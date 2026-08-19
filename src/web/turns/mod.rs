@@ -245,23 +245,31 @@ pub(in crate::web) async fn create_turn(
     if target_store
         .has_running_turns()
         .map_err(ApiError::internal)?
-        && state
-            .manager
-            .lock()
-            .unwrap()
-            .session_runs_match_audience(&session_id, PromptAudience::External)
+        && {
+            let manager = state.manager.lock().unwrap();
+            manager.session_runs_match_audience(&session_id, PromptAudience::External)
+                // 目标续轮也走排队：它是机器自己开的轮，人开口该优先，而不是
+                // 撞一个 409 让人重发。回合循环在每个工具边界都会取排队的输入。
+                || manager.session_runs_are_goal_rounds(&session_id)
+        }
     {
-        let (run_id, turn_id) = unique_run_target(
-            &state.manager.lock().unwrap(),
-            &session_id,
-            PromptAudience::External,
-        )
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "the running turn is not ready or is ambiguous",
-            )
-        })?;
+        let audience = {
+            let manager = state.manager.lock().unwrap();
+            if manager.session_runs_are_goal_rounds(&session_id) {
+                PromptAudience::Owner
+            } else {
+                PromptAudience::External
+            }
+        };
+        let (run_id, turn_id) =
+            unique_run_target(&state.manager.lock().unwrap(), &session_id, audience).ok_or_else(
+                || {
+                    ApiError::new(
+                        StatusCode::CONFLICT,
+                        "the running turn is not ready or is ambiguous",
+                    )
+                },
+            )?;
         let receipt = enqueue_turn_update(
             &state,
             TurnUpdateRequest {
@@ -461,19 +469,80 @@ pub(in crate::web) async fn stop_job_http(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// 取消一个在飞的 run；命中就返回 true。
+///
+/// 顺带解除目标的武装：打断一个自主轮 = 人明确说停。不解除的话这一轮刚被
+/// 掐掉、驱动器转头就开下一轮——退出 REPL 再进来看到它自己又跑起来了，
+/// 正是这么来的。要接着跑得 `/goal resume`。
+///
+/// REPL 走 IPC、WebUI 走 HTTP，两条路都从这里过：各写一份判断迟早分叉。
+/// 停掉一个会话的全部在飞 run 并等它们退场（删除会话前用）。
+///
+/// 「运行中不许删」对用户是个谜语——他要的是这个会话消失，跑没跑完他不关心。
+/// 先替他按停止，再走正常删除。等待有限时：万一 run 卡死不退场，回落到原来
+/// 的「管理占用」报错，而不是把 IPC 处理器挂死。
+pub(in crate::web) async fn stop_session_runs(
+    state: &DaemonState,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    // 先解除武装再取消：取消时仍在武装的目标会被驱动器当作「人刚重新授权」
+    // 立刻重开一轮（edit 的中断重开语义靠的就是这个），和删除抢跑。
+    crate::tools::goal::set_armed(session_id, false);
+    {
+        let manager = state.manager.lock().unwrap();
+        for run in manager.active_runs.values() {
+            if &*run.session_id == session_id {
+                run.request_cancel();
+            }
+        }
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !state.manager.lock().unwrap().session_has_runs(session_id) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub(in crate::web) fn cancel_run_and_disarm_goal(state: &DaemonState, run_id: &str) -> bool {
+    let cancelled = {
+        let manager = state.manager.lock().unwrap();
+        manager.active_runs.get(run_id).map(|run| {
+            run.request_cancel();
+            (
+                run.session_id.to_string(),
+                matches!(
+                    run.turn_origin,
+                    crate::tools::workspace::TurnOrigin::GoalRound { .. }
+                ),
+            )
+        })
+    };
+    let Some((session_id, was_goal_round)) = cancelled else {
+        return false;
+    };
+    if was_goal_round {
+        crate::tools::goal::set_armed(&session_id, false);
+        tracing::info!(
+            session = %session_id,
+            "goal disarmed after the user cancelled an autonomous round"
+        );
+    }
+    true
+}
+
 pub(in crate::web) async fn cancel_run(
     State(state): State<DaemonState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     require_mutation(&headers, &state)?;
-    let cancelled = {
-        let manager = state.manager.lock().unwrap();
-        manager
-            .active_runs
-            .get(&run_id)
-            .map(RunInfo::request_cancel)
-    };
+    let cancelled = cancel_run_and_disarm_goal(&state, &run_id).then_some(());
     if cancelled.is_none() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "active run not found"));
     }
@@ -558,4 +627,3 @@ pub(in crate::web) async fn close_question(
     }
     Ok(StatusCode::NO_CONTENT)
 }
-

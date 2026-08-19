@@ -6,7 +6,8 @@
 
 use crate::cli::*;
 
-pub(in crate::cli) const JOB_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub(in crate::cli) const JOB_SPINNER_FRAMES: [char; 10] =
+    ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub(in crate::cli) fn format_job_duration(seconds: u64) -> String {
     if seconds >= 3600 {
@@ -48,7 +49,10 @@ pub(in crate::cli) fn background_job_lines(
         let marker = JOB_SPINNER_FRAMES[spinner_phase % JOB_SPINNER_FRAMES.len()];
         let kind_word = kind_label(job);
         let kind_pad = " ".repeat(kind_col.saturating_sub(visible_width(kind_word)));
-        let mut left = format!("{marker} {kind_word}{kind_pad} {} · {}", job.job_id, job.title);
+        let mut left = format!(
+            "{marker} {kind_word}{kind_pad} {} · {}",
+            job.job_id, job.title
+        );
         let timer = format_job_duration(job.runtime_seconds);
         let timer_width = visible_width(&timer);
         // Never exceed the terminal width: a wrapped strip line would shift
@@ -62,10 +66,7 @@ pub(in crate::cli) fn background_job_lines(
             .saturating_sub(left_width)
             .saturating_sub(timer_width)
             .max(1);
-        lines.push(format!(
-            "\x1b[2m{left}{}{timer}\x1b[0m",
-            " ".repeat(pad)
-        ));
+        lines.push(format!("\x1b[2m{left}{}{timer}\x1b[0m", " ".repeat(pad)));
     }
     lines
 }
@@ -73,11 +74,12 @@ pub(in crate::cli) fn background_job_lines(
 /// Strips the bracketed prefix off a background-job wake headline, leaving
 /// `子代理完成 82bea3 · 标题`. The older `[后台命令完成] ` spelling still shows
 /// up in sessions recorded before the rename.
-pub(in crate::cli) fn job_wake_headline(headline: &str) -> &str {
+pub(in crate::cli) fn job_wake_headline(headline: &str) -> String {
     headline
         .strip_prefix("[后台任务完成] ")
         .or_else(|| headline.strip_prefix("[后台命令完成] "))
-        .unwrap_or(headline)
+        .map(str::to_string)
+        .unwrap_or_else(|| headline.to_string())
 }
 
 /// Fires a desktop notification unless the REPL window has focus.

@@ -159,7 +159,7 @@ fn cold_started_daemon_reports_a_nonzero_context_for_the_current_session() {
 
     // 而且要和「有 Agent 时」算出来的是同一个数——两条路口径不一致的话，
     // 切个会话数字就跳。
-    let live = build_session_agent(&config, &paths, &store).unwrap();
+    let live = build_session_agent(&config, &paths, &store, AgentMode::Normal).unwrap();
     assert_eq!(
         cold.tokens,
         live.effective_context_tokens().unwrap(),
@@ -691,7 +691,11 @@ fn resetting_a_conversation_also_clears_its_todo_list() {
         assert!(
             crate::tools::session_todos(&paths, &session_id).is_empty(),
             "{}后待办还在——面板和模型看到的都是上一轮的清单",
-            if clear_only { "清空会话" } else { "重置对话" }
+            if clear_only {
+                "清空会话"
+            } else {
+                "重置对话"
+            }
         );
     }
 }
@@ -734,4 +738,61 @@ async fn session_created_event_carries_the_mode() {
         record["mode"], "dev",
         "事件里没有 mode——前端会把这个 dev 会话分到普通模式组"
     );
+}
+
+/// 打断一个自主轮之后，目标不该自己接着跑。
+///
+/// 实测：Ctrl+C 掐掉一轮，退出 REPL 再进来，它又在跑了——取消只停了那一个
+/// run，武装标记还在，驱动器转头就认领了下一轮。人按下停止就是明确说停，
+/// 要接着跑得 `/goal resume`。
+///
+/// REPL 走 IPC、WebUI 走 HTTP，两条路共用 `cancel_run_and_disarm_goal`，
+/// 这里钉的是那个函数。
+#[tokio::test]
+async fn cancelling_an_autonomous_round_disarms_the_goal() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = DaemonState::for_test(test_paths(temp.path()), 8332).unwrap();
+    let session_id = state.state_store.session_id().to_string();
+    let goal = state
+        .state_store
+        .create_goal(&session_id, "长任务", Some(9))
+        .unwrap();
+    crate::tools::goal::set_armed(&session_id, true);
+
+    // 登记一个「正在跑的自主轮」。
+    let run_id = "run_test_goal_round".to_string();
+    let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+    state.manager.lock().unwrap().active_runs.insert(
+        run_id.clone(),
+        RunInfo {
+            session_id: session_id.clone().into(),
+            mode: AgentMode::Normal,
+            audience: PromptAudience::Owner,
+            cancel: cancel_tx,
+            turn_id: None,
+            queue_target: None,
+            supersede: std::sync::Arc::new(crate::agent::TurnSupersedeSignal::default()),
+            platform_followup: None,
+            operation: RunOperation::Create,
+            job_wake: true,
+            turn_origin: crate::tools::workspace::TurnOrigin::GoalRound {
+                goal_id: goal.goal_id.clone(),
+                revision: goal.revision,
+                round: 1,
+            },
+            job_wake_label: None,
+        },
+    );
+
+    assert!(
+        cancel_run_and_disarm_goal(&state, &run_id),
+        "没找到那个 run"
+    );
+    assert!(
+        !crate::tools::goal::is_armed(&session_id),
+        "取消之后还武装着——驱动器会转头开下一轮"
+    );
+    // 目标本身还在，阶段不动：人可以 /goal resume 接着跑。
+    let after = state.state_store.goal(&session_id).unwrap().unwrap();
+    assert_eq!(after.phase, crate::state::GoalPhase::Active);
 }

@@ -9,17 +9,16 @@ use crate::web::*;
 /// Old WebUI versions could make a platform-owned conversation the global
 /// current session. Repair that pointer before constructing the local agent
 /// so QQ history can never become the WebUI/CLI startup conversation.
-pub(in crate::web) fn ensure_local_current_session(state_store: &StateStore, persona: &str) -> Result<()> {
+pub(in crate::web) fn ensure_local_current_session(
+    state_store: &StateStore,
+    persona: &str,
+) -> Result<()> {
     let current_session_id = state_store.session_id();
     if is_available_local_session(state_store, &current_session_id, persona)? {
         return Ok(());
     }
 
-    let target_session_id = match state_store
-        .list_local_sessions(persona)?
-        .into_iter()
-        .next()
-    {
+    let target_session_id = match state_store.list_local_sessions(persona)?.into_iter().next() {
         Some(overview) => overview.record.session_id,
         None => {
             state_store
@@ -37,9 +36,7 @@ pub(in crate::web) fn is_available_local_session(
 ) -> Result<bool> {
     let usable = state_store
         .session_record(session_id)?
-        .is_some_and(|record| {
-            record.persona == persona && record.kind == "user"
-        });
+        .is_some_and(|record| record.persona == persona && record.kind == "user");
     Ok(usable && !state_store.is_platform_session(session_id)?)
 }
 
@@ -112,7 +109,12 @@ pub(in crate::web) async fn handle_session_command(
                 .collect();
             Ok(json!({ "current": &*current, "sessions": sessions }))
         }
-        IpcCommand::CreateSession { name, switch, kind, mode } => {
+        IpcCommand::CreateSession {
+            name,
+            switch,
+            kind,
+            mode,
+        } => {
             // Whitelisted: `ask` is the only non-user kind a client may mint,
             // and it is deliberately unswitchable — subagent audit sessions and
             // anything else stay daemon-internal.
@@ -305,11 +307,7 @@ pub(in crate::web) async fn handle_session_command(
         IpcCommand::Goal { target, input } => {
             let record = resolve_local_session_ref(state, &target)?;
             let session_id = record.session_id;
-            let paths = &state.paths;
-            let text = crate::tools::goal::execute_goal_command(paths, &session_id, &input);
-            // 人刚改过目标，驱动器该重新看一眼：`/goal resume` 之后正是要它
-            // 立刻接着跑，而不是干等下一个事件把它唤醒。
-            crate::web::nudge_goal_driver(state, &session_id);
+            let text = crate::web::apply_goal_command(state, &session_id, &input);
             Ok(json!({ "text": text }))
         }
         IpcCommand::DeleteSession { target } => {
@@ -323,6 +321,20 @@ pub(in crate::web) async fn handle_session_command(
                     "终端集成会话不可删除",
                 )
                 .to_string());
+            }
+            // 运行中的会话也能删：先替用户按停止，等 run 退场再删。
+            if state
+                .manager
+                .lock()
+                .unwrap()
+                .session_has_runs(&record.session_id)
+            {
+                crate::web::stop_session_runs(
+                    state,
+                    &record.session_id,
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
             }
             reserve_admin_for_session(&state.manager, &record.session_id)
                 .map_err(|error| error.message)?;
@@ -344,6 +356,9 @@ pub(in crate::web) async fn handle_session_command(
                 .map_err(|error| safe_error_message(&error));
             release_admin(&state.manager);
             result?;
+            // 库里的目标行随会话级联删除；进程内的 goal 状态（armed 等）
+            // 也一起清，不然条目在内存里陪跑到进程退出。
+            crate::tools::goal::forget_session(&record.session_id);
             state.events.publish(
                 "session.deleted",
                 json!({ "session_id": record.session_id }),

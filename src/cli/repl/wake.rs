@@ -18,6 +18,9 @@ pub(in crate::cli) async fn follow_wake_run(
     live: &mut LiveReplTail,
     run_id: &str,
     label: &str,
+    // 附着期间静默执行的 `/goal` 要落在**这个 REPL 的会话**上，不能拿
+    // daemon 的当前会话指针顶替——普通模式的 REPL 早就有自己的会话了。
+    session_id: &str,
     jobs_feed: &JobsFeed,
     jobs_shared: &std::sync::Arc<SharedJobsFeed>,
 ) -> Result<()> {
@@ -51,12 +54,18 @@ pub(in crate::cli) async fn follow_wake_run(
     {
         live.suspend()?;
         let mut stdout = io::stdout();
-        let header = if label.is_empty() {
+        // 目标续轮不打表头：一个长任务会连着跑几十轮，每轮顶一行「第 N 轮」
+        // 只会把真正的输出挤散。轮次已经在 footer 上（那是它常驻的位置）。
+        let header = if label == crate::tools::goal::GOAL_ROUND_LABEL {
+            String::new()
+        } else if label.is_empty() {
             crate::i18n::text("⚙ background task finished", "⚙ 后台任务完成").to_string()
         } else {
             format!("⚙ {label}")
         };
-        queue!(stdout, Print(format!("\x1b[2m{header}\x1b[0m\r\n\r\n")))?;
+        if !header.is_empty() {
+            queue!(stdout, Print(format!("\x1b[2m{header}\x1b[0m\r\n\r\n")))?;
+        }
         stdout.flush()?;
         live.output_cursor = cursor_position_or(live.output_cursor);
         let output_cursor = live.output_cursor;
@@ -88,7 +97,70 @@ pub(in crate::cli) async fn follow_wake_run(
                     if !event::poll(Duration::ZERO)? {
                         continue;
                     }
-                    match live.editor.handle_event(event::read()?, paths, true)? {
+                    let event = event::read()?;
+                    // 斜杠命令在**编辑器处理回车之前**拦：编辑器一旦处理
+                    // Enter 就会清空缓冲区，「输入原样留着」就成了空话——
+                    // 显示滞留旧文本，下一次按键才暴露缓冲区其实已经空了。
+                    if matches!(
+                        &event,
+                        crossterm::event::Event::Key(crossterm::event::KeyEvent {
+                            code: crossterm::event::KeyCode::Enter,
+                            kind,
+                            ..
+                        }) if *kind != crossterm::event::KeyEventKind::Release
+                    ) {
+                        let line = live.editor.input.trim_start().to_string();
+                        match crate::cli::repl::editor::parse_repl_input(&line) {
+                            crate::slash_commands::ReplInput::Slash(
+                                crate::slash_commands::ReplSlashCommand::Goal,
+                                args,
+                            ) => {
+                                let args = args.trim().to_string();
+                                if args == "edit" {
+                                    // 原地变身成「/goal edit <当前目标>」，
+                                    // 零输出；没有目标就静默吞掉这次回车。
+                                    if crate::cli::repl::session::prefill_goal_edit_input(
+                                        paths,
+                                        Some(session_id),
+                                        live,
+                                    ) && !live.external_output_active
+                                    {
+                                        synchronized_terminal_update(
+                                            CursorAfterUpdate::Preserve,
+                                            || live.redraw(),
+                                        )?;
+                                    }
+                                    continue;
+                                }
+                                // 静默执行：edit/pause/clear 会让 daemon 掐掉
+                                // 当前续轮（edit 随后按新目标重开一轮），流的
+                                // 中断与重启本身就是反馈。
+                                let _ = crate::cli::repl::session::send_ipc_admin(
+                                    paths,
+                                    IpcCommand::Goal {
+                                        target: crate::ipc::SessionRef::Id {
+                                            id: session_id.to_string(),
+                                        },
+                                        input: args,
+                                    },
+                                )
+                                .await;
+                                live.editor.clear();
+                                if !live.external_output_active {
+                                    synchronized_terminal_update(
+                                        CursorAfterUpdate::Preserve,
+                                        || live.redraw(),
+                                    )?;
+                                }
+                                continue;
+                            }
+                            // 其他命令运行中不可用，也不打提示（流中间的系统
+                            // 消息会写坏渲染）：吞掉回车，输入原样留在输入框。
+                            crate::slash_commands::ReplInput::Slash(..) => continue,
+                            crate::slash_commands::ReplInput::Chat => {}
+                        }
+                    }
+                    match live.editor.handle_event(event, paths, true)? {
                         LiveEditorAction::None => {}
                         LiveEditorAction::Redraw if !live.external_output_active => {
                             synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
@@ -98,6 +170,8 @@ pub(in crate::cli) async fn follow_wake_run(
                         LiveEditorAction::Redraw | LiveEditorAction::ClearScreen => {}
                         LiveEditorAction::EmptySubmit => {}
                         LiveEditorAction::Submit(submission) => {
+                            // 斜杠命令到不了这里：上面的回车闸在编辑器处理
+                            // 之前就拦下了。这里只剩普通消息，照常排队。
                             let Some(target_turn) = turn_id.as_deref() else {
                                 continue;
                             };
@@ -116,7 +190,24 @@ pub(in crate::cli) async fn follow_wake_run(
                                 )?;
                             }
                         }
-                        LiveEditorAction::Interrupt | LiveEditorAction::Exit => {
+                        LiveEditorAction::Interrupt => {
+                            // 目标续轮上 Ctrl+C 的意图是「停」，走 WebUI 停止
+                            // 按钮同一条取消路径（取消即解除武装）。仅脱离的话，
+                            // 续轮在 daemon 里继续跑：用户面对的是一个看起来
+                            // 停了、`/goal` 却说「进行中」、还在烧额度的幽灵轮。
+                            // 其他后台唤醒保持仅脱离——那些回合不是它发起的。
+                            if label == crate::tools::goal::GOAL_ROUND_LABEL {
+                                let _ = send_ipc_command(
+                                    paths,
+                                    IpcCommand::Cancel {
+                                        run_id: run_id.to_string(),
+                                    },
+                                )
+                                .await;
+                            }
+                            break 'outer;
+                        }
+                        LiveEditorAction::Exit => {
                             // Detach only: the wake turn keeps running.
                             break 'outer;
                         }

@@ -58,10 +58,23 @@ pub(in crate::web) async fn goal_command_http(
 ) -> std::result::Result<Json<Value>, ApiError> {
     require_mutation(&headers, &state)?;
     require_local_web_session(&state, &request.session_id)?;
-    let text =
-        crate::tools::goal::execute_goal_command(&state.paths, &request.session_id, &request.input);
-    crate::web::nudge_goal_driver(&state, &request.session_id);
+    let text = crate::web::apply_goal_command(&state, &request.session_id, &request.input);
     Ok(Json(json!({ "text": text })))
+}
+
+/// 会话当前目标的结构化快照。
+///
+/// 与 `/api/goal` 返回的人类可读文本分开：那条是命令的回执（一段话），
+/// 这条是给状态行用的字段，前端要按阶段决定显示哪些按钮。
+pub(in crate::web) async fn session_goal_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_auth(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
+    let goal = crate::tools::goal::session_goal_json(&state.paths, &session_id);
+    Ok(Json(goal))
 }
 
 /// 复用 `ResetConversationRequest`，不再造一个字段一样的类型。
@@ -109,6 +122,128 @@ pub(in crate::web) async fn compact_conversation(
             Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "agent worker stopped while compacting the conversation",
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(in crate::web) struct PopConversationRequest {
+    pub(in crate::web) session_id: Option<String>,
+    #[serde(default)]
+    pub(in crate::web) count: Option<usize>,
+    /// 指定要弹出的轮次（来自弹出选择器的多选）。非空时优先于 `count`。
+    #[serde(default)]
+    pub(in crate::web) turn_ids: Vec<String>,
+}
+
+/// 可弹出轮次清单，给 `/pop` 的多选列表用。
+///
+/// 判定收口在 `oldest_evictable_visible_turns`——和 REPL 的交互式挑选、
+/// 按数量弹出是同一套「哪些轮能弹」的口径，三处分叉的话同一轮在一个入口
+/// 能弹、另一个入口说不能。
+pub(in crate::web) async fn poppable_turns_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_auth(&headers, &state)?;
+    require_local_web_session(&state, &session_id)?;
+    let turns = state
+        .state_store
+        .pinned(&session_id)
+        .oldest_evictable_visible_turns(usize::MAX)
+        .map_err(ApiError::internal)?;
+    let items = turns
+        .into_iter()
+        .map(|turn| {
+            let preview: String = turn.display_content.chars().take(120).collect();
+            json!({
+                "turn_id": turn.turn_id,
+                "preview": preview,
+                "timestamp": turn.user_timestamp,
+                "tokens": turn.token_total,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "turns": items })))
+}
+
+/// `/pop <count>`：从当前上下文弹出最旧的 N 轮。
+///
+/// REPL 的无参数形态是交互式挑选，离不开终端；WebUI 对齐的是
+/// `miyu pop <count>` 的按数量形态。轮次在这里解析成 id 再交给
+/// `ActorCommand::Pop`——actor 侧会拿可弹出集合再过滤一遍，读取和
+/// 预订管理锁之间被人抢先弹掉的轮次不会被弹两次。
+pub(in crate::web) async fn pop_conversation(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<PopConversationRequest>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    require_mutation(&headers, &state)?;
+    let session_id = request
+        .session_id
+        .unwrap_or_else(|| state.state_store.session_id().to_string());
+    require_local_web_session(&state, &session_id)?;
+    let turn_ids: Vec<String> = if !request.turn_ids.is_empty() {
+        // 选择器多选：具体弹哪些由 actor 再按可弹出集合过滤一遍，这里
+        // 不重复校验（读取与执行之间状态可能已变，校验也只是快照）。
+        request.turn_ids
+    } else {
+        let count = request.count.unwrap_or(1);
+        if count == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "pop count must be greater than zero",
+            ));
+        }
+        state
+            .state_store
+            .pinned(&session_id)
+            .oldest_evictable_visible_turns(count)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|turn| turn.turn_id)
+            .collect()
+    };
+    if turn_ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "no evictable turns in the active context",
+        ));
+    }
+    let session_id: std::sync::Arc<str> = session_id.into();
+    reserve_admin_for_session(&state.manager, &session_id)?;
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .actor_tx
+        .send(ActorCommand::Pop {
+            session_id: session_id.clone(),
+            turn_ids,
+            reply,
+        })
+        .is_err()
+    {
+        release_admin(&state.manager);
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent worker is unavailable",
+        ));
+    }
+    match receiver.await {
+        Ok(Ok(data)) => Ok(Json(json!({ "ok": true, "result": data }))),
+        Ok(Err(AdminFailure::Invalid(message))) => {
+            Err(ApiError::new(StatusCode::CONFLICT, message))
+        }
+        Ok(Err(AdminFailure::Internal(message))) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            safe_error_message(&message),
+        )),
+        Err(_) => {
+            release_admin(&state.manager);
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent worker stopped while popping the conversation",
             ))
         }
     }
