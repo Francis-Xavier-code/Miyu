@@ -772,14 +772,18 @@ mod tests {
     #[test]
     fn goal_round_prompt_states_where_it_came_from() {
         let prompt = crate::tools::goal::goal_round_prompt("把测试跑绿", 2, 10);
+        // 断言按小写比，大小写不是这条测试要守的东西。
+        let lowered = prompt.to_lowercase();
         for expected in [
-            "the user set",     // 谁下的
-            "/goal",            // 怎么下的
-            "not an injection", // 直接回应模型的怀疑
-            "may have nothing to do with the messages just above", // 为什么对不上
+            "the user set",             // 谁下的
+            "/goal",                    // 怎么下的
+            "not an injection",         // 直接回应模型的怀疑
+            "unrelated to the messages", // 为什么和上文对不上
+            "get_goal",                 // 拿 goal_id/revision 的入口
+            "waiting",                  // 不许拿一整轮只说「我在等你」
         ] {
             assert!(
-                prompt.contains(expected),
+                lowered.contains(expected),
                 "续轮提示词丢了来历说明（缺 {expected:?}）——模型会把它当注入拒掉:\n{prompt}"
             );
         }

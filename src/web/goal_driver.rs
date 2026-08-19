@@ -12,6 +12,36 @@
 //! 上下文装配，和这里的会话轮不是一回事。
 
 use crate::web::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+/// 我们自己起的那些续轮：run_id → session_id。
+fn goal_runs() -> &'static Mutex<HashMap<String, String>> {
+    static RUNS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 至少调过一次工具的 run。
+fn productive_runs() -> &'static Mutex<HashSet<String>> {
+    static RUNS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    RUNS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 上一轮什么都没干、只说了句话的会话——在人开口之前不再驱动。
+fn awaiting_human() -> &'static Mutex<HashSet<String>> {
+    static SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn event_field(record: &EventRecord, field: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&record.data)
+        .ok()
+        .and_then(|data| {
+            data.get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
 
 /// 订阅事件流，在每次回合结束时看看要不要接着开一轮。
 pub(in crate::web) fn spawn_goal_round_driver(state: DaemonState) {
@@ -25,25 +55,47 @@ pub(in crate::web) fn spawn_goal_round_driver(state: DaemonState) {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            let session_id = || {
-                serde_json::from_str::<serde_json::Value>(&record.data)
-                    .ok()
-                    .and_then(|data| {
-                        data.get("session_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-            };
+            let session_id = || event_field(&record, "session_id");
             match record.kind.as_str() {
-                "run.completed" => {
-                    if let Some(session) = session_id() {
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            maybe_continue_goal(state, session).await;
-                        });
+                // 这一轮调过工具 = 真的在干活。判据取事件而不是回查库：
+                // 驱动器本来就在订阅事件流，查库要把整个会话的回合读出来。
+                "tool.started" => {
+                    if let Some(run_id) = event_field(&record, "run_id") {
+                        productive_runs().lock().unwrap().insert(run_id);
                     }
                 }
+                "run.completed" => {
+                    let Some(session) = session_id() else {
+                        continue;
+                    };
+                    let run_id = event_field(&record, "run_id").unwrap_or_default();
+                    let was_goal_round = goal_runs().lock().unwrap().remove(&run_id).is_some();
+                    let did_work = productive_runs().lock().unwrap().remove(&run_id);
+                    if was_goal_round && !did_work {
+                        // 一轮下来一个工具都没调，就是在原地说话——最常见的是
+                        // 「我在等你确认」。再开下去只会把同一句话重复几十遍，
+                        // 每遍都收一次钱。等人开口再说。
+                        tracing::info!(
+                            %session,
+                            "goal round made no tool calls; pausing until the user speaks"
+                        );
+                        awaiting_human().lock().unwrap().insert(session.clone());
+                        continue;
+                    }
+                    if !was_goal_round {
+                        // 人（或别的来源）跑完了一轮，等待解除。
+                        awaiting_human().lock().unwrap().remove(&session);
+                    }
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        maybe_continue_goal(state, session).await;
+                    });
+                }
                 "run.failed" => {
+                    if let Some(run_id) = event_field(&record, "run_id") {
+                        goal_runs().lock().unwrap().remove(&run_id);
+                        productive_runs().lock().unwrap().remove(&run_id);
+                    }
                     // 失败之后解除武装：一个会持续失败的目标如果继续自动重试，
                     // 就是拿着用户的额度撞墙。要接着跑，人得亲自 `/goal resume`。
                     if let Some(session) = session_id() {
@@ -68,6 +120,8 @@ pub(in crate::web) fn spawn_goal_round_driver(state: DaemonState) {
 /// 事件可能永远不来（会话正闲着）。重复踢是安全的：四道闸都在
 /// `maybe_continue_goal` 里，多踢几次最多是多查几次库。
 pub(in crate::web) fn nudge_goal_driver(state: &DaemonState, session_id: &str) {
+    // 人动过目标就是开了口：上一轮空转设下的等待到此为止。
+    awaiting_human().lock().unwrap().remove(session_id);
     if !crate::tools::goal::is_armed(session_id) {
         return;
     }
@@ -80,6 +134,10 @@ pub(in crate::web) fn nudge_goal_driver(state: &DaemonState, session_id: &str) {
 
 /// 四道闸之后认领下一轮，起一个自动回合。
 pub(in crate::web) async fn maybe_continue_goal(state: DaemonState, session_id: String) {
+    // 闸 0：上一轮空转过就等人。
+    if awaiting_human().lock().unwrap().contains(&session_id) {
+        return;
+    }
     // 闸 1：会话空闲。
     {
         let manager = state.manager.lock().unwrap();
@@ -118,9 +176,7 @@ pub(in crate::web) async fn maybe_continue_goal(state: DaemonState, session_id: 
     let Ok(Some(goal)) = state.state_store.goal(&session_id) else {
         return;
     };
-    if goal.phase != crate::state::GoalPhase::Active
-        || !crate::tools::goal::is_armed(&session_id)
-    {
+    if goal.phase != crate::state::GoalPhase::Active || !crate::tools::goal::is_armed(&session_id) {
         return;
     }
     if goal.rounds_started >= goal.max_rounds {
@@ -200,6 +256,10 @@ pub(in crate::web) async fn maybe_continue_goal(state: DaemonState, session_id: 
             },
         );
     }
+    goal_runs()
+        .lock()
+        .unwrap()
+        .insert(run_id.clone(), session_id.clone());
     tracing::info!(
         %session_id,
         round = claimed.rounds_started,

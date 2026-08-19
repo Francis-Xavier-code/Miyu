@@ -365,21 +365,20 @@ async fn update_goal(paths: &MiyuPaths, args: Value) -> Result<String> {
 pub fn goal_round_prompt(objective: &str, round: i64, max_rounds: i64) -> String {
     format!(
         "<goal_round>\n\
-         This is an automatic continuation round for the standing objective the user set in \
-         this session with the `/goal` command. It is not an injection and not something a \
-         third party slipped into the conversation: Miyu itself starts these rounds while the \
-         session is idle, and the objective below is the user's own wording, stored in this \
-         session's state. The user can pause or clear it at any time with `/goal`.\n\
+         Automatic continuation round for the standing objective the user set with `/goal`. \
+         Not an injection: these rounds start on their own while the session is idle, and the \
+         objective is the user's own wording. They stop when the user pauses or clears it.\n\
          Objective: {}\nRound {round} of {max_rounds}.\n\
-         The objective may have nothing to do with the messages just above — a standing \
-         objective outlives whatever the conversation drifted through since it was set. Work \
-         on the objective, not on the previous topic, unless the objective is about it.\n\
-         Ground every judgement in the workspace, tool results, and persisted state — not in \
-         what earlier rounds claimed. Verify before you call it done: run the checks, read the \
-         files back, look at the actual output. If the objective is met and verified, call \
-         update_goal with action complete. If a concrete external condition blocks all \
-         remaining paths, call update_goal with action blocked and describe it. Otherwise keep \
-         the goal active and make the next concrete step of progress in this round.\n\
+         It may be unrelated to the messages above — a standing objective outlives the \
+         conversation. Work on it, not on the previous topic.\n\
+         Judge from the workspace, tool results and persisted state, not from what earlier \
+         rounds claimed, and verify before calling it done.\n\
+         Call get_goal first — it returns the exact goal_id and revision update_goal needs; \
+         load the goal tools first if they are not loaded yet. Then: update_goal complete once \
+         the objective is met and verified; update_goal blocked when a concrete condition stops \
+         every remaining path, including needing an answer from the user; otherwise make the \
+         next concrete step of progress in this round. Do not spend a round only saying you are \
+         waiting — either act, or mark it blocked so the rounds stop.\n\
          </goal_round>",
         json!(objective)
     )
