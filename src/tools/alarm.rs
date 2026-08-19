@@ -73,7 +73,7 @@ async fn set_alarm(args: Value, paths: MiyuPaths) -> Result<String> {
         Local::now().timestamp_millis(),
         std::process::id()
     );
-    let exe = std::env::current_exe()?;
+    let exe = crate::paths::miyu_executable()?;
     let mut command = Command::new(exe);
     command
         .arg("__alarm-worker")

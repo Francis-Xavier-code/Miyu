@@ -152,10 +152,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "tool_reports_child_table",
         apply: apply_v25_tool_reports_child_table,
     },
+    Migration {
+        version: 26,
+        name: "session_goals",
+        apply: apply_v26_session_goals,
+    },
 ];
 
 /// Latest schema version this build produces.
-pub const LATEST_VERSION: i64 = 25;
+pub const LATEST_VERSION: i64 = 26;
 
 /// Returns the schema version currently recorded in the database.
 pub fn current_version(conn: &Connection) -> Result<i64> {
@@ -189,20 +194,38 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
 }
 
 fn apply_pending(conn: &mut Connection, current: i64) -> Result<()> {
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+    apply_migrations(conn, current, MIGRATIONS)
+}
+
+/// 迁移列表作为参数传进来，测试才能塞一个故意写坏的迁移进去验回滚。
+fn apply_migrations(conn: &mut Connection, current: i64, migrations: &[Migration]) -> Result<()> {
+    for migration in migrations.iter().filter(|m| m.version > current) {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .with_context(|| format!("failed to begin migration '{}'", migration.name))?;
+        // 迁移**动手之前**的违规数。库里可能本来就有孤儿行（崩溃、外部工具、
+        // 一次 `.recover` 之后都可能留下），那不是这个迁移的责任。
+        let before = foreign_key_violations(&tx)?;
         (migration.apply)(&tx)
             .with_context(|| format!("schema migration '{}' failed", migration.name))?;
-        let violations: i64 =
-            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if violations > 0 {
+        let after = foreign_key_violations(&tx)?;
+        // 只看**新增**的。以前是「跑完还有违规就回滚」，于是库里但凡有一条
+        // 历史脏数据，以后所有升级都会失败、daemon 直接起不来，而且报错指向
+        // 一个完全无辜的迁移——它只是碰巧排在最前面。
+        if after > before {
             bail!(
-                "schema migration '{}' left {violations} foreign-key violations; rolling back",
-                migration.name
+                "schema migration '{}' introduced {} foreign-key violations \
+                 (before {before}, after {after}); rolling back",
+                migration.name,
+                after - before
+            );
+        }
+        if before > 0 {
+            // 放行但要留痕：脏数据仍然存在，只是不该由升级路径来当门卫。
+            tracing::warn!(
+                migration = migration.name,
+                violations = before,
+                "database has pre-existing foreign-key violations; migration applied anyway"
             );
         }
         tx.pragma_update(None, "user_version", migration.version)?;
@@ -210,6 +233,12 @@ fn apply_pending(conn: &mut Connection, current: i64) -> Result<()> {
             .with_context(|| format!("failed to commit migration '{}'", migration.name))?;
     }
     Ok(())
+}
+
+fn foreign_key_violations(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+        row.get(0)
+    })?)
 }
 
 fn user_version(conn: &Connection) -> Result<i64> {
@@ -262,6 +291,69 @@ mod tests {
             user_version(&conn).unwrap(),
             MIGRATIONS.last().unwrap().version
         );
+    }
+
+    /// 库里本来就有的外键孤儿，不该把以后所有升级都堵死。
+    ///
+    /// 这条是真事：一次数据库损坏恢复在 `turn_journal_segments` 里留下 3 条
+    /// 指向已不存在回合的孤儿行。半个月后加了一个和它们毫无关系的迁移，
+    /// daemon 就再也起不来了，报错还指着那个无辜的迁移——它只是碰巧排在
+    /// 待跑队列的最前面。
+    #[test]
+    fn pre_existing_violations_do_not_block_unrelated_migrations() {
+        let mut conn = open_migrated();
+        // 造一条孤儿：外键此刻不生效（迁移期间本来就关着），直接插得进去。
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO turn_journal_segments
+                 (turn_id, revision, segment_index, status, started_at)
+             VALUES ('turn_does_not_exist', 0, 0, 'interrupted', '2026-08-18T00:00:00Z');
+             PRAGMA user_version = 25;",
+        )
+        .unwrap();
+        assert!(foreign_key_violations(&conn).unwrap() > 0, "前置条件不成立");
+
+        run_migrations(&mut conn).expect("历史脏数据把升级路径堵死了");
+        assert_eq!(
+            user_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().version
+        );
+        // 脏数据仍在——迁移器不该顺手替别人打扫，只是不再当门卫。
+        assert!(foreign_key_violations(&conn).unwrap() > 0);
+    }
+
+    /// 但迁移**自己**造出来的违规仍然必须回滚——放宽的是「不追究前人」，
+    /// 不是「不管了」。
+    #[test]
+    fn a_migration_that_breaks_referential_integrity_still_rolls_back() {
+        let mut conn = open_migrated();
+        // 真实迁移期间外键是关的（见 `run_migrations` 的注释：表重建会让
+        // DROP TABLE 的隐式删除级联到子表）。这里照做，否则坏迁移在 INSERT
+        // 那一步就被拦下，走不到我们要验的那道检查。
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let latest = MIGRATIONS.last().unwrap().version;
+        let bad = [Migration {
+            version: latest + 1,
+            name: "deliberately_broken",
+            apply: |conn| {
+                conn.execute_batch(
+                    "INSERT INTO turn_journal_segments
+                         (turn_id, revision, segment_index, status, started_at)
+                     VALUES ('turn_missing', 0, 0, 'running', '2026-08-18T00:00:00Z');",
+                )?;
+                Ok(())
+            },
+        }];
+
+        let error = apply_migrations(&mut conn, latest, &bad)
+            .expect_err("迁移把引用完整性搞坏了却提交了");
+        assert!(
+            format!("{error}").contains("introduced"),
+            "报错要说清是这个迁移新增的：{error}"
+        );
+        // 事务回滚了：坏行没留下，版本号也没往前走。
+        assert_eq!(foreign_key_violations(&conn).unwrap(), 0);
+        assert_eq!(user_version(&conn).unwrap(), latest);
     }
 
     /// v24 的老库升到 v25：新表建出来，列里的老报告一个字节不动。

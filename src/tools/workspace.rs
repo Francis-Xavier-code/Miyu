@@ -120,6 +120,16 @@ pub enum TurnOrigin {
     Human,
     /// 后台任务完成唤醒的合成轮。
     JobWake,
+    /// 目标驱动器自动开的续轮。
+    ///
+    /// 带着认领时的 (goal_id, revision, round)。工具层据此判定「本轮恰好是
+    /// 当前目标的那一轮」——只有这种轮才允许模型自己报完成/受阻;别的自动轮
+    /// (比如任务唤醒)不行,拿着旧轮号的更不行。
+    GoalRound {
+        goal_id: String,
+        revision: i64,
+        round: i64,
+    },
 }
 
 tokio::task_local! {

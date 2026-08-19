@@ -585,6 +585,39 @@ pub(in crate::state) fn create_turn_redo_backup_tables(conn: &Connection) -> Res
 ///
 /// `report_id` 用 INTEGER PRIMARY KEY 自增：插入顺序就是报告顺序，所以追加时
 /// **一次读都不用做**（不必查 MAX(seq)）——那正是要消掉的东西。
+/// v26：会话目标（goal）重新建表。
+///
+/// 这张表在 v22 建过、v24 又被落掉——当时验收判定「goal 没什么用处」。现在
+/// 目标循环重做回来，所以再建一次。历史上的 v22/v24 保持原样不动：迁移是
+/// 只进不退的账本，改写旧条目会让已经跑过它们的库和新库走出两套形状。
+///
+/// 每会话至多一个当前目标（`session_id` 就是主键）。`revision` 是变更的
+/// CAS 凭证：模型先 `get_goal` 拿到 (goal_id, revision)，再带着它更新；期间
+/// 有别人改过就撞版本，模型重读后自纠，而不是把别人的改动覆盖掉。
+///
+/// 「是否自动续跑」有意不在这张表里——它驻在 daemon 内存，重启即失，必须由
+/// 人 `/goal resume` 重新授权。落库的话，一次崩溃重启就能让机器在无人看管的
+/// 情况下继续自己开轮。
+pub(in crate::state) fn apply_v26_session_goals(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS goals (
+            session_id      TEXT PRIMARY KEY
+                            REFERENCES sessions(session_id) ON DELETE CASCADE,
+            goal_id         TEXT NOT NULL,
+            revision        INTEGER NOT NULL,
+            objective       TEXT NOT NULL,
+            phase           TEXT NOT NULL,
+            blocked_code    TEXT,
+            blocked_message TEXT,
+            max_rounds      INTEGER NOT NULL,
+            rounds_started  INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 pub(in crate::state) fn apply_v25_tool_reports_child_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS turn_tool_reports (

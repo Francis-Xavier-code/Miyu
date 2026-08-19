@@ -48,6 +48,11 @@ mod web;
 use anyhow::Result;
 
 pub async fn run() -> Result<()> {
+    // 趁二进制还在磁盘上，先把自己的路径记下来。daemon 一跑就是几小时，
+    // 期间升级安装包或重新编译都会把这个文件换掉，那之后 `/proc/self/exe`
+    // 读出来的是 `".../miyu (deleted)"`，再想 spawn 自己就 ENOENT 了
+    // （长图渲染器、闹钟、知识库索引都靠这条路）。
+    paths::prime_miyu_executable();
     if platforms::plugins::renderer_worker_requested() {
         return platforms::plugins::run_renderer_worker().await;
     }

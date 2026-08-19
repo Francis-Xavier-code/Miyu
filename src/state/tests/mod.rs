@@ -11,3 +11,4 @@ mod assets;
 mod queue;
 mod compact;
 mod redo;
+mod goals;

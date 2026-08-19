@@ -29,7 +29,7 @@ pub(in crate::platforms::plugins::renderer) fn renderer_fonts_dir() -> Result<Pa
     #[cfg(debug_assertions)]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts"));
     candidates.push(PathBuf::from("/usr/share/miyu/fonts"));
-    if let Ok(executable) = std::env::current_exe() {
+    if let Ok(executable) = crate::paths::miyu_executable() {
         if let Some(prefix) = executable.parent().and_then(std::path::Path::parent) {
             candidates.push(prefix.join("share/miyu/fonts"));
         }

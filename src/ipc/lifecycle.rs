@@ -437,8 +437,8 @@ pub(crate) fn start_daemon_process(
         .open(paths.logs_dir().join("daemon.log"))?;
     // The daemon is this very binary re-executed with a hidden subcommand,
     // so a single installed file is always sufficient.
-    let executable =
-        std::env::current_exe().context("resolving the Miyu executable to spawn the daemon")?;
+    let executable = crate::paths::miyu_executable()
+        .context("resolving the Miyu executable to spawn the daemon")?;
     let mut command = std::process::Command::new(executable);
     command.arg("__daemon");
     append_daemon_process_args(&mut command, launch);

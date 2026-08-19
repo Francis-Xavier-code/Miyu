@@ -286,7 +286,7 @@ impl KnowledgeBase {
         {
             return Ok(());
         }
-        let exe = std::env::current_exe()?;
+        let exe = crate::paths::miyu_executable()?;
         Command::new(exe)
             .args(["kb", "embed", "reindex", "--quiet"])
             .stdin(Stdio::null())

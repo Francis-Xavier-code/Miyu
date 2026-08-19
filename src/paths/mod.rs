@@ -3,6 +3,45 @@ mod resource_migration;
 pub(crate) use legacy_migration::*;
 pub(crate) use resource_migration::*;
 
+/// Miyu 自己这个可执行文件的路径，**在它可能被替换之前**记下来。
+///
+/// 好几处功能靠再执行一遍自己来干活：daemon 是 `miyu __daemon`，长图渲染器是
+/// `miyu __render_worker`，闹钟和知识库索引也是。它们原本各自调
+/// `std::env::current_exe()`，而那在 Linux 上读的是 `/proc/self/exe`——**一旦
+/// 磁盘上的文件被换掉（升级安装包、开发时重新编译），这个符号链接就变成
+/// `/path/to/miyu (deleted)`，拿它去 spawn 必然 ENOENT。**
+///
+/// 后果很隐蔽：长回复不再转图片、直接发成大段文字，只在滚动日志里留一条
+/// warning，用户看到的是「这功能怎么不работа了」。
+///
+/// 所以：第一次调用就把结果缓存下来（daemon 启动时立刻预热，那时文件还在），
+/// 并且把 `(deleted)` 后缀剥掉——路径本身通常仍指向新装上的那个二进制。
+pub fn miyu_executable() -> Result<PathBuf> {
+    static EXECUTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(path) = EXECUTABLE.get() {
+        return Ok(path.clone());
+    }
+    let raw = std::env::current_exe().context("locating the Miyu executable")?;
+    let resolved = strip_deleted_suffix(&raw).unwrap_or(raw);
+    Ok(EXECUTABLE.get_or_init(|| resolved).clone())
+}
+
+/// 进程启动早期预热一次，趁二进制还没被换掉。
+pub fn prime_miyu_executable() {
+    let _ = miyu_executable();
+}
+
+/// `/proc/self/exe` 在文件被替换后会读出 `".../miyu (deleted)"`。
+/// 剥掉那个后缀，且只在剥完确实存在时才采信——不然宁可用原样报错，
+/// 也好过悄悄跑到一个不相干的路径上。
+fn strip_deleted_suffix(path: &Path) -> Option<PathBuf> {
+    const SUFFIX: &str = " (deleted)";
+    let name = path.file_name()?.to_str()?;
+    let stripped = name.strip_suffix(SUFFIX)?;
+    let candidate = path.with_file_name(stripped);
+    candidate.exists().then_some(candidate)
+}
+
 use crate::i18n::text as t;
 use anyhow::{bail, Context, Result};
 use directories::{BaseDirs, UserDirs};

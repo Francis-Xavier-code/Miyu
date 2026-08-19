@@ -61,7 +61,8 @@ impl Drop for WorkerSlot {
 
 impl WorkerProcess {
     pub(in crate::platforms::plugins::renderer) async fn spawn() -> Result<Self> {
-        let executable = std::env::current_exe().context("locating the Miyu executable")?;
+        let executable = crate::paths::miyu_executable()?;
+        let executable_for_error = executable.clone();
         let mut command = tokio::process::Command::new(executable);
         command
             .arg(WORKER_ARG)
@@ -70,9 +71,13 @@ impl WorkerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .context("starting the long-image renderer worker")?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "starting the long-image renderer worker ({}); \
+                 if Miyu was upgraded or rebuilt while running, restart the daemon",
+                executable_for_error.display()
+            )
+        })?;
         let stdin = child
             .stdin
             .take()

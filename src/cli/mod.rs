@@ -177,6 +177,17 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         Some(Command::AlarmWorker(args)) => run_alarm_worker(args),
         Some(Command::DaemonWorker(args)) => {
             let _logging_guard = crate::logging::init(&paths, cli.debug).ok();
+            // daemon 的 stdout/stderr 被重定向进 daemon.log，而 tracing 写的是
+            // 另一个按天滚动的文件。出了事翻错文件是常态——排查一次长回复不转
+            // 图片，我在 daemon.log 里绕了很久，真正的 warning 一直躺在
+            // miyu.YYYY-MM-DD.log 里。所以在这条日志的开头指一次路。
+            println!(
+                "{}",
+                crate::i18n::text(
+                    "Detailed logs (warnings, tool failures) go to miyu.YYYY-MM-DD.log in the same directory; this file only carries startup output.",
+                    "详细日志（警告、工具失败）在同目录的 miyu.YYYY-MM-DD.log；本文件只有启动输出。"
+                )
+            );
             crate::daemon::run(paths, args).await
         }
         Some(Command::Tool(args)) => run_tool(&paths, mode, args).await,

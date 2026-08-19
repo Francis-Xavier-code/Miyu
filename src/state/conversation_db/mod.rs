@@ -1,4 +1,6 @@
 mod attachments;
+mod goals;
+pub use goals::*;
 mod history;
 mod platform;
 mod queue;

@@ -227,6 +227,90 @@ impl StateStore {
         )
     }
 
+    // ---- 会话目标（goal）----
+    //
+    // 一律显式传 session_id 而不是用 `self.session()`：续轮驱动器在 daemon 的
+    // 后台任务里跑，它推的会话未必是当前会话。
+
+    pub fn goal(&self, session_id: &str) -> Result<Option<crate::state::GoalRecord>> {
+        self.conv_db.goal(session_id)
+    }
+
+    pub fn create_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        max_rounds: Option<i64>,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db.create_goal(session_id, objective, max_rounds)
+    }
+
+    pub fn edit_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        objective: Option<&str>,
+        max_rounds: Option<i64>,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db
+            .edit_goal(session_id, goal_id, revision, objective, max_rounds)
+    }
+
+    pub fn pause_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db.pause_goal(session_id, goal_id, revision)
+    }
+
+    pub fn resume_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db.resume_goal(session_id, goal_id, revision)
+    }
+
+    pub fn complete_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db.complete_goal(session_id, goal_id, revision)
+    }
+
+    pub fn block_goal(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db
+            .block_goal(session_id, goal_id, revision, code, message)
+    }
+
+    pub fn clear_goal(&self, session_id: &str, goal_id: &str, revision: i64) -> Result<()> {
+        self.conv_db.clear_goal(session_id, goal_id, revision)
+    }
+
+    pub fn begin_goal_round(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        revision: i64,
+        expected_round: i64,
+    ) -> Result<crate::state::GoalRecord> {
+        self.conv_db
+            .begin_goal_round(session_id, goal_id, revision, expected_round)
+    }
+
     pub fn reset_conversation(&self) -> Result<()> {
         self.clear_session_content()?;
         usage::reset_conversation(&self.usage_file())

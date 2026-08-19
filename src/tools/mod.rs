@@ -36,6 +36,7 @@ mod scripts;
 mod skills;
 mod subagent_runner;
 mod task;
+pub mod goal;
 mod todowrite;
 pub(crate) use todowrite::{clear_session_todos, session_todos};
 pub(crate) mod usage_query;
@@ -283,6 +284,9 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "load_tools" => t("Load", "加载"),
         "manage_script" => t("Manage scripts", "管理脚本"),
         "todowrite" => t("Todo list", "任务列表"),
+        "get_goal" => t("Goal", "读取目标"),
+        "create_goal" => t("Set goal", "创建目标"),
+        "update_goal" => t("Update goal", "更新目标"),
         "review_aur_package" => t("Review AUR package", "审查 AUR 包"),
         "install_aur_package" => t("Install AUR package", "安装 AUR 包"),
         "review_pkgbuild_directory" => t("Review PKGBUILD directory", "审查 PKGBUILD 目录"),
@@ -380,6 +384,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     // edit_file/edit_string 与 dev 同步退场(验收四轮:normal 也去冗余)。
     apply_patch::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
+    goal::register(&mut registry, paths.clone());
     alarm::register(&mut registry, paths.clone());
     clipboard::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
@@ -539,6 +544,7 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     jobs::register_management(&mut registry);
     apply_patch::register(&mut registry);
     todowrite::register(&mut registry, paths.clone());
+    goal::register(&mut registry, paths.clone());
     web::register_fetch(&mut registry);
     if config.plugins.web.enabled {
         web::register(&mut registry, config.plugins.web.clone());

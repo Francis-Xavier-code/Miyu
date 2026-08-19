@@ -1,0 +1,26 @@
+{
+  "name": "update_goal",
+  "display_name": "更新目标",
+  "description": "更新当前目标的精确版本（先调 get_goal，照抄它返回的 goal_id 与 revision）。action 取 edit | pause | resume | complete | blocked。edit/pause/resume 只能在人类直接发起的回合里调用；在当前这一轮自动续轮里，额外允许 complete 与 blocked。blocked 必须给 blocked_reason，且未达到连续轮数下限时会被机械拒绝。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "goal_id": { "type": "string", "description": "get_goal 返回的精确 goal_id。" },
+      "revision": { "type": "integer", "description": "get_goal 返回的精确 revision（正整数）。" },
+      "action": {
+        "type": "string",
+        "enum": ["edit", "pause", "resume", "complete", "blocked"],
+        "description": "要执行的动作。"
+      },
+      "objective": { "type": "string", "description": "替换后的目标文案；仅 action=edit 有效。" },
+      "max_goal_rounds": { "type": "integer", "description": "替换后的轮数上限；仅 action=edit 有效。" },
+      "blocked_reason": { "type": "string", "description": "具体的阻塞条件；action=blocked 时必填。" }
+    },
+    "required": ["goal_id", "revision", "action"],
+    "additionalProperties": false
+  },
+  "permission": "writes",
+  "always_loaded": false,
+  "load_policy": "summary",
+  "groups": ["planning"]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "create_goal",
+  "display_name": "创建目标",
+  "description": "当人类当前的请求是需要跨多个自动轮持续推进的长任务时，为本会话创建唯一的持久目标。可以从任意语言的表述里推断这个意图；单轮就能做完的琐事不要建目标。只有人类直接发起的回合才能调用，自动轮调用会被拒绝。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "objective": {
+        "type": "string",
+        "description": "从人类请求中提炼出的具体完成目标。"
+      },
+      "max_goal_rounds": {
+        "type": "integer",
+        "description": "可选：自动续轮的上限（正整数）。不给则用默认值。"
+      }
+    },
+    "required": ["objective"],
+    "additionalProperties": false
+  },
+  "permission": "writes",
+  "always_loaded": false,
+  "load_policy": "summary",
+  "groups": ["planning"]
+}
