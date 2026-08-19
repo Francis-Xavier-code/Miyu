@@ -5,6 +5,7 @@ mod archlinux;
 mod artifact;
 mod ask_question;
 mod calculator;
+mod awacy_query;
 mod caniplayonlinux_query;
 mod clipboard;
 mod deep_research;
@@ -390,7 +391,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     web::register_fetch(&mut registry);
     fcitx_wiki::register(&mut registry);
     weather::register(&mut registry);
-    protondb_query::register(&mut registry);
+    protondb_query::register(&mut registry, paths.clone());
     // 插件关就不注册:关掉的插件仍然常驻一份完整契约,是三个面都白背的
     // 纯浪费(08-17 实测 get_exchange_rate 311 字符)。
     if config.plugins.exchange_rate.enabled {
@@ -580,7 +581,7 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     registry.set_default_timeout_secs(config.tools.default_timeout_secs);
     web::register_fetch(&mut registry);
     weather::register(&mut registry);
-    protondb_query::register(&mut registry);
+    protondb_query::register(&mut registry, paths.clone());
     // 插件关就不注册:关掉的插件仍然常驻一份完整契约,是三个面都白背的
     // 纯浪费(08-17 实测 get_exchange_rate 311 字符)。
     if config.plugins.exchange_rate.enabled {
@@ -699,7 +700,7 @@ mod tests {
         assert!(!names(&dev_registry(&config, &paths)).contains(&"vision_analyze".to_string()));
     }
 
-    fn test_paths(root: &std::path::Path) -> MiyuPaths {
+    pub(super) fn test_paths(root: &std::path::Path) -> MiyuPaths {
         MiyuPaths {
             root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
