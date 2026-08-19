@@ -385,7 +385,7 @@ pub(in crate::agent) fn interrupted_turn_replay_messages(
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     messages.push(ChatMessage::turn_context(
-        "<interrupted-turn-recovery>上一轮回复已中断。以下内容是中断前已经持久化的模型输出和工具进度；不要重新执行已经完成的工具，基于这些内容继续处理当前用户请求。</interrupted-turn-recovery>",
+        "<interrupted-turn-recovery>The previous reply was interrupted. Below is the model output and tool progress that had already been persisted before the interruption; do not re-run tools that already completed — continue handling the current user request from this content.</interrupted-turn-recovery>",
     ));
 
     // A redo revision only journals the new branch. Preserve the already

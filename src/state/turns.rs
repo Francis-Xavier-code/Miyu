@@ -15,6 +15,7 @@ impl StateStore {
         Self {
             state_dir: self.state_dir.clone(),
             artifacts_dir: self.artifacts_dir.clone(),
+            shared_files_dir: self.shared_files_dir.clone(),
             conv_db: self.conv_db.clone(),
             platform_access: self.platform_access.clone(),
             session_id: Arc::new(std::sync::RwLock::new(session_id.into())),

@@ -257,7 +257,7 @@ pub fn closed_tool_output() -> String {
 }
 
 pub fn assistant_exchange_text(exchange: &QuestionExchange) -> String {
-    let mut output = String::from("补充确认：");
+    let mut output = String::from("Clarification questions:");
     for (index, question) in exchange.questions.iter().enumerate() {
         output.push_str(&format!(
             "\n{}. [{}] {}",
@@ -272,16 +272,16 @@ pub fn assistant_exchange_text(exchange: &QuestionExchange) -> String {
             }
         }
         if question.custom {
-            output.push_str("\n   - 可输入自定义答案");
+            output.push_str("\n   - custom answer allowed");
         }
     }
     output
 }
 
 pub fn user_exchange_text(exchange: &QuestionExchange) -> String {
-    let mut output = String::from("补充回答：");
+    let mut output = String::from("Clarification answers:");
     for (question, answers) in exchange.questions.iter().zip(&exchange.answers) {
-        output.push_str(&format!("\n- {}：{}", question.header, answers.join("、")));
+        output.push_str(&format!("\n- {}: {}", question.header, answers.join(", ")));
     }
     output
 }
@@ -369,7 +369,7 @@ mod tests {
         let exchange = QuestionExchange::new(request(), vec![vec!["全部".to_string()]]).unwrap();
         let text = assistant_exchange_text(&exchange);
         assert!(text.contains("全部: 修改全部相关文件"));
-        assert!(text.contains("可输入自定义答案"));
+        assert!(text.contains("custom answer allowed"));
     }
 
     #[test]

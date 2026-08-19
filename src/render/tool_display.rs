@@ -246,7 +246,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         "deep_research" => string_arg(&args, &["topic"]),
         "check_issue" => string_arg(&args, &["target", "area", "issue", "symptom"]),
         "get_weather" => string_arg(&args, &["location"])
-            .or_else(|| Some(t("automatic location", "自动定位").to_string())),
+            .or_else(|| Some(t("missing location", "缺少地点").to_string())),
         "get_exchange_rate" => {
             let base = string_arg(&args, &["base"])?;
             let target = string_arg(&args, &["target"])?;

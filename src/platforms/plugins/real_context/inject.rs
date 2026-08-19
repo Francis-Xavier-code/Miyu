@@ -352,11 +352,11 @@ impl RealContextPlugin {
         let affection_level = affection
             .as_ref()
             .map(|value| value.level_name)
-            .unwrap_or("中立");
+            .unwrap_or("neutral");
         let affection_prompt = affection
             .as_ref()
             .map(|value| value.relationship_prompt.as_str())
-            .unwrap_or("按当前关系自然判断。");
+            .unwrap_or("Judge naturally based on the current relationship.");
         let affection_bias = affection.as_ref().map_or(0.0, |value| value.reply_bias);
         let judged = tokio::select! {
             biased;
@@ -625,12 +625,12 @@ impl RealContextPlugin {
             // 提示词说一次(实测一条 780K token 的群聊请求里它出现 558 次、
             // 共 60,264 字符)。这里只保留会变的缺口提示。
             let gap_note = if truncated_backlog {
-                "\n（这段时间的消息较多，此处只包含其中最近的一部分；更早的记录可用 search_real_chat_history 取得。）"
+                "\n(There were many messages in this period; only the most recent portion is included here. Earlier records are available via search_real_chat_history.)"
             } else {
                 ""
             };
             format!(
-                "[此前群聊记录]{gap_note}\n{}\n\n{current_block}",
+                "[Prior group chat records]{gap_note}\n{}\n\n{current_block}",
                 formatted.text
             )
         };

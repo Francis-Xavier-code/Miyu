@@ -7,7 +7,7 @@ pub(crate) use scoring::*;
 
 use super::store::{GroupKey, HistoryStore, RecentQuery};
 use crate::config::{AppConfig, RealContextPluginSettings, REAL_CONTEXT_PLUGIN_ID};
-use crate::i18n::{agent_text as t, text_for, Locale};
+use crate::i18n::{text_for, Locale};
 use crate::llm::{ChatMessage, OpenAiCompatibleClient};
 use crate::paths::MiyuPaths;
 use crate::platforms::{ConversationKind, PlatformTurnContext};
@@ -368,10 +368,7 @@ pub(super) fn register_query_tool(
     registry.register(
         ToolSpec::new(
             "query_qq_relationship",
-            t(
-                "Read Miyu's relationship state with a QQ user when relationship context is useful. The result intentionally omits numeric scores.",
-                "当关系背景有助于回答时，查询 Miyu 与某个 QQ 用户的关系状态。结果不会返回具体分数。",
-            ),
+            "Read Miyu's relationship state with a QQ user when relationship context is useful. The result intentionally omits numeric scores.",
             json!({
                 "type": "object",
                 "properties": {
@@ -386,7 +383,7 @@ pub(super) fn register_query_tool(
                 async move { query_relationship(arguments, context, settings).await }
             },
         )
-        .with_display_name(t("Query QQ relationship", "查询 QQ 关系")),
+        .with_display_name("Query QQ relationship"),
     );
 }
 

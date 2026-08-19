@@ -22,6 +22,7 @@ mod images;
 mod inbound;
 mod notices;
 mod outbound;
+mod proactive;
 mod send;
 mod turn;
 use adapter::*;
@@ -33,6 +34,7 @@ use connection::*;
 // 这三样 onebot 之外也要用（platforms 持有注册表与监听器，web 复用端口），
 // 子模块本身是私有的，得显式再导出一层
 pub(crate) use connection::{onebot_ws_on_web_port, ConnectionRegistry, QqListenerManager};
+pub(crate) use proactive::send_direct_text;
 pub(crate) use turn::wake_conversation_for_job;
 use files::*;
 use group_join::*;

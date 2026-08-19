@@ -10,21 +10,27 @@ use crate::platforms::plugins::real_context::*;
 
 pub(in crate::platforms::plugins::real_context) const TRIGGER_KEY: &str = "real_context.trigger";
 
-pub(in crate::platforms::plugins::real_context) const MODERATION_NOTICE_KEY: &str = "real_context.moderation_notice";
+pub(in crate::platforms::plugins::real_context) const MODERATION_NOTICE_KEY: &str =
+    "real_context.moderation_notice";
 
-pub(in crate::platforms::plugins::real_context) const REPLY_MARKED_KEY: &str = "real_context.reply_marked";
+pub(in crate::platforms::plugins::real_context) const REPLY_MARKED_KEY: &str =
+    "real_context.reply_marked";
 
-pub(in crate::platforms::plugins::real_context) const ACTIVE_TARGETS_KEY: &str = "real_context.active_targets";
+pub(in crate::platforms::plugins::real_context) const ACTIVE_TARGETS_KEY: &str =
+    "real_context.active_targets";
 
 pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_TARGET_MESSAGES: usize = 8;
 
 pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_SUPPLEMENT_MESSAGES: usize = 5;
 
-pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_CURRENT_CONTENT_BYTES: usize = 16 * 1024;
+pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_CURRENT_CONTENT_BYTES: usize =
+    16 * 1024;
 
-pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_TARGET_PROMPT_BYTES: usize = 128 * 1024;
+pub(in crate::platforms::plugins::real_context) const MAX_ACTIVE_TARGET_PROMPT_BYTES: usize =
+    128 * 1024;
 
-pub(in crate::platforms::plugins::real_context) const REPLY_WATERMARK_KEY: &str = "reply_ingress_watermark";
+pub(in crate::platforms::plugins::real_context) const REPLY_WATERMARK_KEY: &str =
+    "reply_ingress_watermark";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::platforms::plugins::real_context) enum TriggerKind {
@@ -57,7 +63,10 @@ impl TriggerKind {
         })
     }
 
-    pub(in crate::platforms::plugins::real_context) fn log_label(self, locale: Locale) -> &'static str {
+    pub(in crate::platforms::plugins::real_context) fn log_label(
+        self,
+        locale: Locale,
+    ) -> &'static str {
         match (locale, self) {
             (Locale::Zh, Self::Probability) => "概率抽样 (probability)",
             (Locale::Zh, Self::Continuation) => "自然续聊 (continuation)",
@@ -72,7 +81,11 @@ impl TriggerKind {
         }
     }
 
-    pub(in crate::platforms::plugins::real_context) fn decision_log_title(self, should_reply: bool, locale: Locale) -> String {
+    pub(in crate::platforms::plugins::real_context) fn decision_log_title(
+        self,
+        should_reply: bool,
+        locale: Locale,
+    ) -> String {
         if locale == Locale::Zh {
             let kind = if self == Self::Continuation {
                 "续聊窗口判断"
@@ -153,7 +166,9 @@ pub(in crate::platforms::plugins::real_context) fn active_judgement_allowed(
                 && !(privileged_sender && settings.privileged_direct_trigger_skip_active_judgement))
 }
 
-pub(in crate::platforms::plugins::real_context) fn active_reply_target(event: &PlatformInboundEvent) -> ActiveReplyTarget {
+pub(in crate::platforms::plugins::real_context) fn active_reply_target(
+    event: &PlatformInboundEvent,
+) -> ActiveReplyTarget {
     let supplemental = event.text.trim().is_empty()
         && !event.media.is_empty()
         && event.media.iter().all(|media| {
@@ -184,7 +199,10 @@ pub(in crate::platforms::plugins::real_context) fn active_reply_target(event: &P
     }
 }
 
-pub(in crate::platforms::plugins::real_context) fn normalize_active_targets(targets: &mut Vec<ActiveReplyTarget>, sender_id: &str) {
+pub(in crate::platforms::plugins::real_context) fn normalize_active_targets(
+    targets: &mut Vec<ActiveReplyTarget>,
+    sender_id: &str,
+) {
     targets.retain(|target| target.sender_id == sender_id);
     let mut seen = std::collections::HashSet::new();
     targets.retain(|target| target.message_id.is_empty() || seen.insert(target.message_id.clone()));
@@ -203,14 +221,19 @@ pub(in crate::platforms::plugins::real_context) fn normalize_active_targets(targ
     }
 }
 
-pub(in crate::platforms::plugins::real_context) fn active_targets_from_context(context: &PlatformTurnContext) -> Vec<ActiveReplyTarget> {
+pub(in crate::platforms::plugins::real_context) fn active_targets_from_context(
+    context: &PlatformTurnContext,
+) -> Vec<ActiveReplyTarget> {
     context
         .plugin_value(ACTIVE_TARGETS_KEY)
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-pub(in crate::platforms::plugins::real_context) fn set_active_targets(context: &PlatformTurnContext, targets: &[ActiveReplyTarget]) {
+pub(in crate::platforms::plugins::real_context) fn set_active_targets(
+    context: &PlatformTurnContext,
+    targets: &[ActiveReplyTarget],
+) {
     if let Ok(value) = serde_json::to_value(targets) {
         context.set_plugin_value(ACTIVE_TARGETS_KEY, value);
     }
@@ -246,7 +269,7 @@ pub(in crate::platforms::plugins::real_context) fn format_mentioned_users(
                 ),
                 Some(name) => safe_prompt_field(name),
                 None if show_ids => format!("QQ:{}", safe_prompt_field(&user.user_id)),
-                None => "名称解析失败的群成员".to_string(),
+                None => "unresolved group member".to_string(),
             })
             .collect::<Vec<_>>()
             .join("、"),
@@ -283,7 +306,7 @@ pub(in crate::platforms::plugins::real_context) fn active_target_prompt(
             target.content.trim()
         };
         let content = if content.is_empty() {
-            "（无文字内容；包含图片或表情）".to_string()
+            "(no text content; contains images or stickers)".to_string()
         } else {
             content.to_string()
         };
@@ -305,7 +328,7 @@ pub(in crate::platforms::plugins::real_context) fn active_target_prompt(
         );
         if let Some(message_id) = target.reply_message_id.as_ref() {
             line.push_str(&format!(
-                "\n  回复引用: msg={}",
+                "\n  reply-to: msg={}",
                 safe_prompt_field(message_id)
             ));
             if let Some(name) = target.reply_sender_name.as_ref() {
@@ -325,7 +348,7 @@ pub(in crate::platforms::plugins::real_context) fn active_target_prompt(
             &target.mentioned_user_ids,
             show_ids,
         ) {
-            line.push_str(&format!("\n  @对象: {mentions}"));
+            line.push_str(&format!("\n  @mentions: {mentions}"));
         }
         line
     };
@@ -348,23 +371,25 @@ pub(in crate::platforms::plugins::real_context) fn active_target_prompt(
     // 块标记同样只描述内容本身。原来结尾那条「只回复当前消息…补充材料不应被单独
     // 回复。需要调用工具时…」整条删除:前两句是跨轮指令丢失的语义来源,末句是多余
     // 的输出约束,而唯一有信息量的「以后文为准」已由标记里的"按时间先后排列"覆盖。
-    let head = format!("[本轮新收到的消息]\n{current}");
+    let head = format!("[New messages received this turn]\n{current}");
     let mut sections = vec![head.clone()];
     if !previous.is_empty() {
         sections.extend([
-            "\n[同一发送者本轮更早发送的消息，按时间先后排列]".to_string(),
+            "\n[Earlier messages from the same sender this turn, in chronological order]"
+                .to_string(),
             previous.join("\n"),
         ]);
     }
     if !supplements.is_empty() {
         sections.extend([
-            "\n[同一发送者随后补发的消息，按时间先后排列]".to_string(),
+            "\n[Follow-up messages sent later by the same sender, in chronological order]"
+                .to_string(),
             supplements.join("\n"),
         ]);
     }
     let body = sections.join("\n");
     let body = if body.len() > MAX_ACTIVE_TARGET_PROMPT_BYTES {
-        let marker = "\n\n（较早合并消息因长度限制省略）\n";
+        let marker = "\n\n(earlier merged messages omitted due to length limits)\n";
         let suffix_budget = MAX_ACTIVE_TARGET_PROMPT_BYTES
             .saturating_sub(head.len())
             .saturating_sub(marker.len());
@@ -419,7 +444,10 @@ pub(in crate::platforms::plugins::real_context) fn restore_core_trigger(
     context.set_response_target(decision.response_target.clone());
 }
 
-pub(in crate::platforms::plugins::real_context) fn restore_trigger_decision(decision: &mut TriggerDecision, fallback: &TriggerDecision) {
+pub(in crate::platforms::plugins::real_context) fn restore_trigger_decision(
+    decision: &mut TriggerDecision,
+    fallback: &TriggerDecision,
+) {
     *decision = fallback.clone();
 }
 
@@ -476,20 +504,25 @@ pub(crate) fn safe_prompt_field(value: &str) -> String {
         .to_string()
 }
 
-pub(in crate::platforms::plugins::real_context) fn moderation_notice(moderation: &judge::ModerationResult) -> String {
+pub(in crate::platforms::plugins::real_context) fn moderation_notice(
+    moderation: &judge::ModerationResult,
+) -> String {
     format!(
-        "疑似违规初判：严重度 {:.1}/10；类型：{}；证据：{}；规则依据：{}；理由：{}；相关 QQ：{}；相关消息 ID：{}。",
+        "Preliminary moderation flag: severity {:.1}/10; category: {}; evidence: {}; rule basis: {}; reasoning: {}; related QQ: {}; related message IDs: {}.",
         moderation.severity,
-        empty_as(&moderation.category, "未分类"),
-        empty_as(&moderation.evidence, "未提供"),
-        empty_as(&moderation.rule_basis, "固定安全底线"),
-        empty_as(&moderation.reasoning, "未提供"),
+        empty_as(&moderation.category, "uncategorized"),
+        empty_as(&moderation.evidence, "not provided"),
+        empty_as(&moderation.rule_basis, "the fixed safety baseline"),
+        empty_as(&moderation.reasoning, "not provided"),
         moderation.related_user_ids.join(", "),
         moderation.related_message_ids.join(", "),
     )
 }
 
-pub(in crate::platforms::plugins::real_context) fn empty_as<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+pub(in crate::platforms::plugins::real_context) fn empty_as<'a>(
+    value: &'a str,
+    fallback: &'a str,
+) -> &'a str {
     if value.trim().is_empty() {
         fallback
     } else {
@@ -497,7 +530,10 @@ pub(in crate::platforms::plugins::real_context) fn empty_as<'a>(value: &'a str, 
     }
 }
 
-pub(in crate::platforms::plugins::real_context) fn find_keyword<'a>(keywords: &'a [String], text: &str) -> Option<&'a str> {
+pub(in crate::platforms::plugins::real_context) fn find_keyword<'a>(
+    keywords: &'a [String],
+    text: &str,
+) -> Option<&'a str> {
     let mut folded = None;
     keywords
         .iter()
@@ -518,7 +554,10 @@ pub(in crate::platforms::plugins::real_context) fn find_keyword<'a>(keywords: &'
         .map(String::as_str)
 }
 
-pub(in crate::platforms::plugins::real_context) fn contains_ascii_case_insensitive(text: &str, needle: &str) -> bool {
+pub(in crate::platforms::plugins::real_context) fn contains_ascii_case_insensitive(
+    text: &str,
+    needle: &str,
+) -> bool {
     if needle.is_empty() {
         return false;
     }

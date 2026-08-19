@@ -124,8 +124,12 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
     // 「是否自动跑」驻内存、重启即失，必须由人 `/goal resume` 重新授权。
     // 不然一次崩溃重启就能让机器在无人看管的情况下继续自己开轮。
     spawn_goal_round_driver(state.clone());
+    // QQ 定时消息:常驻 tick 循环,每个 tick 现读配置,启停/改表无需重启。
+    crate::platforms::plugins::scheduled_messages::spawn_scheduled_message_worker(state.clone());
     let app = router(state.clone());
     let urls = ipc::web_access_urls_for(bind_ip, port);
+    // share_file 工具用这些地址把相对下载路径拼成局域网完整链接。
+    tools::set_share_url_bases(urls.clone());
     for url in &urls {
         println!("Miyu WebUI: {url}");
     }
@@ -294,6 +298,12 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
         .route("/api/events", get(events))
         .route("/api/assets/{asset_id}", get(image_asset))
         .route("/api/artifacts/{asset_id}", get(artifact_asset))
+        .route("/api/shared", get(shared_files_list))
+        .route(
+            "/api/shared/{share_id}",
+            get(shared_file_download).delete(shared_file_delete),
+        )
+        .route("/shared.js", get(shared_js_asset))
         .route(
             "/api/attachments",
             post(upload_user_attachment).layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),

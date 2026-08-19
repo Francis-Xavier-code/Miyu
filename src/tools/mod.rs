@@ -3,6 +3,8 @@ mod api_quota;
 mod apply_patch;
 mod archlinux;
 mod artifact;
+mod share_file;
+pub use share_file::set_share_url_bases;
 mod ask_question;
 mod awacy_query;
 mod calculator;
@@ -363,11 +365,7 @@ pub(crate) fn command_deny_guard(patterns: Vec<String>) -> ToolGuard {
             .iter()
             .find(|pattern| !pattern.is_empty() && command.contains(pattern.as_str()))
             .map(|pattern| {
-                crate::i18n::agent_is_zh()
-                    .then(|| format!("命令包含被禁止的模式 `{pattern}`,已拒绝执行"))
-                    .unwrap_or_else(|| {
-                        format!("command contains the denied pattern `{pattern}` and was rejected")
-                    })
+                format!("command contains the denied pattern `{pattern}` and was rejected")
             })
     })
 }
@@ -468,6 +466,15 @@ pub fn register_webui_artifact_tools(
     session_id: &str,
 ) {
     artifact::register_webui(registry, paths, session_id);
+}
+
+/// WebUI 文件分享工具。与 artifact 演示区解耦，单独注册。
+pub fn register_webui_share_tools(
+    registry: &mut ToolRegistry,
+    config: &AppConfig,
+    store: crate::state::StateStore,
+) {
+    share_file::register_webui(registry, config, store);
 }
 
 pub fn webui_artifact_manifest(paths: &MiyuPaths, session_id: &str) -> anyhow::Result<String> {
@@ -607,6 +614,11 @@ pub fn restricted_platform_registry(config: &AppConfig, paths: &MiyuPaths) -> To
     }
     if config.plugins.image_generation.enabled {
         image_generation::register(&mut registry, config.clone(), paths.clone());
+        // 静态英文追加,所有平台会话字节一致,不影响本地注册表的描述。
+        registry.amend_description(
+            "generate_image",
+            " In messaging-platform conversations at most one image is generated per user request; the limit is enforced automatically.",
+        );
     }
     if config.skills.enabled {
         if let Err(error) = skills::register_skills(&mut registry, config, paths) {

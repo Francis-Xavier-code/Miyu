@@ -1,7 +1,7 @@
 {
   "name": "register_deep_research_reference",
   "display_name": "注册引用来源",
-  "description": "登记来源并取得稳定引用标记（如 [W1]）。\nRegister a source and receive a stable citation marker such as [W1].",
+  "description": "Register a source and receive a stable citation marker such as [W1].",
   "parameters": {
     "type": "object",
     "properties": {

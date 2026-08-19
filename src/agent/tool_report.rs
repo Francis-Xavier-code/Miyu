@@ -280,11 +280,7 @@ pub(in crate::agent) fn prune_tool_output(
     }
     let chars: Vec<char> = output.chars().collect();
     let omitted = chars.len() - head - tail;
-    let marker = format!(
-        "\n…[{} {omitted} {}]\n",
-        crate::i18n::agent_text("omitted", "已省略"),
-        crate::i18n::agent_text("chars from the middle", "字符（中段）")
-    );
+    let marker = format!("\n…[{} {omitted} {}]\n", "omitted", "chars from the middle");
     let mut pruned = String::new();
     pruned.extend(&chars[..head]);
     pruned.push_str(&marker);

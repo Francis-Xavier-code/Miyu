@@ -269,6 +269,32 @@ impl PlatformTurnContext {
             .unwrap_or(default_enabled)
     }
 
+    /// 平台生图豁免：管理员，或私聊白名单成员（静态配置 ∪ 动态授权）。
+    /// 与 `allow_non_admin_host_tools` 解耦——那是宿主工具的开关，不管生图。
+    pub(crate) fn image_generation_unlimited(&self) -> bool {
+        if self.is_admin {
+            return true;
+        }
+        if self.conversation.kind != ConversationKind::Private {
+            return false;
+        }
+        let statically_whitelisted = self.sender_id.parse::<i64>().ok().is_some_and(|sender| {
+            self.config
+                .platforms
+                .qq
+                .private_chats
+                .whitelist
+                .contains(&sender)
+        });
+        statically_whitelisted
+            || access_control::has_dynamic_access(
+                &self.state_store,
+                &self.conversation.account_id,
+                access_control::AccessPermission::PrivateWhitelist,
+                &self.sender_id,
+            )
+    }
+
     pub(crate) fn host_tools_allowed(&self) -> bool {
         if self.is_admin {
             return true;

@@ -198,5 +198,5 @@ async fn job_stop_terminates_a_running_job() {
     assert_eq!(stopped["status"], "stopped");
     // 新语义(08-16):停止即报告,条目当场出表;日志仍在磁盘。
     let error = job_status(json!({"job_id": job_id})).await.unwrap_err();
-    assert!(format!("{error:#}").contains("不存在"), "{error:#}");
+    assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
 }

@@ -1,7 +1,7 @@
 {
   "name": "get_goal",
   "display_name": "读取目标",
-  "description": "读取本会话当前的长任务目标：用于比较并设置的精确 goal_id/revision、目标文案、阶段、已用/上限轮数、阻塞原因，以及自动续跑是否已武装。调用 update_goal 前必须先调它拿到最新的 goal_id 与 revision。",
+  "description": "Read this session's current long-task goal: the exact goal_id/revision used for compare-and-set, the goal text, phase, used/max turn counts, blocking reason, and whether auto-continuation is armed. Must be called before update_goal to obtain the latest goal_id and revision.",
   "parameters": { "type": "object", "properties": {}, "additionalProperties": false },
   "permission": "reads",
   "always_loaded": false,

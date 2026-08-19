@@ -1,5 +1,4 @@
 use super::PlatformTurnContext;
-use crate::i18n::agent_text as t;
 use crate::platform_types::{ConversationKind, OutboundMessage, OutboundOrigin, OutboundSegment};
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
@@ -21,7 +20,7 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": t("Optional text or Markdown.", "可选文本或 Markdown。") },
+                "text": { "type": "string", "description": "Optional text or Markdown." },
                 "images": {
                     "type": "array",
                     "maxItems": MAX_TOOL_IMAGES,
@@ -55,7 +54,7 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": t("Text or Markdown to send.", "要发送的文本或 Markdown。") }
+                "text": { "type": "string", "description": "Text or Markdown to send." }
             },
             "required": ["text"],
             "additionalProperties": false
@@ -64,10 +63,7 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
     registry.register(
         ToolSpec::new(
             "send_message_to_user",
-            t(
-                "Send text, local images, or local files to the current messaging-platform conversation. Use native attachments only for content that another tool has not already emitted in this turn; the host delivers tool-emitted images automatically. This tool cannot target another conversation.",
-                "向当前通讯平台会话发送文本、本地图片或本地文件。仅发送本轮中尚未由其他工具发布的原生附件；工具已发布的图片会由宿主自动投递。此工具不能指定其他会话。",
-            ),
+            "Send text, local images, or local files to the current messaging-platform conversation. Use native attachments only for content that another tool has not already emitted in this turn; the host delivers tool-emitted images automatically. This tool cannot target another conversation.",
             parameters,
             move |arguments| {
                 let context = context.clone();
@@ -75,7 +71,7 @@ pub(crate) fn register(registry: &mut ToolRegistry, context: Arc<PlatformTurnCon
             },
         )
         .writes()
-        .with_display_name(t("Send message", "发送消息")),
+        .with_display_name("Send message"),
     );
 }
 
@@ -83,10 +79,7 @@ fn register_mention(registry: &mut ToolRegistry, context: Arc<PlatformTurnContex
     registry.register(
         ToolSpec::new(
             "qq_mention_users",
-            t(
-                "Make Miyu's next outgoing message in the current QQ group natively @ one or more members. Provide exact QQ IDs; use get_group_members_info first when only names are known. These explicit targets replace the automatic reply mention but preserve its message-quote behavior. This tool does not send a separate message.",
-                "让 Miyu 在当前 QQ 群的下一条消息中原生艾特一名或多名成员。请提供准确 QQ 号；只知道名字时先调用 get_group_members_info。显式目标会覆盖自动回复艾特，但保留消息引用策略。此工具不会单独发送消息。",
-            ),
+            "Make Miyu's next outgoing message in the current QQ group natively @ one or more members. Provide exact QQ IDs; use get_group_members_info first when only names are known. These explicit targets replace the automatic reply mention but preserve its message-quote behavior. This tool does not send a separate message.",
             json!({
                 "type": "object",
                 "properties": {
@@ -98,7 +91,7 @@ fn register_mention(registry: &mut ToolRegistry, context: Arc<PlatformTurnContex
                             "type": "string",
                             "pattern": "^[1-9][0-9]{4,11}$"
                         },
-                        "description": t("Exact QQ IDs of the members to mention, in display order.", "要艾特的群成员 QQ 号列表，按显示顺序填写。")
+                        "description": "Exact QQ IDs of the members to mention, in display order."
                     }
                 },
                 "required": ["user_ids"],
@@ -110,7 +103,7 @@ fn register_mention(registry: &mut ToolRegistry, context: Arc<PlatformTurnContex
             },
         )
         .writes()
-        .with_display_name(t("Mention group members", "艾特群成员")),
+        .with_display_name("Mention group members"),
     );
 }
 
@@ -177,10 +170,7 @@ async fn mention(arguments: Value, context: &PlatformTurnContext) -> Result<Stri
         "ok": true,
         "user_ids": user_ids,
         "conversation": context.conversation.scope_key(),
-        "message": t(
-            "The next outgoing message will mention these members. Write that message normally.",
-            "下一条发出的消息会艾特这些成员，请正常撰写消息内容。"
-        )
+        "message": "The next outgoing message will mention these members. Write that message normally."
     })
     .to_string())
 }
@@ -281,17 +271,14 @@ fn register_usage_query(registry: &mut ToolRegistry, context: Arc<PlatformTurnCo
     registry.register(
         ToolSpec::new(
             "query_token_usage",
-            t(
-                "Query Miyu's token usage statistics: totals, request count, cache hit rate, and the per-source (agent / messaging platforms) model breakdown. range: 1d (rolling 24h, default) / 7d / 30d / all.",
-                "查询 Miyu 的 token 消耗统计:总量、请求数、缓存命中率,以及按来源(智能体/通讯平台)的模型构成。range 可选 1d(近 24 小时,默认)/ 7d / 30d / all。",
-            ),
+            "Query Miyu's token usage statistics: totals, request count, cache hit rate, and the per-source (agent / messaging platforms) model breakdown. range: 1d (rolling 24h, default) / 7d / 30d / all.",
             json!({
                 "type": "object",
                 "properties": {
                     "range": {
                         "type": "string",
                         "enum": ["1d", "7d", "30d", "all"],
-                        "description": t("Time range, defaults to 1d (rolling 24h).", "统计范围,默认 1d(近 24 小时)。")
+                        "description": "Time range, defaults to 1d (rolling 24h)."
                     }
                 },
                 "additionalProperties": false
@@ -301,7 +288,7 @@ fn register_usage_query(registry: &mut ToolRegistry, context: Arc<PlatformTurnCo
                 async move { query_token_usage(arguments, context).await }
             },
         )
-        .with_display_name(t("Token usage", "用量统计")),
+        .with_display_name("Token usage"),
     );
 }
 

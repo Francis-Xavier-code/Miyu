@@ -30,6 +30,8 @@ pub const QQ_MEME_COLLECTOR_PLUGIN_ID: &str = "qq_meme_collector";
 
 pub const QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID: &str = "qq_group_join_approval";
 
+pub const QQ_SCHEDULED_MESSAGES_PLUGIN_ID: &str = "qq_scheduled_messages";
+
 pub(crate) const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValidator)] = &[
     ("reply_processor", validate_reply_processor_plugin_config),
     (REAL_CONTEXT_PLUGIN_ID, validate_real_context_plugin_config),
@@ -52,6 +54,10 @@ pub(crate) const PLATFORM_PLUGIN_VALIDATORS: &[(&str, PlatformPluginConfigValida
     (
         QQ_GROUP_JOIN_APPROVAL_PLUGIN_ID,
         validate_qq_group_join_approval_plugin_config,
+    ),
+    (
+        QQ_SCHEDULED_MESSAGES_PLUGIN_ID,
+        validate_qq_scheduled_messages_plugin_config,
     ),
 ];
 
@@ -113,6 +119,121 @@ pub(crate) fn validate_reply_processor_plugin_config(instance: &PlatformPluginIn
             })?;
             if value.len() > 4_096 || value.contains('\0') {
                 bail!("platform plugin reply_processor.{key} is invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 定时消息插件的配置校验。格式错误在保存/启动阶段就要炸出来，运行时的
+/// 解析器只做防御性跳过。时间/星期解析逻辑刻意与运行侧保持独立小实现，
+/// 避免 config 层反向依赖 platforms 层。
+pub(crate) fn validate_qq_scheduled_messages_plugin_config(
+    instance: &PlatformPluginInstanceConfig,
+) -> Result<()> {
+    let Some(tasks) = instance.settings.get("tasks") else {
+        return Ok(());
+    };
+    let tasks = tasks
+        .as_array()
+        .context("platform plugin qq_scheduled_messages.tasks must be an array")?;
+    if tasks.len() > 64 {
+        bail!("platform plugin qq_scheduled_messages.tasks supports at most 64 tasks");
+    }
+    for (index, task) in tasks.iter().enumerate() {
+        let task = task.as_object().with_context(|| {
+            format!("platform plugin qq_scheduled_messages.tasks[{index}] must be an object")
+        })?;
+        let conversation = task
+            .get("conversation")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| {
+                format!(
+                    "platform plugin qq_scheduled_messages.tasks[{index}].conversation must be a string like \"group:123\" or \"private:456\""
+                )
+            })?;
+        let valid_conversation = conversation
+            .trim()
+            .split_once(':')
+            .is_some_and(|(kind, id)| {
+                matches!(kind, "group" | "private")
+                    && !id.is_empty()
+                    && id.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        if !valid_conversation {
+            bail!(
+                "platform plugin qq_scheduled_messages.tasks[{index}].conversation must be \"group:<id>\" or \"private:<id>\""
+            );
+        }
+        let times = task
+            .get("times")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| {
+                format!("platform plugin qq_scheduled_messages.tasks[{index}].times must be an array of \"HH:MM\" strings")
+            })?;
+        if times.is_empty() || times.len() > 48 {
+            bail!(
+                "platform plugin qq_scheduled_messages.tasks[{index}].times must contain 1 to 48 entries"
+            );
+        }
+        for time in times {
+            let valid_time = time.as_str().is_some_and(|time| {
+                time.trim().split_once(':').is_some_and(|(hour, minute)| {
+                    hour.parse::<u32>().is_ok_and(|hour| hour < 24)
+                        && minute.parse::<u32>().is_ok_and(|minute| minute < 60)
+                })
+            });
+            if !valid_time {
+                bail!(
+                    "platform plugin qq_scheduled_messages.tasks[{index}].times entries must be \"HH:MM\" (got {time})"
+                );
+            }
+        }
+        let message = task
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| {
+                format!("platform plugin qq_scheduled_messages.tasks[{index}].message must be a string")
+            })?;
+        if message.trim().is_empty() || message.chars().count() > 4_096 {
+            bail!(
+                "platform plugin qq_scheduled_messages.tasks[{index}].message must be non-empty and at most 4096 characters"
+            );
+        }
+        if let Some(days) = task.get("days") {
+            let days = days.as_array().with_context(|| {
+                format!("platform plugin qq_scheduled_messages.tasks[{index}].days must be an array of weekday names")
+            })?;
+            if days.is_empty() {
+                bail!(
+                    "platform plugin qq_scheduled_messages.tasks[{index}].days must not be empty when present"
+                );
+            }
+            for day in days {
+                let valid_day = day.as_str().is_some_and(|day| {
+                    matches!(
+                        day.trim().to_ascii_lowercase().as_str(),
+                        "mon" | "monday"
+                            | "tue" | "tuesday"
+                            | "wed" | "wednesday"
+                            | "thu" | "thursday"
+                            | "fri" | "friday"
+                            | "sat" | "saturday"
+                            | "sun" | "sunday"
+                    )
+                });
+                if !valid_day {
+                    bail!(
+                        "platform plugin qq_scheduled_messages.tasks[{index}].days entries must be weekday names like \"mon\" (got {day})"
+                    );
+                }
+            }
+        }
+        if let Some(account) = task.get("account") {
+            if !account.is_i64() {
+                bail!(
+                    "platform plugin qq_scheduled_messages.tasks[{index}].account must be an integer QQ account id"
+                );
             }
         }
     }

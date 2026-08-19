@@ -12,7 +12,6 @@ pub(crate) use ledger::*;
 pub(crate) use output::*;
 
 use super::{CommandOutputStream, ToolProgress, ToolRegistry, ToolSpec};
-use crate::i18n::agent_text as t;
 use crate::paths::MiyuPaths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -396,7 +395,7 @@ pub async fn spawn_background(
         "job_id": job_id,
         "pid": pid,
         "log": log_path.display().to_string(),
-        "note": t("Background command running. You will be woken automatically when it finishes — do not poll job_status to wait; query it only when you need interim logs. Never assume the result before completion.", "后台命令运行中。完成后会自动唤起你——不要为了等待结果轮询 job_status，只在需要查看中途日志时查询；完成前不要臆测其结果。")
+        "note": "Background command running. You will be woken automatically when it finishes — do not poll job_status to wait; query it only when you need interim logs. Never assume the result before completion."
     }))?)
 }
 
@@ -472,10 +471,7 @@ where
         "kind": "background_subagent",
         "job_id": job_id,
         "log": log_path.display().to_string(),
-        "note": t(
-            "Subagent detached to the background. Query with job_status (the log holds its progress); never assume its result before it finishes — you will be woken automatically when it completes.",
-            "子代理已后台分离运行。用 job_status 查询（日志即其进度）；完成前不要臆测结果，完成后会自动唤起你跟进。"
-        )
+        "note": "Subagent detached to the background. Query with job_status (the log holds its progress); never assume its result before it finishes — you will be woken automatically when it completes."
     }))?)
 }
 
@@ -557,7 +553,7 @@ fn ensure_jobs_visible(ids: &[String], current: Option<&str>, all: bool, verb: &
     for id in ids {
         if let Some(job) = jobs.get(id) {
             if !job_visible(job.session_id.as_deref(), current, all) {
-                bail!("后台任务 {id} 属于其他会话；如确需{verb}请传 all=true");
+                bail!("background job {id} belongs to another session; pass all=true if you really need to {verb} it");
             }
         }
     }
@@ -640,11 +636,11 @@ pub async fn stop_job(job_id: &str) -> Result<()> {
 async fn job_stop(args: Value) -> Result<String> {
     let ids = requested_job_ids(&args);
     if ids.is_empty() {
-        bail!("job_id 或 job_ids 至少提供一个；usage: job_stop({{\"job_ids\":[\"abc123\"]}})");
+        bail!("provide at least one of job_id or job_ids; usage: job_stop({{\"job_ids\":[\"abc123\"]}})");
     }
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let current = super::workspace::try_session();
-    ensure_jobs_visible(&ids, current.as_deref(), all, "停止")?;
+    ensure_jobs_visible(&ids, current.as_deref(), all, "stop")?;
     if ids.len() > 1 {
         // Concurrent for the same reason as `stop_session_jobs`; per-id errors
         // still stay per-id rather than aborting the batch.
@@ -664,13 +660,13 @@ async fn job_stop(args: Value) -> Result<String> {
     }
     let job_id = &ids[0];
     let job = job_snapshot(job_id)
-        .with_context(|| format!("后台任务 {job_id} 不存在"))?;
+        .with_context(|| format!("background job {job_id} does not exist"))?;
     if job.state.is_terminal() {
         return Ok(serde_json::to_string_pretty(&json!({
             "ok": true,
             "job_id": job_id,
             "status": job.state.label(),
-            "note": t("the background task had already finished", "该后台任务此前已结束"),
+            "note": "the background task had already finished",
         }))?);
     }
     let status = stop_one(job_id).await?;
@@ -684,7 +680,7 @@ async fn job_stop(args: Value) -> Result<String> {
 /// Stop a single job; returns its resulting status label.
 async fn stop_one(job_id: &str) -> Result<String> {
     let job = job_snapshot(job_id)
-        .with_context(|| format!("后台任务 {job_id} 不存在"))?;
+        .with_context(|| format!("background job {job_id} does not exist"))?;
     if job.state.is_terminal() {
         return Ok(job.state.label());
     }
@@ -727,14 +723,8 @@ pub fn register_management(registry: &mut ToolRegistry) {
 
 fn job_spec() -> ToolSpec {
     let actions = json!(["status", "stop"]);
-    let action_hint = t(
-        "status inspects, stop terminates. Defaults to status.",
-        "status 查询，stop 停止。默认 status。",
-    );
-    let description = t(
-            "Background jobs. action=status with no other argument lists every job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. action=stop terminates jobs (commands get SIGTERM then SIGKILL; subagents are aborted), single or by job_ids. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.",
-            "后台任务。action=status 不带其它参数就列出本会话全部任务——每条都带 recent_output（日志尾部片段）和 log_size，想知道「都跑成什么样了」一次调用就够。要某个任务的增量输出，带 job_id 加 offset；要同时看多个，带 job_ids（日志额度在它们之间均分）。想完整翻阅或从头读某份日志，用 read_file 读它的 log_path（支持按行分页）。action=stop 停止任务（命令先 SIGTERM 后 SIGKILL，子代理直接中止），支持 job_ids 批量。跨会话加 all=true。立即返回——不要为等待结果而循环调用：任务完成会自动唤起你。",
-    );
+    let action_hint = "status inspects, stop terminates. Defaults to status.";
+    let description = "Background jobs. action=status with no other argument lists every job of this session — each entry carries recent_output (the tail of its log) and log_size, so one call answers \"how are my jobs doing\". For a specific job's incremental output pass job_id plus offset; for several at once pass job_ids (the log budget is split between them). To read a log in full or from the start, read_file its log_path — it pages by line. action=stop terminates jobs (commands get SIGTERM then SIGKILL; subagents are aborted), single or by job_ids. Add all=true to reach other sessions. Returns immediately — never call it in a loop to wait: you are woken automatically when a job finishes.";
     ToolSpec::new(
         "job",
         description,
@@ -742,14 +732,14 @@ fn job_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": actions, "description": action_hint },
-                "all": { "type": "boolean", "description": t("true reaches other sessions' jobs.", "true 时不限本会话。") },
-                "job_id": { "type": "string", "description": t("A single job id.", "单个任务 id。") },
+                "all": { "type": "boolean", "description": "true reaches other sessions' jobs." },
+                "job_id": { "type": "string", "description": "A single job id." },
                 "job_ids": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": t("Several job ids at once; for status the log budget is split between them.", "一次多个任务 id；status 时日志额度在它们之间均分。")
+                    "description": "Several job ids at once; for status the log budget is split between them."
                 },
-                "offset": { "type": "integer", "minimum": 0, "description": t("status only: byte offset into the log, from the previous next_offset. The list mode's recent_output is a tail snippet, not a resume point.", "仅 status：日志读取起始字节偏移，用上次返回的 next_offset。列表模式的 recent_output 是尾部片段，不能当续读起点。") }
+                "offset": { "type": "integer", "minimum": 0, "description": "status only: byte offset into the log, from the previous next_offset. The list mode's recent_output is a tail snippet, not a resume point." }
             },
             "additionalProperties": false
         }),
@@ -761,7 +751,7 @@ fn job_spec() -> ToolSpec {
             }
         },
     )
-    .with_display_name(t("Background jobs", "后台任务"))
+    .with_display_name("Background jobs")
 }
 
 #[cfg(test)]

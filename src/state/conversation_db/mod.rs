@@ -8,6 +8,8 @@ mod rows;
 pub(crate) use rows::*;
 pub use rows::{interrupted_text, pending_placeholder};
 mod sessions;
+mod shared_files;
+pub use shared_files::SharedFile;
 mod turns;
 mod types;
 pub use types::*;

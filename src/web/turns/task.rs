@@ -40,6 +40,57 @@ pub(in crate::web) fn into_pasted_images(
 /// StateStore pinned to the turn's session, and an independent cancel signal.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::web) async fn run_turn_task(
+    config: AppConfig,
+    paths: MiyuPaths,
+    store: StateStore,
+    base_store: StateStore,
+    manager: Arc<Mutex<ManagerState>>,
+    events: EventHub,
+    questions: QuestionBroker,
+    run_id: String,
+    session_id: Arc<str>,
+    input: TurnTaskInput,
+    mode: AgentMode,
+    audience: PromptAudience,
+    profile: Option<platforms::TurnProfile>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    resource_cache: Arc<Mutex<TurnResourceCache>>,
+    turn_engine: TurnEngineState,
+    memory_organizer: Option<MemoryOrganizerHandle>,
+) {
+    // 平台回合挂生图配额(管理员/私聊白名单豁免);本地回合不挂,保持无限。
+    // 包在整个 turn future 外面,turn 内所有工具执行路径都能看到同一计数器。
+    let image_limit = profile
+        .as_ref()
+        .and_then(|profile| profile.platform.as_ref())
+        .filter(|context| !context.image_generation_unlimited())
+        .map(|_| crate::tools::workspace::ImageGenLimit::new(1));
+    crate::tools::workspace::with_image_gen_limit(
+        image_limit,
+        run_turn_task_inner(
+            config,
+            paths,
+            store,
+            base_store,
+            manager,
+            events,
+            questions,
+            run_id,
+            session_id,
+            input,
+            mode,
+            audience,
+            profile,
+            cancel,
+            resource_cache,
+            turn_engine,
+            memory_organizer,
+        ),
+    )
+    .await
+}
+
+async fn run_turn_task_inner(
     mut config: AppConfig,
     paths: MiyuPaths,
     store: StateStore,
@@ -171,6 +222,8 @@ pub(in crate::web) async fn run_turn_task(
         }
         if local_webui && config.tools.enabled {
             tools::register_webui_artifact_tools(&mut normal_tools, &paths, &session_id);
+            // 分享是全局清单,用根库而不是会话钉定克隆。
+            tools::register_webui_share_tools(&mut normal_tools, &config, base_store.clone());
         }
         if profile
             .as_ref()
@@ -221,23 +274,25 @@ pub(in crate::web) async fn run_turn_task(
             .map(|profile| profile.turn_system_context.clone())
             .unwrap_or_default();
         if local_webui && mode == AgentMode::Normal {
-            let manifest = tools::webui_artifact_manifest(&paths, &session_id)
-                .unwrap_or_else(|_| "（Artifact 清单暂时不可用）".to_string());
+            let manifest =
+                tools::webui_artifact_manifest(&paths, &session_id).unwrap_or_else(|_| {
+                    "(the artifact manifest is temporarily unavailable)".to_string()
+                });
             // v7 Phase 2.1: the manifest changes whenever artifacts change, so
             // it rides the turn tail; only the static policy stays in the
             // system prompt.
             turn_system_context.push(format!(
-                "<artifact-workspace>\n{manifest}\n使用 read_artifact 和 apply_artifact_patch 按文件名操作已有 Artifact；不要用 glob 搜索托管目录，也不要猜测 ~/.miyu 路径。\n</artifact-workspace>"
+                "<artifact-workspace>\n{manifest}\nUse read_artifact and apply_artifact_patch with bare artifact file names to work on existing artifacts; do not glob the managed directory or guess ~/.miyu paths.\n</artifact-workspace>"
             ));
             runtime_system_context.push(
                 "<artifact-policy>\n\
-                你正在 Miyu WebUI 中工作，并且拥有 Artifact 展示工具。\n\
-                - 当用户明确要求报告、文档、网页、表格、数据文件、独立代码文件或其他可下载成品时，必须创建或展示 Artifact。\n\
-                - 对由你直接编写的文本交付物，优先调用 create_artifact；filename 必须带正确扩展名。\n\
-                - 对命令或其他工具已经生成的文件，调用 present_artifact。\n\
-                - 更新已有 Artifact 时先使用 read_artifact，再使用 apply_artifact_patch 做局部修改；补丁路径只写 Artifact 文件名。除非用户明确要求完全重写，否则不要用 create_artifact 覆盖全文。\n\
-                - 内容完成并自检后再发布。普通项目源码修改、配置修改、测试夹具和简短回答不要发布为 Artifact。\n\
-                - Artifact 是回答的一部分；发布成功后再用简短文字告知用户。\n\
+                You are working in the Miyu WebUI and have artifact presentation tools.\n\
+                - When the user explicitly asks for a report, document, web page, table, data file, standalone code file, or another downloadable deliverable, you must create or present an artifact.\n\
+                - For text deliverables you write yourself, prefer create_artifact; filename must carry the correct extension.\n\
+                - For files already produced by commands or other tools, call present_artifact.\n\
+                - To update an existing artifact, read_artifact first, then apply_artifact_patch for targeted edits; patch paths use the bare artifact file name. Do not overwrite the whole file with create_artifact unless the user explicitly asks for a full rewrite.\n\
+                - Publish only after the content is complete and self-checked. Do not publish ordinary project source edits, config changes, test fixtures, or short answers as artifacts.\n\
+                - The artifact is part of the answer; after publishing succeeds, tell the user briefly in text.\n\
                 </artifact-policy>"
                     .to_string(),
             );

@@ -193,7 +193,7 @@ pub(crate) async fn job_status(args: Value) -> Result<String> {
         // Batch: same per-job shape as the single-id form, wrapped in `jobs`.
         // The log budget is split across the requested ids so asking about
         // five jobs cannot drag back five full logs.
-        ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
+        ensure_jobs_visible(&ids, current.as_deref(), all, "inspect")?;
         let budget = (MAX_STATUS_OUTPUT_CHARS / ids.len()).max(1);
         let mut rows = Vec::with_capacity(ids.len());
         for id in &ids {
@@ -202,7 +202,7 @@ pub(crate) async fn job_status(args: Value) -> Result<String> {
                 None => rows.push(json!({
                     "job_id": id,
                     "ok": false,
-                    "error": format!("后台命令 {id} 不存在；后台命令随宿主进程重启而清空"),
+                    "error": format!("background job {id} does not exist; background jobs are cleared when the host process restarts"),
                 })),
             }
         }
@@ -251,9 +251,10 @@ pub(crate) async fn job_status(args: Value) -> Result<String> {
         }))?);
     };
 
-    ensure_jobs_visible(&ids, current.as_deref(), all, "查看")?;
-    let job = job_snapshot(job_id)
-        .with_context(|| format!("后台命令 {job_id} 不存在；后台命令随宿主进程重启而清空"))?;
+    ensure_jobs_visible(&ids, current.as_deref(), all, "inspect")?;
+    let job = job_snapshot(job_id).with_context(|| {
+        format!("background job {job_id} does not exist; background jobs are cleared when the host process restarts")
+    })?;
 
     // Single id keeps the flat shape it always had.
     let mut detail = job_detail_json(&job, offset, MAX_STATUS_OUTPUT_CHARS);

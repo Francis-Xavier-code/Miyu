@@ -226,7 +226,10 @@ fn turn_context_blocks_already_visible_in_fossils_are_skipped() {
     // 只有 [SystemInfo: 前缀的常驻通告参与去重;指涉"当前回合"的块
     // (唤醒通知/身份告警/审核初判)即使字节相同也必须重发
     assert!(notice.starts_with(STANDING_ADVISORY_PREFIX));
-    assert!(!"本轮由系统自动触发：一个后台任务刚刚结束。".starts_with(STANDING_ADVISORY_PREFIX));
+    assert!(
+        !"This turn was triggered automatically by the system: a background job just finished."
+            .starts_with(STANDING_ADVISORY_PREFIX)
+    );
     assert!(!"<qq-identity-warning>…</qq-identity-warning>".starts_with(STANDING_ADVISORY_PREFIX));
 }
 

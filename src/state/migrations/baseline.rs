@@ -618,6 +618,31 @@ pub(in crate::state) fn apply_v26_session_goals(conn: &Connection) -> Result<()>
     Ok(())
 }
 
+/// v27：WebUI 文件分享清单。与 artifact（演示区、快照进库）是两个独立概念：
+/// 分享条目只存元数据，字节留在磁盘上——reference 模式直接指向原文件，
+/// snapshot 模式指向 data/shared/ 托管副本。不挂 turn 外键：分享是全局的、
+/// 跨会话长期存在，删回合不应打断别人正在下载的链接。
+pub(in crate::state) fn apply_v27_shared_files(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS shared_files (
+            share_id     TEXT PRIMARY KEY,
+            file_name    TEXT NOT NULL,
+            title        TEXT NOT NULL DEFAULT '',
+            mode         TEXT NOT NULL,
+            source_path  TEXT NOT NULL,
+            stored_path  TEXT NOT NULL,
+            size_bytes   INTEGER NOT NULL,
+            mtime_unix   INTEGER NOT NULL,
+            mime         TEXT NOT NULL,
+            kind         TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_shared_files_created
+            ON shared_files(created_at, share_id);",
+    )?;
+    Ok(())
+}
+
 pub(in crate::state) fn apply_v25_tool_reports_child_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS turn_tool_reports (

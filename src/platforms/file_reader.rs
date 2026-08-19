@@ -1,5 +1,4 @@
 use super::PlatformTurnContext;
-use crate::i18n::agent_text as t;
 use crate::platform_types::PlatformContextFileRef;
 use crate::tools::{ToolRegistry, ToolSpec};
 use anyhow::{bail, Context, Result};
@@ -39,15 +38,9 @@ pub(crate) fn register(
     let description = if state.context.conversation.kind
         == crate::platform_types::ConversationKind::Group
     {
-        t(
-            "Read a text file uploaded to the current QQ group. `file` must be a file id from the visible chat history (e.g. file_<message_id>_1). Compressed archives, executables, images, video, and other binary formats are rejected; text is capped at 128 KiB per call.",
-            "读取当前 QQ 群上传的文本文件。`file` 必须是可见聊天记录中的文件 ID（例如 file_<message_id>_1）。压缩包、可执行文件、图片、视频等二进制格式会被拒绝；单次最多读取 128 KiB 文本。",
-        )
+        "Read a text file uploaded to the current QQ group. `file` must be a file id from the visible chat history (e.g. file_<message_id>_1). Compressed archives, executables, images, video, and other binary formats are rejected; text is capped at 128 KiB per call."
     } else {
-        t(
-            "Read a text file uploaded through the current QQ/platform conversation. `file` is either a file id from the visible chat history (e.g. file_<message_id>_1) or an absolute path Miyu already downloaded under its platform_files cache. Compressed archives, executables, images, video, and other binary formats are rejected; text is capped at 128 KiB per call.",
-            "读取当前 QQ/平台会话中上传的文本文件。`file` 是可见聊天记录中的文件 ID（例如 file_<message_id>_1），或 Miyu 已下载到 platform_files 缓存目录下的绝对路径。压缩包、可执行文件、图片、视频等二进制格式会被拒绝；单次最多读取 128 KiB 文本。",
-        )
+        "Read a text file uploaded through the current QQ/platform conversation. `file` is either a file id from the visible chat history (e.g. file_<message_id>_1) or an absolute path Miyu already downloaded under its platform_files cache. Compressed archives, executables, images, video, and other binary formats are rejected; text is capped at 128 KiB per call."
     };
     registry.register(
         ToolSpec::new(
@@ -58,10 +51,7 @@ pub(crate) fn register(
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": t(
-                            "File id from chat history, or a local path already under platform_files.",
-                            "聊天记录中的文件 ID，或已位于 platform_files 下的本地路径。"
-                        )
+                        "description": "File id from chat history, or a local path already under platform_files."
                     }
                 },
                 "required": ["file"],
@@ -72,7 +62,7 @@ pub(crate) fn register(
                 async move { read(arguments, state).await }
             },
         )
-        .with_display_name(t("Read uploaded file", "读取上传文件")),
+        .with_display_name("Read uploaded file"),
     );
 }
 

@@ -5619,7 +5619,8 @@
     elements.artifactTitle.textContent = artifact.name;
     elements.artifactTitle.title = artifact.name;
     elements.artifactTypeLabel.textContent = artifactTypeLabel(artifact);
-    elements.artifactDownloadButton.href = artifact.url;
+    // ?download=1 → 后端强制 attachment,markdown/pdf 也直接落盘而不是再开预览。
+    elements.artifactDownloadButton.href = `${artifact.url}?download=1`;
     elements.artifactPreviewButton.parentElement.hidden = isImage;
     elements.artifactImageActions.hidden = !isImage;
     elements.artifactImageExternalButton.href = isImage ? artifact.url : "";
@@ -7004,6 +7005,9 @@
     // 待办列表挂在签外面,收起态也看得见——那是给人看的产出,不是调试信息。
     const todos = window.MiyuTodos?.isTodoTool(name) ? window.MiyuTodos.render(output) : null;
     if (todos) card.appendChild(todos);
+    // 分享附件同理:文件卡片是交付物,直接出现在气泡里,点击即下载。
+    const shared = window.MiyuShared?.isShareTool(name) ? window.MiyuShared.renderCard(output) : null;
+    if (shared) card.appendChild(shared);
     return card;
   }
 
@@ -7440,6 +7444,12 @@
         const todos = window.MiyuTodos.render(output);
         tool.card.querySelector(".todo-panel")?.remove();
         if (todos) tool.card.appendChild(todos);
+      }
+      // 分享附件同坑同修:实时完成时也要挂,否则只有刷新后才能看到卡片。
+      if (ok && window.MiyuShared?.isShareTool(tool.name)) {
+        const shared = window.MiyuShared.renderCard(output);
+        tool.card.querySelector(".shared-attachment")?.remove();
+        if (shared) tool.card.appendChild(shared);
       }
       scheduleCommandOutputPreview(tool, data?.preview);
       updateToolStatus(tool, ok ? "完成" : "失败", ok ? "check" : "circle-alert", ok ? "is-success" : "is-failure");

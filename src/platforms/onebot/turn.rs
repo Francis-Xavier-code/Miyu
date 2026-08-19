@@ -12,7 +12,11 @@ use crate::platforms::onebot::*;
 /// 合成唤醒事件的 user_id:优先 spawn 回合记录的真实发起者;私聊退回会话
 /// 对端(该私聊唯一的人类);群聊无记录时保持机器人自身——不凭空授予权限,
 /// 只是回到修复前的降级行为。
-pub(in crate::platforms::onebot) fn wake_sender_user_id(initiator: Option<&str>, target: Target, self_id: i64) -> i64 {
+pub(in crate::platforms::onebot) fn wake_sender_user_id(
+    initiator: Option<&str>,
+    target: Target,
+    self_id: i64,
+) -> i64 {
     initiator
         .and_then(|id| id.trim().parse().ok())
         .or(match target {
@@ -24,7 +28,7 @@ pub(in crate::platforms::onebot) fn wake_sender_user_id(initiator: Option<&str>,
 
 /// Background-job completion wake: a self-initiated model turn in a bound
 /// QQ conversation. There is no inbound event — reply targeting, affection
-/// and trigger judging all no-op — the sender display name stays "系统",
+/// and trigger judging all no-op — the sender display name stays "System",
 /// so the model reads the job result and reports it into the conversation
 /// in its own voice.
 pub(crate) async fn wake_conversation_for_job(
@@ -63,7 +67,7 @@ pub(crate) async fn wake_conversation_for_job(
     let event = json!({
         "self_id": self_id,
         "user_id": sender_user_id,
-        "sender": { "nickname": "系统" },
+        "sender": { "nickname": "System" },
     });
     let context = Arc::new(platform_turn_context(
         state, conn, target, &event, config, None,
@@ -78,8 +82,9 @@ pub(crate) async fn wake_conversation_for_job(
     // like an inbound turn would.
     let prepared = context.prepare_turn(content).await;
     let mut turn_system_context = vec![
-        "本轮由系统自动触发：一个后台任务刚刚结束，报告与结果就在本轮消息里。\
-         这不是任何群成员或用户发来的消息；以你自己的身份把结果自然地发到会话里。"
+        "This turn was triggered automatically by the system: a background job just finished, \
+         and its report and results are in this turn's message. This is not a message from any \
+         group member or user; deliver the results into the conversation naturally, in your own voice."
             .to_string(),
     ];
     turn_system_context.extend(prepared.turn_system_context);
@@ -315,33 +320,26 @@ pub(in crate::platforms::onebot) async fn enqueue_tool_followup(
         } else if attempted_images > 0 {
             bail!("the follow-up image could not be downloaded");
         } else if parsed.at_self {
-            content = t(
-                "(they @-mentioned you without any text)",
-                "（对方@了你，但没有其他内容）",
-            )
-            .to_string();
+            content = "(they @-mentioned you without any text)".to_string();
         } else {
             bail!("the follow-up message had no model-visible content");
         }
     }
     if failed_images > 0 {
-        content.push_str(t(
-            "\n(the message also contained an image that could not be downloaded; do not claim to have seen it)",
-            "\n（消息还附带了未能下载的图片；不要声称已经看到了它）",
-        ));
+        content.push_str("\n(the message also contained an image that could not be downloaded; do not claim to have seen it)");
     }
     if quoted_images > 0 {
         content.push_str(&quoted_image_prompt(quoted_images));
     }
     let display_content = content.clone();
-    content.push_str("\n\nQQ 后续消息可信元数据：");
+    content.push_str("\n\nTrusted metadata for this QQ follow-up message: ");
     content.push_str(&format!(
-        "发送者 QQ={}; 消息 ID={}",
+        "sender QQ={}; message ID={}",
         inbound_event.sender_id, inbound_event.message_id
     ));
     if let Some(reply) = inbound_event.replied_message.as_ref() {
         content.push_str(&format!(
-            "; 回复消息 ID={}; 被回复者 QQ={}",
+            "; replied-to message ID={}; replied-to sender QQ={}",
             reply.message_id, reply.sender_id
         ));
     }
@@ -362,7 +360,7 @@ pub(in crate::platforms::onebot) async fn enqueue_tool_followup(
                 })
                 .collect::<Vec<_>>()
         };
-        content.push_str(&format!("; @对象={}", mentions.join("、")));
+        content.push_str(&format!("; @-mentions={}", mentions.join(", ")));
     }
 
     context.observe_inbound(inbound_event).await;
@@ -487,20 +485,13 @@ pub(in crate::platforms::onebot) async fn build_and_run_turn(
                 .await?;
             return Ok(None);
         } else if parsed.at_self {
-            content = t(
-                "(they @-mentioned you without any text)",
-                "（对方@了你，但没有其他内容）",
-            )
-            .to_string();
+            content = "(they @-mentioned you without any text)".to_string();
         } else {
             return Ok(None);
         }
     }
     if failed_images > 0 && !content.is_empty() {
-        content.push_str(t(
-            "\n(the message also contained an image that could not be downloaded; do not claim to have seen it)",
-            "\n（消息还附带了未能下载的图片；不要声称已经看到了它）",
-        ));
+        content.push_str("\n(the message also contained an image that could not be downloaded; do not claim to have seen it)");
     }
     if quoted_images > 0 {
         content.push_str(&quoted_image_prompt(quoted_images));
@@ -540,13 +531,15 @@ pub(in crate::platforms::onebot) async fn build_and_run_turn(
     let mut system_context = vec![
         qq_identity_policy(context.conversation.kind),
         qq_history_format(context.config.platforms.qq.user_identification),
-        "<qq-context-images>如果本轮出现 <context-images> 块，里面是此前群聊记录中可按需查看的历史图片 ID。你尚未看到这些图片的实际内容；只有回答确实依赖图片时，才用 vision_analyze 并把对应 ID 作为 image 参数，不得根据占位符猜测内容。</qq-context-images>".to_string(),
+        "<qq-context-images>If a <context-images> block appears in this turn, it lists IDs of historical images from earlier group-chat records that can be viewed on demand. You have not seen the actual content of these images; only when the answer truly depends on an image, call vision_analyze with the corresponding ID as the image argument. Never guess image content from the placeholders.</qq-context-images>".to_string(),
     ];
     if let Some(prompt) = route
         .map(|route| route.extra_prompt.trim())
         .filter(|prompt| !prompt.is_empty())
     {
-        system_context.push(format!("QQ 会话附加规则：\n{prompt}"));
+        system_context.push(format!(
+            "Additional rules for this QQ conversation:\n{prompt}"
+        ));
     }
     system_context.extend(prepared.system_context);
     let profile = TurnProfile {

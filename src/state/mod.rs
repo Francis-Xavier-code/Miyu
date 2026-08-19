@@ -1,5 +1,7 @@
 mod assets;
 mod history;
+mod shared_files;
+pub use conversation_db::SharedFile;
 mod queue;
 mod sessions;
 mod turns;
@@ -178,6 +180,7 @@ pub(crate) enum PlatformAccessMutationResult {
 pub struct StateStore {
     state_dir: PathBuf,
     artifacts_dir: PathBuf,
+    shared_files_dir: PathBuf,
     conv_db: Arc<ConversationDb>,
     platform_access: Arc<SharedPlatformAccess>,
     /// Active session. Shared across clones and swappable at runtime so a
@@ -210,6 +213,7 @@ impl StateStore {
         Ok(Self {
             state_dir,
             artifacts_dir: paths.data_dir.join("artifacts"),
+            shared_files_dir: paths.data_dir.join("shared"),
             conv_db,
             platform_access,
             session_id,

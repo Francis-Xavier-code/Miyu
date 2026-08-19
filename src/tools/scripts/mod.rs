@@ -3,7 +3,7 @@ pub(crate) use index::*;
 
 use super::registry::UnregisteredScript;
 use super::{ToolRegistry, ToolSpec};
-use crate::i18n::{agent_is_zh, agent_text as t, is_zh};
+use crate::i18n::is_zh;
 use crate::paths::MiyuPaths;
 use crate::tools::tool_descriptions::LoadPolicy;
 use anyhow::{bail, Context, Result};
@@ -152,8 +152,8 @@ fn clip_output(value: &str) -> String {
                 .chars()
                 .take(MAX_SCRIPT_OUTPUT_CHARS)
                 .collect::<String>(),
-            t("truncated to", "已截断到"),
-            t("chars", "字符")
+            "truncated to",
+            "chars"
         )
     }
 }
@@ -173,60 +173,57 @@ fn make_executable(path: &Path) -> Result<()> {
 fn register_script_tools(registry: &mut ToolRegistry, scripts_dir: PathBuf) {
     registry.register(ToolSpec::new(
         "manage_script",
-        t(
-            "Manage user scripts as tools. action=register adds or updates one (the script must already exist in the scripts directory; this updates index.json, sets the executable bit, and the script becomes callable in later tool rounds). action=unregister removes it from the index, optionally deleting the file.",
-            "把用户脚本管理为工具。action=register 注册或更新（脚本必须已存在于 scripts 目录；会更新 index.json、设置可执行权限，脚本在后续工具轮次中立即可用）。action=unregister 从索引移除，可选同时删除文件。",
-        ),
+        "Manage user scripts as tools. action=register adds or updates one (the script must already exist in the scripts directory; this updates index.json, sets the executable bit, and the script becomes callable in later tool rounds). action=unregister removes it from the index, optionally deleting the file.",
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["register", "unregister"],
-                    "description": t("register adds or updates, unregister removes.", "register 注册/更新，unregister 注销。")
+                    "description": "register adds or updates, unregister removes."
                 },
                 "id": {
                     "type": "string",
                     "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$",
-                    "description": t("Unique tool identifier (ASCII, starts with a letter). This is the function name the AI calls.", "唯一工具标识符（ASCII，字母开头）。这是 AI 调用的函数名。")
+                    "description": "Unique tool identifier (ASCII, starts with a letter). This is the function name the AI calls."
                 },
                 "display_name": {
                     "type": "string",
-                    "description": t("Human-readable display name, may contain Chinese characters.", "可读显示名称，可包含中文。")
+                    "description": "Human-readable display name, may contain Chinese characters."
                 },
                 "description": {
                     "type": "string",
-                    "description": t("Optional tool description override. If omitted, Miyu reads the script header lines `Description:`/`description:` or `描述：` and sends only one localized description to the AI.", "可选的工具描述覆盖。省略时 Miyu 会读取脚本头部的 `Description:`/`description:` 或 `描述：`，并只向 AI 提供一条本地化描述。")
+                    "description": "Optional tool description override. If omitted, Miyu reads the script header lines `Description:`/`description:` or `描述：` and sends only one localized description to the AI."
                 },
                 "path": {
                     "type": "string",
-                    "description": t("register only: script file name or path within the user scripts directory.", "仅 register：用户 scripts 目录内的脚本文件名或路径。")
+                    "description": "register only: script file name or path within the user scripts directory."
                 },
                 "parameters": {
                     "type": "object",
-                    "description": t("JSON schema for tool parameters. If omitted, a generic schema with stdin is used.", "工具参数的 JSON schema。省略时使用带 stdin 的通用 schema。")
+                    "description": "JSON schema for tool parameters. If omitted, a generic schema with stdin is used."
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": t("Optional timeout in seconds, max 300.", "可选超时时间，单位秒，最大 300。")
+                    "description": "Optional timeout in seconds, max 300."
                 },
                 "always_loaded": {
                     "type": "boolean",
-                    "description": t("Optional loading override. By default scripts with a custom schema are loaded on demand, while scripts using generic stdin are always visible.", "可选加载策略覆盖。默认有自定义 schema 的脚本按需加载，使用通用 stdin 的脚本始终可见。")
+                    "description": "Optional loading override. By default scripts with a custom schema are loaded on demand, while scripts using generic stdin are always visible."
                 },
                 "load_policy": {
                     "type": "string",
                     "enum": ["summary", "group", "hidden"],
-                    "description": t("Hybrid catalog policy. summary shows this script as a single load target, group exposes it through group:<name>, hidden keeps it out of the catalog.", "Hybrid 工具目录策略。summary 将脚本作为单独加载目标展示；group 通过 group:<name> 展示；hidden 不展示在目录中。")
+                    "description": "Hybrid catalog policy. summary shows this script as a single load target, group exposes it through group:<name>, hidden keeps it out of the catalog."
                 },
                 "groups": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": t("Optional hybrid catalog groups, e.g. gaming or systeminfo.", "可选 Hybrid 目录分组，例如 gaming 或 systeminfo。")
+                    "description": "Optional hybrid catalog groups, e.g. gaming or systeminfo."
                 },
                 "delete_file": {
                     "type": "boolean",
-                    "description": t("unregister only: also delete the script file from disk. Only affects files within the scripts directory.", "仅 unregister：同时从磁盘删除脚本文件。仅影响 scripts 目录内的文件。")
+                    "description": "unregister only: also delete the script file from disk. Only affects files within the scripts directory."
                 }
             },
             "required": ["action", "id"],

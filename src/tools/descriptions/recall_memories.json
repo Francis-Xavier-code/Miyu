@@ -1,17 +1,17 @@
 {
   "name": "recall_memories",
   "display_name": "召回记忆",
-  "description": "搜索已记住的知识点和过往事件；scope=episode 只搜日记式的过往事件。\n联想记忆里被截断的条目会带 id，用 recall_memories id=<id> 取全文。需要时可用 include_forgotten 包含已遗忘记忆。只读，不改变记忆状态。",
+  "description": "Search remembered knowledge points and past events; scope=episode searches only diary-style past events.\nTruncated entries in associative memory carry an id; use recall_memories id=<id> to fetch the full text. Use include_forgotten to include forgotten memories when needed. Read-only; does not change memory state.",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "搜索关键词或问题。只有用 id 直取时才可省略。"
+        "description": "Search keywords or a question. May be omitted only when fetching directly by id."
       },
       "id": {
         "type": "integer",
-        "description": "按 id 直接取一条记忆的全文。"
+        "description": "Fetch the full text of a single memory directly by id."
       },
       "scope": {
         "type": "string",
@@ -19,15 +19,15 @@
           "all",
           "episode"
         ],
-        "description": "all 搜知识点和事件（默认）；episode 只搜过往事件。"
+        "description": "all searches knowledge points and events (default); episode searches only past events."
       },
       "max_results": {
         "type": "integer",
-        "description": "可选结果数量限制。"
+        "description": "Optional limit on the number of results."
       },
       "include_forgotten": {
         "type": "boolean",
-        "description": "是否包含已遗忘记忆。"
+        "description": "Whether to include forgotten memories."
       }
     }
   },

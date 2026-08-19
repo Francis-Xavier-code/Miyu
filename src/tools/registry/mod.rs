@@ -73,11 +73,7 @@ impl ToolRegistry {
 
     fn timeout_error(name: &str, limit: std::time::Duration) -> anyhow::Error {
         let secs = limit.as_secs();
-        if crate::i18n::agent_is_zh() {
-            anyhow::anyhow!("工具 `{name}` 执行超时（超过 {secs} 秒）已中止")
-        } else {
-            anyhow::anyhow!("tool `{name}` timed out after {secs}s and was aborted")
-        }
+        anyhow::anyhow!("tool `{name}` timed out after {secs}s and was aborted")
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {

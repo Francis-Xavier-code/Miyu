@@ -110,15 +110,11 @@ fn require_human(origin: &TurnOrigin, verb: &str) -> Result<()> {
 }
 
 pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
-    let t = crate::i18n::agent_text;
     let get_paths = paths.clone();
     registry.register(
         ToolSpec::new(
             "get_goal",
-            t(
-                "Read the current same-session goal: exact id/revision for compare-and-set, objective, phase, rounds used/limit, blocker when present, and whether autonomous continuation is armed. Call this before update_goal.",
-                "读取本会话当前目标：用于比较并设置的精确 id/revision、目标、阶段、已用/上限轮数、阻塞原因，以及自动续跑是否已武装。调用 update_goal 前先调它。",
-            ),
+            "Read the current same-session goal: exact id/revision for compare-and-set, objective, phase, rounds used/limit, blocker when present, and whether autonomous continuation is armed. Call this before update_goal.",
             super::registry::empty_parameters(),
             move |_args| {
                 let paths = get_paths.clone();
@@ -136,15 +132,12 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
     registry.register(
         ToolSpec::new(
             "create_goal",
-            t(
-                "Create one persisted same-session completion goal when the current direct human request is a long-running objective that should continue across autonomous goal rounds. Infer that intent from any language; do not use this for trivial single-turn work. Rejected on automatic turns.",
-                "当当前人类请求是需要跨自动轮持续推进的长任务时，创建本会话唯一的持久目标。可从任意语言的请求推断意图；琐碎单轮工作不要建目标。自动轮调用会被拒。",
-            ),
+            "Create one persisted same-session completion goal when the current direct human request is a long-running objective that should continue across autonomous goal rounds. Infer that intent from any language; do not use this for trivial single-turn work. Rejected on automatic turns.",
             json!({
                 "type": "object",
                 "properties": {
-                    "objective": {"type": "string", "description": t("The concrete completion objective inferred from the direct human request.", "从人类请求中提炼的具体完成目标。")},
-                    "max_goal_rounds": {"type": "integer", "description": t("Optional positive limit on automatic continuation rounds.", "可选：自动续轮上限（正整数）。")}
+                    "objective": {"type": "string", "description": "The concrete completion objective inferred from the direct human request."},
+                    "max_goal_rounds": {"type": "integer", "description": "Optional positive limit on automatic continuation rounds."}
                 },
                 "required": ["objective"],
                 "additionalProperties": false
@@ -174,19 +167,16 @@ pub fn register(registry: &mut ToolRegistry, paths: MiyuPaths) {
     registry.register(
         ToolSpec::new(
             "update_goal",
-            t(
-                "Update the exact current goal revision (call get_goal first and copy its goal_id/revision). Actions: edit | pause | resume | complete | blocked. edit/pause/resume require a direct human turn; during the current autonomous goal round, complete and blocked are also allowed. blocked needs blocked_reason and is mechanically rejected before the configured minimum consecutive rounds.",
-                "更新当前目标的精确 revision（先 get_goal 并照抄 goal_id/revision）。action：edit|pause|resume|complete|blocked。edit/pause/resume 需人类发起轮；自主 goal round 内额外允许 complete 与 blocked。blocked 必须给 blocked_reason，且未达连续轮数下限会被机械拒绝。",
-            ),
+            "Update the exact current goal revision (call get_goal first and copy its goal_id/revision). Actions: edit | pause | resume | complete | blocked. edit/pause/resume require a direct human turn; during the current autonomous goal round, complete and blocked are also allowed. blocked needs blocked_reason and is mechanically rejected before the configured minimum consecutive rounds.",
             json!({
                 "type": "object",
                 "properties": {
-                    "goal_id": {"type": "string", "description": t("Exact id returned by get_goal.", "get_goal 返回的精确 id。")},
-                    "revision": {"type": "integer", "description": t("Exact positive revision returned by get_goal.", "get_goal 返回的精确 revision。")},
+                    "goal_id": {"type": "string", "description": "Exact id returned by get_goal."},
+                    "revision": {"type": "integer", "description": "Exact positive revision returned by get_goal."},
                     "action": {"type": "string", "enum": ["edit", "pause", "resume", "complete", "blocked"]},
-                    "objective": {"type": "string", "description": t("Replacement objective; only with action edit.", "替换目标文案；仅 action=edit 有效。")},
-                    "max_goal_rounds": {"type": "integer", "description": t("Replacement round cap; only with action edit.", "替换轮数上限；仅 action=edit 有效。")},
-                    "blocked_reason": {"type": "string", "description": t("Concrete blocking condition; required with action blocked.", "具体阻塞条件；action=blocked 时必填。")}
+                    "objective": {"type": "string", "description": "Replacement objective; only with action edit."},
+                    "max_goal_rounds": {"type": "integer", "description": "Replacement round cap; only with action edit."},
+                    "blocked_reason": {"type": "string", "description": "Concrete blocking condition; required with action blocked."}
                 },
                 "required": ["goal_id", "revision", "action"],
                 "additionalProperties": false

@@ -1,19 +1,19 @@
 {
   "name": "alarm",
   "display_name": "闹钟",
-  "description": "管理本地闹钟：action=set 设置、list 列出、cancel 取消。\ntime 支持 30s、10m、1h 30m 或 14:30。闹钟在后台 Miyu 进程运行，使用内置声音，可用 audio_file 指定本地 .wav/.mp3 替代。",
+  "description": "Manage local alarms: action=set to set one, list to list them, cancel to cancel one.\ntime accepts 30s, 10m, 1h 30m, or 14:30. Alarms run in the background Miyu process using a built-in sound; pass audio_file to use a local .wav/.mp3 instead.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
         "enum": ["set", "list", "cancel"],
-        "description": "set 设置，list 列出，cancel 取消。"
+        "description": "set to set, list to list, cancel to cancel."
       },
-      "time": { "type": "string", "description": "action=set 必填：时长或时钟时间。" },
-      "label": { "type": "string", "description": "action=set 可选：闹钟标签。" },
-      "audio_file": { "type": "string", "description": "action=set 可选：本地 .wav 或 .mp3。" },
-      "id": { "type": "string", "description": "action=cancel 必填：闹钟 id。" }
+      "time": { "type": "string", "description": "Required for action=set: a duration or a clock time." },
+      "label": { "type": "string", "description": "Optional for action=set: alarm label." },
+      "audio_file": { "type": "string", "description": "Optional for action=set: local .wav or .mp3 file." },
+      "id": { "type": "string", "description": "Required for action=cancel: alarm id." }
     },
     "required": ["action"]
   },

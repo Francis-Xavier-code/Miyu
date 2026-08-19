@@ -54,6 +54,9 @@ if [ "$failed" -gt 0 ]; then
 fi
 echo "用例数 $now（基线 $before）"
 
+step "模型面语言"
+bash scripts/check-model-english.sh
+
 step "文件规模"
 python3 scripts/refactor_size_report.py --check
 

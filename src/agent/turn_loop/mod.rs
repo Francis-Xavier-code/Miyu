@@ -475,7 +475,7 @@ impl Agent {
             if tool_limit_reached {
                 let mut result = result;
                 let warning = format!(
-                    "工具调用已达到上限 {} 轮，未执行后续工具调用。可将 `tools.max_rounds` 设为 0 以允许无限工具调用。",
+                    "Tool calls reached the limit of {} rounds; the remaining tool calls were not executed. Set `tools.max_rounds` to 0 to allow unlimited tool rounds.",
                     self.max_tool_rounds
                 );
                 let warning_chunk = if result.content.trim().is_empty() {
@@ -530,7 +530,7 @@ impl Agent {
                 for call in &result.tool_calls {
                     messages.push(ChatMessage::tool(
                         call.id.clone(),
-                        "error: 本次回复因输出 token 上限被截断，工具调用参数可能不完整。请重新发起该工具调用并给出完整参数。",
+                        "error: this reply was truncated by the output token limit, so the tool call arguments may be incomplete. Re-issue this tool call with complete arguments.",
                     ));
                 }
                 continue;
@@ -697,7 +697,7 @@ impl Agent {
                             }
                         } else {
                             let output = format!(
-                                "tool error: 工具 `{}` 尚未加载。请先调用 load_tools，参数为 {{\"names\":[\"{}\"]}}。",
+                                "tool error: tool `{}` is not loaded yet. Call load_tools first with {{\"names\":[\"{}\"]}}.",
                                 call.function.name,
                                 call.function.name,
                             );

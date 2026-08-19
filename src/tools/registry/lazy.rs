@@ -86,13 +86,13 @@ pub(crate) fn stub_definition(tool: &ToolSpec) -> ToolDefinition {
     // 例外是 stub_example:参数壳是空的,模型没取契约就调用时只能猜字段名,
     // 声明了示例的工具在这里补上。示例并进同一对括号,不额外占一对。
     let note = match &tool.stub_example {
-        Some(example) => format!("精简条目，例：{example}"),
-        None => "精简条目".to_string(),
+        Some(example) => format!("stub entry, e.g. {example}"),
+        None => "stub entry".to_string(),
     };
     let description = if summary.is_empty() {
-        format!("（{note}：契约经 load_tools 获取）")
+        format!("({note}: fetch the full contract via load_tools)")
     } else {
-        format!("{summary}（{note}）")
+        format!("{summary} ({note})")
     };
     ToolDefinition {
         kind: "function",
@@ -200,7 +200,7 @@ mod tests {
         let stub = stub_definition(&spec("查询某个游戏在 Linux 上的兼容性。"));
         assert_eq!(
             stub.function.description,
-            "查询某个游戏在 Linux 上的兼容性。（精简条目）"
+            "查询某个游戏在 Linux 上的兼容性。 (stub entry)"
         );
     }
 
@@ -213,7 +213,7 @@ mod tests {
         );
         assert_eq!(
             stub.function.description,
-            r#"查询某个游戏在 Linux 上的兼容性。（精简条目，例：{"query":"艾尔登法环"}）"#
+            r#"查询某个游戏在 Linux 上的兼容性。 (stub entry, e.g. {"query":"艾尔登法环"})"#
         );
     }
 
@@ -222,7 +222,7 @@ mod tests {
         let stub = spec("").with_stub_example(r#"{"query":"x"}"#);
         assert_eq!(
             stub_definition(&stub).function.description,
-            r#"（精简条目，例：{"query":"x"}：契约经 load_tools 获取）"#
+            r#"(stub entry, e.g. {"query":"x"}: fetch the full contract via load_tools)"#
         );
     }
 }

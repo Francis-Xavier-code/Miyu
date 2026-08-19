@@ -34,9 +34,9 @@ impl Agent {
         let mut descriptions = Vec::new();
         for (i, img) in images.iter().enumerate() {
             let prompt = if input.trim().is_empty() {
-                "请简洁描述这张图片，并指出重要细节。".to_string()
+                "Describe this image concisely and point out the important details.".to_string()
             } else {
-                format!("用户消息：{input}\n\n请基于图片内容回答或描述图片，不要编造看不见的信息。")
+                format!("User message: {input}\n\nAnswer based on the image content or describe the image; do not make up details you cannot see.")
             };
             match vision::analyze_image_url_with_prompt(
                 &self.config,

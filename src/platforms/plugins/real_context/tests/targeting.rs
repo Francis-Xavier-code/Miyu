@@ -91,9 +91,9 @@ fn active_target_prompt_is_bounded_and_keeps_the_current_message() {
 
     assert!(prompt.len() <= MAX_ACTIVE_TARGET_PROMPT_BYTES);
     assert!(prompt.contains("CURRENT:"));
-    assert!(prompt.contains("较早合并消息因长度限制省略"));
+    assert!(prompt.contains("earlier merged messages omitted due to length limits"));
     // 截断保留的头部是带标记的当前消息,而不是裸正文。
-    assert!(prompt.starts_with("[本轮新收到的消息]\nCURRENT:"));
+    assert!(prompt.starts_with("[New messages received this turn]\nCURRENT:"));
 }
 
 #[test]

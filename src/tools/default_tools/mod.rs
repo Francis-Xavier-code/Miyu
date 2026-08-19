@@ -7,7 +7,6 @@ use sysinfo::*;
 
 use super::{CommandOutputStream, ToolProgress, ToolRegistry, ToolSpec};
 use crate::host_info::{parse_macos_system_version, read_small_file};
-use crate::i18n::agent_text as t;
 use crate::tools::patch_preview::write_with_patch_preview;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -27,8 +26,8 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
     register_run_command(registry, allow_command_execution);
     registry.register(ToolSpec::new_with_progress(
         "trash_path",
-        t("Move files, directories, or symlinks to the system Trash instead of permanently deleting them. Pass every path in one call — one call per path floods the transcript. Use this when the user asks to delete/remove/clean up local paths; do not use rm unless explicitly requested.", "把文件、目录或符号链接移入系统回收站，而不是永久删除。要删多个时一次性全部传入，逐个调用会刷屏。用户要求删除/移除/清理本地路径时优先使用它；除非用户明确要求，不要使用 rm。"),
-        json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"description": t("Paths to move to Trash. Absolute, workspace-relative, and ~/ paths are all accepted.", "要移入回收站的路径列表。支持绝对路径、工作区相对路径和 ~/ 路径。")}},"required":["paths"],"additionalProperties":false}),
+        "Move files, directories, or symlinks to the system Trash instead of permanently deleting them. Pass every path in one call — one call per path floods the transcript. Use this when the user asks to delete/remove/clean up local paths; do not use rm unless explicitly requested.",
+        json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"description": "Paths to move to Trash. Absolute, workspace-relative, and ~/ paths are all accepted."}},"required":["paths"],"additionalProperties":false}),
         |args, progress| async move { trash_paths(args, progress) },
     ).writes());
 }
@@ -38,8 +37,8 @@ pub fn register(registry: &mut ToolRegistry, allow_command_execution: bool) {
 pub fn register_run_command(registry: &mut ToolRegistry, allow_command_execution: bool) {
     registry.register(ToolSpec::new_with_progress(
         "run_command",
-        t("Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job(action=status) and stop with job(action=stop).", "当 skills.allow_command_execution 启用时，在工作区运行 shell 命令。长时命令（构建、dev server）用 background=true：立即返回 job_id，用 job(action=status) 查询、job(action=stop) 停止。"),
-        json!({"type":"object","properties":{"command":{"type":"string","description": t("Command to run.", "要运行的命令。")},"timeout_seconds":{"type":"integer","description": t("Optional timeout in seconds (1-120, default 30). Ignored when background=true.", "可选超时时间，单位秒（1-120，默认 30）；background=true 时忽略。")},"background":{"type":"boolean","description": t("Run detached as a background command and return a short job_id immediately.", "作为后台命令分离运行，立即返回短 job_id。")},"title":{"type":"string","description": t("Short display title (<=16 chars) for the background command.", "后台命令的短标题（不超过 16 字），用于状态行显示，例如 release 构建。")}},"required":["command"],"additionalProperties":false}),
+        "Run a shell command in the workspace when skills.allow_command_execution is enabled. Set background=true for long-running commands (builds, dev servers): it returns a job_id immediately; poll with job(action=status) and stop with job(action=stop).",
+        json!({"type":"object","properties":{"command":{"type":"string","description": "Command to run."},"timeout_seconds":{"type":"integer","description": "Optional timeout in seconds (1-120, default 30). Ignored when background=true."},"background":{"type":"boolean","description": "Run detached as a background command and return a short job_id immediately."},"title":{"type":"string","description": "Short display title (<=16 chars) for the background command."}},"required":["command"],"additionalProperties":false}),
         move |args, progress| async move {
             run_command(args, allow_command_execution, progress).await
         },
@@ -51,26 +50,26 @@ pub fn register_run_command(registry: &mut ToolRegistry, allow_command_execution
 pub fn register_readonly(registry: &mut ToolRegistry) {
     registry.register(ToolSpec::new(
         "check_os_info",
-        t("Check basic read-only OS, shell, desktop session, kernel, host, and package-manager context. For concrete Linux input method issues, load the linux-input-method-diagnose skill.", "查看只读基础系统信息，包括 OS、shell、桌面会话、内核、主机和包管理器上下文。排查具体 Linux 输入法问题时先加载 linux-input-method-diagnose 技能。"),
+        "Check basic read-only OS, shell, desktop session, kernel, host, and package-manager context. For concrete Linux input method issues, load the linux-input-method-diagnose skill.",
         json!({"type":"object","properties":{},"additionalProperties":false}),
         |_| async move { check_os_info() },
     ));
     registry.register(ToolSpec::new(
         "read_file",
-        t("Read a UTF-8 text file by 1-based line offset, or list a directory page. Use absolute paths, workspace-relative paths, or ~/ paths. Large files are paged and binary files are refused.", "按 1 起始行号分页读取 UTF-8 文本文件，或分页列出目录。支持绝对路径、工作区相对路径和 ~/ 路径。大文件会分页，二进制文件会被拒绝。"),
-        json!({"type":"object","properties":{"path":{"type":"string","description": t("File or directory path.", "文件或目录路径。")},"offset":{"type":"integer","description": t("Starting line, 1-based.", "起始行，1 起始。")},"limit":{"type":"integer","description": t("Maximum lines to read.", "最多读取行数。")}},"required":["path"],"additionalProperties":false}),
+        "Read a UTF-8 text file by 1-based line offset, or list a directory page. Use absolute paths, workspace-relative paths, or ~/ paths. Large files are paged and binary files are refused.",
+        json!({"type":"object","properties":{"path":{"type":"string","description": "File or directory path."},"offset":{"type":"integer","description": "Starting line, 1-based."},"limit":{"type":"integer","description": "Maximum lines to read."}},"required":["path"],"additionalProperties":false}),
         |args| async move { read_file(args) },
     ));
     registry.register(ToolSpec::new(
         "glob",
-        t("Find files by case-insensitive glob pattern under a directory. Defaults to workspace; use ~ or /home for user files, or / for protected global search.", "在目录下按大小写不敏感 glob 模式查找文件。默认工作区；查用户文件用 ~ 或 /home，受保护的全局搜索可用 /。"),
-        json!({"type":"object","properties":{"path":{"type":"string","description": t("Directory to search. Defaults to workspace; use ~ or /home for user files, or / for protected global search.", "搜索目录，默认工作区；查用户文件用 ~ 或 /home，受保护的全局搜索可用 /。")},"pattern":{"type":"string","description": t("Case-insensitive glob pattern, for example *ai*test*.", "大小写不敏感 Glob 模式，例如 *ai*测试*。")},"max_results":{"type":"integer","description": t("Maximum results.", "最多结果数。")}},"required":["pattern"],"additionalProperties":false}),
+        "Find files by case-insensitive glob pattern under a directory. Defaults to workspace; use ~ or /home for user files, or / for protected global search.",
+        json!({"type":"object","properties":{"path":{"type":"string","description": "Directory to search. Defaults to workspace; use ~ or /home for user files, or / for protected global search."},"pattern":{"type":"string","description": "Case-insensitive glob pattern, for example *ai*test*."},"max_results":{"type":"integer","description": "Maximum results."}},"required":["pattern"],"additionalProperties":false}),
         |args| async move { glob_files(args).await },
     ));
     registry.register(ToolSpec::new(
         "grep",
-        t("Search file contents using ripgrep under a directory or single file. Defaults to workspace; use ~ or /home for user files, or / for protected global search. No matches are returned as an empty ok result.", "在目录或单个文件中用 ripgrep 搜索内容。默认工作区；查用户文件用 ~ 或 /home，受保护的全局搜索可用 /。无匹配会作为成功的空结果返回。"),
-        json!({"type":"object","properties":{"path":{"type":"string","description": t("Directory or file to search. Defaults to workspace; use ~ or /home for user files, or / for protected global search.", "要搜索的目录或文件，默认工作区；查用户文件用 ~ 或 /home，受保护的全局搜索可用 /。")},"pattern":{"type":"string","description": t("Regex pattern.", "正则模式。")},"include":{"type":"string","description": t("Optional case-insensitive file glob filter.", "可选大小写不敏感文件 glob 过滤。")},"max_results":{"type":"integer","description": t("Maximum matches.", "最多匹配数。")}},"required":["pattern"],"additionalProperties":false}),
+        "Search file contents using ripgrep under a directory or single file. Defaults to workspace; use ~ or /home for user files, or / for protected global search. No matches are returned as an empty ok result.",
+        json!({"type":"object","properties":{"path":{"type":"string","description": "Directory or file to search. Defaults to workspace; use ~ or /home for user files, or / for protected global search."},"pattern":{"type":"string","description": "Regex pattern."},"include":{"type":"string","description": "Optional case-insensitive file glob filter."},"max_results":{"type":"integer","description": "Maximum matches."}},"required":["pattern"],"additionalProperties":false}),
         |args| async move { grep_text(args).await },
     ));
 }
@@ -95,8 +94,8 @@ fn clip_output_with_meta(value: &str) -> ClippedOutput {
     ClippedOutput {
         text: format!(
             "...[{} {omitted} {}]\n{tail}",
-            t("omitted", "已省略"),
-            t("chars, showing tail", "字符，显示尾部")
+            "omitted",
+            "chars, showing tail"
         ),
         truncated: true,
         omitted_chars: omitted,
@@ -113,8 +112,8 @@ fn command_output_limited(output: std::process::Output, max_lines: usize) -> Res
     if stdout_raw.lines().nth(max_lines).is_some() {
         stdout.push_str(&format!(
             "\n[{} {max_lines} {}]",
-            t("truncated to the first", "已截断到前"),
-            t("results", "条结果")
+            "truncated to the first",
+            "results"
         ));
     }
     Ok(command_text(
@@ -131,9 +130,9 @@ fn search_output_limited(output: std::process::Output, max_lines: usize) -> Resu
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         return Ok(if stderr.is_empty() {
-            t("no matches", "无匹配").to_string()
+            "no matches".to_string()
         } else {
-            format!("{}\n[stderr]\n{stderr}", t("no matches", "无匹配"))
+            format!("{}\n[stderr]\n{stderr}", "no matches")
         });
     }
     command_output_limited(output, max_lines)
@@ -313,7 +312,7 @@ fn required(args: &Value, key: &str) -> Result<String> {
         .unwrap_or_default()
         .trim();
     if value.is_empty() {
-        bail!("{}: {key}", t("required argument missing", "缺少必需参数"))
+        bail!("{}: {key}", "required argument missing")
     } else {
         Ok(value.to_string())
     }
@@ -495,7 +494,8 @@ mod tests {
         .await
         .unwrap();
         // rg 的"无匹配"是退出码 1 + 空 stdout,不能渲染成失败。
-        assert_eq!(result, crate::i18n::text("no matches", "无匹配"));
+        // 工具结果是模型可见面,恒为英文,不随系统 locale 变化。
+        assert_eq!(result, "no matches");
     }
 
     #[test]

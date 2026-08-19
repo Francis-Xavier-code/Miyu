@@ -1,15 +1,15 @@
 {
   "name": "aur",
   "display_name": "AUR 查询",
-  "description": "AUR 官方 RPC 查询：action=search 搜包、info 包详情、status 服务状态。\nstatus 会给出 Arch/AUR 的故障、降级和停机信息。",
+  "description": "Official AUR RPC queries: action=search to search packages, info for package details, status for service status.\nstatus reports outages, degradations, and downtime for Arch/AUR.",
   "parameters": {
     "type": "object",
     "properties": {
-      "action": { "type": "string", "enum": ["search", "info", "status"], "description": "search 搜包，info 详情，status 服务状态。" },
-      "query": { "type": "string", "description": "action=search 必填：搜索词。" },
-      "package_name": { "type": "string", "description": "action=info 必填：包名。" },
-      "limit": { "type": "integer", "description": "仅 search：最多结果数。" },
-      "search_by": { "type": "string", "description": "仅 search：搜索字段。" }
+      "action": { "type": "string", "enum": ["search", "info", "status"], "description": "search to search packages, info for details, status for service status." },
+      "query": { "type": "string", "description": "Required for action=search: search term." },
+      "package_name": { "type": "string", "description": "Required for action=info: package name." },
+      "limit": { "type": "integer", "description": "search only: maximum number of results." },
+      "search_by": { "type": "string", "description": "search only: field to search by." }
     },
     "required": ["action"]
   },

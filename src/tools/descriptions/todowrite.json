@@ -1,19 +1,19 @@
 {
   "name": "todowrite",
   "display_name": "任务列表",
-  "description": "维护当前会话的任务列表：传 todos 整表替换，传 updates 做增量变更。\n二者必须且只能给一个。updates 支持 add/update/remove/clear，可用 index（1 起始）或 match_content 定位目标。",
+  "description": "Maintain the task list for the current session: pass todos to replace the whole list, or updates for incremental changes.\nExactly one of the two must be provided. updates supports add/update/remove/clear, and targets items by index (1-based) or match_content.",
   "parameters": {
     "type": "object",
     "properties": {
       "todos": {
         "type": "array",
-        "description": "完整任务列表。此操作会替换整个列表。",
+        "description": "The complete task list. This operation replaces the entire list.",
         "items": {
           "type": "object",
           "properties": {
             "content": {
               "type": "string",
-              "description": "任务简述。"
+              "description": "Short task description."
             },
             "status": {
               "type": "string",
@@ -42,7 +42,7 @@
       },
       "updates": {
         "type": "array",
-        "description": "按顺序原子应用的任务变更。",
+        "description": "Task changes applied atomically, in order.",
         "items": {
           "type": "object",
           "properties": {
@@ -57,15 +57,15 @@
             },
             "index": {
               "type": "integer",
-              "description": "目标任务序号，1 起始。新增时表示插入位置；省略则追加。"
+              "description": "Target task number, 1-based. For add, the insertion position; omit to append."
             },
             "match_content": {
               "type": "string",
-              "description": "省略 index 时，用于定位目标任务的完整内容。"
+              "description": "When index is omitted, the full content used to locate the target task."
             },
             "content": {
               "type": "string",
-              "description": "新增或修改后的任务内容。"
+              "description": "The task content to add, or the content after modification."
             },
             "status": {
               "type": "string",
