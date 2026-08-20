@@ -39,9 +39,12 @@ fn renderer_loads_only_the_fonts_needed_by_the_request() {
     let cjk_face_count = {
         let faces = renderer.font_system.db().faces().collect::<Vec<_>>();
         assert!(!faces.is_empty());
+        // 启动即加载正文 CJK 与等宽代码字体两个文件;emoji 仍按需。
         assert!(faces.iter().all(|face| matches!(
             &face.source,
-            fontdb::Source::File(path) if path == &font_dir.join(CJK_FONT_FILE)
+            fontdb::Source::File(path)
+                if path == &font_dir.join(CJK_FONT_FILE)
+                    || path == &font_dir.join(CODE_FONT_FILE)
         )));
         let families = faces
             .iter()

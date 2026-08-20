@@ -445,9 +445,19 @@ pub fn is_context_overflow_error(error: &anyhow::Error) -> bool {
 /// previous_response_id),而上游没有服务端会话状态,就找不到
 /// function_call_output 对应的 function_call。窄匹配上游原文,
 /// 命中即触发"清续传+全量重发+持久记 false"自愈(任务#16)。
+///
+/// 三种措辞(issue #32:只认第一种时,newapi 网关转发的 OpenAI 官方变体
+/// "…for function call output with call_id …"漏网,同一请求重试三次后
+/// 直接报错,自愈从未触发):
+/// - "No tool call found for tool output"(部分网关)
+/// - "No tool call found for function call output"(OpenAI 官方措辞)
+/// - 自家探测 bail("OpenAI Responses continuation is not supported"):
+///   能力探测已知不支持却还带着续传,同样该走清续传全量重发。
 pub fn is_responses_continuation_unsupported_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}");
     text.contains("No tool call found for tool output")
+        || text.contains("No tool call found for function call output")
+        || text.contains("OpenAI Responses continuation is not supported")
 }
 
 #[cfg(test)]
@@ -536,5 +546,28 @@ mod overflow_classifier_tests {
     fn unrelated_errors_do_not_match() {
         assert!(!is_context_overflow_message("connection reset by peer"));
         assert!(!is_context_overflow_message("invalid api key"));
+    }
+}
+
+#[cfg(test)]
+mod continuation_signature_tests {
+    /// issue #32:三种措辞都要命中——只认网关变体时 OpenAI 官方措辞
+    /// ("…for function call output with call_id …")漏网,自愈从未触发。
+    #[test]
+    fn continuation_unsupported_matches_all_known_wordings() {
+        let hit = |text: &str| {
+            super::is_responses_continuation_unsupported_error(&anyhow::anyhow!(
+                "{}",
+                text
+            ))
+        };
+        assert!(hit("status_code=400, No tool call found for tool output with id x"));
+        assert!(hit(
+            "status_code=400, No tool call found for function call output with call_id call_AhcSn"
+        ));
+        assert!(hit(
+            "no LLM provider/model endpoint succeeded: - newapi / gpt: OpenAI Responses continuation is not supported by this provider"
+        ));
+        assert!(!hit("upstream returned HTTP 400: bad request"));
     }
 }

@@ -159,7 +159,7 @@ impl OpenAiCompatibleClient {
         let info = if provider_uses_claude_code(&self.provider) {
             ModelReasoningInfo {
                 provider_npm: None,
-                variants: claude_code_reasoning_variants(),
+                variants: claude_code_reasoning_variants(&self.provider.default_model),
             }
         } else {
             models_cache::reasoning_info(&self.provider.id, &self.provider.default_model)?

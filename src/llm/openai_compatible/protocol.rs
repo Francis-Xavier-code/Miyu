@@ -93,9 +93,14 @@ pub(in crate::llm::openai_compatible) fn anthropic_reasoning_budget(max_tokens: 
 }
 
 /// Claude Code 的思考档:CLI 的 `--effort` 五档,不走 models.dev 目录
-/// (那里没有这个"供应商")。所有预置模型统一给全档,CLI 对不支持档位的
-/// 模型自行降级。
-pub(in crate::llm::openai_compatible) fn claude_code_reasoning_variants() -> Vec<ReasoningVariant> {
+/// (那里没有这个"供应商")。haiku 不支持调整思考力度,不给档
+/// (用户 08-20 裁定)。
+pub(in crate::llm::openai_compatible) fn claude_code_reasoning_variants(
+    model: &str,
+) -> Vec<ReasoningVariant> {
+    if model == "haiku" {
+        return Vec::new();
+    }
     ["low", "medium", "high", "xhigh", "max"]
         .into_iter()
         .map(|effort| ReasoningVariant {
@@ -107,7 +112,7 @@ pub(in crate::llm::openai_compatible) fn claude_code_reasoning_variants() -> Vec
 
 pub(in crate::llm::openai_compatible) fn supported_reasoning_variants(provider: &ProviderConfig, model: &str) -> Vec<ReasoningVariant> {
     if provider_uses_claude_code(provider) {
-        return claude_code_reasoning_variants();
+        return claude_code_reasoning_variants(model);
     }
     let Some(info) = models_cache::reasoning_info(&provider.id, model) else {
         return Vec::new();

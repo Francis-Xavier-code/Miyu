@@ -248,13 +248,15 @@ async fn missing_binary_reports_actionable_error() {
     );
 }
 
-/// 思考档:thinking-variant 选择映射成 CLI 的 --effort。
+/// 思考档:thinking-variant 选择映射成 CLI 的 --effort(用 opus 测——
+/// haiku 不支持思考力度调整,已无档位,见下一条)。
 #[tokio::test]
 async fn selected_thinking_variant_maps_to_effort_flag() {
     let dir = tempfile::tempdir().unwrap();
     let mut client = claude_code_client(dir.path(), "cc-effort");
+    client.provider.default_model = "opus".to_string();
     client.thinking_variants.insert(
-        thinking_variant_key("cc-effort", "haiku"),
+        thinking_variant_key("cc-effort", "opus"),
         "high".to_string(),
     );
     client
@@ -268,6 +270,28 @@ async fn selected_thinking_variant_maps_to_effort_flag() {
         .unwrap();
     let args = read(dir.path(), "args.txt");
     assert!(args.contains("--effort\nhigh"), "args: {args}");
+}
+
+/// haiku 不支持思考力度调整:无档位,残留的档位选择也不产生 --effort。
+#[tokio::test]
+async fn haiku_has_no_thinking_variants_and_sends_no_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = claude_code_client(dir.path(), "cc-haiku-effort");
+    client.thinking_variants.insert(
+        thinking_variant_key("cc-haiku-effort", "haiku"),
+        "high".to_string(),
+    );
+    client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    let args = read(dir.path(), "args.txt");
+    assert!(!args.contains("--effort"), "args: {args}");
 }
 
 /// 未启用的供应商在端点池装配时给出可操作的报错。
