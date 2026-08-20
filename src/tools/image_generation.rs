@@ -177,7 +177,7 @@ const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emi
 
 // 平台回合的图不自动投递(08-20 裁定):模型显式发送,链路对它透明,失败
 // 时它能看见错误并重试——自动投递静默失灵过三连。
-const PLATFORM_INSTRUCTION: &str = "The image was saved to disk at the returned path. It is NOT delivered automatically: to show it to the user, call send_message_to_user now with images=[{\"path\": <the returned path>, \"alt\": <short description>}]. Do not put the local file path in your reply text.";
+const PLATFORM_INSTRUCTION: &str = "The image was saved to disk at the returned path. It is not delivered automatically: send it to the user exactly once with send_message_to_user, images=[{\"path\": <the returned path>, \"alt\": <short description>}]. If a send_message_to_user result in this conversation already shows this image delivered, the send is complete — never send the same image twice. Do not put the local file path in your reply text.";
 
 /// 把 `reference_images` 收成一串引用。
 ///

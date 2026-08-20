@@ -174,7 +174,18 @@ pub(in crate::platforms::onebot) async fn execute_builtin_command(
                         let queued = state.platforms.queued_session_turns(&session_id);
                         let ticket = state.platforms.preempt_session_turns(&session_id);
                         let cancelled = cancel_session_runs(state, &session_id);
-                        let _session_turn = ticket.acquire().await.ok();
+                        // 等被取消的回合真正退出再报数,但设上限:回合卡在
+                        // LLM 超时重试/慢工具里退不出来时,/stop 的回复被
+                        // 这里拖住,在用户看来就像命令排队了(08-20 实测
+                        // 正常场景 0.5s,风暴场景数十秒)。超时先回话,
+                        // 停止信号早已发出。
+                        let _session_turn = tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            ticket.acquire(),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
                         tracing::info!(
                             target: "miyu::qq",
                             session_id = %session_id,

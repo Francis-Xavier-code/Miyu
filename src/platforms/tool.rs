@@ -224,7 +224,34 @@ async fn send(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<Str
             bail!("local attachments require an authorized platform administrator");
         }
     }
-    for (image, path) in images.iter().zip(image_paths) {
+    // 幂等闸:本会话已投递过的图不再重复发送。LLM 端点失败重试会让模型把
+    // 「发送这张图」的指引重演一遍(真机同图 4 连发),工具层按内容 digest
+    // 兜底,与平台自动投递的去重同一语义。
+    let mut skipped_duplicates = 0usize;
+    let mut fresh = Vec::new();
+    if !image_paths.is_empty() {
+        let delivered = context.delivered_image_digests();
+        for (image, path) in images.iter().zip(image_paths) {
+            let duplicate = std::fs::read(&path)
+                .ok()
+                .map(|bytes| blake3::hash(&bytes))
+                .is_some_and(|digest| delivered.contains(&digest));
+            if duplicate {
+                skipped_duplicates += 1;
+            } else {
+                fresh.push((image, path));
+            }
+        }
+        if fresh.is_empty() && skipped_duplicates > 0 && files.is_empty() {
+            return Ok(json!({
+                "ok": true,
+                "deduplicated": true,
+                "message": "This image was already delivered to this conversation; the send is complete. Do not send it again."
+            })
+            .to_string());
+        }
+    }
+    for (image, path) in fresh {
         let alt = image
             .get("alt")
             .and_then(Value::as_str)
