@@ -188,8 +188,8 @@ pub(in crate::cli) async fn stop_daemon(paths: &MiyuPaths) -> Result<()> {
 /// MIYU_HOME 判定(未设 = 默认 ~/.miyu),隔离测试环境的 daemon 不受波及。
 async fn sweep_stray_daemons(paths: &MiyuPaths) -> usize {
     let my_root = paths.root_dir.clone();
-    let default_root = std::env::var_os("HOME")
-        .map(|home| std::path::PathBuf::from(home).join(".miyu"));
+    let default_root =
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".miyu"));
     let mut strays = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
