@@ -36,8 +36,8 @@ pub fn shared_file_mime_kind(path: &Path) -> (&'static str, &'static str) {
         "webp" => ("image/webp", "image"),
         "svg" => ("image/svg+xml", "other"), // svg 可携脚本，只当附件下载
         "pdf" => ("application/pdf", "other"),
-        "txt" | "md" | "log" => ("text/plain; charset=utf-8", "other"),
-        "json" => ("application/json", "other"),
+        "txt" | "md" | "log" => ("text/plain; charset=utf-8", "text"),
+        "json" => ("application/json", "text"),
         "zip" => ("application/zip", "other"),
         "gz" | "tgz" => ("application/gzip", "other"),
         "tar" => ("application/x-tar", "other"),

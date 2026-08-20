@@ -252,3 +252,28 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
   `daemon stop` 报"未运行"却活着,用户 12:00 的测试全打在旧代码上。处理=
   kill 幽灵后干净重启;真机终验:kitty 图形字节实录+结果摘要行+回复确认。
   一次性会话的资产随阅后即焚级联删除属设计语义。
+
+## 14. 第七轮(2026-08-20 下午,用户实测二批)
+
+- **present_artifact 假 ok**:桥泵此前只接 Image,Artifact progress 被丢——
+  补 Artifact 臂(save_artifact_asset+tool.artifact 事件,与图片同构);真机
+  验证 artifact_assets 落 bridge_present_artifact_1。
+- **上下文表 1.2M 假数**:claude 结果帧 usage 是整轮累计(多次工具迭代求
+  和);表读数改用流内最后一次 message_start/delta 的真实 per-call usage
+  (ChatResult.last_request_usage 由中转直供,回合层不再用轮累计覆盖,
+  RoundUsage 优先取它)——这正是"拿 claude 侧数据"的正确来源。
+- **ask_question 过桥**(bridge_question):对 QuestionBroker 复刻回合内问答
+  流(question.requested 带活动 run_id→前端既有 UI→答案回 oneshot→问答对
+  落 running turn);claude 侧 MCP 客户端超时经 MCP_TOOL_TIMEOUT 放宽 30 分
+  钟。真机:claude 提问→REPL 弹窗→Closed 回传→claude 正确反应。
+- **后台任务跟进**:claude 自己的后台/通知活在单次进程里,轮末即杀跟不了
+  进;job/alarm 从去重表**请回**(Miyu 的 daemon 常驻+完成唤醒才是这套架构
+  的后台);glob/grep/todowrite 按用户裁定入表。miyu_tools 默认改 **all**
+  (dev 也挂,ask_question 尤其)。
+- share_file 的 txt/md/log/json kind 改 "text";runtime 时间戳带时区(%:z,
+  字节稳定);WebUI 音频/视频/文件卡片美化(web/shared.js+styles.css,待浏
+  览器验收)。
+- **已知限制(立项未做)**:①步间 followup——非 CLI 硬限制,stream-json
+  stdin 可中途注入,但需要"常驻进程+排队注入"的重构;②WebUI 切走再切回,
+  中转的工具卡片消失——重绘数据源 turn.tool_flow 与模型回放耦合,直接塞会
+  污染回放/打断续传,需要 display-only 持久化车道(如 turns 新列)。

@@ -239,7 +239,7 @@ impl OpenAiCompatibleClient {
             // 两套同开时去重:与 claude 原生重复的 Miyu 工具剔除,原生优先
             // (用户拍板清单;load_skill/manage_skill 与 claude 的 Skill 内容
             // 不同,不算重复)。
-            if let Some(mcp_config) = mcp_bridge_config(runtime, native_on) {
+            if let Some(mcp_config) = mcp_bridge_config(native_on) {
                 args.push("--mcp-config".into());
                 args.push(mcp_config);
                 args.push("--allowedTools".into());
@@ -261,8 +261,9 @@ impl OpenAiCompatibleClient {
 /// `miyu tool-call` 同一条会话→模式→registry 解析链。没有会话作用域(测试
 /// /直连辅助请求)就不挂桥。
 /// 两套工具同开时从桥里剔除的 Miyu 工具(与 claude 原生功能重复,原生
-/// 在训练分布内、优先):Bash/Edit/Read/Task/WebSearch/WebFetch 各自的
-/// Miyu 对应物,以及 claude 自带后台任务与定时能力覆盖的 job/alarm。
+/// 在训练分布内、优先)。job/alarm **不剔**:claude 自己的后台/定时机制
+/// 活在单次进程里,中转每轮一进程、轮末即杀,活不过回合;Miyu 的 job 走
+/// daemon 常驻 + 完成唤醒开新轮,才是这套架构下唯一能跟进的后台。
 const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
     "read_file",
     "apply_patch",
@@ -273,11 +274,9 @@ const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
     "glob",
     "grep",
     "todowrite",
-    "job",
-    "alarm",
 ];
 
-fn mcp_bridge_config(runtime: &ClaudeCodeRuntime, exclude_duplicates: bool) -> Option<String> {
+fn mcp_bridge_config(exclude_duplicates: bool) -> Option<String> {
     let session = crate::tools::workspace::try_session()?;
     let exe = crate::paths::miyu_executable().ok()?;
     let origin =

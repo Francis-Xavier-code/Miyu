@@ -224,14 +224,20 @@ pub(in crate::web) async fn handle_session_command(
                     crate::tools::workspace::with_turn_origin(
                         turn_origin,
                         crate::tools::workspace::with_bridge_depth(depth + 1, async {
-                            call_with_bridge_progress(
-                                state,
-                                &session_id,
-                                &registry,
-                                &name,
-                                &arguments,
-                            )
-                            .await
+                            // ask_question 是交互特例:注册表里只有报错桩,真实
+                            // 流程走 broker 问答(与回合内同一条前端通道)。
+                            if name == "ask_question" {
+                                Ok(bridge_ask_question(state, &session_id, &arguments).await)
+                            } else {
+                                call_with_bridge_progress(
+                                    state,
+                                    &session_id,
+                                    &registry,
+                                    &name,
+                                    &arguments,
+                                )
+                                .await
+                            }
                         }),
                     ),
                 ),
@@ -477,7 +483,12 @@ pub(in crate::web) fn attach_owner_turn_tools(
     mode: AgentMode,
     session_id: &str,
 ) {
-    if mode == AgentMode::Normal && config.tools.enabled {
+    if !config.tools.enabled {
+        return;
+    }
+    // 与 task.rs 相同的条件:平台会话进不了桥,ask_question 两种模式都有。
+    crate::tools::register_ask_question(registry);
+    if mode == AgentMode::Normal {
         crate::tools::register_webui_artifact_tools(registry, &state.paths, session_id);
         crate::tools::register_webui_share_tools(registry, config, state.state_store.clone());
     }

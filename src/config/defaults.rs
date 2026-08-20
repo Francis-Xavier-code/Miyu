@@ -436,7 +436,7 @@ pub(crate) fn default_claude_code_native_tools() -> String {
 }
 
 pub(crate) fn default_claude_code_miyu_tools() -> String {
-    "normal".to_string()
+    "all".to_string()
 }
 
 pub(crate) fn default_claude_code_timeout_seconds() -> u64 {

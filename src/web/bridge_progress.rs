@@ -56,33 +56,8 @@ fn handle_bridge_progress(
     match event {
         crate::tools::ToolProgressEvent::Image { path, alt, size } => {
             *image_seq += 1;
-            // 挂到该会话正在跑的回合上(桥调用发生在 claude-code 中转回合
-            // 期间,那个 running turn 就是可见回合);没有活动回合就放弃——
-            // image_assets 的 turn_id 外键必须指向真实 turn 行。
-            let run = {
-                let manager = state.manager.lock().unwrap();
-                manager
-                    .active_runs
-                    .iter()
-                    .find(|(_, info)| &*info.session_id == session_id)
-                    .map(|(run_id, info)| (run_id.clone(), info.turn_id.clone()))
-            };
-            let turn_id = match &run {
-                Some((_, Some(turn_id))) => Some(turn_id.clone()),
-                _ => state
-                    .state_store
-                    .pinned(session_id)
-                    .running_turn_queue_target()
-                    .ok()
-                    .flatten()
-                    .map(|target| target.turn_id),
-            };
-            let Some(turn_id) = turn_id else {
-                tracing::warn!(
-                    session_id,
-                    tool = tool_name,
-                    "bridge tool image dropped: no running turn to attach it to"
-                );
+            let Some((run, turn_id)) = resolve_bridge_turn(state, session_id, tool_name, "image")
+            else {
                 return;
             };
             let tool_id = format!("bridge_{tool_name}_{image_seq}");
@@ -101,7 +76,7 @@ fn handle_bridge_progress(
                     // 与 RunEventMapper 的 tool.image 同形,REPL/WebUI 按
                     // run_id 过滤后走同一条渲染路;没有活动 run 就只落库
                     // (刷新可见)。
-                    if let Some((run_id, _)) = run {
+                    if let Some(run_id) = run {
                         state.events.publish(
                             "tool.image",
                             json!({
@@ -122,6 +97,48 @@ fn handle_bridge_progress(
                 ),
             }
         }
+        // Artifact 与图片同构:落 artifact asset + tool.artifact 事件。丢掉
+        // 它就是 present_artifact "假 ok" 的根源(工具答成功,WebUI 里啥都
+        // 没有)。
+        crate::tools::ToolProgressEvent::Artifact { path, title } => {
+            *image_seq += 1;
+            let Some((run, turn_id)) =
+                resolve_bridge_turn(state, session_id, tool_name, "artifact")
+            else {
+                return;
+            };
+            let tool_id = format!("bridge_{tool_name}_{image_seq}");
+            match state
+                .state_store
+                .save_artifact_asset(&turn_id, Some(&tool_id), &path, &title)
+            {
+                Ok(asset) => {
+                    tracing::info!(
+                        session_id,
+                        tool = tool_name,
+                        turn_id = %turn_id,
+                        "bridge tool artifact persisted"
+                    );
+                    if let Some(run_id) = run {
+                        state.events.publish(
+                            "tool.artifact",
+                            json!({
+                                "run_id": run_id,
+                                "tool_id": tool_id,
+                                "name": tool_name,
+                                "artifact": SafeArtifactAsset::from(asset),
+                            }),
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    session_id,
+                    tool = tool_name,
+                    %error,
+                    "failed to persist a bridge tool artifact"
+                ),
+            }
+        }
         crate::tools::ToolProgressEvent::PrepareForExternalOutput { ready } => {
             // 桥没有用户终端:明确拒绝,工具走 report_image 等非终端路径。
             // (空 progress 会误答 true,print_image 曾把图打进 daemon stdout。)
@@ -129,5 +146,44 @@ fn handle_bridge_progress(
         }
         // 文本进度/命令输出/artifact 在桥语义下没有去处,与既往一致丢弃。
         _ => {}
+    }
+}
+
+/// 桥调用挂靠的 (活动 run, running turn):没有运行中回合就放弃——asset 的
+/// turn_id 外键必须指向真实 turn 行。
+fn resolve_bridge_turn(
+    state: &DaemonState,
+    session_id: &str,
+    tool_name: &str,
+    what: &str,
+) -> Option<(Option<String>, String)> {
+    let run = {
+        let manager = state.manager.lock().unwrap();
+        manager
+            .active_runs
+            .iter()
+            .find(|(_, info)| &*info.session_id == session_id)
+            .map(|(run_id, info)| (run_id.clone(), info.turn_id.clone()))
+    };
+    let turn_id = match &run {
+        Some((_, Some(turn_id))) => Some(turn_id.clone()),
+        _ => state
+            .state_store
+            .pinned(session_id)
+            .running_turn_queue_target()
+            .ok()
+            .flatten()
+            .map(|target| target.turn_id),
+    };
+    match turn_id {
+        Some(turn_id) => Some((run.map(|(run_id, _)| run_id), turn_id)),
+        None => {
+            tracing::warn!(
+                session_id,
+                tool = tool_name,
+                "bridge tool {what} dropped: no running turn to attach it to"
+            );
+            None
+        }
     }
 }

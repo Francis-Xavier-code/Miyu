@@ -84,6 +84,9 @@ where
         .stderr(std::process::Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
+    // MCP 工具调用的客户端超时:ask_question 这类交互工具要等人回答,
+    // claude 默认的 MCP 超时等不起,放宽到 30 分钟。
+    command.env("MCP_TOOL_TIMEOUT", "1800000");
     if runtime.prefer_subscription {
         // 环境里的按量 API key 会抢走订阅登录态,中转的意义就没了。
         command.env_remove("ANTHROPIC_API_KEY");
@@ -307,7 +310,14 @@ where
         }
         content = result_text;
     }
-    let usage = usage_from_result_frame(&final_frame).or(state.usage.take());
+    // 结果帧的 usage 是整轮累计(多次工具迭代求和),记 Σ 用它;上下文表
+    // 读数要的是"最后一次模型调用的真实占用",那在流内最后一个
+    // message_start/delta 里(state.usage 恰好保存的就是最新一次)。
+    let per_request_usage = state.usage.take().map(|mut usage| {
+        usage.normalize_cache_fields();
+        usage
+    });
+    let usage = usage_from_result_frame(&final_frame).or_else(|| per_request_usage.clone());
     let stop_reason = final_frame
         .get("stop_reason")
         .and_then(Value::as_str)
@@ -315,6 +325,7 @@ where
         .or(state.stop_reason.take());
     let mut result = finalize_stream_result(content, state.reasoning, usage, Vec::new(), false)?;
     result.finish_reason = map_anthropic_stop_reason(stop_reason);
+    result.last_request_usage = per_request_usage;
     Ok(TurnOutcome {
         result,
         claude_session: session_id,

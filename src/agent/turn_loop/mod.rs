@@ -378,16 +378,22 @@ impl Agent {
             }
             usage_accumulator.add_result(&result, messages);
             if let Some(turn_usage) = usage_accumulator.usage() {
-                let round = result.usage.clone().unwrap_or_else(|| {
-                    let prompt = overflow::estimate_messages_tokens(&request_messages) as u64;
-                    let completion = estimate_result_tokens(&result) as u64;
-                    Usage {
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        total_tokens: prompt.saturating_add(completion),
-                        ..Usage::default()
-                    }
-                });
+                // 上下文表读数优先取供应商标注的"最后一次请求"口径。
+                let round = result
+                    .last_request_usage
+                    .clone()
+                    .or_else(|| result.usage.clone())
+                    .unwrap_or_else(|| {
+                        let prompt =
+                            overflow::estimate_messages_tokens(&request_messages) as u64;
+                        let completion = estimate_result_tokens(&result) as u64;
+                        Usage {
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            total_tokens: prompt.saturating_add(completion),
+                            ..Usage::default()
+                        }
+                    });
                 on_event(AgentEvent::RoundUsage {
                     round: Box::new(round),
                     turn: TurnTokens::from_usage(Some(&turn_usage)),
@@ -466,7 +472,13 @@ impl Agent {
                     publish_auto_artifact_candidates(&artifact_candidates, on_event)?;
                 }
                 if let Some(usage) = usage_accumulator.usage() {
-                    result.last_request_usage = result.usage.take();
+                    // 供应商已给出"最后一次请求"的口径(claude-code 中转:
+                    // 结果帧是整轮累计,真实上下文在流内最后一次调用里)时
+                    // 尊重之,不再用轮用量覆盖。
+                    let round_usage = result.usage.take();
+                    if result.last_request_usage.is_none() {
+                        result.last_request_usage = round_usage;
+                    }
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -490,7 +502,10 @@ impl Agent {
                 }))?;
                 result.tool_calls.clear();
                 if let Some(usage) = usage_accumulator.usage() {
-                    result.last_request_usage = result.usage.take();
+                    let round_usage = result.usage.take();
+                    if result.last_request_usage.is_none() {
+                        result.last_request_usage = round_usage;
+                    }
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
