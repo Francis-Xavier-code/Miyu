@@ -17,17 +17,32 @@ mod stream;
 
 use crate::llm::openai_compatible::*;
 
-/// 客户端构造期解析好的运行时参数(binary/工作目录/桥开关),端点间共享。
+/// 客户端构造期解析好的运行时参数(binary/工具作用域/权限模式),端点间共享。
 pub(in crate::llm::openai_compatible) struct ClaudeCodeRuntime {
     pub(in crate::llm::openai_compatible) binary: PathBuf,
-    pub(in crate::llm::openai_compatible) workdir: PathBuf,
     /// Miyu home 根(MIYU_HOME):MCP 桥子进程必须显式带上,不赌 claude 会
     /// 把父环境透传给 MCP server——透传缺失时桥会静默连到默认 home 的
     /// daemon,拿错目录还不报错。
     pub(in crate::llm::openai_compatible) home: PathBuf,
-    pub(in crate::llm::openai_compatible) expose_miyu_tools: bool,
+    /// claude 原生工具(Bash/Edit/Read…)的模式作用域:off/dev/normal/all。
+    pub(in crate::llm::openai_compatible) native_tools: String,
+    /// Miyu 工具经 MCP 桥挂给 claude 的模式作用域:off/dev/normal/all。
+    pub(in crate::llm::openai_compatible) miyu_tools: String,
+    /// 原生工具开启时的 --permission-mode(无头模式没有交互审批)。
+    pub(in crate::llm::openai_compatible) permission_mode: String,
     pub(in crate::llm::openai_compatible) idle_timeout: Duration,
     pub(in crate::llm::openai_compatible) prefer_subscription: bool,
+}
+
+/// 模式作用域判定:会话是 dev 还是 normal 由 Agent 构造时经
+/// `with_claude_code_dev_mode` 打到客户端上。未知值按 off 兜底。
+pub(in crate::llm::openai_compatible) fn scope_allows(scope: &str, dev_mode: bool) -> bool {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "all" => true,
+        "dev" => dev_mode,
+        "normal" => !dev_mode,
+        _ => false,
+    }
 }
 
 impl ClaudeCodeRuntime {
@@ -43,10 +58,10 @@ impl ClaudeCodeRuntime {
         };
         Self {
             binary,
-            // 专用空目录,避免 claude 顺着 cwd 自动发现无关项目的 CLAUDE.md。
-            workdir: paths.state_dir.join("claude-code-workspace"),
             home: paths.root_dir.clone(),
-            expose_miyu_tools: plugin.expose_miyu_tools,
+            native_tools: plugin.native_tools.clone(),
+            miyu_tools: plugin.miyu_tools.clone(),
+            permission_mode: plugin.permission_mode.clone(),
             idle_timeout: Duration::from_secs(plugin.idle_timeout_seconds.max(30)),
             prefer_subscription: plugin.prefer_subscription,
         }
@@ -79,6 +94,9 @@ impl OpenAiCompatibleClient {
         // 辅助请求(压缩摘要、标题、judge)一次一个 claude 会话即可,不建持久
         // 会话也不参与续传匹配,免得污染主对话的会话映射。
         let ephemeral = self.request_scope != "chat";
+        // 一律用会话工作区(与 run_command 同源):原生工具在这里操作文件,
+        // 无工具时 cwd 无关紧要。回合作用域外(测试/辅助)回退进程 cwd。
+        let workdir = crate::tools::workspace::effective_workdir();
         let chain = session::prefix_chain(&self.provider.id, &model, &system_prompt, &conversation);
         let resumable = if ephemeral {
             None
@@ -108,7 +126,7 @@ impl OpenAiCompatibleClient {
                 // conversation 是续传哈希链的原料,录下来才能诊断"为什么没命中"。
                 &json!({ "args": args, "stdin": payload, "conversation": conversation }),
             );
-            stream::run_claude_turn(&runtime, &args, &payload, request_id, on_chunk).await
+            stream::run_claude_turn(&runtime, &workdir, &args, &payload, request_id, on_chunk).await
         };
         let outcome = match outcome {
             Err(error)
@@ -127,7 +145,7 @@ impl OpenAiCompatibleClient {
                 let payload = payload::render_user_payload(&conversation);
                 let args =
                     self.claude_code_args(&runtime, &model, &system_prompt, None, ephemeral);
-                stream::run_claude_turn(&runtime, &args, &payload, request_id, on_chunk).await?
+                stream::run_claude_turn(&runtime, &workdir, &args, &payload, request_id, on_chunk).await?
             }
             other => other?,
         };
@@ -190,11 +208,21 @@ impl OpenAiCompatibleClient {
             args.push("--system-prompt".into());
             args.push(system_prompt.to_string());
         }
-        // 内置工具全关:文件/终端能力属于 Miyu 的工具面,不属于中转的模型面。
-        args.push("--tools".into());
-        args.push(String::new());
+        // 工具面按双四档作用域装配;辅助请求(摘要/标题)永远无工具。
+        let native_on =
+            !ephemeral && scope_allows(&runtime.native_tools, self.claude_code_dev_mode);
+        let miyu_on = !ephemeral && scope_allows(&runtime.miyu_tools, self.claude_code_dev_mode);
+        if native_on {
+            // claude 原生工具(训练分布内)开放;无头模式没有交互审批,
+            // 权限模式决定 Bash 等是否可用(默认 bypassPermissions)。
+            args.push("--permission-mode".into());
+            args.push(runtime.permission_mode.clone());
+        } else {
+            args.push("--tools".into());
+            args.push(String::new());
+        }
         args.push("--strict-mcp-config".into());
-        if !ephemeral && runtime.expose_miyu_tools {
+        if miyu_on {
             if let Some(mcp_config) = mcp_bridge_config(runtime) {
                 args.push("--mcp-config".into());
                 args.push(mcp_config);

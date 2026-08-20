@@ -48,6 +48,8 @@ impl Agent {
         } else {
             config
         };
+        // claude-code 中转的双四档工具作用域按会话模式裁决;其他协议无感。
+        let client = client.with_claude_code_dev_mode(mode == AgentMode::Dev);
         let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
         let system_prompt = with_memory_preamble(
             with_host_environment(

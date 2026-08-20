@@ -145,6 +145,7 @@ pub(super) fn client_over(endpoints: Vec<LlmEndpoint>) -> OpenAiCompatibleClient
         request_scope: "chat",
         claude_code: None,
         claude_code_platform_blocked: false,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     }
 }
@@ -171,6 +172,7 @@ pub(super) fn test_client(provider: ProviderConfig) -> OpenAiCompatibleClient {
         request_scope: "chat",
         claude_code: None,
         claude_code_platform_blocked: false,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     }
 }

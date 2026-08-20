@@ -95,6 +95,9 @@ pub struct OpenAiCompatibleClient {
     claude_code: Option<Arc<ClaudeCodeRuntime>>,
     /// 平台(QQ 等)回合置位:claude-code 走用户订阅额度,仅限本机会话。
     claude_code_platform_blocked: bool,
+    /// 本会话是否 dev 模式(Agent 构造时置位),claude-code 的双四档工具
+    /// 作用域(native_tools/miyu_tools)按它判定。
+    claude_code_dev_mode: bool,
 }
 
 #[derive(Clone, Copy)]

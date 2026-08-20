@@ -93,7 +93,14 @@ def main():
         mark = len(chunks)
         os.write(master, b"\r")  # 回车编辑第一行(claude-code)
         form = wait_for("编辑 Claude Code", mark)
-        for expected in ["启用(订阅中转", "claude 可执行文件", "MCP 桥", "看门狗"]:
+        for expected in [
+            "启用(订阅中转",
+            "claude 可执行文件",
+            "原生工具作用域",
+            "Miyu 工具挂给 claude",
+            "权限模式",
+            "看门狗",
+        ]:
             assert expected in form, f"专用表单缺字段 {expected!r}:\n{form[-800:]}"
         for absent in ["Base URL", "API Key", "协议", "额外请求体"]:
             assert absent not in form, f"专用表单不该出现 {absent!r}:\n{form[-800:]}"

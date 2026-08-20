@@ -66,6 +66,7 @@ fn classify_claude_failure(text: &str) -> Option<HttpStatusFailure> {
 
 pub(super) async fn run_claude_turn<F>(
     runtime: &ClaudeCodeRuntime,
+    workdir: &std::path::Path,
     args: &[String],
     stdin_payload: &str,
     request_id: &str,
@@ -74,16 +75,10 @@ pub(super) async fn run_claude_turn<F>(
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
-    std::fs::create_dir_all(&runtime.workdir).with_context(|| {
-        format!(
-            "failed to create claude-code workdir: {}",
-            runtime.workdir.display()
-        )
-    })?;
     let mut command = tokio::process::Command::new(&runtime.binary);
     command
         .args(args)
-        .current_dir(&runtime.workdir)
+        .current_dir(workdir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

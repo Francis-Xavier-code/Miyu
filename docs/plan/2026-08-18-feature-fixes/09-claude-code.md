@@ -187,3 +187,24 @@
 启用后中转正常/`--effort low` 实测入参/TUI PTY 探针
 (testkit/claude-code/tui_probe.py)四段全过——未启用标、专用表单无 HTTP 字
 段、表单内启用+保存、落盘后启用态与预置模型完好。
+
+## 11. 工具面双四档(2026-08-20 第三轮讨论定稿)
+
+用户实测发现经桥的 Miyu 工具在 claude 侧执行、本就不走 Miyu 渲染管线,"保
+渲染"不成立;裁定原生工具转正。定稿:
+
+- **两个独立四档作用域**(off/dev/normal/all,按会话模式裁决,专用表单可改):
+  `native_tools`(claude 自带 Bash/Edit/Read…,**默认 all**)与
+  `miyu_tools`(MCP 桥,**默认 off**)。可叠加:dev 会话可同时拥有两边。
+- 原生工具开启时:去掉 `--tools ""`,改传 `--permission-mode`(共用
+  plugins.claude_code.permission_mode,**默认改为 bypassPermissions**——无头
+  模式没有交互审批,acceptEdits 下 Bash 会被拒;委托工具同步吃这个默认)。
+- **工作目录一律会话工作区**(workspace::effective_workdir,与 run_command
+  同源),删除固定空目录设计;辅助请求(scope≠chat)保持无工具。
+- 会话模式经 Agent 构造期 `with_claude_code_dev_mode` 打到客户端。
+- 已知代价:原生工具跑长静默命令会撞流空闲看门狗(默认 300s,表单可调)。
+
+真机验证:默认档下 claude 用自带 Bash 读取随机口令文件并原样回复(不可伪造),
+请求日志实测 `--permission-mode bypassPermissions` 且无 `--tools`/`--mcp-config`;
+作用域四组合单测(all/dev×normal 会话/dev×dev 会话/normal×dev 会话)全绿;
+TUI 探针含新字段复测全过。

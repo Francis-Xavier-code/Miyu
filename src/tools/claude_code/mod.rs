@@ -141,7 +141,7 @@ mod tests {
         let args = std::fs::read_to_string(workdir.join("args.txt")).unwrap();
         assert_eq!(
             args,
-            "-p\n--output-format\njson\n--permission-mode\nacceptEdits\n--model\nclaude-sonnet-x\n--append-system-prompt\nextra system\n--resume\nsess-old\n"
+            "-p\n--output-format\njson\n--permission-mode\nbypassPermissions\n--model\nclaude-sonnet-x\n--append-system-prompt\nextra system\n--resume\nsess-old\n"
         );
         assert_eq!(
             std::fs::read_to_string(workdir.join("stdin.txt")).unwrap(),

@@ -71,7 +71,7 @@ pub(super) async fn run(
     let binary = if binary.is_empty() { "claude" } else { binary };
     let permission_mode = plugin.permission_mode.trim();
     let permission_mode = if permission_mode.is_empty() {
-        "acceptEdits"
+        "bypassPermissions"
     } else {
         permission_mode
     };

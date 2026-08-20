@@ -47,9 +47,10 @@ fn claude_code_client(dir: &std::path::Path, provider_id: &str) -> OpenAiCompati
     let mut client = test_client(provider);
     client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
         binary: fake_claude_script(dir),
-        workdir: dir.join("workspace"),
         home: dir.to_path_buf(),
-        expose_miyu_tools: false,
+        native_tools: "off".to_string(),
+        miyu_tools: "off".to_string(),
+        permission_mode: "bypassPermissions".to_string(),
         idle_timeout: Duration::from_secs(30),
         prefer_subscription: true,
     }));
@@ -104,7 +105,10 @@ async fn first_turn_spawns_fresh_session_with_full_flags() {
 
     let args = read(dir.path(), "args.txt");
     assert!(args.contains("--model\nhaiku"), "args: {args}");
-    assert!(args.contains("--system-prompt\npersona prompt"), "args: {args}");
+    assert!(
+        args.contains("--system-prompt\npersona prompt"),
+        "args: {args}"
+    );
     assert!(args.contains("--tools\n\n"), "内置工具应整体关闭: {args}");
     assert!(args.contains("--strict-mcp-config"), "args: {args}");
     assert!(!args.contains("--resume"), "首轮不该续传: {args}");
@@ -209,7 +213,8 @@ async fn platform_turns_are_refused() {
         .await
         .unwrap_err();
     assert!(
-        format!("{error:#}").contains("owner sessions") || format!("{error:#}").contains("本机会话"),
+        format!("{error:#}").contains("owner sessions")
+            || format!("{error:#}").contains("本机会话"),
         "{error:#}"
     );
 }
@@ -221,9 +226,10 @@ async fn missing_binary_reports_actionable_error() {
     let mut client = claude_code_client(dir.path(), "cc-missing");
     client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
         binary: dir.path().join("no-such-claude"),
-        workdir: dir.path().join("workspace"),
         home: dir.path().to_path_buf(),
-        expose_miyu_tools: false,
+        native_tools: "off".to_string(),
+        miyu_tools: "off".to_string(),
+        permission_mode: "bypassPermissions".to_string(),
         idle_timeout: Duration::from_secs(30),
         prefer_subscription: true,
     }));
@@ -291,4 +297,76 @@ async fn disabled_provider_is_rejected_at_pool_assembly() {
         text.contains("disabled") || text.contains("未启用"),
         "{text}"
     );
+}
+
+/// 双四档作用域:原生工具开 ⇒ 换 --permission-mode 且不再关内置工具;
+/// 关 ⇒ --tools "";dev 档随客户端的会话模式旗标翻转。
+#[tokio::test]
+async fn native_tool_scope_shapes_the_cli_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = fake_claude_script(dir.path());
+    let runtime = |scope: &str| {
+        Arc::new(ClaudeCodeRuntime {
+            binary: script.clone(),
+            home: dir.path().to_path_buf(),
+            native_tools: scope.to_string(),
+            miyu_tools: "off".to_string(),
+            permission_mode: "bypassPermissions".to_string(),
+            idle_timeout: Duration::from_secs(30),
+            prefer_subscription: true,
+        })
+    };
+    let run = |client: OpenAiCompatibleClient| async move {
+        client
+            .chat_claude_code_stream(
+                vec![ChatMessage::plain("user", "hi")],
+                Vec::new(),
+                "req-test",
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+    };
+
+    // all:普通会话也开原生工具。
+    let mut client = claude_code_client(dir.path(), "cc-scope-all");
+    client.claude_code = Some(runtime("all"));
+    run(client).await;
+    let args = read(dir.path(), "args.txt");
+    assert!(
+        args.contains("--permission-mode\nbypassPermissions"),
+        "{args}"
+    );
+    assert!(
+        !args.contains("--tools"),
+        "原生工具开时不该关内置工具: {args}"
+    );
+    assert!(args.contains("--strict-mcp-config"), "{args}");
+
+    // dev 档 + 普通会话:原生工具关。
+    let mut client = claude_code_client(dir.path(), "cc-scope-dev-off");
+    client.claude_code = Some(runtime("dev"));
+    run(client).await;
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--tools\n\n"), "{args}");
+    assert!(!args.contains("--permission-mode"), "{args}");
+
+    // dev 档 + dev 会话:原生工具开。
+    let mut client = claude_code_client(dir.path(), "cc-scope-dev-on");
+    client.claude_code = Some(runtime("dev"));
+    let client = client.with_claude_code_dev_mode(true);
+    run(client).await;
+    let args = read(dir.path(), "args.txt");
+    assert!(
+        args.contains("--permission-mode\nbypassPermissions"),
+        "{args}"
+    );
+
+    // normal 档 + dev 会话:原生工具关。
+    let mut client = claude_code_client(dir.path(), "cc-scope-normal");
+    client.claude_code = Some(runtime("normal"));
+    let client = client.with_claude_code_dev_mode(true);
+    run(client).await;
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--tools\n\n"), "{args}");
 }
