@@ -1,3 +1,4 @@
+mod claude_code_form;
 mod personas;
 mod platforms;
 mod plugin_settings;
@@ -9,6 +10,7 @@ mod scheduled_messages;
 mod settings;
 mod undo;
 mod widgets;
+use claude_code_form::*;
 use personas::*;
 use platforms::*;
 use plugin_settings::*;
