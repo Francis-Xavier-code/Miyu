@@ -341,6 +341,17 @@ fn compact_line(text: &str, limit: usize) -> String {
     collapsed
 }
 
+/// 按字符截断但保留换行结构:Bash 的输出走命令输出块渲染,折叠空白会把
+/// 多行日志压成一行。
+fn truncate_block(text: &str, limit: usize) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.chars().count() > limit {
+        trimmed.chars().take(limit).collect::<String>() + "…"
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn emit_remote_tool_started<F>(
     frame: &Value,
     remote_tools: &mut HashMap<String, String>,
@@ -418,7 +429,11 @@ where
                 "id": id,
                 "name": name,
                 "ok": ok,
-                "output": compact_line(&output, 4000),
+                "output": if name == "Bash" {
+                    truncate_block(&output, 4000)
+                } else {
+                    compact_line(&output, 4000)
+                },
             })
             .to_string(),
         })?;
@@ -613,4 +628,18 @@ fn usage_from_result_frame(frame: &Value) -> Option<Usage> {
         cache_reported: true,
         ..Usage::default()
     })
+}
+
+#[cfg(test)]
+mod output_shaping_tests {
+    /// Bash 走命令输出块,换行必须保住;其余工具仍折叠成一行摘要。
+    #[test]
+    fn bash_output_keeps_line_structure() {
+        assert_eq!(super::truncate_block("a\nb\n", 4000), "a\nb");
+        assert_eq!(super::compact_line("a\nb", 4000), "a b");
+        let long = "x".repeat(4001);
+        let cut = super::truncate_block(&long, 4000);
+        assert!(cut.ends_with('…'));
+        assert_eq!(cut.chars().count(), 4001);
+    }
 }

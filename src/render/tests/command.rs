@@ -343,3 +343,10 @@ fn parses_command_result_json() {
     assert_eq!(result.stdout, "unused");
     assert_eq!(result.stderr, "not found");
 }
+
+#[test]
+fn command_tool_family_covers_native_bash() {
+    assert!(is_command_tool("run_command"));
+    assert!(is_command_tool("Bash"));
+    assert!(!is_command_tool("read_file"));
+}

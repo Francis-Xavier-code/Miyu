@@ -6846,9 +6846,10 @@
   function toolSubject(name, value) {
     const args = parsedToolArguments(value);
     const toolName = String(name || "");
-    if (toolName === "run_command") {
+    if (toolName === "run_command" || toolName === "Bash") {
       const line = compactLine(args.command || args.cmd);
-      return args.background === true ? `[后台] ${line}` : line;
+      const background = args.background === true || args.run_in_background === true;
+      return background ? `[后台] ${line}` : line;
     }
     if (toolName === "read_file") {
       const path = compactPath(args.path);
@@ -6947,7 +6948,7 @@
     const card = document.createElement("section");
     card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
     const name = String(call?.name || "");
-    if (name === "run_command") card.classList.add("is-command");
+    if (name === "run_command" || name === "Bash") card.classList.add("is-command");
     if (name === "task") card.classList.add("is-task");
     // 图标配色来自 is-success（金）/ is-failure（红）。两个都不加会退回默认色，
     // 看起来就是「颜色不对」。
@@ -7079,7 +7080,7 @@
   // 未列家族回落扳手。全部 lucide 线稿,无 emoji。
   function toolIconName(name) {
     const n = String(name || "");
-    if (["run_command", "job_status", "job_stop"].includes(n)) return "terminal";
+    if (["run_command", "Bash", "job_status", "job_stop"].includes(n)) return "terminal";
     if (["web_search", "web_fetch", "search_web", "webfetch"].includes(n)) return "globe";
     if (n === "search_web_images") return "image-search";
     if (n === "apply_patch" || n === "apply_artifact_patch") return "square-pen";
@@ -7120,7 +7121,7 @@
     const card = document.createElement("section");
     card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
     card.dataset.toolId = toolId;
-    const isCommand = String(data?.name || "") === "run_command";
+    const isCommand = ["run_command", "Bash"].includes(String(data?.name || ""));
     if (isCommand) card.classList.add("is-command");
     const isTask = String(data?.name || "") === "task" || /^task[:：]/i.test(String(data?.display_name || ""));
     if (isTask) card.classList.add("is-task");

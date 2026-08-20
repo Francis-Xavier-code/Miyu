@@ -66,7 +66,7 @@ impl RunEventMapper {
         let display_name = tools::readable_tool_name(&event_name);
         ActiveTool {
             id: call_id,
-            command_output: (name == "run_command")
+            command_output: crate::render::is_command_tool(&name)
                 .then(|| crate::render::CommandOutputTail::new(self.command_output_lines)),
             name,
             display_name,

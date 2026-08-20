@@ -314,3 +314,18 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
 - MCP 对外接入达成度:`miyu mcp-serve` 是标准 stdio server,任何 MCP 客户
   端可挂(env: MIYU_SESSION 指会话;MIYU_HOME/XDG_RUNTIME_DIR 必须与
   daemon 环境一致地传或不传)。
+
+## 17. 第十轮(2026-08-20 下午)
+
+- **Bash 展示与 run_command 完全对齐**(用户验收指出颜色不同/输出缺失):
+  渲染层引入命令家族判定 is_command_tool(run_command|Bash),Bash 进
+  CommandLiveDisplay(同一个 $ 标题行/↳ 命令/│ 输出尾巴,颜色同源);流侧
+  Bash 输出不再折叠空白(truncate_block 保换行),WebUI 事件映射同步给
+  Bash 分配输出尾巴,前端命令卡家族(is-command/图标/主题)纳入 Bash。
+  真机(隔离 daemon+PTY+pyte 还原):`$ 运行命令×1 ok / ↳ printf … /
+  │ BASHL1-3` 三行输出块齐全。
+- **图片上方空两行修复**(用户截图点名):print_image_file 开头的前导空行
+  删除——所有调用方都紧跟 prepare_for_external_output,摘要冻结已留一个
+  空行,叠加即两行。真机:冻结行→↳ 主题→恰好一个空行→图形字节。
+- 前端批(音频卡/多选/删末会话闩锁/share 重建)用户浏览器验收通过,已提交
+  (21e63a02)。

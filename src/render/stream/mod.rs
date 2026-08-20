@@ -221,7 +221,7 @@ impl StreamRenderer {
         stream: CommandOutputStream,
         chunk: &[u8],
     ) -> Result<()> {
-        if self.plain || name != "run_command" {
+        if self.plain || !is_command_tool(name) {
             return Ok(());
         }
         if let Some(display) = &mut self.command_display {

@@ -69,8 +69,9 @@ pub(crate) async fn print_image(
 }
 
 pub async fn print_image_file(path: &Path, size: Option<String>) -> Result<()> {
-    println!();
-    io::stdout().flush()?;
+    // 不再自带前导空行:所有调用方都紧跟 prepare_for_external_output,
+    // 摘要冻结(write_activity_summary)已留了一个空行,这里再空一行就是
+    // 图片上方空两行(用户 08-20 实测点名)。
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false)
         && crate::terminal::kitty::is_native_kitty_terminal()
         && crate::terminal::kitty::supports_path(path)
