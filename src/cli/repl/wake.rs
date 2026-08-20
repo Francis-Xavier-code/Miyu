@@ -343,6 +343,32 @@ pub(in crate::cli) async fn follow_wake_run(
                     output: ipc_text(&data, "output").to_string(),
                 },
             )?,
+            // shellhook/唤醒形态此前没有这个分支,工具图片(表情包/生图/
+            // print_image)在客户端被静默丢弃——REPL 形态(one_shot 事件循环)
+            // 一直有,唯独这条流漏了。
+            "tool.image" => {
+                renderer.prepare_for_external_output()?;
+                live.apply_renderer_frame(&mut renderer)?;
+                synchronized_terminal_update(CursorAfterUpdate::Hidden, || live.suspend())?;
+                live.external_output_active = true;
+                let state = StateStore::new(paths)?;
+                let size = remote_tool_image_size(
+                    ipc_text(&data, "name"),
+                    ipc_text(&data, "size"),
+                    &config,
+                );
+                if let Err(error) = render_remote_tool_image(&state, &data, size).await {
+                    renderer.write_system_message(&format!(
+                        "{}: {error}",
+                        t("Could not display tool image", "工具图片显示失败")
+                    ))?;
+                }
+                live.lift_external_output_into_page()?;
+                live.external_output_active = false;
+                live.output_cursor = cursor_position_or(live.output_cursor);
+                live.resume_at(live.output_cursor)?;
+                live.apply_renderer_frame(&mut renderer)?;
+            }
             "queue.consumed" => {
                 let prompt_ids: Vec<String> = data
                     .get("prompt_ids")

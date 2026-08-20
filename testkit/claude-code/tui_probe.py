@@ -94,7 +94,7 @@ def main():
         os.write(master, b"\r")  # 回车编辑第一行(claude-code)
         form = wait_for("编辑 Claude Code", mark)
         for expected in [
-            "启用(订阅中转",
+            "启用(中转 Claude Code",
             "claude 可执行文件",
             "原生工具作用域",
             "Miyu 工具挂给 claude",

@@ -78,7 +78,7 @@ fn handle_bridge_progress(
                     .map(|target| target.turn_id),
             };
             let Some(turn_id) = turn_id else {
-                tracing::debug!(
+                tracing::warn!(
                     session_id,
                     tool = tool_name,
                     "bridge tool image dropped: no running turn to attach it to"
@@ -91,6 +91,13 @@ fn handle_bridge_progress(
                 .save_image_asset(&turn_id, Some(&tool_id), &path, &alt)
             {
                 Ok(asset) => {
+                    tracing::info!(
+                        session_id,
+                        tool = tool_name,
+                        turn_id = %turn_id,
+                        asset_id = %asset.asset_id,
+                        "bridge tool image persisted"
+                    );
                     // 与 RunEventMapper 的 tool.image 同形,REPL/WebUI 按
                     // run_id 过滤后走同一条渲染路;没有活动 run 就只落库
                     // (刷新可见)。

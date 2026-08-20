@@ -104,7 +104,10 @@ where
         }
     })?;
     let pid = child.id().unwrap_or_default();
-    let mut stdin = child.stdin.take().context("claude-code stdin unavailable")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("claude-code stdin unavailable")?;
     let stdout = child
         .stdout
         .take()
@@ -183,6 +186,19 @@ where
                     }
                 }
             }
+            // 完整 assistant 帧带 tool_use 的完整入参:思考通道补一行摘要,
+            // 否则用户只看到 [tool: 名字] 不知道它在干什么。
+            Some("assistant") => {
+                for input_line in tool_use_summaries(&value) {
+                    push_reasoning_line(&mut state, &input_line, on_chunk)?;
+                }
+            }
+            // user 帧是 CLI 回填的工具结果:同样给一行截断摘要。
+            Some("user") => {
+                for result_line in tool_result_summaries(&value) {
+                    push_reasoning_line(&mut state, &result_line, on_chunk)?;
+                }
+            }
             Some("stream_event") => {
                 if let Some(event) = value.get("event") {
                     match serde_json::from_value::<AnthropicStreamEvent>(event.clone()) {
@@ -253,8 +269,7 @@ where
         } else {
             result_text.clone()
         };
-        let mut error =
-            anyhow::anyhow!("claude-code turn failed ({subtype}): {}", detail.trim());
+        let mut error = anyhow::anyhow!("claude-code turn failed ({subtype}): {}", detail.trim());
         if let Some(failure) = classify_claude_failure(&format!("{detail}\n{stderr_text}")) {
             error = error.context(failure);
         }
@@ -308,6 +323,81 @@ where
     })
 }
 
+/// 折叠空白并按字符截断,给思考通道的一行摘要用。
+fn compact_line(text: &str, limit: usize) -> String {
+    let mut collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > limit {
+        collapsed = collapsed.chars().take(limit).collect::<String>() + "…";
+    }
+    collapsed
+}
+
+fn tool_use_summaries(frame: &Value) -> Vec<String> {
+    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| {
+            let input = block.get("input")?;
+            let summary = compact_line(&input.to_string(), 160);
+            (summary != "{}").then(|| format!("  ⚙ {summary}\n"))
+        })
+        .collect()
+}
+
+fn tool_result_summaries(frame: &Value) -> Vec<String> {
+    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|block| {
+            let content = block.get("content")?;
+            let text = match content {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => return None,
+            };
+            let summary = compact_line(&text, 200);
+            (!summary.is_empty()).then(|| format!("  ↳ {summary}\n"))
+        })
+        .collect()
+}
+
+fn push_reasoning_line<F>(
+    state: &mut AnthropicStreamState,
+    line: &str,
+    on_chunk: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ChatStreamChunk) -> Result<()>,
+{
+    if !state.reasoning_part_active {
+        if !state.reasoning.is_empty() && !state.reasoning.ends_with("\n\n") {
+            state.reasoning.push_str("\n\n");
+        }
+        on_chunk(ChatStreamChunk {
+            kind: ChatStreamKind::ReasoningPartStart,
+            text: String::new(),
+        })?;
+        state.reasoning_part_active = true;
+    }
+    push_buffered_chunk(
+        &mut state.reasoning,
+        &mut state.reasoning_emitted,
+        ChatStreamKind::Reasoning,
+        line.to_string(),
+        on_chunk,
+    )
+}
+
 /// stream_event 内层事件 → 内容/思考缓冲。与 [`handle_anthropic_sse_data`]
 /// 的差异:tool_use 只在思考通道展示一行,不进工具累加器;跨消息(message_
 /// start 再来一次)时 content 用空行接续。
@@ -319,9 +409,7 @@ fn handle_claude_stream_event<F>(
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
-    let close_reasoning_part = |state: &mut AnthropicStreamState,
-                                on_chunk: &mut F|
-     -> Result<()> {
+    let close_reasoning_part = |state: &mut AnthropicStreamState, on_chunk: &mut F| -> Result<()> {
         if state.reasoning_part_active {
             flush_buffer(
                 &state.reasoning,
@@ -338,9 +426,7 @@ where
         }
         Ok(())
     };
-    let open_reasoning_part = |state: &mut AnthropicStreamState,
-                               on_chunk: &mut F|
-     -> Result<()> {
+    let open_reasoning_part = |state: &mut AnthropicStreamState, on_chunk: &mut F| -> Result<()> {
         if !state.reasoning_part_active {
             if !state.reasoning.is_empty() && !state.reasoning.ends_with("\n\n") {
                 state.reasoning.push_str("\n\n");

@@ -405,7 +405,7 @@ async fn duplicate_miyu_tools_are_excluded_when_both_toolsets_are_on() {
         "两套同开应点名剔除重复工具: {args}"
     );
     assert!(
-        !args.contains("\"glob"),
-        "glob/grep 不在剔除表(用户拍板保留): {args}"
+        args.contains("glob") && args.contains("todowrite"),
+        "glob/grep/todowrite 也在剔除表: {args}"
     );
 }

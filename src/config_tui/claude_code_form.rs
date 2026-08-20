@@ -18,10 +18,7 @@ pub(in crate::config_tui) fn edit_claude_code_provider_form(
 ) -> Result<Option<ProviderConfig>> {
     let mut fields = vec![
         Field::new(
-            t(
-                "Enabled (subscription relay + claude_code tool)",
-                "启用(订阅中转 + claude_code 工具)",
-            ),
+            t("Enabled (Claude Code relay)", "启用(中转 Claude Code)"),
             provider.enabled.to_string(),
         )
         .choices(&["true", "false"]),

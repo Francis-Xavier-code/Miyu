@@ -204,6 +204,15 @@ impl OpenAiCompatibleClient {
         .collect();
         args.push("--model".into());
         args.push(model.to_string());
+        // 用户在模型菜单显式配了上下文窗口,就同步给 claude 的自动压缩阈值
+        // (compact 后会话 id 不变,续传不断);没配则随 claude 自身默认。
+        // CLI 只收 100k–1M,低于下限的配置不透传。
+        if let Some(window) = self.provider.model_context_window.get(model) {
+            if (100_000..=1_000_000).contains(window) {
+                args.push("--autocompact".into());
+                args.push(window.to_string());
+            }
+        }
         // 思考档:Miyu 的 thinking-variant 选择映射到 CLI 的 --effort。
         if let Some((_, variant)) = self.selected_reasoning_variant() {
             if let crate::models_cache::ReasoningSetting::Effort(effort) = variant.setting {
@@ -234,7 +243,7 @@ impl OpenAiCompatibleClient {
         if miyu_on {
             // 两套同开时去重:与 claude 原生重复的 Miyu 工具剔除,原生优先
             // (用户拍板清单;load_skill/manage_skill 与 claude 的 Skill 内容
-            // 不同,不算重复;glob/grep/todowrite 保留)。
+            // 不同,不算重复)。
             if let Some(mcp_config) = mcp_bridge_config(runtime, native_on) {
                 args.push("--mcp-config".into());
                 args.push(mcp_config);
@@ -266,6 +275,9 @@ const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
     "task",
     "web_search",
     "web_fetch",
+    "glob",
+    "grep",
+    "todowrite",
     "job",
     "alarm",
 ];

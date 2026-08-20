@@ -217,7 +217,7 @@ TUI 探针含新字段复测全过。
    `~/.claude/projects/*/<会话id>.jsonl` 转录。真机:reset 后转录零残留。
    顺手修:**会话标题生成的 LLM 调用 scope 误标 "chat"**(08-10 调研 P2 旧
    账)改为 "session-title",在中转下不再产生游离的持久 claude 会话。
-2. **上下文限制**:预置模型钉 200k 窗口(模板+normalize 对存量条目回填);
+2. **上下文限制**:窗口不钉值(第五轮用户裁定:回猜测默认 168k,要改自己在模型菜单设);
    Miyu 的压缩管自己的账本,claude 侧真实上下文由其 autocompact 自管,Miyu
    压缩→链断→重开会话间接同步。
 3. **桥工具图片**:新增 web/bridge_progress——桥内层调用改走带 progress 的
@@ -237,3 +237,18 @@ TUI 探针含新字段复测全过。
 (用户实测);ask_question 未过桥。`task` 已进去重剔除表,中转路径不受影响。
 **排查铁律**:隔离测试 home 的配置文件会钉住旧默认(permission_mode/
 miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
+
+## 13. 第五轮(2026-08-20 下午)
+
+- 窗口钉撤销(用户裁定:回猜测默认,要改自己设);新增 **--autocompact 同步**:
+  模型菜单显式配了窗口(100k–1M)就透传给 claude 的自动压缩阈值。
+- 剔除表补 glob/grep/todowrite(claude 原生有 Glob/Grep/TodoWrite,此前人格
+  声称"宿主没有"是错的);表单启用标签改「启用(中转 Claude Code)」。
+- **工具透明度**:assistant 帧的 tool_use 入参(⚙)与 user 帧的工具结果(↳)
+  截断摘要进思考通道,不再只有 [tool: 名字]。
+- **wake.rs 补 tool.image 分支**(唤醒/shellhook 流此前静默丢图);桥泵日志
+  升级(persisted=info/dropped=warn)。
+- **"改动没生效"根因=幽灵 daemon**:旧进程二进制已删除态仍占 8300,
+  `daemon stop` 报"未运行"却活着,用户 12:00 的测试全打在旧代码上。处理=
+  kill 幽灵后干净重启;真机终验:kitty 图形字节实录+结果摘要行+回复确认。
+  一次性会话的资产随阅后即焚级联删除属设计语义。
