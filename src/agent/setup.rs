@@ -456,13 +456,13 @@ impl Agent {
         self.prepare_for_turn()
     }
 
-    /// 平台(QQ 等)回合的工具轮数兜底:`tools.max_rounds = 0`(无限)对本机
-    /// 会话是合理默认,但平台回合失控时没人守在终端里按停——真机 web_search
-    /// 同 query 222 连就是这么烧起来的。显式配了非 0 值则尊重配置。
+    /// 平台(QQ 等)回合的工具轮数上限(platforms.max_tool_rounds,默认 32,
+    /// 0=不限):平台回合失控时没人守在终端里按停——真机 web_search 同
+    /// query 222 连就是这么烧起来的。
     pub fn cap_tool_rounds_for_platform(&mut self) {
-        const PLATFORM_TOOL_ROUND_CAP: usize = 32;
-        if self.max_tool_rounds == 0 {
-            self.max_tool_rounds = PLATFORM_TOOL_ROUND_CAP;
+        let cap = self.config.platforms.max_tool_rounds;
+        if cap > 0 {
+            self.max_tool_rounds = cap;
         }
     }
 }
