@@ -329,3 +329,24 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
   空行,叠加即两行。真机:冻结行→↳ 主题→恰好一个空行→图形字节。
 - 前端批(音频卡/多选/删末会话闩锁/share 重建)用户浏览器验收通过,已提交
   (21e63a02)。
+
+## 18. 第十一轮(2026-08-20 傍晚)——WebUI 切换保活(§14 已知限制清偿)
+
+- **回合进行中切走再切回不再丢已渲染输出**。根因:切会话时
+  disposeAllLiveRuns 销毁直播状态,切回只能靠事件环重放,而环只留 4096 条,
+  长回复的 delta 洪流必然把它冲掉(resync 两轮后放弃→空壳)。
+- 修法=**离屏保活**:直播状态(liveRuns)跨切换保留,气泡 DOM 游离但事件照
+  常写入;live 记归属会话(sessionId),reattachLiveArticles 按会话过滤重
+  挂(停止按钮/待答问题卡一并归位);视图副作用(滚动 contentAdded/时间线
+  挂载/问题坞/用户消息补渲/state.turns 注入)按 liveViewed 屏蔽;
+  conversationRunning 只数本视图;restoreLiveRuns 只对全新空壳重放(保活
+  的再放一遍=正文翻倍);**checkpoint 落库的部分正文与保活气泡是同一份**,
+  被未结束 live 认领的 running 回合,持久化渲染只画用户消息
+  (liveClaimsTurn)。
+- 真机(playwright+chrome headless,隔离 daemon,订阅 haiku,sleep 45 造
+  在跑窗口,__liveDebug 探针):切走前 conn=true→在B conn=false 且 B 无串
+  台→切回 conn=true 原样重挂;OPENING 计数切换前后不变(不丢不重);离屏
+  期间新增的工具卡 1→2 出现在保活气泡里;完成后 DONE 出现、二次切回计数
+  不变。测具坑:断言用"切换前后计数不变"的不变式——思考签里模型会复述
+  指令原文,绝对值断言全是假警报;测试会话要每轮新建(老会话人格对指令式
+  提示词逆反)。
