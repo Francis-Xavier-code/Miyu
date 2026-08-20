@@ -323,6 +323,8 @@ async fn run_turn_task_inner(
                 );
             }
             if let Some(context) = profile.platform.as_deref() {
+                // 平台回合的工具轮数兜底(max_rounds=0 时生效,见方法注释)。
+                agent.cap_tool_rounds_for_platform();
                 let principal = context.principal().stable_key();
                 agent.set_memory_request_context(
                     if context.is_admin {

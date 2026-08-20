@@ -35,6 +35,11 @@ impl Agent {
     {
         let mut tool_round = initial_tool_rounds;
         let mut question_rounds = initial_question_rounds;
+        // 同参重复计数(回合级):failover 风暴里弱模型会把同一个调用逐字节
+        // 重复到天荒地老(真机 web_search 同 query 222 连,QQ 发图 4 连),
+        // 第三次起熔断——不执行,把"结果已经在上下文里"明说给模型。
+        let mut repeated_tool_calls: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
         let mut replay_start = replay_start;
         // Passive overflow recovery is a one-shot barrier per turn: the
         // post-compaction retry must not recover another overflow (pi /
@@ -612,6 +617,31 @@ impl Agent {
                     name: event_name.clone(),
                     arguments: call.function.arguments.clone(),
                 })?;
+                // 同参重复熔断(阈值 2 次:第 3 次相同调用起拒绝执行)。
+                let repeat_key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    call.function.name.hash(&mut hasher);
+                    call.function.arguments.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let repeats = repeated_tool_calls.entry(repeat_key).or_insert(0);
+                *repeats += 1;
+                if *repeats > 2 {
+                    let output = format!(
+                        "tool error: this exact call ({} with identical arguments) already ran {} times in this turn and will not run again. Its earlier results are already in the conversation above — use them, take a different action, or finish your reply.",
+                        call.function.name,
+                        *repeats - 1
+                    );
+                    on_event(AgentEvent::ToolResult {
+                        call_id: call_id.clone(),
+                        name: event_name.clone(),
+                        ok: false,
+                        output: output.clone(),
+                    })?;
+                    messages.push(ChatMessage::tool(call.id, output));
+                    continue;
+                }
                 if question_call_count > 1 {
                     let output = "tool error: only one ask_question call is allowed per tool batch; combine all questions into one call".to_string();
                     on_event(AgentEvent::ToolResult {

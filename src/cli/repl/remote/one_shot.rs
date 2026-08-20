@@ -273,6 +273,7 @@ pub(in crate::cli) async fn try_run_remote_chat(
                         LiveEditorAction::Exit => {
                             renderer.finish()?;
                             if let Some(live) = live.as_deref_mut() {
+                                live.stop_footer_spinner()?;
                                 live.apply_renderer_frame(&mut renderer)?;
                             }
                             return Err(anyhow::Error::new(RemoteTurnDetached));
@@ -664,6 +665,9 @@ pub(in crate::cli) async fn try_run_remote_chat(
             "run.cancelled" => {
                 renderer.finish()?;
                 if let Some(live) = live.as_deref_mut() {
+                    // 提前 return 的取消路径也要熄波浪:漏掉它,输入框贴着
+                    // 终端底部取消时最后一帧波浪就留在屏上(08-20 实测)。
+                    live.stop_footer_spinner()?;
                     live.apply_renderer_frame(&mut renderer)?;
                 }
                 return Err(anyhow::Error::new(RemoteTurnCancelled));
