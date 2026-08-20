@@ -294,3 +294,23 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
   次性闩锁(app.js,随前端批待浏览器验收)。
 - 理论递归提示:外层 claude→mcp task→子代理→中转→内层 claude→mcp task…
   与 claude_code 工具的递归同属 D19 放行范畴,由订阅限流自然约束。
+
+## 16. 第九轮(2026-08-20 晚)
+
+- **切走丢卡片正式修复(display-only 车道)**:ToolFlowRound 加 `remote`
+   标记(JSON 列免迁移)——中转侧工具活动随回合收集(Agent 泵挂钩)、落进
+  tool_flow 供 UI 重绘,回放/估算/压缩三处消费点统一跳过 remote 轮,问答
+  对回放门改按"有无原生轮"判定。真机:remote 轮落库且次轮 --resume 保持
+  (增量 188B,回放未被污染)。share_file 富预览在重建路径复原(app.js
+  hook,随前端批)。
+- **中转环境事实注入**(常量字节):每轮一进程、自带后台/通知活不过本轮;
+  桥在场时补 mcp__miyu__task/job/alarm 三句。第八轮 task 只改了注释没删数
+  组项,本轮真正移出剔除表。真机后台闭环:task(background)发射→daemon 跑
+  →完成唤醒新轮→claude 汇报回码,全链通。
+- REPL 摘要行 ↳ 主题补 claude 原生工具白名单(Bash 命令/Read 等路径/
+  WebFetch 安全 URL/Task 描述/ToolSearch query);原生 Bash 的结果以命令输
+  出块渲染(与 run_command 同路),不再只有一行 ok。
+- 上下文表读数第 2 处对齐;流式思考本就已接(thinking_delta→思考通道)。
+- MCP 对外接入达成度:`miyu mcp-serve` 是标准 stdio server,任何 MCP 客户
+  端可挂(env: MIYU_SESSION 指会话;MIYU_HOME/XDG_RUNTIME_DIR 必须与
+  daemon 环境一致地传或不传)。

@@ -148,6 +148,7 @@ impl Agent {
         // 调用时空 flow 也必须写入,否则旧工具流会被冒名回放。
         let mut tool_flow = derive_tool_flow(&messages, replay_start);
         prune_tool_flow(&mut tool_flow, &self.config.context);
+        self.append_remote_tool_flow(&mut tool_flow);
         self.state
             .set_turn_tool_flow(&candidate.turn_id, &tool_flow)?;
         if self.memory.process_after_turn(

@@ -215,12 +215,6 @@ impl OpenAiCompatibleClient {
                 args.push(effort);
             }
         }
-        if !system_prompt.trim().is_empty() {
-            // 整体替换默认系统提示词:人格/开发提示词原样过去,同时甩掉
-            // Claude Code 自带的 CLI 身份与 CLAUDE.md 注入。
-            args.push("--system-prompt".into());
-            args.push(system_prompt.to_string());
-        }
         // 工具面按双四档作用域装配。subagent 作用域也给:中转不会把工具
         // 循环交还给外层(SubagentRunner 收到的永远是最终文本),子代理的
         // 干活能力全靠内层 claude 自己的原生工具 + MCP 桥闭环;真正的纯文
@@ -229,6 +223,23 @@ impl OpenAiCompatibleClient {
         let native_on =
             tool_capable && scope_allows(&runtime.native_tools, self.claude_code_dev_mode);
         let miyu_on = tool_capable && scope_allows(&runtime.miyu_tools, self.claude_code_dev_mode);
+        {
+            // 整体替换默认系统提示词:人格/开发提示词原样过去,同时甩掉
+            // Claude Code 自带的 CLI 身份与 CLAUDE.md 注入。工具开启时追加
+            // 中转环境说明(常量字节,前缀稳定):每轮一进程,自带后台/通知
+            // 活不过本轮——这是模型光靠自我认知猜不到的宿主事实。
+            let mut prompt = system_prompt.to_string();
+            if native_on || miyu_on {
+                prompt.push_str(RELAY_ENVIRONMENT_NOTE);
+                if miyu_on {
+                    prompt.push_str(RELAY_MIYU_TOOLS_NOTE);
+                }
+            }
+            if !prompt.trim().is_empty() {
+                args.push("--system-prompt".into());
+                args.push(prompt);
+            }
+        }
         if native_on {
             // claude 原生工具(训练分布内)开放;无头模式没有交互审批,
             // 权限模式决定 Bash 等是否可用(默认 bypassPermissions)。
@@ -264,24 +275,28 @@ impl OpenAiCompatibleClient {
 /// Miyu 工具经 MCP stdio 桥挂给 claude:`miyu mcp-serve` 打回 daemon,与
 /// `miyu tool-call` 同一条会话→模式→registry 解析链。没有会话作用域(测试
 /// /直连辅助请求)就不挂桥。
+/// 中转环境事实(声明式,不写指令;常量字节保证前缀稳定)。
+const RELAY_ENVIRONMENT_NOTE: &str = "\n\n<relay-environment>\nThis session runs inside Miyu's relay: each turn is a fresh CLI process that exits when the turn ends. Work backgrounded through the built-in tools (Bash run_in_background, background Task) dies with the process, and its completion notifications never arrive.\n</relay-environment>";
+
+/// miyu 工具桥在场时的补充事实。
+const RELAY_MIYU_TOOLS_NOTE: &str = "\n<relay-environment-tools>\nThe mcp__miyu__ tools live in the persistent Miyu daemon and survive across turns: mcp__miyu__task runs a background subagent that wakes a follow-up turn when it finishes, mcp__miyu__job inspects or stops those, and mcp__miyu__alarm schedules timed reminders.\n</relay-environment-tools>";
+
 /// 两套工具同开时从桥里剔除的 Miyu 工具(与 claude 原生功能重复,原生
-/// 在训练分布内、优先)。job/alarm **不剔**:claude 自己的后台/定时机制
+/// 在训练分布内、优先)。task **不剔**:与原生 Task 语义不同——Miyu 子代理
+/// 在 daemon 里作为后台任务运行、完成后唤醒开新轮跟进,与 job(查/停)成对。
+/// job/alarm **不剔**:claude 自己的后台/定时机制
 /// 活在单次进程里,中转每轮一进程、轮末即杀,活不过回合;Miyu 的 job 走
 /// daemon 常驻 + 完成唤醒开新轮,才是这套架构下唯一能跟进的后台。
 const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
     "read_file",
     "apply_patch",
     "run_command",
-    "task",
     "web_search",
     "web_fetch",
     "glob",
     "grep",
     "todowrite",
 ];
-// task 不剔:它与 claude 原生 Task 语义不同——Miyu 子代理在 daemon 里作为
-// 后台任务运行、完成后唤醒开新轮跟进;claude 的 Task 活在单次进程里,轮末
-// 即杀。job(查询/停止)与 task(发射)成对。
 
 fn mcp_bridge_config(exclude_duplicates: bool) -> Option<String> {
     let session = crate::tools::workspace::try_session()?;

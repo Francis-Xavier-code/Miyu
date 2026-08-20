@@ -107,6 +107,7 @@ impl Agent {
             repeat_chain: crate::tools::repeat_reminder::RepeatChain::default(),
             preset_dialogs,
             last_request_snapshot: None,
+            pending_remote_tool_calls: std::sync::Mutex::new(Vec::new()),
             last_request_endpoint: None,
             keepalive_cancel: None,
             consecutive_compacts: std::sync::atomic::AtomicU32::new(0),

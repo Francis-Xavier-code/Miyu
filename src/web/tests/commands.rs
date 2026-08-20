@@ -106,6 +106,7 @@ fn turn_payload_carries_the_tools_that_ran() {
         .set_turn_tool_flow(
             "t1",
             &[crate::state::ToolFlowRound {
+                remote: false,
                 assistant_content: String::new(),
                 assistant_reasoning: None,
                 calls: vec![crate::state::ToolFlowCall {

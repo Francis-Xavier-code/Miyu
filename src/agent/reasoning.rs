@@ -227,14 +227,26 @@ where
                         .unwrap_or_default()
                         .to_string()
                 };
+                let name = text_of("name");
+                let output = text_of("output");
+                // 原生 Bash 的输出走命令输出块(与 run_command 同一渲染路),
+                // 否则 REPL 摘要只有一行 ok,命令打了什么全看不见。
+                if name == "Bash" && !output.is_empty() {
+                    on_event(AgentEvent::CommandOutput {
+                        call_id: text_of("id"),
+                        name: name.clone(),
+                        stream: crate::tools::CommandOutputStream::Stdout,
+                        chunk: output.clone().into_bytes(),
+                    })?;
+                }
                 on_event(AgentEvent::ToolResult {
                     call_id: text_of("id"),
-                    name: text_of("name"),
+                    name,
                     ok: value
                         .get("ok")
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(true),
-                    output: text_of("output"),
+                    output,
                 })?;
             }
         }

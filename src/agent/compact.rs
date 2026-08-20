@@ -746,7 +746,7 @@ fn turn_to_text(turn: &Turn) -> String {
     }
     // v20+ 工具密集回合的主体在 tool_flow 里(reports 多为空):漏计它,
     // 压缩预算会把"40 轮"当成保尾额度塞进 16K,压后必然仍超。
-    for round in &turn.tool_flow {
+    for round in turn.tool_flow.iter().filter(|round| !round.remote) {
         output.push_str(&round.assistant_content);
         if let Some(reasoning) = &round.assistant_reasoning {
             output.push_str(reasoning);
