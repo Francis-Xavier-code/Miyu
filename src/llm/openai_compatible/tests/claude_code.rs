@@ -242,3 +242,53 @@ async fn missing_binary_reports_actionable_error() {
         "应指路配置项: {text}"
     );
 }
+
+/// 思考档:thinking-variant 选择映射成 CLI 的 --effort。
+#[tokio::test]
+async fn selected_thinking_variant_maps_to_effort_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = claude_code_client(dir.path(), "cc-effort");
+    client.thinking_variants.insert(
+        thinking_variant_key("cc-effort", "haiku"),
+        "high".to_string(),
+    );
+    client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--effort\nhigh"), "args: {args}");
+}
+
+/// 未启用的供应商在端点池装配时给出可操作的报错。
+#[tokio::test]
+async fn disabled_provider_is_rejected_at_pool_assembly() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let mut config = AppConfig::default();
+    config.normalize_builtin_providers();
+    // 唯一激活模型指向默认禁用的 claude-code。
+    config.active_provider_models = Some(vec![crate::config::ActiveProviderModelConfig {
+        provider_id: "claude-code".to_string(),
+        model: "sonnet".to_string(),
+    }]);
+    let choices = vec![crate::config::ProviderModelChoice {
+        provider_id: "claude-code".to_string(),
+        provider_name: "Claude Code".to_string(),
+        model: "sonnet".to_string(),
+    }];
+    let error = match OpenAiCompatibleClient::from_choices(&config, &paths, &choices) {
+        Ok(_) => panic!("禁用的供应商不该装配出端点池"),
+        Err(error) => error,
+    };
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("disabled") || text.contains("未启用"),
+        "{text}"
+    );
+}

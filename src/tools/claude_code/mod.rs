@@ -403,23 +403,31 @@ printf '{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"n
         assert!(error.contains("already in progress"), "{error}");
     }
 
-    /// 注册面(§09):本机 owner 底座有、平台受限表没有、随插件开关走、
-    /// 子代理排除表点名。
+    /// 注册面(§09 + 08-20 统一总开关):内置 Claude Code 供应商默认禁用,
+    /// 工具随之缺席;启用后本机 owner 底座有、平台受限表仍没有;子代理排除
+    /// 表点名。
     #[test]
     fn registry_surfaces_follow_the_owner_only_rule() {
         let temp = tempfile::tempdir().unwrap();
         let paths = crate::tools::tests::test_paths(temp.path());
         let mut config = crate::config::AppConfig::default();
+        config.normalize_builtin_providers();
 
+        // 默认禁用:开箱不注册,要用户在供应商设置里显式启用订阅接入。
+        assert!(!crate::tools::builtin_registry(&config, &paths).contains("claude_code"));
+        assert!(!crate::tools::dev_registry(&config, &paths).contains("claude_code"));
+
+        for provider in &mut config.providers {
+            if provider.is_claude_code() {
+                provider.enabled = true;
+            }
+        }
+        assert!(config.claude_code_enabled());
         assert!(crate::tools::builtin_registry(&config, &paths).contains("claude_code"));
         assert!(crate::tools::dev_registry(&config, &paths).contains("claude_code"));
         assert!(
             !crate::tools::restricted_platform_registry(&config, &paths).contains("claude_code")
         );
         assert!(crate::tools::task::SUBAGENT_EXCLUDED.contains(&"claude_code"));
-
-        config.plugins.claude_code.enabled = false;
-        assert!(!crate::tools::builtin_registry(&config, &paths).contains("claude_code"));
-        assert!(!crate::tools::dev_registry(&config, &paths).contains("claude_code"));
     }
 }

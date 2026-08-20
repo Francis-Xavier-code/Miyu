@@ -155,7 +155,15 @@ impl OpenAiCompatibleClient {
         &self,
     ) -> Option<(ModelReasoningInfo, ReasoningVariant)> {
         let id = self.selected_thinking_variant_id()?;
-        let info = models_cache::reasoning_info(&self.provider.id, &self.provider.default_model)?;
+        // Claude Code 不在 models.dev 目录里,思考档由协议自供(--effort 五档)。
+        let info = if provider_uses_claude_code(&self.provider) {
+            ModelReasoningInfo {
+                provider_npm: None,
+                variants: claude_code_reasoning_variants(),
+            }
+        } else {
+            models_cache::reasoning_info(&self.provider.id, &self.provider.default_model)?
+        };
         let variant = info
             .variants
             .iter()

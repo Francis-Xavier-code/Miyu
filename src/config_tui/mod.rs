@@ -469,6 +469,21 @@ impl<'a> ProviderBrowser<'a> {
         if self.config.providers.is_empty() {
             return;
         }
+        if self
+            .config
+            .providers
+            .get(self.provider_idx)
+            .is_some_and(ProviderConfig::is_claude_code)
+        {
+            // 内置供应商删了下次加载也会被重新注入,徒增困惑;要停用走编辑
+            // 表单里的启用开关。
+            self.status = t(
+                "Claude Code is built in and cannot be deleted; disable it in its edit form instead.",
+                "Claude Code 是内置供应商,不可删除;要停用请在编辑表单里关掉启用开关。",
+            )
+            .to_string();
+            return;
+        }
         self.undo.record(self.config);
         let removed = self.config.providers.remove(self.provider_idx);
         self.config.remove_provider_references(&removed.id);
@@ -493,7 +508,18 @@ impl<'a> ProviderBrowser<'a> {
         match self.active_col {
             0 => {
                 if let Some(provider) = self.config.providers.get(self.provider_idx).cloned() {
-                    if let Some(provider) = edit_provider_form(stdout, provider)? {
+                    // 内置 Claude Code 走专用表单:没有 HTTP 概念,只有启用
+                    // 总开关与 CLI 中转设置。
+                    let edited = if provider.is_claude_code() {
+                        edit_claude_code_provider_form(
+                            stdout,
+                            provider,
+                            &mut self.config.plugins.claude_code,
+                        )?
+                    } else {
+                        edit_provider_form(stdout, provider)?
+                    };
+                    if let Some(provider) = edited {
                         let old_id = self.config.providers[self.provider_idx].id.clone();
                         self.config.providers[self.provider_idx] = provider.clone();
                         if self.config.active_provider == old_id {
@@ -598,7 +624,15 @@ impl<'a> ProviderBrowser<'a> {
             .config
             .providers
             .iter()
-            .map(|provider| format!("  {}", provider.display_name))
+            .map(|provider| {
+                if provider.enabled {
+                    format!("  {}", provider.display_name)
+                } else {
+                    // 目前只有内置 Claude Code 会处于未启用态,标出来免得
+                    // 用户找不到"为什么模型列表里没有它"。
+                    format!("  {}{}", provider.display_name, t(" (disabled)", "(未启用)"))
+                }
+            })
             .collect::<Vec<_>>();
         let models = self
             .models

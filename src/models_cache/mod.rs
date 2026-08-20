@@ -259,6 +259,7 @@ mod tests {
     fn manual_model_cost_overrides_catalogue() {
         let mut config = crate::config::AppConfig::default();
         config.providers.push(crate::config::ProviderConfig {
+            enabled: true,
             id: "relay".to_string(),
             display_name: "Relay".to_string(),
             base_url: "https://relay.example/v1".to_string(),

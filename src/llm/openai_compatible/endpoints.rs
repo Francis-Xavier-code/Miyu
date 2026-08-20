@@ -236,6 +236,17 @@ pub(in crate::llm::openai_compatible) fn llm_endpoints(config: &AppConfig, paths
     let mut errors = Vec::new();
     for choice in config.active_provider_model_choices() {
         let mut provider = config.provider(Some(&choice.provider_id))?.clone();
+        if !provider.enabled {
+            errors.push(format!(
+                "{}: {}",
+                provider.id,
+                t(
+                    "provider is disabled; enable it in the provider settings",
+                    "供应商未启用;请在供应商设置里启用"
+                )
+            ));
+            continue;
+        }
         provider.default_model = choice.model;
         let client = endpoint_client(&provider)?;
         if provider_uses_claude_code(&provider) {

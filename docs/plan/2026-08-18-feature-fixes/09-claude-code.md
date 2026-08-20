@@ -165,3 +165,25 @@
 `claude_code` 工具在中转模式下经 MCP 可见,存在 claude 套 claude 的理论递归
 （D19 本就允许,深度由订阅限流自然约束）;④平台侧辅助请求（qq-judge 等）未
 挂平台门禁,如平台会话把主池配成 claude-code 需自行避免。
+
+## 10. 形态整改（2026-08-20 第二轮验收反馈）
+
+用户裁定:Claude Code 不该是"协议"这个用户概念,应是**内置特殊供应商**。整改:
+
+- 供应商列表天生含「Claude Code」条目(normalize 自动注入存量配置),**默认
+  未启用**,列表行带「(未启用)」标;内置条目不可删除(删了下次加载也会回来)。
+- 回车打开**专用编辑表单**:启用总开关/显示名/claude binary/MCP 工具桥开关/
+  流空闲看门狗——没有 base_url/协议/API Key/超时/额外请求体。通用表单的协议
+  下拉撤掉 claude-code(协议降级为内部实现细节)。
+- **启用开关=总开关**:同时控制订阅中转可选与 claude_code 委托工具注册
+  (plugins.claude_code.enabled 字段退役);未启用不进任何模型选择器,激活池
+  指向它给明确的"供应商未启用"双语报错(端点装配/from_choices/new 三道)。
+- 模型列表预置 CLI 别名 fable/opus/sonnet/haiku(默认 sonnet);模型浏览器对
+  它跳过 HTTP /models 拉取直接回预置表。**思考档接通**:每模型
+  low/medium/high/xhigh/max 五档(supported_reasoning_variants 协议自供,不走
+  models.dev),选择经 thinking-variants.json 持久化,请求时映射 `--effort`。
+
+真机验证(第二轮):注入+禁用报错(激活池指向禁用条目→"供应商未启用")/
+启用后中转正常/`--effort low` 实测入参/TUI PTY 探针
+(testkit/claude-code/tui_probe.py)四段全过——未启用标、专用表单无 HTTP 字
+段、表单内启用+保存、落盘后启用态与预置模型完好。

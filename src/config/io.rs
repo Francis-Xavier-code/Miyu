@@ -299,14 +299,8 @@ impl AppConfig {
             if !provider_ids.insert(provider.id.as_str()) {
                 bail!("duplicate provider id: {}", provider.id);
             }
-            // claude-code 协议的传输层是本机 CLI 子进程,没有 URL 概念。
-            if provider.base_url.trim().is_empty()
-                && !provider.protocol.trim().eq_ignore_ascii_case("claude-code")
-                && !provider
-                    .protocol
-                    .trim()
-                    .eq_ignore_ascii_case("claude-code-cli")
-            {
+            // Claude Code 特殊供应商的传输层是本机 CLI 子进程,没有 URL 概念。
+            if provider.base_url.trim().is_empty() && !provider.is_claude_code() {
                 bail!("provider {} base_url cannot be empty", provider.id);
             }
         }

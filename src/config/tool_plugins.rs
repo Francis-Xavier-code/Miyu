@@ -58,8 +58,6 @@ pub struct PluginsConfig {
 /// 协议共用这份配置。CLI 用用户既有的订阅登录态，Miyu 不经手任何凭据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodePluginConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// 空 = 从 PATH 解析 `claude`。
     #[serde(default)]
     pub binary: String,
@@ -87,7 +85,6 @@ pub struct ClaudeCodePluginConfig {
 impl Default for ClaudeCodePluginConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             binary: String::new(),
             permission_mode: default_claude_code_permission_mode(),
             timeout_seconds: default_claude_code_timeout_seconds(),

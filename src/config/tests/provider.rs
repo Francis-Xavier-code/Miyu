@@ -727,6 +727,7 @@ fn remove_active_provider_model_clears_last_current_model() {
 #[test]
 fn extra_body_roundtrip() {
     let original = ProviderConfig {
+        enabled: true,
         id: "test".to_string(),
         display_name: "Test".to_string(),
         base_url: "https://example.com".to_string(),
@@ -891,5 +892,51 @@ fn real_config_window_source() {
     println!(
         "  池子聚合 → {:?}",
         config.active_context_window_with_source().unwrap()
+    );
+}
+
+/// 08-20:Claude Code 是内置特殊供应商——normalize 自动注入、默认禁用、
+/// 模型预置 CLI 别名;未启用时不进任何模型选择器,启用即出现。
+#[test]
+fn claude_code_builtin_provider_is_injected_disabled_with_preset_models() {
+    let mut config = AppConfig::default();
+    config.normalize_builtin_providers();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.is_claude_code())
+        .expect("内置 Claude Code 供应商应被注入");
+    assert_eq!(provider.id, "claude-code");
+    assert!(!provider.enabled, "默认必须是禁用态");
+    assert_eq!(provider.models, ["fable", "opus", "sonnet", "haiku"]);
+    assert_eq!(provider.default_model, "sonnet");
+    assert!(!config.claude_code_enabled());
+
+    // 未启用 ⇒ 选择器里不可见。
+    assert!(!config
+        .text_provider_model_choices()
+        .iter()
+        .any(|choice| choice.provider_id == "claude-code"));
+
+    for provider in &mut config.providers {
+        if provider.is_claude_code() {
+            provider.enabled = true;
+        }
+    }
+    assert!(config.claude_code_enabled());
+    let choices = config.text_provider_model_choices();
+    assert!(choices
+        .iter()
+        .any(|choice| choice.provider_id == "claude-code" && choice.model == "sonnet"));
+
+    // 重复 normalize 不会二次注入。
+    config.normalize_builtin_providers();
+    assert_eq!(
+        config
+            .providers
+            .iter()
+            .filter(|provider| provider.is_claude_code())
+            .count(),
+        1
     );
 }

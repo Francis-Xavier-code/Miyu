@@ -442,3 +442,7 @@ pub(crate) fn default_claude_code_max_output_bytes() -> u64 {
 pub(crate) fn default_claude_code_idle_timeout_seconds() -> u64 {
     300
 }
+
+pub(crate) fn bool_is_true(value: &bool) -> bool {
+    *value
+}

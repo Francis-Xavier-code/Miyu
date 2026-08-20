@@ -127,6 +127,7 @@ impl AppConfig {
     pub fn provider_model_choices(&self) -> Vec<ProviderModelChoice> {
         self.providers
             .iter()
+            .filter(|provider| provider.enabled)
             .flat_map(|provider| {
                 let models =
                     if provider.models.is_empty() && !provider.default_model.trim().is_empty() {
@@ -153,6 +154,8 @@ impl AppConfig {
     pub fn text_provider_model_choices(&self) -> Vec<ProviderModelChoice> {
         self.providers
             .iter()
+            // 未启用的供应商(内置 Claude Code 默认关)不进任何选择器。
+            .filter(|provider| provider.enabled)
             .flat_map(|provider| {
                 provider
                     .models
@@ -669,5 +672,15 @@ impl AppConfig {
             Some(index) => self.providers[index] = provider,
             None => self.providers.push(provider),
         }
+    }
+}
+
+impl AppConfig {
+    /// 内置 Claude Code 特殊供应商是否启用。这是订阅接入的**总开关**:
+    /// 同时决定中转供应商可选与 `claude_code` 委托工具注册。
+    pub fn claude_code_enabled(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.is_claude_code() && provider.enabled)
     }
 }

@@ -177,6 +177,13 @@ impl OpenAiCompatibleClient {
         .collect();
         args.push("--model".into());
         args.push(model.to_string());
+        // 思考档:Miyu 的 thinking-variant 选择映射到 CLI 的 --effort。
+        if let Some((_, variant)) = self.selected_reasoning_variant() {
+            if let crate::models_cache::ReasoningSetting::Effort(effort) = variant.setting {
+                args.push("--effort".into());
+                args.push(effort);
+            }
+        }
         if !system_prompt.trim().is_empty() {
             // 整体替换默认系统提示词:人格/开发提示词原样过去,同时甩掉
             // Claude Code 自带的 CLI 身份与 CLAUDE.md 注入。

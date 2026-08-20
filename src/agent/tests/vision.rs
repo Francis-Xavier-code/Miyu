@@ -156,6 +156,7 @@ async fn binary_image_reaches_vision_pool_then_text_model() {
     config.tools.enabled = false;
     config.plugins.vision.enabled = true;
     config.providers.push(ProviderConfig {
+        enabled: true,
         id: "vision-test".to_string(),
         display_name: "Vision Test".to_string(),
         base_url: format!("http://{}/v1", vision_listener.local_addr().unwrap()),

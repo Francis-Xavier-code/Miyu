@@ -452,7 +452,7 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     }
     // 只进本机 owner 底座;平台受限表不注册,turn 装配层对复用 normal 底座
     // 的平台管理员会话再摘一次(§09)。
-    if config.plugins.claude_code.enabled {
+    if config.claude_code_enabled() {
         claude_code::register(&mut registry, config.plugins.claude_code.clone(), paths.clone());
     }
     let task_tools = registry.clone();
@@ -582,7 +582,7 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
         memory::register(&mut registry, config.dev_scoped(), paths.clone());
     }
     // dev 本来就只有 owner 面,照常随插件开关注册(§09)。
-    if config.plugins.claude_code.enabled {
+    if config.claude_code_enabled() {
         claude_code::register(&mut registry, config.plugins.claude_code.clone(), paths.clone());
     }
     let task_tools = registry.clone();

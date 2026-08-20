@@ -92,7 +92,23 @@ pub(in crate::llm::openai_compatible) fn anthropic_reasoning_budget(max_tokens: 
     (max_tokens > 1024 && requested < u64::from(max_tokens)).then_some(requested)
 }
 
+/// Claude Code 的思考档:CLI 的 `--effort` 五档,不走 models.dev 目录
+/// (那里没有这个"供应商")。所有预置模型统一给全档,CLI 对不支持档位的
+/// 模型自行降级。
+pub(in crate::llm::openai_compatible) fn claude_code_reasoning_variants() -> Vec<ReasoningVariant> {
+    ["low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .map(|effort| ReasoningVariant {
+            id: effort.to_string(),
+            setting: ReasoningSetting::Effort(effort.to_string()),
+        })
+        .collect()
+}
+
 pub(in crate::llm::openai_compatible) fn supported_reasoning_variants(provider: &ProviderConfig, model: &str) -> Vec<ReasoningVariant> {
+    if provider_uses_claude_code(provider) {
+        return claude_code_reasoning_variants();
+    }
     let Some(info) = models_cache::reasoning_info(&provider.id, model) else {
         return Vec::new();
     };
@@ -122,8 +138,8 @@ pub(in crate::llm::openai_compatible) fn reasoning_variant_supported_for_protoco
     protocol: ProviderProtocol,
 ) -> bool {
     match protocol {
-        // Claude Code 自己管理思考(adaptive thinking),中转层不透传思考档。
-        ProviderProtocol::ClaudeCode => false,
+        // Claude Code 只认 `--effort` 的档位语义。
+        ProviderProtocol::ClaudeCode => matches!(variant.setting, ReasoningSetting::Effort(_)),
         ProviderProtocol::OpenAiResponses => matches!(
             variant.setting,
             ReasoningSetting::Effort(_) | ReasoningSetting::Toggle(_) | ReasoningSetting::Disabled

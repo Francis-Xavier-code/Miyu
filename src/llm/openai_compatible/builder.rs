@@ -87,6 +87,18 @@ impl OpenAiCompatibleClient {
                     continue;
                 }
             };
+            if !provider.enabled {
+                errors.push(format!(
+                    "{} / {}: {}",
+                    provider.id,
+                    choice.model,
+                    t(
+                        "provider is disabled; enable it in the provider settings",
+                        "供应商未启用;请在供应商设置里启用"
+                    )
+                ));
+                continue;
+            }
             provider.default_model = choice.model.clone();
             let client = endpoint_client(&provider)?;
             if provider_uses_claude_code(&provider) {
@@ -146,6 +158,16 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn new(provider: &ProviderConfig, config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
+        if !provider.enabled {
+            bail!(
+                "{}: {}",
+                t(
+                    "provider is disabled; enable it in the provider settings",
+                    "供应商未启用;请在供应商设置里启用"
+                ),
+                provider.id
+            );
+        }
         if provider.default_model.trim().is_empty() {
             bail!(
                 "{}: {}",

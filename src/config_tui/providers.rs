@@ -55,6 +55,10 @@ impl ModelEntry {
 }
 
 pub(in crate::config_tui) fn fetch_models(provider: &ProviderConfig) -> Result<Vec<String>> {
+    if provider.is_claude_code() {
+        // 本机 CLI 后端没有 /models HTTP 端点;模型列表就是预置的 CLI 别名。
+        return Ok(provider.models.clone());
+    }
     let api_key = provider.api_key.as_deref().unwrap_or_default();
     let mut api_key = if let Some(env_name) = api_key.strip_prefix("$env:") {
         std::env::var(env_name).unwrap_or_default()
@@ -577,6 +581,78 @@ pub(in crate::config_tui) fn select_model_pool(
     }
 }
 
+/// Claude Code 特殊供应商的编辑表单。它不是 HTTP 端点,所以没有
+/// base_url/协议/API Key/超时/额外请求体;取而代之的是启用总开关(同时控制
+/// 订阅中转与 claude_code 委托工具)和 CLI 中转的几个开关(存 plugins.claude_code)。
+pub(in crate::config_tui) fn edit_claude_code_provider_form(
+    stdout: &mut io::Stdout,
+    provider: ProviderConfig,
+    plugin: &mut crate::config::ClaudeCodePluginConfig,
+) -> Result<Option<ProviderConfig>> {
+    let mut fields = vec![
+        Field::new(
+            t(
+                "Enabled (subscription relay + claude_code tool)",
+                "启用(订阅中转 + claude_code 工具)",
+            ),
+            provider.enabled.to_string(),
+        )
+        .choices(&["true", "false"]),
+        Field::new(t("Display name", "显示名称"), provider.display_name.clone()),
+        Field::new(
+            t("claude binary (empty = PATH)", "claude 可执行文件(空=PATH)"),
+            plugin.binary.clone(),
+        ),
+        Field::new(
+            t(
+                "Expose Miyu tools to claude (MCP bridge)",
+                "把 Miyu 工具挂给 claude(MCP 桥)",
+            ),
+            plugin.expose_miyu_tools.to_string(),
+        )
+        .choices(&["true", "false"]),
+        Field::new(
+            t("Stream idle watchdog (seconds)", "流空闲看门狗(秒)"),
+            plugin.idle_timeout_seconds.to_string(),
+        ),
+    ];
+    loop {
+        if !run_form(
+            stdout,
+            t(" EDIT CLAUDE CODE ", " 编辑 Claude Code "),
+            &mut fields,
+        )? {
+            return Ok(None);
+        }
+        let enabled = match parse_bool_field(&fields[0].value) {
+            Ok(value) => value,
+            Err(error) => {
+                message(stdout, &format!("{error:#}"))?;
+                continue;
+            }
+        };
+        let expose_miyu_tools = match parse_bool_field(&fields[3].value) {
+            Ok(value) => value,
+            Err(error) => {
+                message(stdout, &format!("{error:#}"))?;
+                continue;
+            }
+        };
+        plugin.binary = fields[2].value.trim().to_string();
+        plugin.expose_miyu_tools = expose_miyu_tools;
+        plugin.idle_timeout_seconds = fields[4].value.trim().parse().unwrap_or(300);
+        let mut updated = provider.clone();
+        updated.enabled = enabled;
+        let display_name = fields[1].value.trim();
+        updated.display_name = if display_name.is_empty() {
+            "Claude Code".to_string()
+        } else {
+            display_name.to_string()
+        };
+        return Ok(Some(updated));
+    }
+}
+
 pub(in crate::config_tui) fn edit_provider_form(
     stdout: &mut io::Stdout,
     provider: ProviderConfig,
@@ -592,12 +668,13 @@ pub(in crate::config_tui) fn edit_provider_form(
         Field::new(t("Configuration ID", "配置 ID"), provider.id.clone()),
         Field::new(t("Display name", "显示名称"), provider.display_name.clone()),
         Field::new("Base URL", provider.base_url.clone()),
+        // claude-code 不在这份下拉里:它是内置特殊供应商的内部协议标识,
+        // 不暴露成用户可选概念(那个供应商走自己的专用表单)。
         Field::new(t("Protocol", "协议"), provider.protocol.clone()).choices(&[
             "auto",
             "openai-chat",
             "openai-responses",
             "anthropic",
-            "claude-code",
         ]),
         Field::new(
             t("API Key or $env:NAME", "API Key 或 $env:NAME"),
@@ -644,6 +721,7 @@ pub(in crate::config_tui) fn edit_provider_form(
             id: fields[0].value.trim().to_string(),
             display_name: fields[1].value.trim().to_string(),
             base_url: normalize_base_url(&fields[2].value),
+            enabled: provider.enabled,
             protocol: fields[3].value.trim().to_string(),
             api_key: Some(fields[4].value.trim().to_string()).filter(|value| !value.is_empty()),
             models: provider.models.clone(),
