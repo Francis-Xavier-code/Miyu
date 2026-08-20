@@ -3,6 +3,16 @@
 use super::shared::*;
 use crate::config::*;
 
+/// Claude Code 置顶后 providers[0] 是禁用的内置条目;位置式引用改按
+/// opencode 模板定位。
+fn first_http_provider(config: &mut AppConfig) -> &mut ProviderConfig {
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .expect("default templates always carry HTTP providers")
+}
+
 #[test]
 fn model_temperature_override_beats_provider_default() {
     let mut provider = ProviderConfig::default_opencodezen();
@@ -52,9 +62,9 @@ fn provider_model_choices_ignore_unconfigured_models() {
 #[test]
 fn active_provider_models_are_replaced_as_one_validated_pool() {
     let mut config = AppConfig::default();
-    let provider_id = config.providers[0].id.clone();
-    config.providers[0].models = vec!["model-a".to_string(), "model-b".to_string()];
-    config.providers[0].default_model = "model-a".to_string();
+    let provider_id = first_http_provider(&mut config).id.clone();
+    first_http_provider(&mut config).models = vec!["model-a".to_string(), "model-b".to_string()];
+    first_http_provider(&mut config).default_model = "model-a".to_string();
     let before = config.active_provider_models.clone();
 
     let invalid = vec![
@@ -197,7 +207,7 @@ fn remove_active_model_references_clears_text_and_multimodal() {
 #[test]
 fn multimodal_provider_model_choices_use_input_modalities() {
     let mut config = AppConfig::default();
-    let provider = &mut config.providers[0];
+    let provider = first_http_provider(&mut config);
     provider.models = vec![
         "text-only".to_string(),
         "audio-only".to_string(),
@@ -225,15 +235,15 @@ fn multimodal_provider_model_choices_use_input_modalities() {
 #[test]
 fn active_multimodal_pool_rejects_and_prunes_non_image_models() {
     let mut config = AppConfig::default();
-    let provider_id = config.providers[0].id.clone();
-    config.providers[0]
+    let provider_id = first_http_provider(&mut config).id.clone();
+    first_http_provider(&mut config)
         .models
         .extend(["audio-only".to_string(), "vision-model".to_string()]);
-    config.providers[0].model_modalities.insert(
+    first_http_provider(&mut config).model_modalities.insert(
         "audio-only".to_string(),
         vec!["text".to_string(), "audio".to_string()],
     );
-    config.providers[0].model_modalities.insert(
+    first_http_provider(&mut config).model_modalities.insert(
         "vision-model".to_string(),
         vec!["text".to_string(), "image".to_string()],
     );
@@ -264,8 +274,10 @@ fn active_multimodal_pool_rejects_and_prunes_non_image_models() {
 #[test]
 fn vision_provider_choice_prefers_multimodal_pool_then_default_mimo() {
     let mut config = AppConfig::default();
-    config.providers[0].models.push("vision-model".to_string());
-    config.providers[0].model_modalities.insert(
+    first_http_provider(&mut config)
+        .models
+        .push("vision-model".to_string());
+    first_http_provider(&mut config).model_modalities.insert(
         "vision-model".to_string(),
         vec!["text".to_string(), "image".to_string()],
     );
@@ -406,7 +418,7 @@ fn an_embedding_model_never_reaches_the_chat_pickers() {
     // It produces vectors, not replies; the multimodal list derives from
     // the text one, so filtering at the source covers both.
     let mut config = AppConfig::default();
-    let provider = config.providers.first_mut().unwrap();
+    let provider = first_http_provider(&mut config);
     provider.models = vec!["chat-model".to_string(), "vector-model".to_string()];
     provider
         .model_modalities
@@ -906,6 +918,8 @@ fn claude_code_builtin_provider_is_injected_disabled_with_preset_models() {
         .iter()
         .find(|provider| provider.is_claude_code())
         .expect("内置 Claude Code 供应商应被注入");
+    // 用户拍板的列表次序:恒置顶。
+    assert!(config.providers[0].is_claude_code());
     assert_eq!(provider.id, "claude-code");
     assert!(!provider.enabled, "默认必须是禁用态");
     assert_eq!(provider.models, ["fable", "opus", "sonnet", "haiku"]);

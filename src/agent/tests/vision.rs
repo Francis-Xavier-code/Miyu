@@ -10,7 +10,11 @@ use tokio::net::TcpListener;
 #[test]
 fn vision_support_requires_every_effective_text_pool_model() {
     let mut config = AppConfig::default();
-    let provider = config.providers.first_mut().unwrap();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
     provider.default_model = "vision-model".to_string();
     provider.models = vec!["vision-model".to_string(), "text-model".to_string()];
     provider.model_modalities.insert(
@@ -42,7 +46,11 @@ fn vision_support_requires_every_effective_text_pool_model() {
 #[test]
 fn vision_preference_controls_direct_image_delivery_to_the_text_pool() {
     let mut config = AppConfig::default();
-    let provider = config.providers.first_mut().unwrap();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
     provider.model_modalities.insert(
         provider.default_model.clone(),
         vec!["text".to_string(), "image".to_string()],

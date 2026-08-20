@@ -190,8 +190,10 @@ pub(in crate::web) async fn handle_session_command(
             // 与回合同源的 registry(guard/超时齐备);会话工作区与来源
             // 一并作用域化,内层工具看到的世界和回合内一致。
             let config = { state.manager.lock().unwrap().config.clone() };
-            let registry = crate::tools::build_tool_registry(&config, &state.paths, mode, false)
-                .map_err(|error| safe_error_message(&error))?;
+            let mut registry =
+                crate::tools::build_tool_registry(&config, &state.paths, mode, false)
+                    .map_err(|error| safe_error_message(&error))?;
+            attach_owner_turn_tools(&mut registry, state, &config, mode, &session_id);
             if !registry.contains(&name) {
                 // 桥专属报错:dev 实测里裸 "unknown tool" 让脚本作者盲试了
                 // 一轮,这里把近似建议和"查目录"的路标一并给出。
@@ -222,7 +224,14 @@ pub(in crate::web) async fn handle_session_command(
                     crate::tools::workspace::with_turn_origin(
                         turn_origin,
                         crate::tools::workspace::with_bridge_depth(depth + 1, async {
-                            registry.call(&name, &arguments).await
+                            call_with_bridge_progress(
+                                state,
+                                &session_id,
+                                &registry,
+                                &name,
+                                &arguments,
+                            )
+                            .await
                         }),
                     ),
                 ),
@@ -257,8 +266,10 @@ pub(in crate::web) async fn handle_session_command(
             };
             let mode = turn_mode_for_session(store, &session_id, AgentMode::Normal);
             let config = { state.manager.lock().unwrap().config.clone() };
-            let registry = crate::tools::build_tool_registry(&config, &state.paths, mode, false)
-                .map_err(|error| safe_error_message(&error))?;
+            let mut registry =
+                crate::tools::build_tool_registry(&config, &state.paths, mode, false)
+                    .map_err(|error| safe_error_message(&error))?;
+            attach_owner_turn_tools(&mut registry, state, &config, mode, &session_id);
             let mode_label = match mode {
                 AgentMode::Dev => "dev",
                 AgentMode::Normal => "normal",
@@ -382,6 +393,7 @@ pub(in crate::web) async fn handle_session_command(
             let result = store
                 .delete_session(&record.session_id)
                 .map_err(|error| safe_error_message(&error));
+            crate::llm::forget_claude_code_session(&record.session_id);
             release_admin(&state.manager);
             result?;
             // 库里的目标行随会话级联删除；进程内的 goal 状态（armed 等）
@@ -451,6 +463,23 @@ pub(in crate::web) async fn handle_session_command(
             Ok(json!({ "session_id": record.session_id }))
         }
         _ => Err("unsupported session command".to_string()),
+    }
+}
+
+/// 与回合装配同源的本机加料(task.rs 同条件):artifact 与 share 工具是
+/// 每回合注册进 normal 表的,基础注册表里没有;桥的目录与调用两边都要补,
+/// 否则 claude 经桥看到的世界与回合内不同源。平台会话进不了桥(解析器已
+/// 拒),dev 表与回合装配一样不含这两组。
+pub(in crate::web) fn attach_owner_turn_tools(
+    registry: &mut crate::tools::ToolRegistry,
+    state: &DaemonState,
+    config: &AppConfig,
+    mode: AgentMode,
+    session_id: &str,
+) {
+    if mode == AgentMode::Normal && config.tools.enabled {
+        crate::tools::register_webui_artifact_tools(registry, &state.paths, session_id);
+        crate::tools::register_webui_share_tools(registry, config, state.state_store.clone());
     }
 }
 

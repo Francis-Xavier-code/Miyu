@@ -370,3 +370,42 @@ async fn native_tool_scope_shapes_the_cli_args() {
     let args = read(dir.path(), "args.txt");
     assert!(args.contains("--tools\n\n"), "{args}");
 }
+
+/// 两套同开时,MCP 桥的 env 里点名剔除与原生重复的 Miyu 工具。
+#[tokio::test]
+async fn duplicate_miyu_tools_are_excluded_when_both_toolsets_are_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = claude_code_client(dir.path(), "cc-dedupe");
+    client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
+        binary: fake_claude_script(dir.path()),
+        home: dir.path().to_path_buf(),
+        native_tools: "all".to_string(),
+        miyu_tools: "all".to_string(),
+        permission_mode: "bypassPermissions".to_string(),
+        idle_timeout: Duration::from_secs(30),
+        prefer_subscription: true,
+    }));
+    // MCP 桥要求会话作用域(env 里带 MIYU_SESSION)。
+    crate::tools::workspace::with_session(std::sync::Arc::from("sess-dedupe"), async {
+        client
+            .chat_claude_code_stream(
+                vec![ChatMessage::plain("user", "hi")],
+                Vec::new(),
+                "req-test",
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--mcp-config"), "{args}");
+    assert!(
+        args.contains("MIYU_MCP_EXCLUDE") && args.contains("run_command"),
+        "两套同开应点名剔除重复工具: {args}"
+    );
+    assert!(
+        !args.contains("\"glob"),
+        "glob/grep 不在剔除表(用户拍板保留): {args}"
+    );
+}

@@ -97,11 +97,19 @@ impl OpenAiCompatibleClient {
         // 一律用会话工作区(与 run_command 同源):原生工具在这里操作文件,
         // 无工具时 cwd 无关紧要。回合作用域外(测试/辅助)回退进程 cwd。
         let workdir = crate::tools::workspace::effective_workdir();
+        let miyu_session = crate::tools::workspace::try_session();
+        let miyu_session = miyu_session.as_deref();
         let chain = session::prefix_chain(&self.provider.id, &model, &system_prompt, &conversation);
         let resumable = if ephemeral {
             None
         } else {
-            session::find_resumable(&self.provider.id, &model, &chain, conversation.len())
+            session::find_resumable(
+                &self.provider.id,
+                &model,
+                miyu_session,
+                &chain,
+                conversation.len(),
+            )
         };
         let outcome = {
             let (resume_id, covered) = match resumable.clone() {
@@ -163,6 +171,7 @@ impl OpenAiCompatibleClient {
                     session::record_session(
                         &self.provider.id,
                         &model,
+                        miyu_session,
                         conversation.len() + 1,
                         next_hash,
                         claude_session.clone(),
@@ -223,7 +232,10 @@ impl OpenAiCompatibleClient {
         }
         args.push("--strict-mcp-config".into());
         if miyu_on {
-            if let Some(mcp_config) = mcp_bridge_config(runtime) {
+            // 两套同开时去重:与 claude 原生重复的 Miyu 工具剔除,原生优先
+            // (用户拍板清单;load_skill/manage_skill 与 claude 的 Skill 内容
+            // 不同,不算重复;glob/grep/todowrite 保留)。
+            if let Some(mcp_config) = mcp_bridge_config(runtime, native_on) {
                 args.push("--mcp-config".into());
                 args.push(mcp_config);
                 args.push("--allowedTools".into());
@@ -244,7 +256,21 @@ impl OpenAiCompatibleClient {
 /// Miyu 工具经 MCP stdio 桥挂给 claude:`miyu mcp-serve` 打回 daemon,与
 /// `miyu tool-call` 同一条会话→模式→registry 解析链。没有会话作用域(测试
 /// /直连辅助请求)就不挂桥。
-fn mcp_bridge_config(runtime: &ClaudeCodeRuntime) -> Option<String> {
+/// 两套工具同开时从桥里剔除的 Miyu 工具(与 claude 原生功能重复,原生
+/// 在训练分布内、优先):Bash/Edit/Read/Task/WebSearch/WebFetch 各自的
+/// Miyu 对应物,以及 claude 自带后台任务与定时能力覆盖的 job/alarm。
+const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
+    "read_file",
+    "apply_patch",
+    "run_command",
+    "task",
+    "web_search",
+    "web_fetch",
+    "job",
+    "alarm",
+];
+
+fn mcp_bridge_config(runtime: &ClaudeCodeRuntime, exclude_duplicates: bool) -> Option<String> {
     let session = crate::tools::workspace::try_session()?;
     let exe = crate::paths::miyu_executable().ok()?;
     let origin =
@@ -253,6 +279,12 @@ fn mcp_bridge_config(runtime: &ClaudeCodeRuntime) -> Option<String> {
     env.insert("MIYU_SESSION".into(), json!(&*session));
     env.insert("MIYU_TURN_ORIGIN".into(), json!(origin));
     env.insert("MIYU_HOME".into(), json!(runtime.home));
+    if exclude_duplicates {
+        env.insert(
+            "MIYU_MCP_EXCLUDE".into(),
+            json!(BRIDGE_DUPLICATE_TOOLS.join(",")),
+        );
+    }
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
         env.insert("XDG_RUNTIME_DIR".into(), json!(xdg.to_string_lossy()));
     }
@@ -268,4 +300,42 @@ fn mcp_bridge_config(runtime: &ClaudeCodeRuntime) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+/// 清空 Miyu 会话时的联动:丢弃它名下的续传映射,并尽力删除 claude 侧的
+/// 会话转录(`~/.claude/projects/<项目槽>/<会话id>.jsonl`)。存储布局是
+/// claude 的内部实现,删不到只记日志不报错——映射已丢弃,该 claude 会话
+/// 无论如何不会再被续传。
+pub(crate) fn forget_claude_code_session(miyu_session: &str) {
+    let removed = session::forget_miyu_session(miyu_session);
+    if removed.is_empty() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let projects = std::path::Path::new(&home).join(".claude").join("projects");
+    let Ok(project_dirs) = std::fs::read_dir(&projects) else {
+        return;
+    };
+    for project in project_dirs.flatten() {
+        for claude_session in &removed {
+            let transcript = project.path().join(format!("{claude_session}.jsonl"));
+            if !transcript.exists() {
+                continue;
+            }
+            match std::fs::remove_file(&transcript) {
+                Ok(()) => tracing::info!(
+                    miyu_session,
+                    claude_session = %claude_session,
+                    "removed the claude-side transcript for a cleared Miyu session"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    path = %transcript.display(),
+                    "failed to remove a claude-side transcript (best effort)"
+                ),
+            }
+        }
+    }
 }

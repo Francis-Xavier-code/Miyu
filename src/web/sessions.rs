@@ -485,6 +485,10 @@ pub(in crate::web) fn spawn_session_title_refinement(
     let Ok(client) = OpenAiCompatibleClient::from_config(config, paths) else {
         return;
     };
+    // 标题生成是侧信道:scope 留在默认 "chat" 会让缓存记账把它算进主对话
+    // (08-10 调研 P2),claude-code 中转还会为它建持久会话且不进会话映射
+    // (清空联动删不到)。
+    let client = client.with_request_scope("session-title");
     let store = store.clone();
     let events = events.clone();
     let seed = seed.to_string();

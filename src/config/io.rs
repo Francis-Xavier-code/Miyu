@@ -162,6 +162,32 @@ impl AppConfig {
                 self.providers.push(provider);
             }
         }
+        // Claude Code 恒置顶(用户拍板的列表次序);存量配置若排在后面搬到最前。
+        if let Some(position) = self
+            .providers
+            .iter()
+            .position(ProviderConfig::is_claude_code)
+        {
+            if position != 0 {
+                let provider = self.providers.remove(position);
+                self.providers.insert(0, provider);
+            }
+        }
+        // 存量 claude-code 条目回填已知别名的 200k 窗口(模板只覆盖新注入;
+        // 不回填的话上下文测算一直用猜测默认值)。用户显式配置的值不动。
+        for provider in &mut self.providers {
+            if !provider.is_claude_code() {
+                continue;
+            }
+            for model in ["fable", "opus", "sonnet", "haiku"] {
+                if provider.models.iter().any(|item| item == model) {
+                    provider
+                        .model_context_window
+                        .entry(model.to_string())
+                        .or_insert(200_000);
+                }
+            }
+        }
         if self.active_provider == "opencodezen" {
             self.active_provider = OPENCODE_PROVIDER_ID.to_string();
         }

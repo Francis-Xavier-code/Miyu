@@ -318,6 +318,12 @@ impl ProviderConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            // 这个"供应商"不在 models.dev 目录里,窗口自己钉:全系 200k。
+            // 不钉会落到"猜测默认",Miyu 的上下文测算与压缩阈值就都不准。
+            model_context_window: ["fable", "opus", "sonnet", "haiku"]
+                .into_iter()
+                .map(|model| (model.to_string(), 200_000))
+                .collect(),
             default_model: "sonnet".to_string(),
             ..Self::template("claude-code", "Claude Code", "")
         }
@@ -353,7 +359,8 @@ impl ProviderConfig {
             Self::template("ollama", "Ollama", "http://localhost:11434/v1"),
             Self::template("lmstudio", "LMStudio", "http://localhost:1234/v1"),
         ]);
-        providers.push(Self::claude_code_template());
+        // Claude Code 置顶:用户拍板的列表次序。
+        providers.insert(0, Self::claude_code_template());
         providers
     }
 

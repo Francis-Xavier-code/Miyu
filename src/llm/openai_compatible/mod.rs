@@ -12,6 +12,7 @@ mod protocol;
 mod sse;
 mod wire;
 use claude_code::ClaudeCodeRuntime;
+pub(crate) use claude_code::forget_claude_code_session;
 use dsml::*;
 use endpoints::*;
 use errors::*;

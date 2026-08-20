@@ -131,7 +131,11 @@ fn global_persona_menu_target_preserves_activation_behavior() {
 #[test]
 fn explicit_vision_choices_only_include_image_capable_models() {
     let mut config = AppConfig::default();
-    let provider = &mut config.providers[0];
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
     provider.models = vec!["text-only".to_string(), "vision".to_string()];
     provider
         .model_modalities
@@ -156,7 +160,11 @@ fn explicit_vision_choices_only_include_image_capable_models() {
 #[test]
 fn removing_a_stale_model_clears_every_reference_to_it() {
     let mut config = AppConfig::default();
-    let provider = &mut config.providers[0];
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
     let provider_id = provider.id.clone();
     provider.models = vec!["gone".to_string(), "alive".to_string()];
     for model in ["gone", "alive"] {
@@ -182,7 +190,11 @@ fn removing_a_stale_model_clears_every_reference_to_it() {
         .remove_active_provider_model(&provider_id, "gone")
         .unwrap();
 
-    let provider = &config.providers[0];
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
     assert!(!provider.models.iter().any(|model| model == "gone"));
     assert!(!provider.model_modalities.contains_key("gone"));
     assert!(!provider.model_context_window.contains_key("gone"));

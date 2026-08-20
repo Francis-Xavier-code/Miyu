@@ -11,6 +11,15 @@ use crate::cli::*;
 
 pub(in crate::cli) async fn run_mcp_serve(paths: &MiyuPaths) -> Result<()> {
     let session = std::env::var("MIYU_SESSION").ok().filter(|s| !s.is_empty());
+    // 与 claude 原生重复的工具由拉起方经 env 点名剔除(原生优先):目录里
+    // 不出现、调用被拒,两边同源。
+    let excluded: std::collections::HashSet<String> = std::env::var("MIYU_MCP_EXCLUDE")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
     let origin = std::env::var("MIYU_TURN_ORIGIN")
         .ok()
         .filter(|s| !s.is_empty());
@@ -43,7 +52,9 @@ pub(in crate::cli) async fn run_mcp_serve(paths: &MiyuPaths) -> Result<()> {
             .unwrap_or(serde_json::Value::Null);
         let response = match method.as_str() {
             "initialize" | "ping" | "tools/list" | "tools/call" => {
-                match handle_request(paths, &session, &origin, depth, &method, &params).await {
+                match handle_request(paths, &session, &origin, depth, &excluded, &method, &params)
+                    .await
+                {
                     Ok(result) => {
                         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
                     }
@@ -81,6 +92,7 @@ async fn handle_request(
     session: &Option<String>,
     origin: &Option<String>,
     depth: u32,
+    excluded: &std::collections::HashSet<String>,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value> {
@@ -98,12 +110,34 @@ async fn handle_request(
             }))
         }
         "ping" => Ok(serde_json::json!({})),
-        "tools/list" => list_tools(paths, session).await,
+        "tools/list" => {
+            let mut listing = list_tools(paths, session).await?;
+            if let Some(tools) = listing
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| {
+                    tool.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|name| !excluded.contains(name))
+                        .unwrap_or(true)
+                });
+            }
+            Ok(listing)
+        }
         "tools/call" => {
             let name = params
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .context("tools/call requires a tool name")?;
+            if excluded.contains(name) {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "tool {name} is not exposed here; use your own native equivalent instead"
+                    ) }],
+                    "isError": true,
+                }));
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()

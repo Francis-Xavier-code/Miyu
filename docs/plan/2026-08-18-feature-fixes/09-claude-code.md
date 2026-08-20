@@ -208,3 +208,32 @@
 请求日志实测 `--permission-mode bypassPermissions` 且无 `--tools`/`--mcp-config`;
 作用域四组合单测(all/dev×normal 会话/dev×dev 会话/normal×dev 会话)全绿;
 TUI 探针含新字段复测全过。
+
+## 12. 第四轮验收整改(2026-08-20,用户实测六问题)
+
+1. **清空联动**:续传映射织入 Miyu 会话 id(不同会话显式隔离,字节级撞链也
+   不共用);/reset、平台清空、/wipe、删除会话六个入口全部联动
+   `llm::forget_claude_code_session`——丢映射 + 尽力删除
+   `~/.claude/projects/*/<会话id>.jsonl` 转录。真机:reset 后转录零残留。
+   顺手修:**会话标题生成的 LLM 调用 scope 误标 "chat"**(08-10 调研 P2 旧
+   账)改为 "session-title",在中转下不再产生游离的持久 claude 会话。
+2. **上下文限制**:预置模型钉 200k 窗口(模板+normalize 对存量条目回填);
+   Miyu 的压缩管自己的账本,claude 侧真实上下文由其 autocompact 自管,Miyu
+   压缩→链断→重开会话间接同步。
+3. **桥工具图片**:新增 web/bridge_progress——桥内层调用改走带 progress 的
+   执行,图片落 image asset(挂到该会话正在跑的 turn)并以 tool.image 事件直
+   发 EventHub,REPL/WebUI 走既有渲染路;`prepare_for_external_output` 明确
+   答 false(旧空 progress 误答 true,print_image 曾把图打进 daemon stdout)。
+   真机:bridge_print_image 资产落库 + REPL 渲染痕迹。
+4. **WebUI 工具过桥**:桥的 ToolCatalog/ToolCall 与回合装配同源补注册
+   artifact 四件 + share_file(attach_owner_turn_tools,normal 表)。
+5. 表单标签去掉档位括号。
+6. **会话隔离**:见 1,映射按 (provider, model, miyu 会话) 三元隔离。
+
+另:双四档默认改 native=all + miyu=normal;供应商列表 Claude Code 置顶
+(default_templates + normalize 搬移,四个位置式引用测试改按 id 定位)。
+
+**已知未修**(桥语义,与中转正交):经桥调用 Miyu `task` 的子代理工具集为空
+(用户实测);ask_question 未过桥。`task` 已进去重剔除表,中转路径不受影响。
+**排查铁律**:隔离测试 home 的配置文件会钉住旧默认(permission_mode/
+miyu_tools 两次踩坑)——"默认没生效"先查配置残值。

@@ -531,7 +531,11 @@ mod tests {
     #[test]
     fn vision_uses_the_active_text_pool_when_it_can_see() {
         let mut config = AppConfig::default();
-        let provider = config.providers.first_mut().unwrap();
+        let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| !provider.is_claude_code())
+        .unwrap();
         let provider_id = provider.id.clone();
         provider.model_modalities.insert(
             provider.default_model.clone(),
@@ -552,7 +556,13 @@ mod tests {
         config.active_provider_models = Some(vec![
             ActiveProviderModelConfig {
                 provider_id: provider_id.clone(),
-                model: config.providers[0].default_model.clone(),
+                model: config
+                    .providers
+                    .iter()
+                    .find(|provider| !provider.is_claude_code())
+                    .unwrap()
+                    .default_model
+                    .clone(),
             },
             ActiveProviderModelConfig {
                 provider_id,

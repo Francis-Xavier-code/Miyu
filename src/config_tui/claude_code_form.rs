@@ -31,17 +31,14 @@ pub(in crate::config_tui) fn edit_claude_code_provider_form(
             plugin.binary.clone(),
         ),
         Field::new(
-            t(
-                "Claude native tools scope (off/dev/normal/all)",
-                "Claude 原生工具作用域(off/dev/normal/all)",
-            ),
+            t("Claude native tools scope", "Claude 原生工具作用域"),
             plugin.native_tools.clone(),
         )
         .choices(TOOL_SCOPES),
         Field::new(
             t(
-                "Miyu tools via MCP bridge scope (off/dev/normal/all)",
-                "Miyu 工具挂给 claude 的作用域(off/dev/normal/all)",
+                "Miyu tools via MCP bridge scope",
+                "Miyu 工具挂给 claude 的作用域",
             ),
             plugin.miyu_tools.clone(),
         )
