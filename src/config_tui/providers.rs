@@ -597,6 +597,7 @@ pub(in crate::config_tui) fn edit_provider_form(
             "openai-chat",
             "openai-responses",
             "anthropic",
+            "claude-code",
         ]),
         Field::new(
             t("API Key or $env:NAME", "API Key 或 $env:NAME"),

@@ -7,6 +7,7 @@ mod shared;
 mod responses;
 mod anthropic;
 mod chat_stream;
+mod claude_code;
 mod failover;
 mod thinking;
 mod extra_body;

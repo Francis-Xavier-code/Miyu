@@ -19,6 +19,9 @@ pub(in crate::llm::openai_compatible) enum ProviderProtocol {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+    /// 本机 Claude Code CLI 中转:传输层是子进程 stream-json,不是 HTTP。
+    /// 只能显式配置,`auto` 永远不会猜到这条线。
+    ClaudeCode,
 }
 
 impl ProviderProtocol {
@@ -30,9 +33,21 @@ impl ProviderProtocol {
             "anthropic" | "anthropic-messages" | "claude" | "claude-messages" => {
                 Ok(Self::Anthropic)
             }
+            "claude-code" | "claude-code-cli" => Ok(Self::ClaudeCode),
             protocol => bail!("unsupported provider protocol: {protocol}"),
         }
     }
+}
+
+/// 端点池装配与 keepalive 分流用:该 provider 是否走 Claude Code CLI 中转。
+/// CLI 用订阅登录态,没有 API key 概念,装配时要豁免 key 解析。
+pub(in crate::llm::openai_compatible) fn provider_uses_claude_code(
+    provider: &ProviderConfig,
+) -> bool {
+    matches!(
+        ProviderProtocol::from_provider(provider),
+        Ok(ProviderProtocol::ClaudeCode)
+    )
 }
 
 pub(in crate::llm::openai_compatible) fn effective_protocol(provider: &ProviderConfig, model: &str) -> Result<ProviderProtocol> {
@@ -107,6 +122,8 @@ pub(in crate::llm::openai_compatible) fn reasoning_variant_supported_for_protoco
     protocol: ProviderProtocol,
 ) -> bool {
     match protocol {
+        // Claude Code 自己管理思考(adaptive thinking),中转层不透传思考档。
+        ProviderProtocol::ClaudeCode => false,
         ProviderProtocol::OpenAiResponses => matches!(
             variant.setting,
             ReasoningSetting::Effort(_) | ReasoningSetting::Toggle(_) | ReasoningSetting::Disabled

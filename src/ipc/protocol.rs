@@ -227,6 +227,10 @@ pub enum Command {
         session: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        /// true 时列表项带完整合同(description+parameters):MCP 桥一次
+        /// tools/list 拿全量,免去逐工具 describe 的 N 次往返。
+        #[serde(default)]
+        full: bool,
     },
     RenameSession {
         target: SessionRef,

@@ -222,6 +222,13 @@ async fn run_turn_task_inner(
                 );
             }
         }
+        if platform_context.is_some() {
+            // claude_code 只属于本机 owner 面(§09):host_tools_allowed 的
+            // 平台管理员会话复用 normal/dev 底座,也一并摘掉——订阅额度和
+            // 本机代理权限不跟平台身份走。
+            normal_tools.unregister("claude_code");
+            dev_tools.unregister("claude_code");
+        }
         if local_webui && config.tools.enabled {
             tools::register_webui_artifact_tools(&mut normal_tools, &paths, &session_id);
             // 分享是全局清单,用根库而不是会话钉定克隆。
@@ -262,7 +269,10 @@ async fn run_turn_task_inner(
             resources
                 .client
                 .clone()
-                .with_buffered_delivery(platform_context.is_some()),
+                .with_buffered_delivery(platform_context.is_some())
+                // 订阅中转仅限本机会话:平台回合命中 claude-code 端点时明确拒
+                // 绝,池里有其他供应商则故障转移接管。
+                .with_platform_delivery(platform_context.is_some()),
             active_tools,
             mode,
             audience,

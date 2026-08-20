@@ -110,3 +110,58 @@
 - D17：默认 permission mode（推荐 `acceptEdits`；`plan` 更安全但体验割裂）。
 - D18：默认启用还是默认关闭（推荐启用但自动探测 binary）。
 - D19：是否允许 `claude_code` 递归调用 Claude Code 自己的 subagent（默认允许，由 Claude 内部处理）。
+
+---
+
+## 9. 施工记录（2026-08-20，claude-code 分支）
+
+用户在 08-20 把范围从"独立工具"扩大为**三件套全做**（D10 改判），并限定
+"仅本人渠道"。全部落地并经真机订阅验证：
+
+### 交付物
+
+1. **`claude-code` 供应商协议**（中转层核心，`src/llm/openai_compatible/claude_code/`
+   四小件：mod/session/payload/stream）：
+   - 传输 = `claude -p` 子进程 stream-json 双向流；`--system-prompt` 整体替换
+     （人格原样过去，无 CLI 身份与 CLAUDE.md 注入,实测首请求仅 ~246 input tok）；
+     内置工具全关（`--tools ""`）。
+   - **会话续传**：进程内逐消息哈希链匹配 append-only 前缀,命中则 `--resume`
+     只发增量（真机实测第二轮 stdin 仅一条新输入）；redo/compact/重启自动整段
+     转写重放（`<conversation-history>` 块）；claude 侧会话丢失（"No conversation
+     found"）一次性自愈重放。
+   - 用量按 Anthropic 口径归一（prompt = input+cache_read+cache_write）,进现有
+     cache-usage 记账;订阅限流/登录失效翻译为 429/401 进端点冷却与故障转移；
+     流空闲看门狗杀进程组。辅助请求（compact/记忆整理等 scope≠chat）走
+     `--no-session-persistence` 一次性会话,不挂桥。
+   - 平台门禁：`with_platform_delivery` 在平台回合拒绝该协议端点（订阅条款）。
+   - 校验豁免：该协议 `base_url` 可为空（io.rs）。
+2. **`miyu mcp-serve`**（隐藏子命令，`src/cli/mcp_serve.rs`）：MCP stdio server,
+   与 `miyu tool-call` 同源——daemon 存活走 IPC ToolCatalog/ToolCall（会话→模式
+   →registry,guard 管线齐备）,直连本地兜底。`ToolCatalog` 新增 `full` 位一次拿
+   全量合同。供应商自动以 `--mcp-config` 挂桥（env 显式带 MIYU_SESSION/
+   MIYU_TURN_ORIGIN/MIYU_HOME/XDG_RUNTIME_DIR）。
+3. **`claude_code` 委托工具**：按本文 §3 落地,偏离两处经用户同意——审计走
+   JSONL（`logs/claude-code-usage.jsonl`）不建 DB 表；新增 `resume` 参数。
+   D17=acceptEdits、D18=默认启用、D19=允许。
+4. 配置 `plugins.claude_code`（工具与供应商共用）,TUI 协议下拉加 `claude-code`。
+
+### 顺手修的存量 bug
+
+- **工具桥在阅后即焚(ask)会话里全 404**：ToolCall/ToolCatalog 的会话解析只认
+  user kind,单次 CLI 形态下 run_command 脚本调桥同样中招；改用 TURN_TARGET_KINDS。
+
+### 真机验证（订阅 haiku,08-20）
+
+| 验证项 | 结果 |
+|---|---|
+| 纯文本中转（一次性会话） | "回复 OK"→"OK",思考流正常透传 |
+| 同会话第二轮续传 | `--resume` 命中,stdin 只有增量一条（testkit/claude-code/run.py,PASS） |
+| MCP 工具闭环 | `sqrt(7.317)*ln(93.4)` 经 claude→mcp-serve→daemon→计算器,回答 12.272270123540252 与本地计算逐位一致 |
+| MCP 握手/目录/调用（不花额度） | initialize/tools/list 59 个工具全合同/tools/call 3978 |
+| 平台门禁/限流分类/binary 缺失/改写重放 | 假 claude 测具 5 项 + 会话链/载荷 4 项,全绿 |
+
+已知限制：①订阅无按 token 计费,成本列仅供参考;②转写重放时人格预设对话会作
+为历史进入 claude 上下文（模型可正确区分,但"上一条"语义可能指向预设）;③
+`claude_code` 工具在中转模式下经 MCP 可见,存在 claude 套 claude 的理论递归
+（D19 本就允许,深度由订阅限流自然约束）;④平台侧辅助请求（qq-judge 等）未
+挂平台门禁,如平台会话把主池配成 claude-code 需自行避免。

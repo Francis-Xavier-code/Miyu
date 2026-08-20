@@ -238,6 +238,16 @@ pub(in crate::llm::openai_compatible) fn llm_endpoints(config: &AppConfig, paths
         let mut provider = config.provider(Some(&choice.provider_id))?.clone();
         provider.default_model = choice.model;
         let client = endpoint_client(&provider)?;
+        if provider_uses_claude_code(&provider) {
+            // claude-code 走本机 CLI 的订阅登录态,没有 API key;单端点直进池。
+            endpoints.push(LlmEndpoint {
+                client: client.clone(),
+                provider: provider.clone(),
+                api_key: String::new(),
+                key_index: 0,
+            });
+            continue;
+        }
         match provider.resolved_api_keys(paths) {
             Ok(keys) => {
                 for key in keys {

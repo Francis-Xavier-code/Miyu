@@ -50,6 +50,53 @@ pub struct PluginsConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub file_sharing: FileSharingPluginConfig,
+    #[serde(default)]
+    pub claude_code: ClaudeCodePluginConfig,
+}
+
+/// 本机 Claude Code CLI 接入：`claude_code` 委托工具与 `claude-code` 供应商
+/// 协议共用这份配置。CLI 用用户既有的订阅登录态，Miyu 不经手任何凭据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCodePluginConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 空 = 从 PATH 解析 `claude`。
+    #[serde(default)]
+    pub binary: String,
+    /// `claude_code` 委托工具的 --permission-mode。
+    #[serde(default = "default_claude_code_permission_mode")]
+    pub permission_mode: String,
+    /// `claude_code` 委托工具的总超时（秒）。
+    #[serde(default = "default_claude_code_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// `claude_code` 委托工具的 stdout 截断上限（字节）。
+    #[serde(default = "default_claude_code_max_output_bytes")]
+    pub max_output_bytes: u64,
+    /// 供应商中转模式下把 Miyu 工具经 MCP 桥挂给 claude（需要 daemon）。
+    #[serde(default = "default_true")]
+    pub expose_miyu_tools: bool,
+    /// 供应商中转模式的流空闲看门狗（秒）：这么久没有任何输出就杀进程。
+    #[serde(default = "default_claude_code_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// 从子进程环境剥离 ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN，强制走订阅
+    /// 登录态而不是按量计费的 API key。
+    #[serde(default = "default_true")]
+    pub prefer_subscription: bool,
+}
+
+impl Default for ClaudeCodePluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            binary: String::new(),
+            permission_mode: default_claude_code_permission_mode(),
+            timeout_seconds: default_claude_code_timeout_seconds(),
+            max_output_bytes: default_claude_code_max_output_bytes(),
+            expose_miyu_tools: true,
+            idle_timeout_seconds: default_claude_code_idle_timeout_seconds(),
+            prefer_subscription: true,
+        }
+    }
 }
 
 /// WebUI 文件分享（`share_file` 工具与 `/api/shared` 路由）。
@@ -439,6 +486,7 @@ impl Default for PluginsConfig {
             diagnostics: DiagnosticsPluginConfig::default(),
             api_quota: ApiQuotaPluginConfig::default(),
             memory: MemoryConfig::default(),
+            claude_code: ClaudeCodePluginConfig::default(),
         }
     }
 }

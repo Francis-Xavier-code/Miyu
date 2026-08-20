@@ -170,8 +170,15 @@ pub(in crate::web) async fn handle_session_command(
             }
             let session_id = match session {
                 Some(session) => {
-                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
-                        .session_id
+                    // 桥必须能寻址阅后即焚(ask)会话:回合正跑在里面,run_command 的
+                    // 脚本与 MCP 桥的内层调用都以它为身份。只认 user 会话会让
+                    // 单次 CLI 形态下的整条工具桥 404(真机实测踩坑)。
+                    resolve_local_session_ref_with_kinds(
+                        state,
+                        &ipc::SessionRef::Id { id: session },
+                        TURN_TARGET_KINDS,
+                    )?
+                    .session_id
                 }
                 None => store.session_id().to_string(),
             };
@@ -224,7 +231,11 @@ pub(in crate::web) async fn handle_session_command(
             .map_err(|error| format!("tool error: {error:#}"))?;
             Ok(json!({ "output": output }))
         }
-        IpcCommand::ToolCatalog { session, name } => {
+        IpcCommand::ToolCatalog {
+            session,
+            name,
+            full,
+        } => {
             // 与 ToolCall 同一条解析链(会话→模式→registry):`--list` 列出的
             // 就是本会话真能调的集合,`--describe` 查的合同也同源。此前
             // 客户端本地建表(按 MIYU_TURN_MODE 环境变量,run_command 并不
@@ -232,8 +243,15 @@ pub(in crate::web) async fn handle_session_command(
             // 逐个调用全报 unknown tool。
             let session_id = match session {
                 Some(session) => {
-                    resolve_local_session_ref(state, &ipc::SessionRef::Id { id: session })?
-                        .session_id
+                    // 桥必须能寻址阅后即焚(ask)会话:回合正跑在里面,run_command 的
+                    // 脚本与 MCP 桥的内层调用都以它为身份。只认 user 会话会让
+                    // 单次 CLI 形态下的整条工具桥 404(真机实测踩坑)。
+                    resolve_local_session_ref_with_kinds(
+                        state,
+                        &ipc::SessionRef::Id { id: session },
+                        TURN_TARGET_KINDS,
+                    )?
+                    .session_id
                 }
                 None => store.session_id().to_string(),
             };
@@ -265,10 +283,20 @@ pub(in crate::web) async fn handle_session_command(
                     let tools = names
                         .iter()
                         .map(|name| {
-                            json!({
-                                "name": name,
-                                "display_name": registry.display_name(name),
-                            })
+                            if full {
+                                let spec = registry.get(name);
+                                json!({
+                                    "name": name,
+                                    "display_name": registry.display_name(name),
+                                    "description": spec.map(|spec| spec.description.clone()),
+                                    "parameters": spec.map(|spec| spec.parameters.clone()),
+                                })
+                            } else {
+                                json!({
+                                    "name": name,
+                                    "display_name": registry.display_name(name),
+                                })
+                            }
                         })
                         .collect::<Vec<_>>();
                     Ok(json!({ "mode": mode_label, "tools": tools }))

@@ -287,6 +287,7 @@ async fn tool_catalog_matches_the_bridge_callable_set() {
     let catalog = handle_session_command(
         &state,
         IpcCommand::ToolCatalog {
+            full: false,
             session: Some(dev_session.clone()),
             name: None,
         },
@@ -327,6 +328,7 @@ async fn tool_catalog_matches_the_bridge_callable_set() {
     let catalog = handle_session_command(
         &state,
         IpcCommand::ToolCatalog {
+            full: false,
             session: None,
             name: None,
         },
@@ -346,6 +348,7 @@ async fn tool_catalog_matches_the_bridge_callable_set() {
     let described = handle_session_command(
         &state,
         IpcCommand::ToolCatalog {
+            full: false,
             session: Some(dev_session),
             name: Some("run_command".to_string()),
         },

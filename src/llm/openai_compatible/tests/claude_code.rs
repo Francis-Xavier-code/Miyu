@@ -1,0 +1,244 @@
+//! claude-code 中转协议:假 `claude` 脚本回放 stream-json,验证参数拼装、
+//! 载荷翻译、流事件→chunk、用量归一、会话续传与平台门禁。不碰真实订阅。
+
+use crate::llm::openai_compatible::tests::shared::*;
+use crate::llm::openai_compatible::*;
+use crate::llm::{ChatMessage, ChatStreamKind};
+
+fn fake_claude_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = dir.join("claude");
+    // 记录 argv 与 stdin,再回放一段固定的 stream-json;带 --resume 时在
+    // 结果帧里沿用同一个会话 id(真 CLI 的行为)。
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+# 会话 id 按测试目录唯一:真实 claude 的会话 id 是全局唯一 UUID,共用一个
+# 假 id 会让并行测试在全局会话映射里互相顶掉(按会话 id 去重)。
+sid="sess-$(basename "$dir")"
+printf '%s\n' "$@" > "$dir/args.txt"
+cat > "$dir/stdin.txt"
+if [ -f "$dir/fail.txt" ]; then
+  echo "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"$sid\",\"result\":\"Claude AI usage limit reached\"}"
+  exit 0
+fi
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\"}"
+echo '{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
+echo '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello from fake"}}}'
+echo '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}'
+echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5}}}'
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$sid\",\"result\":\"Hello from fake\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20,\"output_tokens\":5,\"output_tokens_details\":{\"thinking_tokens\":2}}}"
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn claude_code_client(dir: &std::path::Path, provider_id: &str) -> OpenAiCompatibleClient {
+    let mut provider = test_provider(provider_id, "");
+    provider.protocol = "claude-code".to_string();
+    provider.default_model = "haiku".to_string();
+    let mut client = test_client(provider);
+    client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
+        binary: fake_claude_script(dir),
+        workdir: dir.join("workspace"),
+        home: dir.to_path_buf(),
+        expose_miyu_tools: false,
+        idle_timeout: Duration::from_secs(30),
+        prefer_subscription: true,
+    }));
+    client
+}
+
+fn read(dir: &std::path::Path, name: &str) -> String {
+    std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+}
+
+/// 首轮:全量参数拼装 + 流事件翻译 + Anthropic 口径用量归一。
+#[tokio::test]
+async fn first_turn_spawns_fresh_session_with_full_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = claude_code_client(dir.path(), "cc-first");
+    let mut chunks = Vec::new();
+    let result = client
+        .chat_stream_inner(
+            vec![
+                ChatMessage::system("persona prompt"),
+                ChatMessage::plain("user", "hello"),
+            ],
+            Vec::new(),
+            None,
+            false,
+            &mut |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.content, "Hello from fake");
+    assert_eq!(result.reasoning.as_deref(), Some("pondering"));
+    assert!(result.tool_calls.is_empty());
+    assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+    // 结果帧优先:prompt = 10 + 90(读) + 20(写) = 120。
+    let usage = result.usage.unwrap();
+    assert_eq!(usage.prompt_tokens, 120);
+    assert_eq!(usage.completion_tokens, 5);
+    assert_eq!(usage.cache_read_tokens, 90);
+    assert_eq!(usage.cache_write_tokens, 20);
+    assert_eq!(usage.reasoning_tokens, 2);
+    assert!(usage.cache_reported);
+    assert!(chunks
+        .iter()
+        .any(|chunk| chunk.kind == ChatStreamKind::Content && chunk.text.contains("Hello")));
+    assert!(chunks
+        .iter()
+        .any(|chunk| chunk.kind == ChatStreamKind::Reasoning && chunk.text.contains("pondering")));
+
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--model\nhaiku"), "args: {args}");
+    assert!(args.contains("--system-prompt\npersona prompt"), "args: {args}");
+    assert!(args.contains("--tools\n\n"), "内置工具应整体关闭: {args}");
+    assert!(args.contains("--strict-mcp-config"), "args: {args}");
+    assert!(!args.contains("--resume"), "首轮不该续传: {args}");
+    // 无会话作用域(测试环境)⇒ 不挂 MCP 桥。
+    assert!(!args.contains("--mcp-config"), "args: {args}");
+    let stdin: serde_json::Value =
+        serde_json::from_str(read(dir.path(), "stdin.txt").trim()).unwrap();
+    assert_eq!(stdin["type"], "user");
+    assert_eq!(stdin["message"]["content"][0]["text"], "hello");
+}
+
+/// 次轮 append-only 延伸:命中前缀链 ⇒ --resume 同一会话,stdin 只带增量。
+#[tokio::test]
+async fn appended_turn_resumes_and_sends_only_the_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = claude_code_client(dir.path(), "cc-resume");
+    let system = ChatMessage::system("persona prompt");
+    let turn1_user = ChatMessage::plain("user", "hello");
+    client
+        .chat_stream_inner(
+            vec![system.clone(), turn1_user.clone()],
+            Vec::new(),
+            None,
+            false,
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+    // 化石回放形态:assistant 正文 + 新一轮输入,前缀与预测严格一致。
+    let history = vec![
+        system.clone(),
+        turn1_user.clone(),
+        ChatMessage::assistant("Hello from fake", None),
+        ChatMessage::plain("user", "and again"),
+    ];
+    client
+        .chat_stream_inner(history, Vec::new(), None, false, &mut |_| Ok(()))
+        .await
+        .unwrap();
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--resume\nsess-"), "应续传: {args}");
+    let stdin = read(dir.path(), "stdin.txt");
+    assert!(stdin.contains("and again"), "stdin: {stdin}");
+    assert!(!stdin.contains("hello"), "增量不该重放首轮输入: {stdin}");
+    assert!(!stdin.contains("conversation-history"), "stdin: {stdin}");
+
+    // 改写历史(redo 形态):匹配不上 ⇒ 重开会话,全量转写重放。
+    let rewritten = vec![
+        system,
+        turn1_user,
+        ChatMessage::assistant("a different reply", None),
+        ChatMessage::plain("user", "third"),
+    ];
+    client
+        .chat_stream_inner(rewritten, Vec::new(), None, false, &mut |_| Ok(()))
+        .await
+        .unwrap();
+    let args = read(dir.path(), "args.txt");
+    assert!(!args.contains("--resume"), "改写历史后不该续传: {args}");
+    let stdin = read(dir.path(), "stdin.txt");
+    assert!(
+        stdin.contains("conversation-history") && stdin.contains("a different reply"),
+        "全量重放应带历史转写: {stdin}"
+    );
+}
+
+/// 订阅限流错误要翻译成端点调度认识的 429/RateLimit(冷却+可转移)。
+#[tokio::test]
+async fn usage_limit_failures_classify_as_rate_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = claude_code_client(dir.path(), "cc-limit");
+    std::fs::write(dir.path().join("fail.txt"), "1").unwrap();
+    let error = client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    let failure = error
+        .downcast_ref::<HttpStatusFailure>()
+        .expect("usage limit should classify as an HTTP-style failure");
+    assert_eq!(failure.kind, HttpFailureKind::RateLimit);
+    assert_eq!(failure.status, 429);
+}
+
+/// 平台门禁:订阅中转仅限本机会话,平台回合直接拒绝。
+#[tokio::test]
+async fn platform_turns_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = claude_code_client(dir.path(), "cc-platform").with_platform_delivery(true);
+    let error = client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("owner sessions") || format!("{error:#}").contains("本机会话"),
+        "{error:#}"
+    );
+}
+
+/// binary 缺失要报可操作的错误,而不是裸 ENOENT。
+#[tokio::test]
+async fn missing_binary_reports_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = claude_code_client(dir.path(), "cc-missing");
+    client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
+        binary: dir.path().join("no-such-claude"),
+        workdir: dir.path().join("workspace"),
+        home: dir.path().to_path_buf(),
+        expose_miyu_tools: false,
+        idle_timeout: Duration::from_secs(30),
+        prefer_subscription: true,
+    }));
+    let error = client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("plugins.claude_code.binary"),
+        "应指路配置项: {text}"
+    );
+}

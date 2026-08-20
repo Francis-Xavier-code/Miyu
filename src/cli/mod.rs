@@ -13,6 +13,7 @@ mod args;
 mod daemon_cmds;
 mod inline_picker;
 mod localize;
+mod mcp_serve;
 mod setup;
 mod stdin_input;
 mod tool_cmds;
@@ -21,6 +22,7 @@ use args::*;
 use daemon_cmds::*;
 use inline_picker::*;
 use localize::*;
+use mcp_serve::*;
 use setup::*;
 use stdin_input::*;
 use tool_cmds::*;
@@ -278,6 +280,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Wipe(args)) => run_wipe(&paths, args.yes).await,
         Some(Command::ToolCallCmd(args)) => run_tool_call(&paths, args).await,
+        Some(Command::McpServe) => run_mcp_serve(&paths).await,
         Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
         Some(Command::Dev) => run_repl(&paths, AgentMode::Dev).await,
         Some(Command::Web(args)) => run_web(&paths, args).await,
