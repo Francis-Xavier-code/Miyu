@@ -14,6 +14,9 @@ pub(in crate::cli) struct ReplFooterStatus {
     pub(in crate::cli) mixed_models: bool,
     pub(in crate::cli) thinking: Option<String>,
     pub(in crate::cli) token_usage: render::TokenMeter,
+    /// 回合运行中的盲文转轮帧号;None=空闲不显示。随 spinner tick 推进,
+    /// set_footer 的权威覆盖(from_config 构造)自然回落 None。
+    pub(in crate::cli) running_spinner: Option<usize>,
 }
 
 /// Σ is hidden entirely when nothing has been spent yet, so an empty session
@@ -50,6 +53,7 @@ impl ReplFooterStatus {
             provider: provider_id,
             mixed_models,
             thinking: None,
+            running_spinner: None,
             token_usage: render::TokenMeter {
                 session_tokens,
                 context_window: window.map(|(value, _)| value),
@@ -228,7 +232,19 @@ pub(in crate::cli) fn repl_footer_left(
 ) -> String {
     let thinking = footer.thinking.as_deref().unwrap_or_default();
     let colored_thinking = (!thinking.is_empty()).then(|| primary_footer_text(thinking));
-    let colored_thinking = colored_thinking.as_deref().unwrap_or_default();
+    let mut colored_thinking = colored_thinking.unwrap_or_default();
+    // 回合运行中,模型信息右侧挂一个盲文转轮(与工具摘要同一组帧):一眼
+    // 可见 AI 是否还在干活(用户 08-20 点名)。
+    if let Some(frame) = footer.running_spinner {
+        if !colored_thinking.is_empty() {
+            colored_thinking.push(' ');
+        }
+        colored_thinking.push_str(&format!(
+            "\x1b[2m{}\x1b[0m",
+            render::wait_spinner::braille_frame(frame)
+        ));
+    }
+    let colored_thinking = colored_thinking.as_str();
     let provider = format!("\x1b[2m{}\x1b[0m", footer.provider);
     let mode = colored_footer_mode_label(mode);
     let full = repl_footer_left_parts(&mode, &footer.model, Some(&provider), colored_thinking);

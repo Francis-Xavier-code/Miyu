@@ -162,7 +162,7 @@ impl LiveReplTail {
 
         let mut input_row = row;
         let mut rendered_rows = 0u16;
-        render_repl_input_with_footer(
+        let footer_row = render_repl_input_with_footer(
             &mut stdout,
             &mut input_row,
             &mut rendered_rows,
@@ -173,6 +173,7 @@ impl LiveReplTail {
             &self.footer,
             false,
         )?;
+        self.footer_row = footer_row;
         // The editor is back on screen: the cursor must be visible no
         // matter which path hid it (e.g. a question prompt suspended the
         // editor with the cursor hidden and then exited early). This is

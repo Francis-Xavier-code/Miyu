@@ -694,7 +694,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
     is_pasted: bool,
     footer: &ReplFooterStatus,
     show_shortcut_hint: bool,
-) -> Result<()> {
+) -> Result<Option<u16>> {
     let suggestions = repl_command_suggestions(input);
     let lines = repl_input_lines(input);
     let prompt_prefix = input_prompt_bar(mode);
@@ -724,6 +724,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
         )?;
     }
     let mut row_offset = 0u16;
+    let footer_row;
     queue!(stdout, MoveTo(0, *input_row), Print(&prompt_prefix))?;
     row_offset = row_offset.saturating_add(1);
     for line in &display_rows {
@@ -749,7 +750,9 @@ pub(in crate::cli) fn render_repl_input_with_footer(
                 repl_command_suggestions_line(&suggestions, suggestion_width)
             ))
         )?;
+        footer_row = None;
     } else {
+        footer_row = Some((*input_row).saturating_add(row_offset));
         queue!(
             stdout,
             MoveTo(0, (*input_row).saturating_add(row_offset)),
@@ -790,7 +793,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
     )?;
     stdout.flush()?;
     *rendered_rows = current_rows;
-    Ok(())
+    Ok(footer_row)
 }
 
 pub(in crate::cli) fn move_after_repl_input(

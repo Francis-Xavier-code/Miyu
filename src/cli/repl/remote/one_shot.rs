@@ -299,6 +299,8 @@ pub(in crate::cli) async fn try_run_remote_chat(
                     renderer.tick_spinner()?;
                     if let Some(live) = live.as_deref_mut() {
                         live.apply_renderer_frame(&mut renderer)?;
+                        // footer 里的运行转轮与等待动画同源推进。
+                        live.tick_footer_spinner()?;
                         // The job strip is part of the live tail, so it keeps
                         // rendering during streaming; throttle to ~every 8th
                         // spinner frame.
@@ -675,6 +677,7 @@ pub(in crate::cli) async fn try_run_remote_chat(
     renderer.finish()?;
     let focused = live.as_deref().map(|live| live.editor.focused);
     if let Some(live) = live {
+        live.stop_footer_spinner()?;
         live.apply_renderer_frame(&mut renderer)?;
         if let Some(raw) = raw.as_mut() {
             raw.handoff();

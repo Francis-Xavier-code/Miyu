@@ -137,6 +137,7 @@ fn register_scoped(
                 paths: paths.clone(),
                 state: Some(state.clone()),
             },
+            state.platform_context.is_some(),
         );
     }
     if !config.plugins.vision.enabled {
