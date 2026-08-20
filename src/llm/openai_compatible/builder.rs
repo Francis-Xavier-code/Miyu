@@ -47,6 +47,7 @@ impl OpenAiCompatibleClient {
             .first()
             .with_context(|| "no active provider/model endpoint is configured")?;
         let continuation_health = ResponsesContinuationHealth::for_provider(paths, &first.provider);
+        let claude_code = claude_code_runtime(&endpoints, config, paths);
         let mut client = Self {
             client: first.client.clone(),
             provider: first.provider.clone(),
@@ -60,6 +61,8 @@ impl OpenAiCompatibleClient {
             max_tokens_override: None,
             request_scope: "chat",
             continuation_health,
+            claude_code,
+            claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -84,8 +87,30 @@ impl OpenAiCompatibleClient {
                     continue;
                 }
             };
+            if !provider.enabled {
+                errors.push(format!(
+                    "{} / {}: {}",
+                    provider.id,
+                    choice.model,
+                    t(
+                        "provider is disabled; enable it in the provider settings",
+                        "供应商未启用;请在供应商设置里启用"
+                    )
+                ));
+                continue;
+            }
             provider.default_model = choice.model.clone();
             let client = endpoint_client(&provider)?;
+            if provider_uses_claude_code(&provider) {
+                // CLI 用订阅登录态,没有 API key;单端点直进池。
+                endpoints.push(LlmEndpoint {
+                    client: client.clone(),
+                    provider: provider.clone(),
+                    api_key: String::new(),
+                    key_index: 0,
+                });
+                continue;
+            }
             match provider.resolved_api_keys(paths) {
                 Ok(keys) => {
                     for key in keys {
@@ -111,6 +136,7 @@ impl OpenAiCompatibleClient {
             ),
         };
         let continuation_health = ResponsesContinuationHealth::for_provider(paths, &first.provider);
+        let claude_code = claude_code_runtime(&endpoints, config, paths);
         let mut client = Self {
             client: first.client.clone(),
             provider: first.provider.clone(),
@@ -124,12 +150,24 @@ impl OpenAiCompatibleClient {
             max_tokens_override: None,
             request_scope: "chat",
             continuation_health,
+            claude_code,
+            claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
     }
 
     pub fn new(provider: &ProviderConfig, config: &AppConfig, paths: &MiyuPaths) -> Result<Self> {
+        if !provider.enabled {
+            bail!(
+                "{}: {}",
+                t(
+                    "provider is disabled; enable it in the provider settings",
+                    "供应商未启用;请在供应商设置里启用"
+                ),
+                provider.id
+            );
+        }
         if provider.default_model.trim().is_empty() {
             bail!(
                 "{}: {}",
@@ -141,23 +179,30 @@ impl OpenAiCompatibleClient {
             );
         }
         let client = endpoint_client(provider)?;
-        let key = provider
-            .resolved_api_keys(paths)?
-            .into_iter()
-            .next()
-            .with_context(|| format!("missing API key for provider {}", provider.id))?;
+        let (key_value, key_index) = if provider_uses_claude_code(provider) {
+            (String::new(), 0)
+        } else {
+            let key = provider
+                .resolved_api_keys(paths)?
+                .into_iter()
+                .next()
+                .with_context(|| format!("missing API key for provider {}", provider.id))?;
+            (key.value, key.index)
+        };
         let endpoint = LlmEndpoint {
             client: client.clone(),
             provider: provider.clone(),
-            api_key: key.value.clone(),
-            key_index: key.index,
+            api_key: key_value.clone(),
+            key_index,
         };
         let continuation_health = ResponsesContinuationHealth::for_provider(paths, provider);
+        let endpoints = vec![endpoint];
+        let claude_code = claude_code_runtime(&endpoints, config, paths);
         let mut client = Self {
             client,
             provider: provider.clone(),
-            api_key: key.value,
-            endpoints: Arc::new(vec![endpoint]),
+            api_key: key_value,
+            endpoints: Arc::new(endpoints),
             thinking_variants: HashMap::new(),
             reasoning_visibility: reasoning_visibility(config),
             buffered_delivery: false,
@@ -166,6 +211,8 @@ impl OpenAiCompatibleClient {
             max_tokens_override: None,
             request_scope: "chat",
             continuation_health,
+            claude_code,
+            claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
         Ok(client)
@@ -285,7 +332,16 @@ impl OpenAiCompatibleClient {
             request_scope: self.request_scope,
             // failover 换端点共享同一健康位(续传本就钉在原端点)。
             continuation_health: self.continuation_health.clone(),
+            claude_code: self.claude_code.clone(),
+            claude_code_dev_mode: self.claude_code_dev_mode,
         }
+    }
+
+    /// Agent 构造时声明会话模式:claude-code 的原生工具/Miyu 工具双作用域
+    /// (off/dev/normal/all)按它裁决。其他协议不受影响。
+    pub fn with_claude_code_dev_mode(mut self, dev: bool) -> Self {
+        self.claude_code_dev_mode = dev;
+        self
     }
 
     /// Returns a clone whose chat completions are capped at `max_tokens`.
@@ -311,4 +367,39 @@ impl OpenAiCompatibleClient {
     pub(crate) fn uses_anthropic_messages(&self) -> bool {
         provider_looks_anthropic(&self.provider)
     }
+}
+
+/// 端点池里出现 claude-code 协议端点时,解析一份共享运行时参数。
+pub(in crate::llm::openai_compatible) fn claude_code_runtime(
+    endpoints: &[LlmEndpoint],
+    config: &AppConfig,
+    paths: &MiyuPaths,
+) -> Option<Arc<ClaudeCodeRuntime>> {
+    if !endpoints
+        .iter()
+        .any(|endpoint| provider_uses_claude_code(&endpoint.provider))
+    {
+        return None;
+    }
+    let mut runtime = ClaudeCodeRuntime::from_config(config);
+    for endpoint in endpoints {
+        if !provider_uses_claude_code(&endpoint.provider) {
+            continue;
+        }
+        let provider_id = &endpoint.provider.id;
+        let model = &endpoint.provider.default_model;
+        // 与上下文测算同源的有效窗口(显式配置→目录→默认),夹到 CLI 的
+        // 100k–1M 后透传给 claude 自压缩。
+        let window = config
+            .context_window_with_source(provider_id, model)
+            .ok()
+            .flatten()
+            .map(|(window, _)| window as u64)
+            .unwrap_or(168_000);
+        runtime.autocompact.insert(
+            format!("{provider_id}\t{model}"),
+            window.clamp(100_000, 1_000_000),
+        );
+    }
+    Some(Arc::new(runtime))
 }

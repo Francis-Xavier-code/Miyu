@@ -193,6 +193,10 @@ pub enum Command {
         #[serde(default)]
         mode: Option<String>,
     },
+    /// 会话列表手动排序:按给定顺序重写展示序(WebUI 侧栏拖拽)。
+    ReorderSessions {
+        session_ids: Vec<String>,
+    },
     /// Session the REPL was last on. Falls back to the current session and
     /// heals the stored pointer when it has gone stale.
     GetReplSession {
@@ -227,6 +231,10 @@ pub enum Command {
         session: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        /// true 时列表项带完整合同(description+parameters):MCP 桥一次
+        /// tools/list 拿全量,免去逐工具 describe 的 N 次往返。
+        #[serde(default)]
+        full: bool,
     },
     RenameSession {
         target: SessionRef,

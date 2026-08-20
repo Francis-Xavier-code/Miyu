@@ -4,7 +4,7 @@ pub mod request_log;
 pub(crate) mod provider_capabilities;
 
 pub(crate) use openai_compatible::{
-    thinking_variant_options_for_model, ThinkingVariantPreferences,
+    forget_claude_code_session, thinking_variant_options_for_model, ThinkingVariantPreferences,
 };
 pub use openai_compatible::{OpenAiCompatibleClient, ThinkingVariantOptions};
 
@@ -389,6 +389,11 @@ pub enum ChatStreamKind {
     ReasoningPartStart,
     ReasoningPartEnd,
     ToolCall,
+    /// 中转(claude-code)侧闭环执行的工具调用開始:text 是
+    /// `{id,name,input}` JSON,回合层翻成标准 tool.started 卡片。
+    RemoteToolStarted,
+    /// 同上的收口:text 是 `{id,name,ok,output}` JSON → tool.finished。
+    RemoteToolFinished,
 }
 
 #[derive(Debug, Clone)]

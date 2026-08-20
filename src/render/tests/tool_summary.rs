@@ -945,3 +945,52 @@ fn tool_preparing_survives_the_tick_that_re_derives_the_phase() {
         .waiting_phase_text()
         .contains(t("Preparing command", "准备执行")));
 }
+
+/// claude-code 原生 Bash 与 run_command 同属命令家族:进 CommandLiveDisplay
+/// (带色命令行+输出尾巴),而不是通用的「Bash×1 ok」摘要行——用户点名两者
+/// 的命令颜色与输出块必须一致。
+#[test]
+fn native_bash_routes_through_the_command_display() {
+    let mut renderer = StreamRenderer::new(
+        ReasoningDisplayMode::Summary,
+        ToolCallDisplayMode::Summary,
+        false,
+        true,
+        10,
+    );
+    renderer.use_external_cursor_control();
+    renderer.use_buffered_output();
+    renderer.live_summary = true;
+    renderer
+        .write_tool_call("Bash", r#"{"command":"echo relay-proof"}"#)
+        .unwrap();
+    let display = renderer
+        .command_display
+        .as_ref()
+        .expect("Bash must open a live command display, not a summary line");
+    assert_eq!(display.command, "echo relay-proof");
+    renderer
+        .write_command_output(
+            "Bash",
+            crate::tools::CommandOutputStream::Stdout,
+            b"relay-proof\n",
+        )
+        .unwrap();
+    renderer
+        .write_tool_result("Bash", true, "relay-proof")
+        .unwrap();
+    assert!(renderer.command_display.is_none());
+    let frame = String::from_utf8_lossy(&renderer.take_output_frame()).to_string();
+    assert!(
+        frame.contains("echo relay-proof"),
+        "the committed block must carry the command line: {frame:?}"
+    );
+    assert!(
+        frame.contains("relay-proof"),
+        "the committed block must carry the captured output: {frame:?}"
+    );
+    assert!(
+        renderer.tool_stats.is_empty(),
+        "Bash must not also land in the generic tool summary"
+    );
+}

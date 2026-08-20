@@ -20,7 +20,7 @@
 | 9 | 重进 REPL footer 上下文为 0 | `cold_context()` 硬编码 `tokens: 0`；daemon 启动后 `manager.context` 一直是 0，`session_state_for` 对“当前会话”直接读这份快照，直到第一次对话才更新 | [06-repl-input-history-sessions-footer.md](06-repl-input-history-sessions-footer.md) |
 | 10 | 第二个 REPL 上键调不出刚输入的历史 | 沙箱实测（daemon + mock LLM）**未复现**：`persist_repl_history_entry` 在提交前写入，第二个 REPL 能读到。疑与用户具体启动方式/会话指针/MIYU_HOME 差异有关，需复现信息；方案改为 daemon 侧实时历史账本 | [06-repl-input-history-sessions-footer.md](06-repl-input-history-sessions-footer.md) |
 | 11 | 天气不应自动定位 | `get_weather` 对 `location="" && forecast` 显式走 `wttr.in auto_location`；工具描述也明确承诺“空字符串自动定位” | [08-weather-no-autolocate.md](08-weather-no-autolocate.md) |
-| 12 | 接入 Claude Code 订阅 | 本机 Claude Code 2.1.220 已 OAuth 登录；`claude -p --output-format json` 是现成的 headless 入口，但 Miyu 目前没有任何调用它的工具 | [09-claude-code.md](09-claude-code.md) |
+| 12 | 接入 Claude Code 订阅 | **已完成（08-20，claude-code 分支）**：范围经用户扩大为三件套——`claude-code` 供应商协议（订阅中转）+ `miyu mcp-serve` 工具桥 + `claude_code` 委托工具，见 [09-claude-code.md](09-claude-code.md) 施工记录 | [09-claude-code.md](09-claude-code.md) |
 | 13 | undo 无法使用 | 核心 `undo_last_turn` 有完整测试且逻辑通过；远端 `/undo` 链路也能定位。需要用户提供具体失败形态（busy / 返回 0 / 无视觉变化）。已发现相邻隐患：undo 只删 turn 行，`manager.context` 刷新依赖“目标会话=当前会话”分支，UI 不回放删除结果 | [10-undo-background-jobs.md](10-undo-background-jobs.md) |
 | 14 | 后台命令是否按会话区分 | 命令和子代理共用 `JobEntry.session_id` + `job_visible()`；远端 REPL 的 strip 也按 `repl_session` 过滤。主要缺口在**直连模式 `JobsFeed::Local` 不过滤**，以及 ledger 恢复后无 session 的旧任务全局可见 | [10-undo-background-jobs.md](10-undo-background-jobs.md) |
 | 15 | ask_question 兼容性 | `ask_question` 是唯一绕过 registry 的特判路径；`always_loaded=false`。默认 stub 模式下模型只能看到 60 字符摘要 + `{"type":"object"}`，拿不到真实 schema，导致参数形状漂移 | [11-ask-question.md](11-ask-question.md) |
@@ -39,7 +39,7 @@
 | D7 | 英文化范围：默认人格 `miyu.md`、默认 dev 提示词、用户自建 persona 是否保持中文？ | 工程提示与工具契约全英；**用户自建 persona 原样保留**；默认 Miyu 人格是否英文化请用户定（推荐保持，它属于产品人格而非工程提示） |
 | D8 | WebUI 文件分享：仅登录用户可下载，还是要生成免登录临时链接？ | 一期仅登录用户 + 一键复制完整下载 URL；免登录临时 token 二期 |
 | D9 | 天气：直接运行（CLI/工具空 location）是返回错误让 AI 追问，还是工具内尝试读取会话最近地点？ | 直接返回明确错误，让 AI 追问用户；不做任何自动定位 |
-| D10 | Claude Code 接入形态：新增 `claude_code` 工具 / 作为 `task` 的 tier / 替代 run_command？ | 新增独立只读+写工具 `claude_code`，headless 调用本机 `claude -p --output-format json`，仅本地 owner 会话注册 |
+| D10 | Claude Code 接入形态：新增 `claude_code` 工具 / 作为 `task` 的 tier / 替代 run_command？ | ~~新增独立工具~~ **08-20 用户改判：全都要**——供应商协议（中转层）+ MCP 工具桥 + 独立工具三件套并行，工具部分维持原设计，仅本地 owner 会话注册 |
 | D11 | undo 请补充复现：报错文案、操作路径（`miyu normal` 还是直连）、会话状态 | 先补 2 个回归测试 + UI 回放修复，再按复现收口 |
 | D12 | 平台生图限制中，“每次请求”=一个用户 turn；turn 内 queued follow-up 是否重置计数？ | 每个 user 输入/queued prompt 重置；同一 turn 内不同 follow-up 各允许一张 |
 | D13 | 普通 REPL 首启自举新会话后，旧行为下用户已有的“终端会话即 REPL 会话”数据怎么处理？ | 不迁移、不删除；新建独立会话，旧数据仍在终端集成会话，用户可用 `/session` 切回 |

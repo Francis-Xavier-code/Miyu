@@ -588,6 +588,8 @@ async fn responses_continuation_is_pinned_to_its_original_endpoint() {
         request_timeouts: None,
         max_tokens_override: None,
         request_scope: "chat",
+        claude_code: None,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     };
     let initial_result = initial_client
@@ -624,6 +626,8 @@ async fn responses_continuation_is_pinned_to_its_original_endpoint() {
         request_timeouts: None,
         max_tokens_override: None,
         request_scope: "chat",
+        claude_code: None,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     };
 

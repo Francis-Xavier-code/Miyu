@@ -48,6 +48,8 @@ impl Agent {
         } else {
             config
         };
+        // claude-code 中转的双四档工具作用域按会话模式裁决;其他协议无感。
+        let client = client.with_claude_code_dev_mode(mode == AgentMode::Dev);
         let base_system_prompt = mode_system_prompt(&config, paths, mode, prompt_audience)?;
         let system_prompt = with_memory_preamble(
             with_host_environment(
@@ -105,6 +107,7 @@ impl Agent {
             repeat_chain: crate::tools::repeat_reminder::RepeatChain::default(),
             preset_dialogs,
             last_request_snapshot: None,
+            pending_remote_tool_calls: std::sync::Mutex::new(Vec::new()),
             last_request_endpoint: None,
             keepalive_cancel: None,
             consecutive_compacts: std::sync::atomic::AtomicU32::new(0),
@@ -451,5 +454,15 @@ impl Agent {
         (self.memory_database_id, self.memory_generation) = self.memory.identity()?;
         self.refresh_preset_dialogs();
         self.prepare_for_turn()
+    }
+
+    /// 平台(QQ 等)回合的工具轮数上限(platforms.max_tool_rounds,默认 32,
+    /// 0=不限):平台回合失控时没人守在终端里按停——真机 web_search 同
+    /// query 222 连就是这么烧起来的。
+    pub fn cap_tool_rounds_for_platform(&mut self) {
+        let cap = self.config.platforms.max_tool_rounds;
+        if cap > 0 {
+            self.max_tool_rounds = cap;
+        }
     }
 }

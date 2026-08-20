@@ -33,6 +33,11 @@ pub(in crate::config_tui) fn select_platforms(
         } else {
             t("disabled", "未启用")
         };
+        let max_rounds_label = if config.platforms.max_tool_rounds == 0 {
+            t("unlimited", "不限").to_string()
+        } else {
+            config.platforms.max_tool_rounds.to_string()
+        };
         let options = vec![
             format!("{}: {state}", t("Tencent QQ", "腾讯 QQ")),
             format!(
@@ -41,6 +46,10 @@ pub(in crate::config_tui) fn select_platforms(
                 config.platforms.command_prefix
             ),
             t("Command list", "命令列表").to_string(),
+            format!(
+                "{}: {max_rounds_label}",
+                t("Max tool rounds per turn", "最大工具轮数")
+            ),
         ];
         draw_menu(
             stdout,
@@ -60,11 +69,28 @@ pub(in crate::config_tui) fn select_platforms(
                 0 => edit_qq(stdout, paths, config)?,
                 1 => edit_platform_command_prefix(stdout, config)?,
                 2 => select_platform_commands(stdout, config)?,
+                3 => edit_platform_max_tool_rounds(stdout, config)?,
                 _ => {}
             },
             _ => {}
         }
     }
+}
+
+/// 平台回合的工具轮数上限(0=不限;默认 32)。web_search 同 query 222 连
+/// 事故后的那道闸,可按需放宽或收紧。
+pub(in crate::config_tui) fn edit_platform_max_tool_rounds(
+    stdout: &mut io::Stdout,
+    config: &mut AppConfig,
+) -> Result<()> {
+    if let Some(value) = edit_u16_value(
+        stdout,
+        t(" MAX TOOL ROUNDS PER TURN ", " 最大工具轮数(0=不限) "),
+        u16::try_from(config.platforms.max_tool_rounds).unwrap_or(u16::MAX),
+    )? {
+        config.platforms.max_tool_rounds = usize::from(value);
+    }
+    Ok(())
 }
 
 pub(in crate::config_tui) fn edit_platform_command_prefix(

@@ -171,6 +171,24 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     let name = tool_event_base_name(name);
     let value = match name {
+        // —— claude 原生工具(中转侧闭环执行,REPL 摘要行同样要有 ↳ 主题) ——
+        "Bash" => {
+            let command = string_arg(&args, &["command"])?;
+            Some(
+                if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+                    format!("[后台] {command}")
+                } else {
+                    command
+                },
+            )
+        }
+        "Read" | "Edit" | "Write" | "NotebookEdit" => {
+            string_arg(&args, &["file_path", "path", "notebook_path"])
+        }
+        "WebFetch" => string_arg(&args, &["url"]).and_then(|url| safe_url_subject(&url)),
+        "WebSearch" | "ToolSearch" => string_arg(&args, &["query"]),
+        "Task" | "Agent" => string_arg(&args, &["description"]),
+        "SlashCommand" => string_arg(&args, &["command"]),
         "task" => string_arg(&args, &["description"]),
         "web_search"
         | "search_web_images"
@@ -215,7 +233,7 @@ pub(crate) fn tool_subject(name: &str, arguments: &str) -> Option<String> {
         "read_knowledge_base_file" | "edit_knowledge_base_file" | "remove_knowledge_base_file" => {
             string_arg(&args, &["file_name"])
         }
-        "glob" | "grep" => {
+        "glob" | "grep" | "Glob" | "Grep" => {
             let pattern = string_arg(&args, &["pattern"]);
             let path = string_arg(&args, &["path"]);
             match (pattern, path) {

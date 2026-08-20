@@ -112,6 +112,8 @@ fn tool_call_succeeded(output: &str) -> bool {
 
 #[derive(Serialize)]
 pub(in crate::web) struct SafeToolRound {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(in crate::web) remote: bool,
     pub(in crate::web) assistant_content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::web) assistant_reasoning: Option<String>,
@@ -121,6 +123,7 @@ pub(in crate::web) struct SafeToolRound {
 impl From<crate::state::ToolFlowRound> for SafeToolRound {
     fn from(round: crate::state::ToolFlowRound) -> Self {
         Self {
+            remote: round.remote,
             assistant_content: round.assistant_content,
             assistant_reasoning: round.assistant_reasoning,
             calls: round

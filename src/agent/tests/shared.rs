@@ -51,6 +51,7 @@ pub(super) fn queue_test_config(base_url: String) -> AppConfig {
         active_provider: "queue-test".to_string(),
         active_provider_models: None,
         providers: vec![ProviderConfig {
+            enabled: true,
             id: "queue-test".to_string(),
             display_name: "Queue Test".to_string(),
             base_url,

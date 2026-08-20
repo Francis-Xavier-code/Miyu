@@ -41,6 +41,7 @@ impl Agent {
         // opencode / Claude Code all converge on exactly one attempt).
         let mut overflow_recovery_attempted = false;
         let mut loaded_tools = self.initial_loaded_tools(messages)?;
+        self.pending_remote_tool_calls.lock().unwrap().clear();
         let mut usage_accumulator = UsageAccumulator::default();
         // v7 cache write-grace: provider prefix-cache writes are async, so a
         // follow-up fired within ~2s can miss the prefix the previous round
@@ -187,6 +188,10 @@ impl Agent {
                             break Some(result);
                         }
                         Some((chunk, received_at)) = chunk_rx.recv() => {
+                            record_remote_tool_chunk(
+                                &chunk,
+                                &self.pending_remote_tool_calls,
+                            );
                             emit_model_chunk_at(
                                 chunk,
                                 received_at,
@@ -358,6 +363,7 @@ impl Agent {
                 continue;
             };
             while let Ok((chunk, received_at)) = chunk_rx.try_recv() {
+                record_remote_tool_chunk(&chunk, &self.pending_remote_tool_calls);
                 emit_model_chunk_at(
                     chunk,
                     received_at,
@@ -378,16 +384,22 @@ impl Agent {
             }
             usage_accumulator.add_result(&result, messages);
             if let Some(turn_usage) = usage_accumulator.usage() {
-                let round = result.usage.clone().unwrap_or_else(|| {
-                    let prompt = overflow::estimate_messages_tokens(&request_messages) as u64;
-                    let completion = estimate_result_tokens(&result) as u64;
-                    Usage {
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        total_tokens: prompt.saturating_add(completion),
-                        ..Usage::default()
-                    }
-                });
+                // 上下文表读数优先取供应商标注的"最后一次请求"口径。
+                let round = result
+                    .last_request_usage
+                    .clone()
+                    .or_else(|| result.usage.clone())
+                    .unwrap_or_else(|| {
+                        let prompt =
+                            overflow::estimate_messages_tokens(&request_messages) as u64;
+                        let completion = estimate_result_tokens(&result) as u64;
+                        Usage {
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            total_tokens: prompt.saturating_add(completion),
+                            ..Usage::default()
+                        }
+                    });
                 on_event(AgentEvent::RoundUsage {
                     round: Box::new(round),
                     turn: TurnTokens::from_usage(Some(&turn_usage)),
@@ -466,7 +478,13 @@ impl Agent {
                     publish_auto_artifact_candidates(&artifact_candidates, on_event)?;
                 }
                 if let Some(usage) = usage_accumulator.usage() {
-                    result.last_request_usage = result.usage.take();
+                    // 供应商已给出"最后一次请求"的口径(claude-code 中转:
+                    // 结果帧是整轮累计,真实上下文在流内最后一次调用里)时
+                    // 尊重之,不再用轮用量覆盖。
+                    let round_usage = result.usage.take();
+                    if result.last_request_usage.is_none() {
+                        result.last_request_usage = round_usage;
+                    }
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -490,7 +508,10 @@ impl Agent {
                 }))?;
                 result.tool_calls.clear();
                 if let Some(usage) = usage_accumulator.usage() {
-                    result.last_request_usage = result.usage.take();
+                    let round_usage = result.usage.take();
+                    if result.last_request_usage.is_none() {
+                        result.last_request_usage = round_usage;
+                    }
                     result.usage = Some(usage);
                     result.usage_estimated = usage_accumulator.estimated;
                 }
@@ -1010,6 +1031,7 @@ impl Agent {
     fn checkpoint_tool_flow(&self, turn_id: &str, messages: &[ChatMessage], replay_start: usize) {
         let mut tool_flow = derive_tool_flow(messages, replay_start);
         prune_tool_flow(&mut tool_flow, &self.config.context);
+        self.append_remote_tool_flow(&mut tool_flow);
         if tool_flow.is_empty() {
             return;
         }
@@ -1020,5 +1042,78 @@ impl Agent {
                 "tool flow checkpoint failed; a crash here would lose what the turn already did"
             );
         }
+    }
+}
+
+
+impl Agent {
+    /// 把收集到的中转侧工具活动折成一条 remote 轮,附到 tool_flow 尾部。
+    /// 检查点与最终写入共用;drain 语义幂等(检查点后新活动继续累积)。
+    fn append_remote_tool_flow(&self, tool_flow: &mut Vec<crate::state::ToolFlowRound>) {
+        let calls = self.pending_remote_tool_calls.lock().unwrap().clone();
+        if calls.is_empty() {
+            return;
+        }
+        tool_flow.push(crate::state::ToolFlowRound {
+            remote: true,
+            assistant_content: String::new(),
+            assistant_reasoning: None,
+            calls,
+        });
+    }
+}
+
+/// 中转侧工具活动的收集:RemoteToolStarted/Finished 的 JSON 载荷折成
+/// ToolFlowCall,失败结果加 "tool error: " 前缀让 SafeToolCall 的 ok 判定
+/// 复用既有规则。
+fn record_remote_tool_chunk(
+    chunk: &ChatStreamChunk,
+    pending: &std::sync::Mutex<Vec<crate::state::ToolFlowCall>>,
+) {
+    let parse = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+    match chunk.kind {
+        ChatStreamKind::RemoteToolStarted => {
+            let Some(value) = parse(&chunk.text) else { return };
+            let field = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            pending.lock().unwrap().push(crate::state::ToolFlowCall {
+                id: field("id"),
+                name: field("name"),
+                arguments: value
+                    .get("input")
+                    .map(|input| input.to_string())
+                    .unwrap_or_default(),
+                output: String::new(),
+            });
+        }
+        ChatStreamKind::RemoteToolFinished => {
+            let Some(value) = parse(&chunk.text) else { return };
+            let id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let ok = value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let output = value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let mut pending = pending.lock().unwrap();
+            if let Some(call) = pending.iter_mut().rev().find(|call| call.id == id) {
+                call.output = if ok {
+                    output.to_string()
+                } else {
+                    format!("tool error: {output}")
+                };
+            }
+        }
+        _ => {}
     }
 }

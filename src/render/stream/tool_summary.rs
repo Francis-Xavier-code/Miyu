@@ -21,7 +21,7 @@ impl StreamRenderer {
         if is_silent_tool(name) {
             return Ok(());
         }
-        if name == "run_command" {
+        if is_command_tool(name) {
             let mut display = CommandLiveDisplay::new(
                 arguments,
                 self.command_output_lines,
@@ -92,7 +92,7 @@ impl StreamRenderer {
         self.end_subagent_stream_line()?;
         let status = if ok { "ok" } else { "err" };
         let elapsed = self.finish_subagent_timer(name);
-        if name == "run_command" {
+        if is_command_tool(name) {
             if let Some(mut display) = self.command_display.take() {
                 display.set_result(ok);
                 let include_output = self.tool_call_mode == ToolCallDisplayMode::Summary

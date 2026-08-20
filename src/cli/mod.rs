@@ -13,6 +13,7 @@ mod args;
 mod daemon_cmds;
 mod inline_picker;
 mod localize;
+mod mcp_serve;
 mod setup;
 mod stdin_input;
 mod tool_cmds;
@@ -21,6 +22,7 @@ use args::*;
 use daemon_cmds::*;
 use inline_picker::*;
 use localize::*;
+use mcp_serve::*;
 use setup::*;
 use stdin_input::*;
 use tool_cmds::*;
@@ -278,6 +280,7 @@ pub async fn run(cli: Cli, paths: MiyuPaths) -> Result<()> {
         }
         Some(Command::Wipe(args)) => run_wipe(&paths, args.yes).await,
         Some(Command::ToolCallCmd(args)) => run_tool_call(&paths, args).await,
+        Some(Command::McpServe) => run_mcp_serve(&paths).await,
         Some(Command::Normal) => run_repl(&paths, AgentMode::Normal).await,
         Some(Command::Dev) => run_repl(&paths, AgentMode::Dev).await,
         Some(Command::Web(args)) => run_web(&paths, args).await,
@@ -470,11 +473,22 @@ fn queued_prompt_lines(prompts: &[QueuedPrompt], mode: AgentMode, cols: usize) -
 }
 
 fn write_committed_user_messages(messages: &[(&str, AgentMode)], leading_gap: bool) -> Result<()> {
+    write_committed_user_messages_from(messages, leading_gap, None)
+}
+
+/// `known_col`:调用方已知的当前光标列。提交路径的同步块内禁止 ESC[6n
+/// 查询(等应答会让 kitty 同步超时、提前提交半成品帧——光标闪屏),
+/// suspend 之后列是确定的,直接传进来。
+fn write_committed_user_messages_from(
+    messages: &[(&str, AgentMode)],
+    leading_gap: bool,
+    known_col: Option<u16>,
+) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let col = cursor_col_or(0);
+    let col = known_col.unwrap_or_else(|| cursor_col_or(0));
     if col > 0 {
         writeln!(stdout)?;
     }

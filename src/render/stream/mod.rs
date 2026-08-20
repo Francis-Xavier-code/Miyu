@@ -221,7 +221,7 @@ impl StreamRenderer {
         stream: CommandOutputStream,
         chunk: &[u8],
     ) -> Result<()> {
-        if self.plain || name != "run_command" {
+        if self.plain || !is_command_tool(name) {
             return Ok(());
         }
         if let Some(display) = &mut self.command_display {
@@ -311,6 +311,8 @@ impl StreamRenderer {
     pub(crate) fn switch_mode(&mut self, mode: ChatStreamKind) -> Result<()> {
         let stdout = &mut self.output;
         match mode {
+            // 中转侧工具卡片不改变流式排版模式。
+            ChatStreamKind::RemoteToolStarted | ChatStreamKind::RemoteToolFinished => {}
             ChatStreamKind::Reasoning => {
                 if self.mode.is_some() {
                     writeln!(stdout)?;

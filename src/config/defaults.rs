@@ -426,3 +426,31 @@ pub(crate) fn default_trim_batch_ratio() -> f32 {
 pub(crate) fn default_on_overflow() -> String {
     "compact".to_string()
 }
+
+pub(crate) fn default_claude_code_permission_mode() -> String {
+    "bypassPermissions".to_string()
+}
+
+pub(crate) fn default_claude_code_native_tools() -> String {
+    "all".to_string()
+}
+
+pub(crate) fn default_claude_code_miyu_tools() -> String {
+    "all".to_string()
+}
+
+pub(crate) fn default_claude_code_timeout_seconds() -> u64 {
+    600
+}
+
+pub(crate) fn default_claude_code_max_output_bytes() -> u64 {
+    512 * 1024
+}
+
+pub(crate) fn default_claude_code_idle_timeout_seconds() -> u64 {
+    300
+}
+
+pub(crate) fn bool_is_true(value: &bool) -> bool {
+    *value
+}

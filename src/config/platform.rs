@@ -82,8 +82,24 @@ pub struct PlatformsConfig {
     pub command_prefix: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, PlatformCommandConfig>,
+    /// 平台回合的工具轮数上限(0=不限)。本机会话跟随 tools.max_rounds,
+    /// 平台回合失控时没人守在终端里按停,单独一道闸(真机 web_search 同
+    /// query 222 连事故)。
+    #[serde(
+        default = "default_platform_max_tool_rounds",
+        skip_serializing_if = "is_default_platform_max_tool_rounds"
+    )]
+    pub max_tool_rounds: usize,
     #[serde(default, skip_serializing_if = "OneBotConfig::is_default")]
     pub qq: OneBotConfig,
+}
+
+pub(crate) fn default_platform_max_tool_rounds() -> usize {
+    32
+}
+
+fn is_default_platform_max_tool_rounds(value: &usize) -> bool {
+    *value == default_platform_max_tool_rounds()
 }
 
 impl Default for PlatformsConfig {
@@ -91,6 +107,7 @@ impl Default for PlatformsConfig {
         Self {
             command_prefix: default_platform_command_prefix(),
             commands: BTreeMap::new(),
+            max_tool_rounds: default_platform_max_tool_rounds(),
             qq: OneBotConfig::default(),
         }
     }

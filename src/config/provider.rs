@@ -81,11 +81,18 @@ pub struct ActiveProviderModelConfig {
     pub model: String,
 }
 
+/// Claude Code 特殊供应商的内部协议标识(不暴露成用户概念)。
+pub const CLAUDE_CODE_PROTOCOL: &str = "claude-code";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
     pub display_name: String,
     pub base_url: String,
+    /// 供应商总开关。目前只有内置的 Claude Code 特殊供应商默认关(要用户
+    /// 显式启用订阅中转);普通 HTTP 供应商恒为 true 且不落盘。
+    #[serde(default = "default_true", skip_serializing_if = "bool_is_true")]
+    pub enabled: bool,
     #[serde(
         default = "default_provider_protocol",
         skip_serializing_if = "is_auto_protocol"
@@ -263,6 +270,7 @@ impl ProviderConfig {
             id: OPENCODE_PROVIDER_ID.to_string(),
             display_name: "opencode Zen".to_string(),
             base_url: OPENCODE_ZEN_BASE_URL.to_string(),
+            enabled: true,
             protocol: default_provider_protocol(),
             api_key: None,
             models: vec![OPENCODE_DEFAULT_CHAT_MODEL.to_string()],
@@ -283,6 +291,7 @@ impl ProviderConfig {
             id: "anthropic".to_string(),
             display_name: "Anthropic".to_string(),
             base_url: "https://api.anthropic.com/v1".to_string(),
+            enabled: true,
             protocol: "anthropic".to_string(),
             api_key: Some("$env:ANTHROPIC_API_KEY".to_string()),
             models: Vec::new(),
@@ -296,6 +305,30 @@ impl ProviderConfig {
             anthropic_max_tokens: default_anthropic_max_tokens(),
             extra_body: None,
         }
+    }
+
+    /// 内置的 Claude Code 特殊供应商:不是 HTTP 端点,是本机 `claude` CLI 的
+    /// 订阅中转。恒存在于供应商列表、默认禁用;base_url/api_key/协议对它没有
+    /// 意义,模型列表预置 CLI 认识的别名,思考档接 `--effort`。
+    pub fn claude_code_template() -> Self {
+        Self {
+            enabled: false,
+            protocol: CLAUDE_CODE_PROTOCOL.to_string(),
+            models: ["fable", "opus", "sonnet", "haiku"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            default_model: "sonnet".to_string(),
+            ..Self::template("claude-code", "Claude Code", "")
+        }
+    }
+
+    /// 该条目是否 Claude Code 特殊供应商(按协议判定,协议是内部实现细节,
+    /// 不暴露在 TUI 表单里)。
+    pub fn is_claude_code(&self) -> bool {
+        let protocol = self.protocol.trim();
+        protocol.eq_ignore_ascii_case(CLAUDE_CODE_PROTOCOL)
+            || protocol.eq_ignore_ascii_case("claude-code-cli")
     }
 
     pub fn default_templates() -> Vec<Self> {
@@ -320,6 +353,8 @@ impl ProviderConfig {
             Self::template("ollama", "Ollama", "http://localhost:11434/v1"),
             Self::template("lmstudio", "LMStudio", "http://localhost:1234/v1"),
         ]);
+        // Claude Code 置顶:用户拍板的列表次序。
+        providers.insert(0, Self::claude_code_template());
         providers
     }
 
@@ -328,6 +363,7 @@ impl ProviderConfig {
             id: id.to_string(),
             display_name: display_name.to_string(),
             base_url: base_url.to_string(),
+            enabled: true,
             protocol: default_provider_protocol(),
             api_key: None,
             models: Vec::new(),
@@ -348,6 +384,7 @@ impl ProviderConfig {
             id: String::new(),
             display_name: String::new(),
             base_url: String::new(),
+            enabled: true,
             protocol: default_provider_protocol(),
             api_key: None,
             models: Vec::new(),

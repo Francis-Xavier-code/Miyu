@@ -331,6 +331,7 @@ mod tests {
 
     fn provider() -> ProviderConfig {
         ProviderConfig {
+            enabled: true,
             id: "vision".to_string(),
             display_name: "Vision".to_string(),
             base_url: "https://example.com/v1".to_string(),

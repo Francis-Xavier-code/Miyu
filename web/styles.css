@@ -448,6 +448,19 @@ textarea:disabled {
   gap: 3px;
 }
 
+/* 侧栏拖拽排序:拖动中的行半透明,落点用主题色细线指示 */
+.session-item.is-dragging {
+  opacity: 0.45;
+}
+
+.session-item.drop-before {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+
+.session-item.drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+
 .session-item {
   position: relative;
   display: grid;
@@ -6944,6 +6957,56 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
   color: var(--text);
 }
 
+/* 批量操作工具条:与行内胶囊按钮同族,禁用态压暗提示不可点 */
+.shared-files-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--text-faint) 22%, transparent);
+}
+
+.shared-files-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--text-faint) 45%, transparent);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.shared-files-tool svg {
+  width: 13px;
+  height: 13px;
+}
+
+.shared-files-tool:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+
+.shared-files-tool:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.shared-files-tool.is-danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.shared-files-check {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .shared-files-list {
   overflow-y: auto;
   padding: 10px 14px 16px;
@@ -6973,6 +7036,14 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
 
 .shared-files-icon {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-soft);
+}
+
+.shared-files-icon svg {
+  width: 16px;
+  height: 16px;
 }
 
 .shared-files-name {
@@ -7020,16 +7091,12 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
   margin-top: 10px;
 }
 
-.shared-files-preview video,
 .shared-files-preview img {
   max-width: 100%;
   max-height: 320px;
-  border-radius: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
   display: block;
-}
-
-.shared-files-preview audio {
-  width: 100%;
 }
 
 /* hidden 属性必须赢过 display:flex,否则面板关不上 */
@@ -7037,46 +7104,81 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
   display: none;
 }
 
-/* ── 气泡内分享附件卡片 ── */
+/* ── 气泡内分享附件卡片(音频/视频/文件是一个视觉家族:8px 圆角 + --line 边框 + 悬停染 accent) ── */
 
 .shared-attachment {
   margin-top: 8px;
   max-width: 420px;
 }
 
-.shared-attachment-preview video,
 .shared-attachment-preview img {
   max-width: 100%;
   max-height: 300px;
-  border-radius: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
   display: block;
   margin-bottom: 6px;
 }
 
-.shared-attachment-preview audio {
-  width: 100%;
+/* 视频容器:黑底收边,原生控件保留 */
+.media-video-shell {
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  background: var(--md-sys-color-surface-container-lowest);
   margin-bottom: 6px;
+  transition: border-color 0.15s ease;
+}
+
+.media-video-shell:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+.media-video-shell video {
+  display: block;
+  width: 100%;
+  max-height: 300px;
+  background: #000;
+}
+
+.shared-files-preview .media-video-shell video {
+  max-height: 320px;
 }
 
 .shared-attachment-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border: 1px solid color-mix(in srgb, var(--text-faint) 40%, transparent);
-  border-radius: 10px;
-  background: var(--surface-2);
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-1);
   color: var(--text);
   text-decoration: none;
   min-width: 0;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 .shared-attachment-row:hover {
-  background: var(--surface-3);
+  background: var(--surface-2);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
 }
 
 .shared-attachment-icon {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
+  color: var(--accent);
+}
+
+.shared-attachment-icon svg {
+  width: 16px;
+  height: 16px;
 }
 
 .shared-attachment-name {
@@ -7092,4 +7194,272 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
   flex: none;
   font-size: 12px;
   color: var(--text-soft);
+}
+
+.shared-attachment-download {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-soft);
+  transition: color 0.15s ease;
+}
+
+.shared-attachment-download svg {
+  width: 15px;
+  height: 15px;
+}
+
+.shared-attachment-row:hover .shared-attachment-download {
+  color: var(--accent);
+}
+
+/* ── 自定义音频播放器 ── */
+
+.media-audio-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-1);
+  transition: border-color 0.15s ease;
+}
+
+.media-audio-card:hover,
+.media-audio-card.is-playing {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+.media-audio-card audio {
+  display: none;
+}
+
+.media-audio-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.media-audio-cover {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-soft), color-mix(in srgb, var(--coral-soft) 55%, var(--accent-soft)));
+  color: var(--user-text);
+}
+
+.media-audio-cover svg {
+  width: 20px;
+  height: 20px;
+}
+
+.media-audio-card.is-playing .media-audio-cover {
+  color: color-mix(in srgb, var(--user-text) 80%, var(--accent-strong));
+}
+
+.media-audio-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-audio-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-audio-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.media-audio-card.is-error .media-audio-meta {
+  color: var(--danger);
+}
+
+.media-audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.media-audio-play {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--inverse-text);
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.media-audio-play:hover {
+  background: var(--accent-strong);
+}
+
+.media-audio-play:active {
+  transform: scale(0.94);
+}
+
+.media-audio-play svg {
+  width: 15px;
+  height: 15px;
+}
+
+.media-audio-time {
+  flex: none;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-soft);
+  min-width: 32px;
+  text-align: center;
+}
+
+.media-audio-track {
+  flex: 1;
+  min-width: 48px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+  border-radius: 999px;
+  /* 轨道底色:内嵌渐变画一条 5px 细线,省一层元素 */
+  background: linear-gradient(color-mix(in srgb, var(--text-faint) 45%, transparent) 0 0) center / 100% 5px no-repeat;
+}
+
+.media-audio-track-fill {
+  position: relative;
+  height: 5px;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  min-width: 0;
+}
+
+.media-audio-track-fill::after {
+  content: "";
+  position: absolute;
+  right: -5px;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  transform: translateY(-50%) scale(0);
+  transition: transform 0.12s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.media-audio-track:hover .media-audio-track-fill::after,
+.media-audio-track.is-scrubbing .media-audio-track-fill::after,
+.media-audio-track:focus-visible .media-audio-track-fill::after {
+  transform: translateY(-50%) scale(1);
+}
+
+.media-audio-track:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 2px;
+}
+
+.media-audio-track.is-static {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.media-audio-icon-btn {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.media-audio-icon-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.media-audio-icon-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* 音量条:accent 已播 + 淡轨道,WebKit/Firefox 各写一份 */
+.media-audio-volume {
+  flex: none;
+  width: 56px;
+  height: 16px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.media-audio-volume::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-faint) 45%, transparent);
+}
+
+.media-audio-volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -3px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.media-audio-volume::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-faint) 45%, transparent);
+}
+
+.media-audio-volume::-moz-range-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.media-audio-volume::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* 窄屏收起音量条,静音键仍在 */
+@media (max-width: 480px) {
+  .media-audio-volume {
+    display: none;
+  }
 }

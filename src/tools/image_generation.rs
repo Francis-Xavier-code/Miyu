@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DESCRIPTION: &str = "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Pass reference_images to work from existing pictures (image-to-image); each entry takes the same kind of reference vision_analyze accepts — a local image path, an http(s) image URL, or a context_image_N id from the chat history. Emits an image event and returns a local path. Messaging platforms deliver emitted images automatically, so do not pass the same image to send_message_to_user. Do not call print_image unless the user explicitly asks to display it.";
+const DESCRIPTION: &str = "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Pass reference_images to work from existing pictures (image-to-image); each entry takes the same kind of reference vision_analyze accepts — a local image path, an http(s) image URL, or a context_image_N id from the chat history. Emits an image event and returns a local path; the host displays emitted images automatically. Do not call print_image unless the user explicitly asks to display it.";
+
+// 平台面的契约:图不自动投递,生成后由模型用 send_message_to_user 发出。
+const PLATFORM_DESCRIPTION: &str = "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Pass reference_images to work from existing pictures (image-to-image); each entry takes the same kind of reference vision_analyze accepts — a local image path, an http(s) image URL, or a context_image_N id from the chat history. Returns the local path of the generated image; it is not delivered automatically — after generating, send it to the user with send_message_to_user, passing images=[{\"path\": ..., \"alt\": ...}].";
 
 fn parameters() -> Value {
     json!({
@@ -33,34 +36,42 @@ fn parameters() -> Value {
 
 pub fn register(registry: &mut ToolRegistry, config: AppConfig, paths: MiyuPaths) {
     let resolver = ReferenceResolver::unscoped(config.clone(), paths);
-    register_with_resolver(registry, config, resolver);
+    register_with_resolver(registry, config, resolver, false);
 }
 
-/// 平台面的注册:参考图沿用 `vision_analyze` 的白名单作用域,由 vision 侧在
-/// 每回合构造好同一份 state 后调进来。
+/// 作用域注册:参考图沿用 `vision_analyze` 的白名单作用域,由 vision 侧在
+/// 每回合构造好同一份 state 后调进来。`platform` 为真=消息平台回合:图不再
+/// 自动投递,由模型显式 send_message_to_user 发送(08-20 用户裁定——自动投
+/// 递静默失灵过,显式发送链路对模型透明可自救)。
 pub(crate) fn register_scoped(
     registry: &mut ToolRegistry,
     config: AppConfig,
     resolver: ReferenceResolver,
+    platform: bool,
 ) {
-    register_with_resolver(registry, config, resolver);
+    register_with_resolver(registry, config, resolver, platform);
 }
 
 fn register_with_resolver(
     registry: &mut ToolRegistry,
     config: AppConfig,
     resolver: ReferenceResolver,
+    platform: bool,
 ) {
     let resolver = Arc::new(resolver);
     registry.register(
         ToolSpec::new_with_progress(
             "generate_image",
-            DESCRIPTION,
+            if platform {
+                PLATFORM_DESCRIPTION
+            } else {
+                DESCRIPTION
+            },
             parameters(),
             move |args, progress| {
                 let config = config.clone();
                 let resolver = resolver.clone();
-                async move { generate_image(args, config, resolver, progress).await }
+                async move { generate_image(args, config, resolver, progress, platform).await }
             },
         )
         .writes(),
@@ -72,6 +83,7 @@ async fn generate_image(
     config: AppConfig,
     resolver: Arc<ReferenceResolver>,
     progress: crate::tools::ToolProgress,
+    platform: bool,
 ) -> Result<String> {
     let plugin = &config.plugins.image_generation;
     if !plugin.enabled {
@@ -115,8 +127,13 @@ async fn generate_image(
         }
     };
     let path = save_image(plugin, prompt, &bytes)?;
-    progress.report_image(path.clone(), prompt.to_string());
-    let should_render_terminal = plugin.auto_print
+    // 平台回合不发图片事件:自动投递撤销,模型按 PLATFORM_INSTRUCTION 用
+    // send_message_to_user 显式发送(生成目录的图有附件门槛豁免)。
+    if !platform {
+        progress.report_image(path.clone(), prompt.to_string());
+    }
+    let should_render_terminal = !platform
+        && plugin.auto_print
         && config.plugins.print_image.enabled
         && progress.prepare_for_external_output().await;
     let print_error = if should_render_terminal {
@@ -143,14 +160,24 @@ async fn generate_image(
         "reference_images": references.len(),
         "printed": printed,
         "print_error": print_error,
-        "assistant_instruction": if printed { PRINTED_INSTRUCTION } else { EMITTED_INSTRUCTION }
+        "assistant_instruction": if platform {
+            PLATFORM_INSTRUCTION
+        } else if printed {
+            PRINTED_INSTRUCTION
+        } else {
+            EMITTED_INSTRUCTION
+        }
     })
     .to_string())
 }
 
 const PRINTED_INSTRUCTION: &str = "The generated image has already been emitted to the host and printed in the terminal. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it. Do not put the local file path in your reply.";
 
-const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply.";
+const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event; the host displays emitted images automatically. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply.";
+
+// 平台回合的图不自动投递(08-20 裁定):模型显式发送,链路对它透明,失败
+// 时它能看见错误并重试——自动投递静默失灵过三连。
+const PLATFORM_INSTRUCTION: &str = "The image was saved to disk at the returned path. It is not delivered automatically: send it to the user exactly once with send_message_to_user, images=[{\"path\": <the returned path>, \"alt\": <short description>}]. If a send_message_to_user result in this conversation already shows this image delivered, the send is complete — never send the same image twice. Do not put the local file path in your reply text.";
 
 /// 把 `reference_images` 收成一串引用。
 ///

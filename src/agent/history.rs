@@ -202,7 +202,8 @@ impl Agent {
             // 纯文本问答对=同一轮发两遍且字节不同于活体,前缀在此掰断
             // (缓存调研 08-16,deepseek 报告 P0-2③实证)。纯文本对只给
             // 无 flow 的老回合兜底。
-            if turn.tool_flow.is_empty() {
+            let has_native_flow = turn.tool_flow.iter().any(|round| !round.remote);
+            if !has_native_flow {
                 for exchange in &turn.question_exchanges {
                     messages.push(ChatMessage::plain(
                         "assistant",
@@ -229,7 +230,7 @@ impl Agent {
             // dsh 形态回放:每轮 assistant 带原生 tool_calls(参数原样字节),
             // 随后各 call 的 role:"tool" 输出;最终回复照旧收尾。老回合
             // (无结构化流)退回 private_tool_memory 压扁兜底。
-            for round in &turn.tool_flow {
+            for round in turn.tool_flow.iter().filter(|round| !round.remote) {
                 push_assistant_message_with_reasoning(
                     messages,
                     round.assistant_content.clone(),

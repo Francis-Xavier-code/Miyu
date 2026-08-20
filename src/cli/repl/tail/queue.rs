@@ -44,14 +44,28 @@ impl LiveReplTail {
         self.pending_chunks.clear();
     }
 
-    pub(in crate::cli) fn commit_submission(&mut self, submission: &LiveSubmission) -> Result<()> {
+    /// 提交回显的绘制半程:同步块内只做本地写。ESC[6n 位置查询要等终端
+    /// 应答,放在同步块里会把块的存活时间拉到毫秒级——kitty 的同步输出有
+    /// 超时保护,超了就提前提交半成品帧,用户看到的就是光标闪到屏幕底部
+    /// 再跳回输入框(08-20 点名)。查询挪到块外的 finalize,此时光标已隐藏,
+    /// 查询期间无可见状态。
+    pub(in crate::cli) fn commit_submission_render(
+        &mut self,
+        submission: &LiveSubmission,
+    ) -> Result<()> {
         self.suspend()?;
-        write_committed_user_messages(
+        // suspend 已把光标 MoveTo(output_cursor):列已知,块内零查询。
+        write_committed_user_messages_from(
             &[(submission.display_content.as_str(), self.editor.mode)],
             true,
+            Some(self.output_cursor.0),
         )?;
-        self.output_cursor = cursor_position_or(self.output_cursor);
         Ok(())
+    }
+
+    /// 提交回显的收尾半程:同步块外、光标隐藏状态下校准输出光标。
+    pub(in crate::cli) fn commit_submission_finalize(&mut self) {
+        self.output_cursor = cursor_position_or(self.output_cursor);
     }
 
     pub(in crate::cli) fn commit_empty_submission(&mut self) -> Result<()> {

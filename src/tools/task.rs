@@ -16,10 +16,11 @@ const SUBAGENT_SYSTEM_PROMPT: &str = include_str!("../prompts/subagent-general.m
 ///
 /// 递归防护保留:这份排除表继续把 task/deep_research、技能创作、闹钟和
 /// 娱乐类工具挡在子代理之外。
-const SUBAGENT_EXCLUDED: &[&str] = &[
+pub(in crate::tools) const SUBAGENT_EXCLUDED: &[&str] = &[
     "task",
     "task_agent",
     "deep_research",
+    "claude_code",
     "load_skill",
     "manage_skill",
     "alarm",

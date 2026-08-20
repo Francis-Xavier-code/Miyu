@@ -2,6 +2,8 @@ mod command;
 mod files;
 mod sysinfo;
 use command::*;
+// claude_code 复用同一套进程组击杀语义,不再抄一份。
+pub(in crate::tools) use command::CommandProcessGroup;
 pub(crate) use files::*;
 use sysinfo::*;
 

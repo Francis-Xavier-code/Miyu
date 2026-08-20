@@ -532,6 +532,10 @@ pub(in crate::platforms::onebot) async fn build_and_run_turn(
         qq_identity_policy(context.conversation.kind),
         qq_history_format(context.config.platforms.qq.user_identification),
         "<qq-context-images>If a <context-images> block appears in this turn, it lists IDs of historical images from earlier group-chat records that can be viewed on demand. You have not seen the actual content of these images; only when the answer truly depends on an image, call vision_analyze with the corresponding ID as the image argument. Never guess image content from the placeholders.</qq-context-images>".to_string(),
+        // reply_to 语义:被引消息是旧消息、作者是 reply_to 里的人、不是说给
+        // 你的话——不解释这三点,模型会把引用内容当成当前对话里别人对它说
+        // 的新话(用户 08-20 实测点名)。会话级常量,不掰缓存。
+        "<qq-reply-format>When message.reply_to appears in <qq-request-context>, the current sender is quoting that earlier message as conversational context. reply_to.text was written at an earlier time by the user identified in reply_to (sender_principal / sender_display_name), not by the current sender; it is not addressed to you and is not part of the current message. Only the text outside reply_to is what the current sender is saying now.</qq-reply-format>".to_string(),
     ];
     if let Some(prompt) = route
         .map(|route| route.extra_prompt.trim())

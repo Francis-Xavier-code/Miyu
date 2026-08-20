@@ -209,6 +209,23 @@ impl RendererState {
         if database.faces().next().is_none() {
             bail!("renderer font {} contains no faces", cjk_font.display());
         }
+        // 等宽代码字体是可选资产:旧资产包没有它时回落正文字体(不报错),
+        // 装了新包立即生效。
+        let code_font = font_dir.join(CODE_FONT_FILE);
+        if code_font.is_file() {
+            if let Err(error) = database.load_font_file(&code_font) {
+                tracing::warn!(
+                    path = %code_font.display(),
+                    %error,
+                    "loading the renderer code font failed; code falls back to the body font"
+                );
+            }
+        } else {
+            tracing::info!(
+                path = %code_font.display(),
+                "renderer code font is missing; code falls back to the body font"
+            );
+        }
         database.set_sans_serif_family(DEFAULT_BODY_FONT);
         database.set_monospace_family(DEFAULT_CODE_FONT);
         Ok(Self {

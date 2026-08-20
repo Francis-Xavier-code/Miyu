@@ -268,7 +268,17 @@ pub(in crate::platforms::plugins::renderer) fn draw_decoration(
     let height = placement.source_end.saturating_sub(placement.source_start);
     match block.kind {
         BlockKind::Code => {
-            fill_rect(image, x, y, COLUMN_WIDTH, height, palette.code_background);
+            fill_rounded_rect(
+                image,
+                x,
+                y,
+                COLUMN_WIDTH,
+                height,
+                palette.code_background,
+                12,
+                placement.source_start == 0,
+                placement.source_end == block.total_height,
+            );
         }
         BlockKind::Quote => {
             fill_rect(image, x, y, COLUMN_WIDTH, height, palette.quote_background);
@@ -551,13 +561,16 @@ pub(in crate::platforms::plugins::renderer) fn draw_text_fragment(
             if x1 <= i64::from(x0) {
                 continue;
             }
-            fill_rect(
+            fill_rounded_rect(
                 image,
                 x0,
                 global_y,
                 (x1 - i64::from(x0)) as u32,
                 (bottom - top) as u32,
                 block.inline_code_background,
+                6,
+                true,
+                true,
             );
         }
         for glyph in run.glyphs {
@@ -603,6 +616,78 @@ pub(in crate::platforms::plugins::renderer) fn draw_text_fragment(
                     }
                 },
             );
+        }
+    }
+}
+
+/// 圆角矩形填充:四角按半径裁剪,边缘 1px 用覆盖率混合抗锯齿。
+/// `round_top`/`round_bottom` 支持跨页分片的代码块——只有块的真实首/尾
+/// 分片才带圆角,中间分片保持直边无缝拼接。
+#[allow(clippy::too_many_arguments)]
+pub(in crate::platforms::plugins::renderer) fn fill_rounded_rect(
+    image: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: [u8; 4],
+    radius: u32,
+    round_top: bool,
+    round_bottom: bool,
+) {
+    let radius = radius.min(width / 2).min(height / 2);
+    if radius == 0 {
+        fill_rect(image, x, y, width, height, color);
+        return;
+    }
+    let end_x = x.saturating_add(width).min(image.width());
+    let end_y = y.saturating_add(height).min(image.height());
+    let r = radius as f32;
+    for py in y.min(end_y)..end_y {
+        for px in x.min(end_x)..end_x {
+            let local_x = (px - x) as f32;
+            let local_y = (py - y) as f32;
+            // 到最近圆角圆心的距离;不在角区=完全覆盖。
+            let corner_x = if local_x < r {
+                Some(r - 0.5)
+            } else if local_x >= width as f32 - r {
+                Some(width as f32 - r - 0.5)
+            } else {
+                None
+            };
+            let corner_y = if round_top && local_y < r {
+                Some(r - 0.5)
+            } else if round_bottom && local_y >= height as f32 - r {
+                Some(height as f32 - r - 0.5)
+            } else {
+                None
+            };
+            let coverage = match (corner_x, corner_y) {
+                (Some(cx), Some(cy)) => {
+                    let distance = ((local_x - cx).powi(2) + (local_y - cy).powi(2)).sqrt();
+                    (r - distance + 0.5).clamp(0.0, 1.0)
+                }
+                _ => 1.0,
+            };
+            if coverage <= 0.0 {
+                continue;
+            }
+            if let Some(pixel) = image.get_pixel_mut_checked(px, py) {
+                if coverage >= 1.0 {
+                    *pixel = Rgba(color);
+                } else {
+                    let base = pixel.0;
+                    let mix = |a: u8, b: u8| {
+                        (f32::from(b) * coverage + f32::from(a) * (1.0 - coverage)).round() as u8
+                    };
+                    *pixel = Rgba([
+                        mix(base[0], color[0]),
+                        mix(base[1], color[1]),
+                        mix(base[2], color[2]),
+                        mix(base[3], color[3]),
+                    ]);
+                }
+            }
         }
     }
 }

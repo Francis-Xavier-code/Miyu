@@ -55,6 +55,10 @@ impl ModelEntry {
 }
 
 pub(in crate::config_tui) fn fetch_models(provider: &ProviderConfig) -> Result<Vec<String>> {
+    if provider.is_claude_code() {
+        // 本机 CLI 后端没有 /models HTTP 端点;模型列表就是预置的 CLI 别名。
+        return Ok(provider.models.clone());
+    }
     let api_key = provider.api_key.as_deref().unwrap_or_default();
     let mut api_key = if let Some(env_name) = api_key.strip_prefix("$env:") {
         std::env::var(env_name).unwrap_or_default()
@@ -592,6 +596,8 @@ pub(in crate::config_tui) fn edit_provider_form(
         Field::new(t("Configuration ID", "配置 ID"), provider.id.clone()),
         Field::new(t("Display name", "显示名称"), provider.display_name.clone()),
         Field::new("Base URL", provider.base_url.clone()),
+        // claude-code 不在这份下拉里:它是内置特殊供应商的内部协议标识,
+        // 不暴露成用户可选概念(那个供应商走自己的专用表单)。
         Field::new(t("Protocol", "协议"), provider.protocol.clone()).choices(&[
             "auto",
             "openai-chat",
@@ -643,6 +649,7 @@ pub(in crate::config_tui) fn edit_provider_form(
             id: fields[0].value.trim().to_string(),
             display_name: fields[1].value.trim().to_string(),
             base_url: normalize_base_url(&fields[2].value),
+            enabled: provider.enabled,
             protocol: fields[3].value.trim().to_string(),
             api_key: Some(fields[4].value.trim().to_string()).filter(|value| !value.is_empty()),
             models: provider.models.clone(),

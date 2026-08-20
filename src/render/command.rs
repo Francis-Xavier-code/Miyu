@@ -418,6 +418,12 @@ pub(crate) fn command_terminal_width() -> usize {
         .unwrap_or(120)
 }
 
+/// 命令家族:走 `CommandLiveDisplay`(带色命令行+输出尾巴)的工具。
+/// claude-code 原生 Bash 的入参同样是 `command` 键,与 run_command 同构。
+pub(crate) fn is_command_tool(name: &str) -> bool {
+    matches!(name, "run_command" | "Bash")
+}
+
 pub(crate) fn command_from_arguments(arguments: &str) -> String {
     let parsed = serde_json::from_str::<Value>(arguments).ok();
     let command = parsed

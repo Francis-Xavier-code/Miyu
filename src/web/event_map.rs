@@ -66,7 +66,7 @@ impl RunEventMapper {
         let display_name = tools::readable_tool_name(&event_name);
         ActiveTool {
             id: call_id,
-            command_output: (name == "run_command")
+            command_output: crate::render::is_command_tool(&name)
                 .then(|| crate::render::CommandOutputTail::new(self.command_output_lines)),
             name,
             display_name,
@@ -264,6 +264,14 @@ impl RunEventMapper {
                 // "use_meme",分不出是 show 还是 search
                 let hide_caption = name == "use_meme:show";
                 let Some(turn_id) = self.turn_id.as_deref() else {
+                    // 这条分支此前完全无日志:图既不落库也不进平台投递,
+                    // 表现为「生图 ok 但群里没图」却查无痕迹(08-20 生图三连丢
+                    // 的排查盲区)。
+                    tracing::warn!(
+                        run_id = %self.run_id,
+                        tool = %tool_name,
+                        "a tool image arrived before the turn id was known and was dropped"
+                    );
                     self.publish(
                         "tool.image",
                         json!({

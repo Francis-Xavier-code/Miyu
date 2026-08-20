@@ -118,6 +118,9 @@ pub enum Command {
     /// 工具桥:以当前会话身份调用一个结构化工具(供 run_command 脚本编排)
     #[command(name = "tool-call")]
     ToolCallCmd(ToolCallArgs),
+    /// MCP stdio 工具桥(claude-code 供应商内部使用,由 claude 拉起)
+    #[command(name = "mcp-serve", hide = true)]
+    McpServe,
 }
 
 #[derive(Debug, Args)]

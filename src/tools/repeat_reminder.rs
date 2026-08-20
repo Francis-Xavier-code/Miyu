@@ -15,8 +15,10 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// 触发提醒的连续次数(升序;首个=温和版,其余=详细版)。
-const THRESHOLDS: [u32; 3] = [3, 5, 8];
+/// 提醒起点(用户 08-20 裁定:第 5 次起**持续**提醒——真机 web_search 同
+/// query 222 连时旧的 3/5/8 三点式提醒发完就永远沉默,循环继续烧了两百多
+/// 轮)。第 5 次给温和版,之后每次详细版。
+const REMINDER_START: u32 = 5;
 
 /// 对链透明的工具:记录类调用不参与也不打断计数。
 const TRANSPARENT: [&str; 1] = ["todowrite"];
@@ -52,10 +54,10 @@ impl RepeatChain {
             self.key = Some(key);
             self.count = 1;
         }
-        if !THRESHOLDS.contains(&self.count) {
+        if self.count < REMINDER_START {
             return None;
         }
-        Some(if self.count == THRESHOLDS[0] {
+        Some(if self.count == REMINDER_START {
             gentle_reminder().to_string()
         } else {
             detailed_reminder(tool_name, self.count, &canonical)
@@ -114,7 +116,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thresholds_fire_gentle_then_detailed_and_go_silent() {
+    fn reminders_start_at_five_and_never_go_silent() {
         let mut chain = RepeatChain::default();
         let mut fired = Vec::new();
         for round in 1..=9u32 {
@@ -123,20 +125,24 @@ mod tests {
             }
         }
         let rounds: Vec<u32> = fired.iter().map(|(round, _)| *round).collect();
-        assert_eq!(rounds, vec![3, 5, 8]);
+        // 第 5 次起每次都提醒:三点式提醒发完就沉默曾放任 222 连循环。
+        assert_eq!(rounds, vec![5, 6, 7, 8, 9]);
         assert!(!fired[0].1.contains("grep"), "温和版不点名工具");
-        assert!(fired[1].1.contains("grep") && fired[1].1.contains('5'));
-        // 超过最高阈值后静默(第 9 次没有触发)。
+        assert!(fired[1].1.contains("grep") && fired[1].1.contains('6'));
     }
 
     #[test]
     fn different_arguments_reset_the_run_and_key_order_is_canonical() {
         let mut chain = RepeatChain::default();
         assert!(chain.observe("grep", r#"{"a":1,"b":2}"#).is_none());
-        // 仅属性顺序不同 → 视为相同,计数 2。
+        // 仅属性顺序不同 → 视为相同,连续计数继续。
         assert!(chain.observe("grep", r#"{"b":2,"a":1}"#).is_none());
-        assert!(chain.observe("grep", r#"{"a":1,"b":2}"#).is_some(), "第 3 次触发");
+        assert!(chain.observe("grep", r#"{"a":1,"b":2}"#).is_none());
+        assert!(chain.observe("grep", r#"{"b":2,"a":1}"#).is_none());
+        assert!(chain.observe("grep", r#"{"a":1,"b":2}"#).is_some(), "第 5 次触发");
         // 换参数 → 链重开。
+        assert!(chain.observe("grep", r#"{"a":9}"#).is_none());
+        assert!(chain.observe("grep", r#"{"a":9}"#).is_none());
         assert!(chain.observe("grep", r#"{"a":9}"#).is_none());
         assert!(chain.observe("grep", r#"{"a":9}"#).is_none());
         assert!(chain.observe("grep", r#"{"a":9}"#).is_some());
@@ -148,7 +154,9 @@ mod tests {
         assert!(chain.observe("grep", "{}").is_none());
         assert!(chain.observe("todowrite", r#"{"todos":[]}"#).is_none());
         assert!(chain.observe("grep", "{}").is_none());
-        // 穿插 todowrite 不断链:这已是连续第 3 次 grep。
+        assert!(chain.observe("grep", "{}").is_none());
+        assert!(chain.observe("grep", "{}").is_none());
+        // 穿插 todowrite 不断链:这已是连续第 5 次 grep。
         assert!(chain.observe("grep", "{}").is_some());
     }
 
@@ -157,7 +165,11 @@ mod tests {
         let mut chain = RepeatChain::default();
         chain.observe("grep", "{}");
         chain.observe("grep", "{}");
+        chain.observe("grep", "{}");
+        chain.observe("grep", "{}");
         chain.reset();
+        assert!(chain.observe("grep", "{}").is_none());
+        assert!(chain.observe("grep", "{}").is_none());
         assert!(chain.observe("grep", "{}").is_none());
         assert!(chain.observe("grep", "{}").is_none());
         assert!(chain.observe("grep", "{}").is_some());
@@ -167,12 +179,11 @@ mod tests {
     fn detailed_preview_is_head_truncated_with_omission_marker() {
         let mut chain = RepeatChain::default();
         let long = format!(r#"{{"content":"{}"}}"#, "x".repeat(2000));
-        chain.observe("write_file", &long);
-        chain.observe("write_file", &long);
-        let text = chain.observe("write_file", &long);
-        // 阈值 3 是温和版,不带参数;推到 5 拿详细版。
-        assert!(text.is_some());
-        chain.observe("write_file", &long);
+        for _ in 0..4 {
+            chain.observe("write_file", &long);
+        }
+        // 第 5 次是温和版,不带参数;第 6 次起详细版带截断预览。
+        assert!(chain.observe("write_file", &long).is_some());
         let detailed = chain.observe("write_file", &long).unwrap();
         assert!(detailed.contains("more chars") || detailed.contains("… (+"));
     }

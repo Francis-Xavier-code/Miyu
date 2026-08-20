@@ -357,6 +357,8 @@ async fn invalid_request_does_not_fail_over_to_another_endpoint() {
         request_timeouts: None,
         max_tokens_override: None,
         request_scope: "chat",
+        claude_code: None,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     };
 

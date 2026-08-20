@@ -19,6 +19,9 @@ pub(in crate::llm::openai_compatible) enum ProviderProtocol {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+    /// 本机 Claude Code CLI 中转:传输层是子进程 stream-json,不是 HTTP。
+    /// 只能显式配置,`auto` 永远不会猜到这条线。
+    ClaudeCode,
 }
 
 impl ProviderProtocol {
@@ -30,9 +33,21 @@ impl ProviderProtocol {
             "anthropic" | "anthropic-messages" | "claude" | "claude-messages" => {
                 Ok(Self::Anthropic)
             }
+            "claude-code" | "claude-code-cli" => Ok(Self::ClaudeCode),
             protocol => bail!("unsupported provider protocol: {protocol}"),
         }
     }
+}
+
+/// 端点池装配与 keepalive 分流用:该 provider 是否走 Claude Code CLI 中转。
+/// CLI 用订阅登录态,没有 API key 概念,装配时要豁免 key 解析。
+pub(in crate::llm::openai_compatible) fn provider_uses_claude_code(
+    provider: &ProviderConfig,
+) -> bool {
+    matches!(
+        ProviderProtocol::from_provider(provider),
+        Ok(ProviderProtocol::ClaudeCode)
+    )
 }
 
 pub(in crate::llm::openai_compatible) fn effective_protocol(provider: &ProviderConfig, model: &str) -> Result<ProviderProtocol> {
@@ -77,7 +92,23 @@ pub(in crate::llm::openai_compatible) fn anthropic_reasoning_budget(max_tokens: 
     (max_tokens > 1024 && requested < u64::from(max_tokens)).then_some(requested)
 }
 
+/// Claude Code 的思考档:CLI 的 `--effort` 五档,不走 models.dev 目录
+/// (那里没有这个"供应商")。所有预置模型统一给全档,CLI 对不支持档位的
+/// 模型自行降级。
+pub(in crate::llm::openai_compatible) fn claude_code_reasoning_variants() -> Vec<ReasoningVariant> {
+    ["low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .map(|effort| ReasoningVariant {
+            id: effort.to_string(),
+            setting: ReasoningSetting::Effort(effort.to_string()),
+        })
+        .collect()
+}
+
 pub(in crate::llm::openai_compatible) fn supported_reasoning_variants(provider: &ProviderConfig, model: &str) -> Vec<ReasoningVariant> {
+    if provider_uses_claude_code(provider) {
+        return claude_code_reasoning_variants();
+    }
     let Some(info) = models_cache::reasoning_info(&provider.id, model) else {
         return Vec::new();
     };
@@ -107,6 +138,8 @@ pub(in crate::llm::openai_compatible) fn reasoning_variant_supported_for_protoco
     protocol: ProviderProtocol,
 ) -> bool {
     match protocol {
+        // Claude Code 只认 `--effort` 的档位语义。
+        ProviderProtocol::ClaudeCode => matches!(variant.setting, ReasoningSetting::Effort(_)),
         ProviderProtocol::OpenAiResponses => matches!(
             variant.setting,
             ReasoningSetting::Effort(_) | ReasoningSetting::Toggle(_) | ReasoningSetting::Disabled

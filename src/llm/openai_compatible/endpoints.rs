@@ -236,8 +236,29 @@ pub(in crate::llm::openai_compatible) fn llm_endpoints(config: &AppConfig, paths
     let mut errors = Vec::new();
     for choice in config.active_provider_model_choices() {
         let mut provider = config.provider(Some(&choice.provider_id))?.clone();
+        if !provider.enabled {
+            errors.push(format!(
+                "{}: {}",
+                provider.id,
+                t(
+                    "provider is disabled; enable it in the provider settings",
+                    "供应商未启用;请在供应商设置里启用"
+                )
+            ));
+            continue;
+        }
         provider.default_model = choice.model;
         let client = endpoint_client(&provider)?;
+        if provider_uses_claude_code(&provider) {
+            // claude-code 走本机 CLI 的订阅登录态,没有 API key;单端点直进池。
+            endpoints.push(LlmEndpoint {
+                client: client.clone(),
+                provider: provider.clone(),
+                api_key: String::new(),
+                key_index: 0,
+            });
+            continue;
+        }
         match provider.resolved_api_keys(paths) {
             Ok(keys) => {
                 for key in keys {
@@ -271,6 +292,8 @@ pub(in crate::llm::openai_compatible) fn stream_chunk_commits_attempt(
     (chunk.kind == ChatStreamKind::ReasoningPartEnd
         && reasoning_visibility != ReasoningVisibility::Hidden)
         || chunk.kind == ChatStreamKind::ToolCall
+        || chunk.kind == ChatStreamKind::RemoteToolStarted
+        || chunk.kind == ChatStreamKind::RemoteToolFinished
         || (chunk.kind == ChatStreamKind::Content && !chunk.text.is_empty())
         || (reasoning_visibility == ReasoningVisibility::Full
             && chunk.kind == ChatStreamKind::Reasoning

@@ -81,7 +81,10 @@ impl OpenAiCompatibleClient {
             .get(index)
             .context("no LLM endpoint configured for cache keepalive")?;
         let client = self.with_endpoint(endpoint);
-        if client.uses_openai_responses() || client.uses_anthropic_messages() {
+        if client.uses_openai_responses()
+            || client.uses_anthropic_messages()
+            || provider_uses_claude_code(&client.provider)
+        {
             return Ok(None);
         }
         client.cache_keepalive_single(messages, tools).await
@@ -387,6 +390,11 @@ impl OpenAiCompatibleClient {
         F: FnMut(ChatStreamChunk) -> Result<()>,
     {
         let protocol = ProviderProtocol::from_provider(&self.provider)?;
+        if protocol == ProviderProtocol::ClaudeCode {
+            return self
+                .chat_claude_code_stream(messages, tools, request_id, on_chunk)
+                .await;
+        }
         let uses_responses = protocol == ProviderProtocol::OpenAiResponses
             || (protocol == ProviderProtocol::Auto && self.uses_openai_responses());
         if previous_response_id.is_some() && !uses_responses {

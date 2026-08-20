@@ -163,6 +163,7 @@
     "session.deleted",
     "session.current_changed",
     "session.updated",
+    "session.reordered",
     "job.started",
     "job.finished",
     "job.acknowledged",
@@ -344,6 +345,8 @@
     liveRuns: new Map(),
     sessionMenuFor: null,
     sessionRenaming: null,
+    sessionDragId: null,
+    lastReorderIds: "",
     modeChooserOpen: false,
     modeChooserKeyHandler: null,
     sessionBusy: false,
@@ -3185,6 +3188,8 @@
     item.dataset.sessionId = id;
 
     const renaming = state.sessionRenaming === id;
+    // 侧栏拖拽排序(组内):HTML5 DnD,drop 时全量提交新顺序。
+    if (!renaming) attachSessionDrag(item, session, id);
     const main = document.createElement(renaming ? "div" : "button");
     main.className = `session-item-main${renaming ? " is-renaming" : ""}`;
     if (!renaming) {
@@ -3369,6 +3374,83 @@
     }, 90);
   }
 
+  function clearSessionDropMarkers() {
+    if (!elements.sessionItems) return;
+    for (const el of elements.sessionItems.querySelectorAll(".drop-before, .drop-after")) {
+      el.classList.remove("drop-before", "drop-after");
+    }
+  }
+
+  function attachSessionDrag(item, session, id) {
+    item.draggable = true;
+    item.addEventListener("dragstart", (event) => {
+      state.sessionDragId = id;
+      item.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      try { event.dataTransfer.setData("text/plain", id); } catch (_) { /* 老内核 */ }
+    });
+    item.addEventListener("dragend", () => {
+      state.sessionDragId = null;
+      item.classList.remove("is-dragging");
+      clearSessionDropMarkers();
+    });
+    item.addEventListener("dragover", (event) => {
+      const dragId = state.sessionDragId;
+      if (!dragId || dragId === id) return;
+      // 只在同一分组(普通/dev)内排序,跨组语义(改会话模式)不存在。
+      const dragging = findSession(dragId);
+      if (!dragging || (dragging?.mode === "dev") !== (session?.mode === "dev")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      const rect = item.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      clearSessionDropMarkers();
+      item.classList.add(before ? "drop-before" : "drop-after");
+    });
+    item.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && item.contains(event.relatedTarget)) return;
+      item.classList.remove("drop-before", "drop-after");
+    });
+    item.addEventListener("drop", (event) => {
+      const dragId = state.sessionDragId;
+      if (!dragId || dragId === id) return;
+      event.preventDefault();
+      const before = item.classList.contains("drop-before");
+      clearSessionDropMarkers();
+      state.sessionDragId = null;
+      commitSessionReorder(dragId, id, before);
+    });
+  }
+
+  async function commitSessionReorder(dragId, targetId, before) {
+    const list = state.sessions;
+    const from = list.findIndex((s) => String(s?.session_id) === String(dragId));
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    let to = list.findIndex((s) => String(s?.session_id) === String(targetId));
+    if (to < 0) {
+      list.splice(from, 0, moved);
+      return;
+    }
+    list.splice(before ? to : to + 1, 0, moved);
+    renderSessionList();
+    // 全量提交当前顺序(两组按数组序混排;后端按序重写 sort_key,分组是
+    // 前端展示层的事)。终端车道会话不参与。
+    const ids = list
+      .filter((s) => !isTerminalSession(s?.session_id))
+      .map((s) => String(s.session_id));
+    state.lastReorderIds = ids.join("\n");
+    try {
+      await apiRequest("/api/sessions/order", {
+        method: "PUT",
+        body: JSON.stringify({ session_ids: ids })
+      });
+    } catch (error) {
+      showToast(error.message || "排序保存失败", "error");
+      refreshSessions();
+    }
+  }
+
   function buildSessionGroupHeader(label, icon) {
     const header = document.createElement("div");
     header.className = "session-group-header";
@@ -3466,13 +3548,28 @@
     elements.liveStopRail.hidden = true;
   }
 
+  // 切换会话不再销毁还在跑的直播状态:事件环只留 4096 条,长回复从 0 重放
+  // 必撞 resync,已渲染的内容就永远回不来了。改成离屏保活——DOM 游离但事件
+  // 照常写入,切回来原样重挂(reattachLiveArticles)。只清掉已结束的残壳。
+  function retireLiveRunsForSwitch() {
+    for (const [runId, live] of [...state.liveRuns.entries()]) {
+      if (live.ended) {
+        disposeLiveState(live);
+        state.liveRuns.delete(runId);
+      }
+    }
+    // 停止栏与问题坞都是全局元素,先清空;切回时按会话重挂。
+    elements.liveStopRail.replaceChildren();
+    elements.liveStopRail.hidden = true;
+  }
+
   function applySessionView(payload) {
     const sessionId = String(payload?.session_id || "");
     if (!sessionId) return;
     if (state.viewSessionId && state.viewSessionId !== sessionId && state.composerAttachments.length) {
       clearComposerAttachments(true);
     }
-    disposeAllLiveRuns();
+    retireLiveRunsForSwitch();
     clearViewSyncTimer();
     state.viewSessionId = sessionId;
     // 记住浏览位置，刷新后回到这里而不是跳去终端车道（见 preferredBootSession）。
@@ -3526,6 +3623,7 @@
     const redo = operation === "redo";
     const runningTurn = redo || userText || !claimTurn ? null : findUnclaimedRunningTurn();
     const live = createLiveState(runId, {
+      sessionId: options.sessionId,
       turnId: turnId || runningTurn?.id || null,
       userText: userText || runningTurn?.user_content || "",
       userAttachments: runningTurn?.attachments || [],
@@ -3539,7 +3637,7 @@
     return live;
   }
 
-  function beginRunReplay() {
+  function beginRunReplay(runIds = null) {
     // 事件环形缓冲已滚过上限时,after=0 必然触发 resync_required →
     // bootstrap → 又 replay 的循环:短窗口内连续吃到 resync 就放弃从头
     // 重放,live 状态由 bootstrap 快照兜底,增量从当前事件 id 继续。
@@ -3549,17 +3647,22 @@
       connectEventSource(state.lastEventId);
       return;
     }
-    state.replayRunIds = new Set(state.liveRuns.keys());
+    // 只重放传入的 run(全新空壳);离屏保活的 live 已吃过这些事件,再放
+    // 一遍正文就翻倍了。
+    state.replayRunIds = runIds ? new Set(runIds) : new Set(state.liveRuns.keys());
     state.replayCutoff = Math.max(state.lastEventId, state.replayCutoff, state.latestEventId);
     state.lastEventId = 0;
     connectEventSource(0);
   }
 
   function restoreLiveRuns(runs) {
-    let restored = false;
+    // 只有全新空壳需要事件重放;离屏保活切回来的 live 内容都在,重放反而
+    // 会把正文写两遍。
+    const fresh = new Set();
     for (const run of runs) {
       const runId = String(run?.run_id || "");
       if (!runId || state.terminalRunIds.has(runId)) continue;
+      const kept = state.liveRuns.has(runId);
       const live = createLiveForRun(runId, "", {
         operation: String(run?.operation || "create"),
         turnId: String(run?.turn_id || "") || null,
@@ -3583,18 +3686,21 @@
         ensureLiveArticle(live);
         showTypingIndicator(live);
       }
-      restored = true;
+      if (!kept) fresh.add(runId);
     }
-    if (restored) beginRunReplay();
+    if (fresh.size) beginRunReplay(fresh);
   }
 
   async function openFallbackSessionView(excludedSessionId) {
     const excluded = String(excludedSessionId || "");
     if (state.viewSessionId !== excluded) return;
-    // deleteSession() 和 session.deleted 事件会各来一次：不去重的话两边
-    // 并发各建一个新会话，删一个凭空多出两个。
-    if (state.fallbackInFlight) return;
+    // deleteSession() 和 session.deleted 事件会各来一次，且到达可能有先后：
+    // 只防并发的旗标挡不住"第一次兜底完成后第二次才到"的时序，两边各建一个
+    // 新会话，删一个凭空多出两个。按被删会话 id 上一次性闩锁：同一场删除，
+    // 兜底只发生一次。
+    if (state.fallbackInFlight || state.fallbackDoneFor === excluded) return;
     state.fallbackInFlight = true;
+    state.fallbackDoneFor = excluded;
     try {
       await openFallbackSessionViewInner(excluded);
     } finally {
@@ -3660,6 +3766,12 @@
   }
 
   function handleSessionEvent(name, data) {
+    if (name === "session.reordered") {
+      // 发起端已乐观重排(lastReorderIds 一致就不用刷);其它客户端拉一次。
+      const ids = Array.isArray(data?.session_ids) ? data.session_ids.map(String).join("\n") : "";
+      if (ids && ids !== state.lastReorderIds) refreshSessions();
+      return;
+    }
     const sessionId = String(data?.session_id || "");
     if (!sessionId) return;
     if (name === "session.created") {
@@ -3713,8 +3825,27 @@
     renderSessionList();
   }
 
+  // 离屏保活的 live 属于别的会话,不算「本视图在跑」。
+  function liveViewed(live) {
+    return !live?.sessionId || String(live.sessionId) === String(state.viewSessionId || "");
+  }
+
+  // 这个 turn 是否被本会话某个还在跑的 live 气泡认领:认领中的回合,
+  // 持久化渲染只画用户消息——checkpoint 落库的部分正文与气泡是同一份内容,
+  // 两边都画就是切回后正文翻倍。
+  function liveClaimsTurn(turnId) {
+    if (!turnId) return false;
+    for (const live of state.liveRuns.values()) {
+      if (!live.ended && liveViewed(live) && String(live.turnId) === String(turnId)) return true;
+    }
+    return false;
+  }
+
   function conversationRunning() {
-    return state.liveRuns.size > 0 || Boolean(state.viewRunningTurnId);
+    for (const live of state.liveRuns.values()) {
+      if (liveViewed(live)) return true;
+    }
+    return Boolean(state.viewRunningTurnId);
   }
 
   function activeTurnUpdateTarget(sessionId) {
@@ -4072,7 +4203,14 @@
     });
   }
 
-  function contentAdded() {
+  // anchor(可选):live 对象或 DOM 节点。离屏保活的 live(别会话)或已游离
+  // 的节点长内容,不该滚动当前视图。
+  function contentAdded(anchor) {
+    if (anchor) {
+      if (anchor.nodeType) {
+        if (!anchor.isConnected) return;
+      } else if (anchor.runId && !liveViewed(anchor)) return;
+    }
     if (state.followOutput) scrollToBottom();
     else elements.jumpBottomButton.hidden = false;
   }
@@ -5742,7 +5880,7 @@
         image.remove();
         fallback.hidden = false;
         figure.classList.add("is-error");
-        contentAdded();
+        contentAdded(figure);
       }, { once: true });
       image.addEventListener("load", contentAdded, { once: true });
       image.src = url;
@@ -5932,6 +6070,12 @@
       }
       for (const call of Array.isArray(round?.calls) ? round.calls : []) {
         blocks.appendChild(createPersistedToolCard(call));
+        // share_file 的富预览(播放器/图片/下载条)重建:实时靠 tool.finished
+        // 的输出渲染,刷新/切换后从落库的 tool_flow 输出里复原同一份。
+        if (window.MiyuShared?.isShareTool(String(call?.name || ""))) {
+          const shared = window.MiyuShared.renderCard(String(call?.output || ""));
+          if (shared) blocks.appendChild(shared);
+        }
       }
     }
     if (String(reasoning || "").trim() && !reasoningHidden()) {
@@ -6088,6 +6232,7 @@
      * 历史重载(后端快照没有 parts 顺序)才退回扁平重建。
      */
     const stash = turnId && turn?.status !== "running" ? state.finishedTurnArticles.get(turnId) : null;
+    const claimed = turn?.status === "running" && liveClaimsTurn(turnId);
     let stashIndex = 0;
     const takeStash = (kind) => {
       if (!stash || stashIndex >= stash.length || stash[stashIndex].kind !== kind) return null;
@@ -6095,7 +6240,7 @@
     };
 
     // 已回答的问题卡在 live article 内部原位保留;仅在无存档时用快照重建。
-    if (!stash) {
+    if (!stash && !claimed) {
       const exchanges = Array.isArray(turn?.question_exchanges) ? turn.question_exchanges : [];
       for (const exchange of exchanges) elements.timeline.appendChild(createPersistedQuestion(exchange, turnId));
     }
@@ -6107,7 +6252,7 @@
       const stashedSegment = takeStash("segment");
       if (stashedSegment) {
         elements.timeline.appendChild(stashedSegment);
-      } else if (precedingContent.trim() || precedingReasoning.trim()) {
+      } else if (!claimed && (precedingContent.trim() || precedingReasoning.trim())) {
         elements.timeline.appendChild(createAssistantMessage({
           content: precedingContent,
           reasoning: precedingReasoning,
@@ -6147,10 +6292,11 @@
       setAssistantRedoAction(stashedFinal, candidate);
       elements.timeline.appendChild(stashedFinal);
     } else if (
-      assistantContent.trim()
-      || assistantReasoning.trim()
-      || assets.length
-      || persistedToolRounds.length
+      !claimed
+      && (assistantContent.trim()
+        || assistantReasoning.trim()
+        || assets.length
+        || persistedToolRounds.length)
     ) {
       elements.timeline.appendChild(createAssistantMessage({
         content: assistantContent,
@@ -6171,7 +6317,7 @@
         muted: turn?.active_context === false
       }));
     }
-    if (turn?.status === "running" || turn?.status === "interrupted") elements.timeline.appendChild(createTurnStatus(turn));
+    if ((turn?.status === "running" && !claimed) || turn?.status === "interrupted") elements.timeline.appendChild(createTurnStatus(turn));
     else if (!stashedFinal && !assistantContent.trim() && !assistantReasoning.trim() && (asFiniteNumber(turn?.token_total) > 0 || turn?.active_context === false)) {
       const metadata = createTurnStatus({ ...turn, status: "completed" });
       metadata.querySelector("span:nth-child(2)").textContent = "本轮已完成";
@@ -6197,8 +6343,10 @@
     loadGoal(state.viewSessionId);
     if (state.finishedTurnArticles.size) {
       const knownTurnIds = new Set(turns.map((turn) => String(turn?.id)));
-      for (const key of [...state.finishedTurnArticles.keys()]) {
-        if (!knownTurnIds.has(key)) state.finishedTurnArticles.delete(key);
+      for (const [key, list] of [...state.finishedTurnArticles.entries()]) {
+        // 别的会话离屏完成的存档不在本会话的 turns 里,不能因此被剪掉。
+        const foreign = list.some((entry) => entry.sessionId && String(entry.sessionId) !== String(state.viewSessionId || ""));
+        if (!foreign && !knownTurnIds.has(key)) state.finishedTurnArticles.delete(key);
       }
     }
     if (turns.length === 0) {
@@ -6248,14 +6396,31 @@
   function reattachLiveArticles() {
     for (const live of state.liveRuns.values()) {
       if (!live.article || live.ended) continue;
-      if (live.article.isConnected) continue;
-      elements.timeline.appendChild(live.article);
+      // 离屏保活的别会话气泡不能挂进当前时间线。
+      if (!liveViewed(live)) continue;
+      // 落库的 running 占位与直播气泡是同一轮:重挂前撤掉占位。
+      removeRunningStatus(live.turnId);
+      if (!live.article.isConnected) elements.timeline.appendChild(live.article);
+      if (live.stopButton && !live.stopButton.isConnected) {
+        elements.liveStopRail.appendChild(live.stopButton);
+        elements.liveStopRail.hidden = false;
+      }
+      // 切走时被 clearQuestionDock 摘下的待答问题,切回原样归位。
+      for (const question of live.questions?.values?.() || []) {
+        if (question.pending && question.card && !question.card.isConnected) {
+          elements.questionDock.appendChild(question.card);
+        }
+      }
     }
+    updateQuestionDock();
+    syncRunIndicator();
   }
 
   function createLiveState(runId, options = {}) {
     return {
       runId,
+      // 归属会话:切走时离屏保活、切回按它过滤重挂(retireLiveRunsForSwitch)。
+      sessionId: String(options.sessionId || state.viewSessionId || ""),
       turnId: options.turnId || null,
       userText: options.userText || "",
       userAttachments: Array.isArray(options.userAttachments) ? options.userAttachments : [],
@@ -6381,6 +6546,8 @@
 
   function ensureLiveUser(live, content) {
     if (!live || live.userRendered) return;
+    // 离屏 live 不往当前时间线插用户消息;切回时落库回合会带上它。
+    if (!liveViewed(live)) return;
     const text = String(content || live.userText || "");
     if (!text.trim() && !live.userAttachments.length) return;
     live.userText = text;
@@ -6458,7 +6625,7 @@
     const indicator = createTypingIndicator();
     live.blocks.appendChild(indicator);
     live.typing = indicator;
-    contentAdded();
+    contentAdded(live);
   }
 
   // 只要这个视图里有回合在跑就转，与是正文、推理还是工具无关。
@@ -6508,7 +6675,9 @@
     live.article.dataset.segmentKind = kind;
     const key = String(live.turnId);
     const list = state.finishedTurnArticles.get(key) || [];
-    list.push({ kind, article: live.article });
+    // sessionId 随存:重建时的清理只能剪本会话的存档(离屏完成的轮要留到
+    // 用户切回它的会话时复用)。
+    list.push({ kind, article: live.article, sessionId: live.sessionId || "" });
     state.finishedTurnArticles.set(key, list);
   }
 
@@ -6555,9 +6724,13 @@
 
   function ensureLiveArticle(live) {
     if (live.article) return live.article;
-    ensureTimelineVisible();
-    ensureLiveUser(live, live.userText);
-    removeRunningStatus(live.turnId);
+    // 离屏 live 的气泡建成游离节点继续吃事件,切回时 reattach 挂载。
+    const viewed = liveViewed(live);
+    if (viewed) {
+      ensureTimelineVisible();
+      ensureLiveUser(live, live.userText);
+      removeRunningStatus(live.turnId);
+    }
     const article = document.createElement("article");
     article.className = "message assistant-message live-assistant";
     article.dataset.role = "assistant";
@@ -6585,11 +6758,13 @@
     stop.appendChild(makeIconSlot("stop-square"));
     stop.addEventListener("click", () => cancelLiveRun(live));
     header.append(avatar, identity);
-    for (const existing of elements.liveStopRail.querySelectorAll(".live-stop-button")) {
-      if (existing.dataset.runId === live.runId) existing.remove();
+    if (viewed) {
+      for (const existing of elements.liveStopRail.querySelectorAll(".live-stop-button")) {
+        if (existing.dataset.runId === live.runId) existing.remove();
+      }
+      elements.liveStopRail.appendChild(stop);
+      elements.liveStopRail.hidden = false;
     }
-    elements.liveStopRail.appendChild(stop);
-    elements.liveStopRail.hidden = false;
     const assistantContent = document.createElement("div");
     assistantContent.className = "assistant-content is-slim";
     const blocks = document.createElement("div");
@@ -6614,7 +6789,7 @@
     streamRail.className = "assistant-stream-rail";
     streamRail.hidden = true;
     article.append(header, bubble, meta, streamRail);
-    elements.timeline.appendChild(article);
+    if (viewed) elements.timeline.appendChild(article);
     live.article = article;
     live.blocks = blocks;
     live.headerStatus = status;
@@ -6624,7 +6799,7 @@
     live.copyButton = copy;
     live.streamRail = streamRail;
     updateLiveStopButton(live);
-    contentAdded();
+    contentAdded(live);
     return article;
   }
 
@@ -6637,7 +6812,7 @@
     block.renderFrame = window.requestAnimationFrame(() => {
       block.renderFrame = null;
       renderMarkdown(block.element, block.raw);
-      contentAdded();
+      contentAdded(block.element);
     });
   }
 
@@ -6666,7 +6841,7 @@
     } else {
       scheduleMarkdownRender(live.currentText);
     }
-    contentAdded();
+    contentAdded(live);
   }
 
   function resetSupersededGeneration(live) {
@@ -6785,7 +6960,7 @@
       reasoning.raw += delta;
       reasoning.body.textContent = reasoning.raw;
       live.assistantReasoning = collectLiveReasoning(live);
-      contentAdded();
+      contentAdded(live);
       return;
     }
     if (name === "reasoning.part_end") {
@@ -6837,9 +7012,10 @@
   function toolSubject(name, value) {
     const args = parsedToolArguments(value);
     const toolName = String(name || "");
-    if (toolName === "run_command") {
+    if (toolName === "run_command" || toolName === "Bash") {
       const line = compactLine(args.command || args.cmd);
-      return args.background === true ? `[后台] ${line}` : line;
+      const background = args.background === true || args.run_in_background === true;
+      return background ? `[后台] ${line}` : line;
     }
     if (toolName === "read_file") {
       const path = compactPath(args.path);
@@ -6938,7 +7114,7 @@
     const card = document.createElement("section");
     card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
     const name = String(call?.name || "");
-    if (name === "run_command") card.classList.add("is-command");
+    if (name === "run_command" || name === "Bash") card.classList.add("is-command");
     if (name === "task") card.classList.add("is-task");
     // 图标配色来自 is-success（金）/ is-failure（红）。两个都不加会退回默认色，
     // 看起来就是「颜色不对」。
@@ -7062,7 +7238,7 @@
     tool.outputRenderFrame = window.requestAnimationFrame(() => {
       tool.outputRenderFrame = null;
       renderCommandOutputPreview(tool);
-      contentAdded();
+      contentAdded(tool.card);
     });
   }
 
@@ -7070,7 +7246,7 @@
   // 未列家族回落扳手。全部 lucide 线稿,无 emoji。
   function toolIconName(name) {
     const n = String(name || "");
-    if (["run_command", "job_status", "job_stop"].includes(n)) return "terminal";
+    if (["run_command", "Bash", "job_status", "job_stop"].includes(n)) return "terminal";
     if (["web_search", "web_fetch", "search_web", "webfetch"].includes(n)) return "globe";
     if (n === "search_web_images") return "image-search";
     if (n === "apply_patch" || n === "apply_artifact_patch") return "square-pen";
@@ -7111,7 +7287,7 @@
     const card = document.createElement("section");
     card.className = state.toolExpanded ? "tool-card" : "tool-card collapsed";
     card.dataset.toolId = toolId;
-    const isCommand = String(data?.name || "") === "run_command";
+    const isCommand = ["run_command", "Bash"].includes(String(data?.name || ""));
     if (isCommand) card.classList.add("is-command");
     const isTask = String(data?.name || "") === "task" || /^task[:：]/i.test(String(data?.display_name || ""));
     if (isTask) card.classList.add("is-task");
@@ -7230,7 +7406,7 @@
     live.tools.set(toolId, tool);
     live.blocks.appendChild(card);
     syncBubbleWidth(live.article);
-    contentAdded();
+    contentAdded(live);
     return tool;
   }
 
@@ -7254,7 +7430,7 @@
     live.preparingTool.remove();
     live.preparingTool = null;
     stopPreparingTimer(live);
-    contentAdded();
+    contentAdded(live);
   }
 
   function stopPreparingTimer(live) {
@@ -7309,7 +7485,7 @@
     renderPreparingLabel(live);
     live.preparingTimer = window.setInterval(() => renderPreparingLabel(live), 200);
     syncBubbleWidth(live.article);
-    contentAdded();
+    contentAdded(live);
   }
 
   function handleToolEvent(name, live, data) {
@@ -7465,7 +7641,7 @@
         tool.head.setAttribute("aria-expanded", "false");
       }
     }
-    contentAdded();
+    contentAdded(live);
   }
 
   function questionHasAnswer(questionState, index = questionState.pageIndex) {
@@ -7631,7 +7807,7 @@
     renderQuestionAnswerSummary(questionState, answers);
     moveQuestionToTimeline(questionState);
     updateControlState();
-    contentAdded();
+    contentAdded(questionState.card);
   }
 
   function markQuestionClosed(questionState) {
@@ -7649,7 +7825,7 @@
     updateControlState();
     showToast("回答界面已关闭");
     if (restoreFocus) window.requestAnimationFrame(focusComposerIfDesktop);
-    contentAdded();
+    contentAdded(questionState.card);
   }
 
   async function closeQuestion(questionState) {
@@ -7950,12 +8126,13 @@
       submitQuestion(questionState);
     });
     live.questions.set(questionId, questionState);
-    elements.questionDock.appendChild(card);
+    // 离屏 live 的问题卡先游离,切回时 reattachLiveArticles 归位。
+    if (liveViewed(live)) elements.questionDock.appendChild(card);
     updateQuestionDock();
     setQuestionPage(questionState, 0);
     updateQuestionOptionClasses(questionState);
     updateControlState();
-    contentAdded();
+    contentAdded(live);
     return questionState;
   }
 
@@ -7995,7 +8172,7 @@
     live.blocks.appendChild(block);
     syncBubbleWidth(live.article);
     live.contextOperation = operation;
-    contentAdded();
+    contentAdded(live);
     return operation;
   }
 
@@ -8022,7 +8199,7 @@
       operation.output.hidden = false;
       live.contextOperation = null;
     }
-    contentAdded();
+    contentAdded(live);
   }
 
   function jobStatusDisplay(status) {
@@ -8233,7 +8410,7 @@
     live.questions = new Map();
     live.contextOperation = null;
     showTypingIndicator(live);
-    contentAdded();
+    contentAdded(live);
   }
 
   function updateLocalTurnFromLive(live, terminalStatus, data) {
@@ -8351,7 +8528,8 @@
       if (live.meta) live.meta.textContent = "";
     }
 
-    updateLocalTurnFromLive(live, kind, data);
+    // 离屏 live 属于别的会话:state.turns 是当前视图的,不能往里塞。
+    if (liveViewed(live)) updateLocalTurnFromLive(live, kind, data);
     // 刚起步就被掐掉的轮（目标编辑打断最常见）：气泡里什么都没有，留着就是
     // 一个空壳。丢弃它，让下面的静默重拉用落库的中断轮接管。
     const emptyCancelled = kind === "cancelled"
@@ -8397,7 +8575,7 @@
     updateRuntimeUsage(data?.usage || null, Boolean(data?.usage_estimated));
     updateConversationChrome();
     updateControlState();
-    contentAdded();
+    contentAdded(live);
     if (state.liveRuns.size === 0) {
       window.requestAnimationFrame(() => {
         if (!state.blocked && !consoleIsOpen()) focusComposerIfDesktop();
@@ -8475,6 +8653,8 @@
 
   async function ensureActiveTurnUser(live, turnId) {
     if (!live || live.userRendered || !turnId) return;
+    // 离屏 live 不补渲用户消息(下面拉的是当前视图的 turns,张冠李戴)。
+    if (!liveViewed(live)) return;
     const existing = state.turns.find((turn) => String(turn?.id) === String(turnId));
     if (existing) {
       live.userText = String(existing.user_content || "");
@@ -8516,6 +8696,7 @@
       // 视图会话里出现的新 run（本端发起、他端发起或重放）都会挂上 live 块。
       // run.started 意味着全新的 turn，不去认领时间线里已有的 running turn。
       live = createLiveForRun(runId, "", {
+        sessionId,
         claimTurn: name !== "run.started",
         operation: String(data?.operation || "create"),
         turnId: String(data?.turn_id || "") || null,

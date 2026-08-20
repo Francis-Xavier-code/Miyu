@@ -143,6 +143,8 @@ pub(super) fn client_over(endpoints: Vec<LlmEndpoint>) -> OpenAiCompatibleClient
         request_timeouts: None,
         max_tokens_override: None,
         request_scope: "chat",
+        claude_code: None,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     }
 }
@@ -167,6 +169,8 @@ pub(super) fn test_client(provider: ProviderConfig) -> OpenAiCompatibleClient {
         request_timeouts: None,
         max_tokens_override: None,
         request_scope: "chat",
+        claude_code: None,
+        claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     }
 }
@@ -191,6 +195,7 @@ pub(super) fn test_paths(root: &std::path::Path) -> MiyuPaths {
 
 pub(super) fn test_provider(id: &str, base_url: &str) -> ProviderConfig {
     ProviderConfig {
+        enabled: true,
         id: id.to_string(),
         display_name: id.to_string(),
         base_url: base_url.to_string(),

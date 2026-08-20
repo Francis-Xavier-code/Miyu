@@ -115,6 +115,10 @@ impl ToolFootprint {
 /// `output` 与该轮模型实际看到的字节一致(超限时是 spill 预览),回放即重现。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolFlowRound {
+    /// 中转(claude-code)侧闭环执行的工具活动:仅供 UI 重绘,**不参与历史
+    /// 回放**(claude 会话自带这些上下文;回放会污染前缀并打断续传)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote: bool,
     #[serde(default)]
     pub assistant_content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +381,8 @@ pub struct SessionRecord {
     pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// 侧栏手动排序键,越小越靠前(v28)。
+    pub sort_key: i64,
 }
 
 #[derive(Debug, Clone)]

@@ -2,6 +2,7 @@ mod anthropic;
 mod builder;
 mod chat;
 mod chat_consume;
+mod claude_code;
 mod variants;
 mod dsml;
 mod endpoints;
@@ -10,6 +11,8 @@ mod lower;
 mod protocol;
 mod sse;
 mod wire;
+use claude_code::ClaudeCodeRuntime;
+pub(crate) use claude_code::forget_claude_code_session;
 use dsml::*;
 use endpoints::*;
 use errors::*;
@@ -89,6 +92,11 @@ pub struct OpenAiCompatibleClient {
     /// "compact", …). Auxiliary callers override it via `with_request_scope`
     /// so cache stats separate the main conversation from side channels.
     request_scope: &'static str,
+    /// claude-code 协议的运行时参数;端点池里没有该协议的端点时为 None。
+    claude_code: Option<Arc<ClaudeCodeRuntime>>,
+    /// 本会话是否 dev 模式(Agent 构造时置位),claude-code 的双四档工具
+    /// 作用域(native_tools/miyu_tools)按它判定。
+    claude_code_dev_mode: bool,
 }
 
 #[derive(Clone, Copy)]

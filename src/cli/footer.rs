@@ -14,6 +14,9 @@ pub(in crate::cli) struct ReplFooterStatus {
     pub(in crate::cli) mixed_models: bool,
     pub(in crate::cli) thinking: Option<String>,
     pub(in crate::cli) token_usage: render::TokenMeter,
+    /// 回合运行中的盲文转轮帧号;None=空闲不显示。随 spinner tick 推进,
+    /// set_footer 的权威覆盖(from_config 构造)自然回落 None。
+    pub(in crate::cli) running_spinner: Option<usize>,
 }
 
 /// Σ is hidden entirely when nothing has been spent yet, so an empty session
@@ -50,6 +53,7 @@ impl ReplFooterStatus {
             provider: provider_id,
             mixed_models,
             thinking: None,
+            running_spinner: None,
             token_usage: render::TokenMeter {
                 session_tokens,
                 context_window: window.map(|(value, _)| value),
@@ -229,14 +233,34 @@ pub(in crate::cli) fn repl_footer_left(
     let thinking = footer.thinking.as_deref().unwrap_or_default();
     let colored_thinking = (!thinking.is_empty()).then(|| primary_footer_text(thinking));
     let colored_thinking = colored_thinking.as_deref().unwrap_or_default();
+    // 回合运行中,模型信息右侧是 Miyu 的声波律动(用户 08-20 选定):五柱
+    // 波浪的高度与亮度随帧流动,颜色跟随模式主色(普通蓝/dev 酒红)。与
+    // 模型信息之间隔三个空格,不进 " · " 序列(用户点名)。
+    let wave = footer
+        .running_spinner
+        .map(|frame| sound_wave_frame(frame, mode == AgentMode::Dev));
+    let with_wave = |text: String| match wave.as_deref() {
+        Some(wave) => format!("{text}   {wave}"),
+        None => text,
+    };
     let provider = format!("\x1b[2m{}\x1b[0m", footer.provider);
     let mode = colored_footer_mode_label(mode);
-    let full = repl_footer_left_parts(&mode, &footer.model, Some(&provider), colored_thinking);
+    let full = with_wave(repl_footer_left_parts(
+        &mode,
+        &footer.model,
+        Some(&provider),
+        colored_thinking,
+    ));
     if visible_width(&full) <= width {
         return full;
     }
 
-    let compact = repl_footer_left_parts(&mode, &footer.model, None, colored_thinking);
+    let compact = with_wave(repl_footer_left_parts(
+        &mode,
+        &footer.model,
+        None,
+        colored_thinking,
+    ));
     if visible_width(&compact) <= width {
         return compact;
     }
@@ -251,7 +275,12 @@ pub(in crate::cli) fn repl_footer_left(
             });
     let model_budget = width.saturating_sub(fixed_width).max(1);
     let model = truncate_display(&footer.model, model_budget);
-    repl_footer_left_parts(&mode, &model, None, colored_thinking)
+    with_wave(repl_footer_left_parts(
+        &mode,
+        &model,
+        None,
+        colored_thinking,
+    ))
 }
 
 pub(in crate::cli) fn repl_footer_left_parts(
@@ -272,6 +301,34 @@ pub(in crate::cli) fn repl_footer_left_parts(
         parts.push(thinking.to_string());
     }
     parts.join(" · ")
+}
+
+/// 声波律动帧:五柱波浪,正弦驱动高度,亮度分 dim/正常/亮 三档主题色。
+/// 每帧相位步进 0.24 rad,配合 80ms 的 footer tick 约每秒 3 rad,与演示稿
+/// 的流速一致。
+pub(in crate::cli) fn sound_wave_frame(frame: usize, dev: bool) -> String {
+    const LEVELS: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+    let (mid, hi) = if dev { ("35", "95") } else { ("34", "94") };
+    let t = frame as f32 * 0.24;
+    let mut out = String::new();
+    for i in 0..5 {
+        let height = ((t - i as f32 * 0.9).sin() + 1.0) / 2.0;
+        let glyph = LEVELS[((height * (LEVELS.len() - 1) as f32) as usize).min(LEVELS.len() - 1)];
+        if height > 0.72 {
+            out.push_str("[1m[");
+            out.push_str(hi);
+        } else if height > 0.35 {
+            out.push_str("[");
+            out.push_str(mid);
+        } else {
+            out.push_str("[2m[");
+            out.push_str(mid);
+        }
+        out.push('m');
+        out.push(glyph);
+        out.push_str("[0m");
+    }
+    out
 }
 
 pub(in crate::cli) fn colored_footer_mode_label(mode: AgentMode) -> String {

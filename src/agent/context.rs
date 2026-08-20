@@ -294,7 +294,9 @@ pub(in crate::agent) fn turn_context_tokens(turn: &crate::state::Turn) -> usize 
     // Fossilized transient tail is replayed with the turn, so count it.
     messages.extend(turn.context_messages.iter().cloned());
     // 与 push_history_turn 同步:有结构化 flow 的回合问答对不再回放。
-    let replay_exchanges: &[crate::question::QuestionExchange] = if turn.tool_flow.is_empty() {
+    // remote 轮(中转侧工具活动)不回放,判定与 push_history_turn 同步。
+    let has_native_flow = turn.tool_flow.iter().any(|round| !round.remote);
+    let replay_exchanges: &[crate::question::QuestionExchange] = if !has_native_flow {
         &turn.question_exchanges
     } else {
         &[]
@@ -323,7 +325,7 @@ pub(in crate::agent) fn turn_context_tokens(turn: &crate::state::Turn) -> usize 
     }
     // 与 push_history_turn 同步:工具轮以原生 tool_calls + tool 输出回放,
     // 漏计 tool_flow 会让 trim/压缩预算对工具密集回合失真数十倍。
-    for round in &turn.tool_flow {
+    for round in turn.tool_flow.iter().filter(|round| !round.remote) {
         push_assistant_message_with_reasoning(
             &mut messages,
             round.assistant_content.clone(),
@@ -356,7 +358,7 @@ pub(in crate::agent) fn turn_context_tokens(turn: &crate::state::Turn) -> usize 
         true,
     );
     // 与 push_history_turn 同步:reports 压扁只在无结构化 flow 时回放。
-    if turn.tool_flow.is_empty() && !turn.tool_reports.is_empty() {
+    if !has_native_flow && !turn.tool_reports.is_empty() {
         messages.push(ChatMessage::turn_context(private_tool_memory(
             &turn.tool_reports,
         )));

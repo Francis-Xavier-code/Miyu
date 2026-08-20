@@ -288,6 +288,10 @@ impl StateStore {
         self.conv_db.rename_session(session_id, name)
     }
 
+    pub fn reorder_sessions(&self, ordered_ids: &[String]) -> Result<()> {
+        self.conv_db.reorder_sessions(ordered_ids)
+    }
+
     pub fn set_session_workspace(&self, session_id: &str, workspace: Option<&str>) -> Result<()> {
         self.conv_db.set_session_workspace(session_id, workspace)
     }

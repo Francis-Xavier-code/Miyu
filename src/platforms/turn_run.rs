@@ -201,6 +201,20 @@ pub(crate) async fn run_platform_turn(
                     .and_then(Value::as_str)
                 {
                     image_assets.push(id.to_string());
+                } else {
+                    // 无 asset 的 tool.image 是资产落库失败/turn 未知的错误
+                    // 事件;静默吞掉=平台图片凭空消失且无迹可查。
+                    let error = data
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    tracing::warn!(
+                        target: "miyu::qq",
+                        run_id = %run_id,
+                        error = %error,
+                        "平台工具图片事件不带资产,已跳过(图片不会投递)"
+                    );
                 }
             }
             "tool.finished" => {

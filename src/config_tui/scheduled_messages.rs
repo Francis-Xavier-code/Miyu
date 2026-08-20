@@ -69,27 +69,11 @@ fn conversation_parts(task: Option<&serde_json::Value>) -> (bool, String) {
     }
 }
 
-/// 先选会话类型（照抄「私聊/群聊专属配置」的交互），再进表单。
-fn select_conversation_kind(stdout: &mut io::Stdout, is_group: bool) -> Result<bool> {
-    let choices = [
-        t("Group chat", "群聊").to_string(),
-        t("Private chat", "私聊").to_string(),
-    ];
-    let current = if is_group { &choices[0] } else { &choices[1] };
-    let selected = select_choice(
-        stdout,
-        t("Conversation type", "会话类型"),
-        current,
-        &choices,
-        "",
-        true,
-    )?;
-    Ok(selected == choices[0])
-}
-
 /// 表单 → 任务 JSON。返回 None 表示用户勾了「移除」。
 /// `group:`/`private:` 前缀由代码拼——让用户手打前缀曾直接撞校验器报错。
-fn task_from_fields(is_group: bool, fields: &[Field]) -> Result<Option<serde_json::Value>> {
+/// 会话类型是表单首项(choices 字段,回车弹菜单)——编辑存量任务不再被
+/// 强制先选一遍类型(用户 08-20 点名)。
+fn task_from_fields(fields: &[Field]) -> Result<Option<serde_json::Value>> {
     if fields
         .last()
         .filter(|field| field.boolean)
@@ -97,7 +81,8 @@ fn task_from_fields(is_group: bool, fields: &[Field]) -> Result<Option<serde_jso
     {
         return Ok(None);
     }
-    let target_id = fields[0].value.trim();
+    let is_group = fields[0].value != t("Private chat", "私聊");
+    let target_id = fields[1].value.trim();
     if target_id.is_empty() || !target_id.bytes().all(|byte| byte.is_ascii_digit()) {
         anyhow::bail!(t(
             "The conversation id must be a plain number (group number or QQ number).",
@@ -114,17 +99,17 @@ fn task_from_fields(is_group: bool, fields: &[Field]) -> Result<Option<serde_jso
     );
     task.insert(
         "times".to_string(),
-        serde_json::json!(field_list(&fields[1].value)),
+        serde_json::json!(field_list(&fields[2].value)),
     );
     task.insert(
         "message".to_string(),
-        serde_json::json!(fields[2].value.trim()),
+        serde_json::json!(fields[3].value.trim()),
     );
-    let days = field_list(&fields[3].value);
+    let days = field_list(&fields[4].value);
     if !days.is_empty() {
         task.insert("days".to_string(), serde_json::json!(days));
     }
-    let account = fields[4].value.trim();
+    let account = fields[5].value.trim();
     if !account.is_empty() {
         let account: i64 = account
             .parse()
@@ -158,8 +143,15 @@ fn task_fields(task: Option<&serde_json::Value>) -> Vec<Field> {
         .and_then(serde_json::Value::as_i64)
         .map(|account| account.to_string())
         .unwrap_or_default();
-    let (_, target_id) = conversation_parts(task);
+    let (is_group, target_id) = conversation_parts(task);
+    let kind_label = if is_group {
+        t("Group chat", "群聊")
+    } else {
+        t("Private chat", "私聊")
+    };
     let mut fields = vec![
+        Field::new(t("Conversation type", "会话类型"), kind_label.to_string())
+            .choices(&[t("Group chat", "群聊"), t("Private chat", "私聊")]),
         Field::new(t("Group number / QQ number", "群号 / QQ 号"), target_id),
         Field::new(
             t("Times (HH:MM, comma separated)", "时间点（HH:MM，逗号分隔）"),
@@ -258,12 +250,10 @@ pub(in crate::config_tui) fn edit_scheduled_messages(
                     write_back(stdout, config, !enabled, tasks)?;
                 } else if selected <= tasks.len() {
                     let index = selected - 1;
-                    let (current_is_group, _) = conversation_parts(tasks.get(index));
-                    let is_group = select_conversation_kind(stdout, current_is_group)?;
                     let mut fields = task_fields(tasks.get(index));
                     if run_form(stdout, t(" EDIT TASK ", " 编辑任务 "), &mut fields)? {
                         let mut tasks = tasks;
-                        match task_from_fields(is_group, &fields) {
+                        match task_from_fields(&fields) {
                             Ok(Some(task)) => tasks[index] = task,
                             Ok(None) => {
                                 tasks.remove(index);
@@ -276,10 +266,9 @@ pub(in crate::config_tui) fn edit_scheduled_messages(
                         write_back(stdout, config, enabled, tasks)?;
                     }
                 } else {
-                    let is_group = select_conversation_kind(stdout, true)?;
                     let mut fields = task_fields(None);
                     if run_form(stdout, t(" ADD TASK ", " 新增任务 "), &mut fields)? {
-                        match task_from_fields(is_group, &fields) {
+                        match task_from_fields(&fields) {
                             Ok(Some(task)) => {
                                 let mut tasks = tasks;
                                 tasks.push(task);
@@ -312,11 +301,12 @@ mod tests {
         let (is_group, _) = conversation_parts(Some(&task));
         assert!(is_group);
         let fields = task_fields(Some(&task));
-        assert_eq!(fields[0].value, "123");
-        assert_eq!(fields[1].value, "08:30,21:00");
-        assert_eq!(fields[3].value, "mon,fri");
-        assert_eq!(fields[4].value, "10001");
-        let rebuilt = task_from_fields(is_group, &fields).unwrap().unwrap();
+        assert_eq!(fields[0].value, t("Group chat", "群聊"));
+        assert_eq!(fields[1].value, "123");
+        assert_eq!(fields[2].value, "08:30,21:00");
+        assert_eq!(fields[4].value, "mon,fri");
+        assert_eq!(fields[5].value, "10001");
+        let rebuilt = task_from_fields(&fields).unwrap().unwrap();
         assert_eq!(rebuilt, task);
     }
 
@@ -329,15 +319,16 @@ mod tests {
         assert!(!is_group);
         assert_eq!(target_id, "10001");
         let fields = task_fields(Some(&task));
-        assert_eq!(fields[0].value, "10001");
-        let rebuilt = task_from_fields(is_group, &fields).unwrap().unwrap();
+        assert_eq!(fields[0].value, t("Private chat", "私聊"));
+        assert_eq!(fields[1].value, "10001");
+        let rebuilt = task_from_fields(&fields).unwrap().unwrap();
         assert_eq!(rebuilt, task);
 
         let mut bad = task_fields(Some(&task));
-        bad[0].value = "not-a-number".to_string();
-        assert!(task_from_fields(false, &bad).is_err());
-        bad[0].value = "".to_string();
-        assert!(task_from_fields(false, &bad).is_err());
+        bad[1].value = "not-a-number".to_string();
+        assert!(task_from_fields(&bad).is_err());
+        bad[1].value = "".to_string();
+        assert!(task_from_fields(&bad).is_err());
     }
 
     #[test]
@@ -347,19 +338,20 @@ mod tests {
         });
         let mut fields = task_fields(Some(&task));
         fields.last_mut().unwrap().value = "true".to_string();
-        assert!(task_from_fields(true, &fields).unwrap().is_none());
+        assert!(task_from_fields(&fields).unwrap().is_none());
     }
 
     #[test]
     fn optional_fields_are_omitted_when_empty() {
         let fields = vec![
+            Field::new("kind", t("Private chat", "私聊").to_string()),
             Field::new("id", "9".to_string()),
             Field::new("t", "07:15".to_string()),
             Field::new("m", "hello".to_string()),
             Field::new("d", "".to_string()),
             Field::new("a", "".to_string()),
         ];
-        let task = task_from_fields(false, &fields).unwrap().unwrap();
+        let task = task_from_fields(&fields).unwrap().unwrap();
         assert_eq!(
             task,
             serde_json::json!({ "conversation": "private:9", "times": ["07:15"], "message": "hello" })

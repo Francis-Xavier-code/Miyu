@@ -320,6 +320,7 @@ pub(in crate::agent) fn derive_tool_flow(
                 .filter(|calls| !calls.is_empty())
             {
                 rounds.push(crate::state::ToolFlowRound {
+                    remote: false,
                     assistant_content: chat_message_text(message).unwrap_or_default(),
                     assistant_reasoning: message
                         .reasoning_content

@@ -111,6 +111,12 @@ pub(in crate::cli) struct LiveReplTail {
     /// 每次 RoundUsage 事件都从基线重新叠加,避免累计值重复相加;
     /// 任何权威更新(set_footer)都会清掉它。
     pub(in crate::cli) round_base_footer: Option<Box<ReplFooterStatus>>,
+    /// footer 行相对 tail_start 的偏移(每次输入区渲染时更新)。存偏移而非
+    /// 绝对行:apply_output_frame 用 \x1b[L/M 整体平移 tail 时不重画,绝对
+    /// 行号会过期——tick 在旧行覆写就画出第二份 footer(孤儿),取消回合后
+    /// 那行永远没人清(用户 08-20 截图实锤)。
+    pub(in crate::cli) footer_offset: Option<u16>,
+    pub(in crate::cli) footer_spinner_last: Option<std::time::Instant>,
     pub(in crate::cli) jobs: Vec<crate::tools::jobs::JobOverview>,
     pub(in crate::cli) job_spinner: usize,
     pub(in crate::cli) output_cursor: (u16, u16),
@@ -487,6 +493,8 @@ impl LiveReplTail {
             pending_chunks: Vec::new(),
             footer,
             round_base_footer: None,
+            footer_offset: None,
+            footer_spinner_last: None,
             jobs: Vec::new(),
             job_spinner: 0,
             output_cursor: cursor_position_or((0, 0)),
@@ -506,6 +514,36 @@ impl LiveReplTail {
     pub(in crate::cli) fn set_footer(&mut self, footer: ReplFooterStatus) {
         self.footer = footer;
         self.round_base_footer = None;
+        self.footer_spinner_last = None;
+    }
+
+    /// 回合收尾:熄掉运行转轮并原地重绘 footer 行(不整帧重绘)。
+    pub(in crate::cli) fn stop_footer_spinner(&mut self) -> Result<()> {
+        if self.footer.running_spinner.take().is_none() {
+            return Ok(());
+        }
+        self.footer_spinner_last = None;
+        let Some(offset) = self.footer_offset else {
+            return Ok(());
+        };
+        let row = self.tail_start.saturating_add(offset);
+        if !self.rendered {
+            return Ok(());
+        }
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        if row >= rows {
+            return Ok(());
+        }
+        let line =
+            crate::cli::footer::repl_footer_line(self.editor.mode, &self.footer, usize::from(cols));
+        let input_cursor = self.input_cursor;
+        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+            let mut stdout = io::stdout();
+            queue!(stdout, MoveTo(0, row), Print(line))?;
+            queue!(stdout, MoveTo(input_cursor.0, input_cursor.1))?;
+            stdout.flush()?;
+            Ok(())
+        })
     }
 
     /// 回合内一次模型请求结束:用基线+回合累计刷新计量并立即重绘。
@@ -521,6 +559,8 @@ impl LiveReplTail {
             .get_or_insert_with(|| Box::new(self.footer.clone()));
         let mut display = (**base).clone();
         display.apply_round_usage(context_tokens, turn);
+        // 基线快照拍于回合开始(转轮未起),别让计量刷新把转轮拍灭。
+        display.running_spinner = self.footer.running_spinner;
         self.footer = display;
         if self.rendered && !self.external_output_active {
             synchronized_terminal_update(CursorAfterUpdate::Shown, || self.redraw())?;
@@ -592,7 +632,47 @@ impl LiveReplTail {
     ) -> Result<()> {
         self.flush_pending_chunks(renderer)?;
         renderer.tick_spinner()?;
-        self.apply_renderer_frame(renderer)
+        self.apply_renderer_frame(renderer)?;
+        self.tick_footer_spinner()
+    }
+
+    /// footer 里的运行转轮:单行覆写(footer 行全宽 padding,直接盖不闪),
+    /// 33ms 的 spinner tick 上节流到 ~80ms 一帧。
+    pub(in crate::cli) fn tick_footer_spinner(&mut self) -> Result<()> {
+        if !self.rendered || self.external_output_active {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        if self
+            .footer_spinner_last
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(80))
+        {
+            return Ok(());
+        }
+        self.footer_spinner_last = Some(now);
+        self.footer.running_spinner =
+            Some(self.footer.running_spinner.map_or(0, |f| f.wrapping_add(1)));
+        let Some(offset) = self.footer_offset else {
+            return Ok(());
+        };
+        let row = self.tail_start.saturating_add(offset);
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        if row >= rows {
+            return Ok(());
+        }
+        let line = crate::cli::footer::repl_footer_line(
+            self.editor.mode,
+            &self.footer,
+            usize::from(cols),
+        );
+        let input_cursor = self.input_cursor;
+        synchronized_terminal_update(CursorAfterUpdate::Preserve, || {
+            let mut stdout = io::stdout();
+            queue!(stdout, MoveTo(0, row), Print(line))?;
+            queue!(stdout, MoveTo(input_cursor.0, input_cursor.1))?;
+            stdout.flush()?;
+            Ok(())
+        })
     }
 
 }

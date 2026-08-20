@@ -185,6 +185,7 @@ impl Agent {
         }
         let mut tool_flow = derive_tool_flow(&messages, replay_start);
         prune_tool_flow(&mut tool_flow, &self.config.context);
+        self.append_remote_tool_flow(&mut tool_flow);
         if !tool_flow.is_empty() {
             self.state.set_turn_tool_flow(&turn_id, &tool_flow)?;
         }

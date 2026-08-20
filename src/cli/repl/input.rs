@@ -132,8 +132,11 @@ pub(in crate::cli) fn read_live_repl_input(
                     }
                     let mode = live.mode();
                     synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-                        live.commit_submission(&submission)
+                        live.commit_submission_render(&submission)
                     })?;
+                    // 光标位置查询在同步块外做:块内等终端应答会撑破 kitty
+                    // 的同步超时,半成品帧(光标在屏幕底部)被提前提交。
+                    live.commit_submission_finalize();
                     raw.keep_cursor_hidden();
                     return Ok(LiveReplOutcome::Submit(
                         mode,
@@ -694,7 +697,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
     is_pasted: bool,
     footer: &ReplFooterStatus,
     show_shortcut_hint: bool,
-) -> Result<()> {
+) -> Result<Option<u16>> {
     let suggestions = repl_command_suggestions(input);
     let lines = repl_input_lines(input);
     let prompt_prefix = input_prompt_bar(mode);
@@ -724,6 +727,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
         )?;
     }
     let mut row_offset = 0u16;
+    let footer_row;
     queue!(stdout, MoveTo(0, *input_row), Print(&prompt_prefix))?;
     row_offset = row_offset.saturating_add(1);
     for line in &display_rows {
@@ -749,7 +753,9 @@ pub(in crate::cli) fn render_repl_input_with_footer(
                 repl_command_suggestions_line(&suggestions, suggestion_width)
             ))
         )?;
+        footer_row = None;
     } else {
+        footer_row = Some((*input_row).saturating_add(row_offset));
         queue!(
             stdout,
             MoveTo(0, (*input_row).saturating_add(row_offset)),
@@ -790,7 +796,7 @@ pub(in crate::cli) fn render_repl_input_with_footer(
     )?;
     stdout.flush()?;
     *rendered_rows = current_rows;
-    Ok(())
+    Ok(footer_row)
 }
 
 pub(in crate::cli) fn move_after_repl_input(

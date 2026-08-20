@@ -162,6 +162,17 @@ impl AppConfig {
                 self.providers.push(provider);
             }
         }
+        // Claude Code 恒置顶(用户拍板的列表次序);存量配置若排在后面搬到最前。
+        if let Some(position) = self
+            .providers
+            .iter()
+            .position(ProviderConfig::is_claude_code)
+        {
+            if position != 0 {
+                let provider = self.providers.remove(position);
+                self.providers.insert(0, provider);
+            }
+        }
         if self.active_provider == "opencodezen" {
             self.active_provider = OPENCODE_PROVIDER_ID.to_string();
         }
@@ -299,7 +310,8 @@ impl AppConfig {
             if !provider_ids.insert(provider.id.as_str()) {
                 bail!("duplicate provider id: {}", provider.id);
             }
-            if provider.base_url.trim().is_empty() {
+            // Claude Code 特殊供应商的传输层是本机 CLI 子进程,没有 URL 概念。
+            if provider.base_url.trim().is_empty() && !provider.is_claude_code() {
                 bail!("provider {} base_url cannot be empty", provider.id);
             }
         }

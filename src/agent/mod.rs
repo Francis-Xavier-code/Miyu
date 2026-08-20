@@ -274,6 +274,10 @@ pub struct Agent {
     /// idle cache-keepalive pings (v7 DeepSeek 高命中策略). Only populated
     /// while `cache.keepalive_seconds > 0`.
     last_request_snapshot: Option<(Vec<ChatMessage>, Vec<crate::llm::ToolDefinition>)>,
+    /// 中转(claude-code)侧闭环执行的工具活动,随回合收集、持久化成
+    /// remote 标记的 ToolFlowRound(仅供 UI 重绘,不回放)。Mutex 只为在
+    /// llm future 借用 self.client 期间也能从事件泵写入。
+    pending_remote_tool_calls: std::sync::Mutex<Vec<crate::state::ToolFlowCall>>,
     /// 上一条真实请求最终落在哪个 endpoint(provider_id, model):keepalive
     /// ping 必须钉住同一缓存域,轮转调度下打到别家=白花钱不保温
     /// (deepseek 报告 P2)。

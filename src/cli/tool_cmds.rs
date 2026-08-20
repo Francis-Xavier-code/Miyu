@@ -42,6 +42,7 @@ pub(in crate::cli) async fn run_tool_call(paths: &MiyuPaths, args: ToolCallArgs)
                 IpcCommand::ToolCatalog {
                     session,
                     name: args.describe.then(|| args.name.clone()).flatten(),
+                    full: false,
                 },
             )
             .await?;

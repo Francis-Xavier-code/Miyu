@@ -9,6 +9,7 @@ mod ask_question;
 mod awacy_query;
 mod calculator;
 mod caniplayonlinux_query;
+mod claude_code;
 mod clipboard;
 mod deep_research;
 mod deepseek_status;
@@ -199,7 +200,7 @@ pub fn preparing_phase(name: &str) -> Option<&'static str> {
         "trash_path" => t("Preparing delete", "准备删除"),
         // A subagent brief is long, and its own timed block only appears once
         // the arguments have all arrived.
-        "task" | "deep_research" => t("Preparing task", "准备任务"),
+        "task" | "deep_research" | "claude_code" => t("Preparing task", "准备任务"),
         "ask_question" => t("Preparing question", "准备问题"),
         // 整张清单都在参数里,条目一多就是几百字节,和批量删是同一个窗口。
         "todowrite" => t("Preparing list", "准备清单"),
@@ -227,6 +228,7 @@ fn builtin_readable_tool_name(name: &str) -> Option<&'static str> {
         "present_artifact" => t("Preview file", "预览文件"),
         "ask_question" => t("Ask user", "询问用户"),
         "task" => t("Subagent", "子代理"),
+        "claude_code" => t("Claude Code", "Claude Code"),
         "read_file" => t("Read file", "读取文件"),
         "write_file" => t("Write file", "写入文件"),
         "edit_file" => t("Edit file", "编辑文件"),
@@ -448,6 +450,11 @@ pub fn builtin_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
     if config.memory_config().enabled {
         memory::register(&mut registry, config.clone(), paths.clone());
     }
+    // 只进本机 owner 底座;平台受限表不注册,turn 装配层对复用 normal 底座
+    // 的平台管理员会话再摘一次(§09)。
+    if config.claude_code_enabled() {
+        claude_code::register(&mut registry, config.plugins.claude_code.clone(), paths.clone());
+    }
     let task_tools = registry.clone();
     task::register(&mut registry, config.clone(), paths.clone(), task_tools);
     scripts::register(&mut registry, paths);
@@ -573,6 +580,10 @@ pub fn dev_registry(config: &AppConfig, paths: &MiyuPaths) -> ToolRegistry {
         // dev 独立记忆:同一套工具,库切到保留人格 "dev" 的命名空间,
         // 与默认人格的记忆互不可见(验收问题一:开发模式也要有记忆)。
         memory::register(&mut registry, config.dev_scoped(), paths.clone());
+    }
+    // dev 本来就只有 owner 面,照常随插件开关注册(§09)。
+    if config.claude_code_enabled() {
+        claude_code::register(&mut registry, config.plugins.claude_code.clone(), paths.clone());
     }
     let task_tools = registry.clone();
     task::register(&mut registry, config.clone(), paths.clone(), task_tools);

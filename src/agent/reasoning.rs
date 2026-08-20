@@ -197,6 +197,59 @@ where
             }
             on_event(AgentEvent::Chunk(chunk))?;
         }
+        // 中转侧闭环执行的工具活动:翻成标准卡片事件。执行不在 Miyu 的
+        // 回合循环里,started/finished 都由流侧给,不产生本地执行。
+        ChatStreamKind::RemoteToolStarted => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&chunk.text) {
+                let text_of = |key: &str| {
+                    value
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                on_event(AgentEvent::ToolCall {
+                    call_id: text_of("id"),
+                    name: text_of("name"),
+                    arguments: value
+                        .get("input")
+                        .map(|input| input.to_string())
+                        .unwrap_or_default(),
+                })?;
+            }
+        }
+        ChatStreamKind::RemoteToolFinished => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&chunk.text) {
+                let text_of = |key: &str| {
+                    value
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let name = text_of("name");
+                let output = text_of("output");
+                // 原生 Bash 的输出走命令输出块(与 run_command 同一渲染路),
+                // 否则 REPL 摘要只有一行 ok,命令打了什么全看不见。
+                if name == "Bash" && !output.is_empty() {
+                    on_event(AgentEvent::CommandOutput {
+                        call_id: text_of("id"),
+                        name: name.clone(),
+                        stream: crate::tools::CommandOutputStream::Stdout,
+                        chunk: output.clone().into_bytes(),
+                    })?;
+                }
+                on_event(AgentEvent::ToolResult {
+                    call_id: text_of("id"),
+                    name,
+                    ok: value
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                    output,
+                })?;
+            }
+        }
         ChatStreamKind::Reasoning => {
             let (title, text) = filter.push(&chunk.text);
             if let Some(title) = title {
