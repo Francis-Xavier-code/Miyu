@@ -54,9 +54,11 @@ impl LiveReplTail {
         submission: &LiveSubmission,
     ) -> Result<()> {
         self.suspend()?;
-        write_committed_user_messages(
+        // suspend 已把光标 MoveTo(output_cursor):列已知,块内零查询。
+        write_committed_user_messages_from(
             &[(submission.display_content.as_str(), self.editor.mode)],
             true,
+            Some(self.output_cursor.0),
         )?;
         Ok(())
     }

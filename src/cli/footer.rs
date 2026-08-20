@@ -232,24 +232,35 @@ pub(in crate::cli) fn repl_footer_left(
 ) -> String {
     let thinking = footer.thinking.as_deref().unwrap_or_default();
     let colored_thinking = (!thinking.is_empty()).then(|| primary_footer_text(thinking));
-    let mut colored_thinking = colored_thinking.unwrap_or_default();
+    let colored_thinking = colored_thinking.as_deref().unwrap_or_default();
     // 回合运行中,模型信息右侧是 Miyu 的声波律动(用户 08-20 选定):五柱
-    // 波浪的高度与亮度随帧流动,颜色跟随模式主色(普通蓝/dev 酒红)。
-    if let Some(frame) = footer.running_spinner {
-        if !colored_thinking.is_empty() {
-            colored_thinking.push(' ');
-        }
-        colored_thinking.push_str(&sound_wave_frame(frame, mode == AgentMode::Dev));
-    }
-    let colored_thinking = colored_thinking.as_str();
+    // 波浪的高度与亮度随帧流动,颜色跟随模式主色(普通蓝/dev 酒红)。与
+    // 模型信息之间隔三个空格,不进 " · " 序列(用户点名)。
+    let wave = footer
+        .running_spinner
+        .map(|frame| sound_wave_frame(frame, mode == AgentMode::Dev));
+    let with_wave = |text: String| match wave.as_deref() {
+        Some(wave) => format!("{text}   {wave}"),
+        None => text,
+    };
     let provider = format!("\x1b[2m{}\x1b[0m", footer.provider);
     let mode = colored_footer_mode_label(mode);
-    let full = repl_footer_left_parts(&mode, &footer.model, Some(&provider), colored_thinking);
+    let full = with_wave(repl_footer_left_parts(
+        &mode,
+        &footer.model,
+        Some(&provider),
+        colored_thinking,
+    ));
     if visible_width(&full) <= width {
         return full;
     }
 
-    let compact = repl_footer_left_parts(&mode, &footer.model, None, colored_thinking);
+    let compact = with_wave(repl_footer_left_parts(
+        &mode,
+        &footer.model,
+        None,
+        colored_thinking,
+    ));
     if visible_width(&compact) <= width {
         return compact;
     }
@@ -264,7 +275,12 @@ pub(in crate::cli) fn repl_footer_left(
             });
     let model_budget = width.saturating_sub(fixed_width).max(1);
     let model = truncate_display(&footer.model, model_budget);
-    repl_footer_left_parts(&mode, &model, None, colored_thinking)
+    with_wave(repl_footer_left_parts(
+        &mode,
+        &model,
+        None,
+        colored_thinking,
+    ))
 }
 
 pub(in crate::cli) fn repl_footer_left_parts(

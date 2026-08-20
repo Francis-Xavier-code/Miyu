@@ -111,8 +111,11 @@ pub(in crate::cli) struct LiveReplTail {
     /// 每次 RoundUsage 事件都从基线重新叠加,避免累计值重复相加;
     /// 任何权威更新(set_footer)都会清掉它。
     pub(in crate::cli) round_base_footer: Option<Box<ReplFooterStatus>>,
-    /// footer 行的屏幕行号(每次输入区渲染时更新),运行转轮单行覆写用。
-    pub(in crate::cli) footer_row: Option<u16>,
+    /// footer 行相对 tail_start 的偏移(每次输入区渲染时更新)。存偏移而非
+    /// 绝对行:apply_output_frame 用 \x1b[L/M 整体平移 tail 时不重画,绝对
+    /// 行号会过期——tick 在旧行覆写就画出第二份 footer(孤儿),取消回合后
+    /// 那行永远没人清(用户 08-20 截图实锤)。
+    pub(in crate::cli) footer_offset: Option<u16>,
     pub(in crate::cli) footer_spinner_last: Option<std::time::Instant>,
     pub(in crate::cli) jobs: Vec<crate::tools::jobs::JobOverview>,
     pub(in crate::cli) job_spinner: usize,
@@ -490,7 +493,7 @@ impl LiveReplTail {
             pending_chunks: Vec::new(),
             footer,
             round_base_footer: None,
-            footer_row: None,
+            footer_offset: None,
             footer_spinner_last: None,
             jobs: Vec::new(),
             job_spinner: 0,
@@ -520,9 +523,10 @@ impl LiveReplTail {
             return Ok(());
         }
         self.footer_spinner_last = None;
-        let Some(row) = self.footer_row else {
+        let Some(offset) = self.footer_offset else {
             return Ok(());
         };
+        let row = self.tail_start.saturating_add(offset);
         if !self.rendered {
             return Ok(());
         }
@@ -648,9 +652,10 @@ impl LiveReplTail {
         self.footer_spinner_last = Some(now);
         self.footer.running_spinner =
             Some(self.footer.running_spinner.map_or(0, |f| f.wrapping_add(1)));
-        let Some(row) = self.footer_row else {
+        let Some(offset) = self.footer_offset else {
             return Ok(());
         };
+        let row = self.tail_start.saturating_add(offset);
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         if row >= rows {
             return Ok(());

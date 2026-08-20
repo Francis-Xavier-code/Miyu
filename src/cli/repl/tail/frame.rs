@@ -173,7 +173,7 @@ impl LiveReplTail {
             &self.footer,
             false,
         )?;
-        self.footer_row = footer_row;
+        self.footer_offset = footer_row.map(|abs| abs.saturating_sub(tail_start));
         // The editor is back on screen: the cursor must be visible no
         // matter which path hid it (e.g. a question prompt suspended the
         // editor with the cursor hidden and then exited early). This is
