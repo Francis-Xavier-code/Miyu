@@ -3591,10 +3591,13 @@
   async function openFallbackSessionView(excludedSessionId) {
     const excluded = String(excludedSessionId || "");
     if (state.viewSessionId !== excluded) return;
-    // deleteSession() 和 session.deleted 事件会各来一次：不去重的话两边
-    // 并发各建一个新会话，删一个凭空多出两个。
-    if (state.fallbackInFlight) return;
+    // deleteSession() 和 session.deleted 事件会各来一次，且到达可能有先后：
+    // 只防并发的旗标挡不住"第一次兜底完成后第二次才到"的时序，两边各建一个
+    // 新会话，删一个凭空多出两个。按被删会话 id 上一次性闩锁：同一场删除，
+    // 兜底只发生一次。
+    if (state.fallbackInFlight || state.fallbackDoneFor === excluded) return;
     state.fallbackInFlight = true;
+    state.fallbackDoneFor = excluded;
     try {
       await openFallbackSessionViewInner(excluded);
     } finally {
@@ -5932,6 +5935,12 @@
       }
       for (const call of Array.isArray(round?.calls) ? round.calls : []) {
         blocks.appendChild(createPersistedToolCard(call));
+        // share_file 的富预览(播放器/图片/下载条)重建:实时靠 tool.finished
+        // 的输出渲染,刷新/切换后从落库的 tool_flow 输出里复原同一份。
+        if (window.MiyuShared?.isShareTool(String(call?.name || ""))) {
+          const shared = window.MiyuShared.renderCard(String(call?.output || ""));
+          if (shared) blocks.appendChild(shared);
+        }
       }
     }
     if (String(reasoning || "").trim() && !reasoningHidden()) {

@@ -9,10 +9,58 @@
  * 单独成文件:app.js 已经九千多行。
  */
 window.MiyuShared = (() => {
-  const KIND_ICON = { video: "🎬", audio: "🎵", image: "🖼", other: "📄" };
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  /*
+   * lucide 图标子集。shared.js 先于 app.js 加载,拿不到那边的 createIcon,
+   * 所以这里自带一份同风格的小表(path 数据同 lucide,24 viewBox / stroke 2)。
+   */
+  const ICONS = {
+    music: [["path", { d: "M9 18V5l12-2v13" }], ["circle", { cx: "6", cy: "18", r: "3" }], ["circle", { cx: "18", cy: "16", r: "3" }]],
+    film: [["rect", { x: "3", y: "3", width: "18", height: "18", rx: "2" }], ["path", { d: "M7 3v18" }], ["path", { d: "M3 7.5h4" }], ["path", { d: "M3 12h18" }], ["path", { d: "M3 16.5h4" }], ["path", { d: "M17 3v18" }], ["path", { d: "M17 7.5h4" }], ["path", { d: "M17 16.5h4" }]],
+    image: [["rect", { x: "3", y: "3", width: "18", height: "18", rx: "2", ry: "2" }], ["circle", { cx: "9", cy: "9", r: "2" }], ["path", { d: "m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" }]],
+    file: [["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }], ["path", { d: "M14 2v6h6" }]],
+    play: [["polygon", { points: "6 3 20 12 6 21 6 3", fill: "currentColor", stroke: "none" }]],
+    pause: [["rect", { x: "14", y: "4", width: "4", height: "16", rx: "1", fill: "currentColor", stroke: "none" }], ["rect", { x: "6", y: "4", width: "4", height: "16", rx: "1", fill: "currentColor", stroke: "none" }]],
+    download: [["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["polyline", { points: "7 10 12 15 17 10" }], ["line", { x1: "12", x2: "12", y1: "15", y2: "3" }]],
+    "volume-2": [["path", { d: "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z" }], ["path", { d: "M16 9a5 5 0 0 1 0 6" }], ["path", { d: "M19.364 18.364a9 9 0 0 0 0-12.728" }]],
+    "volume-x": [["path", { d: "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z" }], ["line", { x1: "22", x2: "16", y1: "9", y2: "15" }], ["line", { x1: "16", x2: "22", y1: "9", y2: "15" }]],
+    "trash-2": [["path", { d: "M3 6h18" }], ["path", { d: "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" }], ["path", { d: "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" }], ["line", { x1: "10", x2: "10", y1: "11", y2: "17" }], ["line", { x1: "14", x2: "14", y1: "11", y2: "17" }]],
+    "check-square": [["polyline", { points: "9 11 12 14 22 4" }], ["path", { d: "M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" }]]
+  };
+  const KIND_ICON = { video: "film", audio: "music", image: "image", other: "file" };
   const MODE_LABEL = { reference: "引用", snapshot: "快照" };
   let panel = null;
   let listBox = null;
+  /* 多选批量操作:选中集以 share_id 为键,render 时会剔除已不存在的条目。 */
+  const selectedIds = new Set();
+  let currentShares = [];
+  let selectAllButton = null;
+  let downloadSelectedButton = null;
+  let deleteSelectedButton = null;
+
+  function createIcon(name, className = "") {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    if (className) svg.setAttribute("class", className);
+    const definition = ICONS[name] || ICONS.file;
+    for (const [tag, attributes] of definition) {
+      const node = document.createElementNS(SVG_NS, tag);
+      for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+      svg.appendChild(node);
+    }
+    return svg;
+  }
+
+  function kindIcon(kind) {
+    return createIcon(KIND_ICON[kind] || KIND_ICON.other);
+  }
 
   function formatSize(bytes) {
     const value = Number(bytes) || 0;
@@ -24,6 +72,216 @@ window.MiyuShared = (() => {
 
   function downloadUrl(id) {
     return `${location.origin}/api/shared/${encodeURIComponent(id)}?download=1`;
+  }
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return "--:--";
+    const total = Math.floor(seconds);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+    return `${h > 0 ? `${h}:` : ""}${mm}:${String(s).padStart(2, "0")}`;
+  }
+
+  /*
+   * 自定义音频播放器卡片:隐藏原生 <audio>,用 JS 驱动。
+   * 封面音符区 + 文件名/大小/时长 + 播放键 + 可拖进度条 + 静音/音量 + 下载,
+   * 配色全部走主题 token,亮暗两套自动协调。
+   */
+  function buildAudioPlayer(src, fileName, sizeBytes) {
+    const card = document.createElement("div");
+    card.className = "media-audio-card";
+
+    const audio = document.createElement("audio");
+    audio.preload = "metadata";
+    audio.src = src;
+
+    /* ── 头部:封面 + 文件名/元信息 ── */
+    const head = document.createElement("div");
+    head.className = "media-audio-head";
+    const cover = document.createElement("div");
+    cover.className = "media-audio-cover";
+    cover.appendChild(createIcon("music"));
+    const info = document.createElement("div");
+    info.className = "media-audio-info";
+    const name = document.createElement("div");
+    name.className = "media-audio-name";
+    name.textContent = fileName;
+    name.title = fileName;
+    const meta = document.createElement("div");
+    meta.className = "media-audio-meta";
+    const sizeText = formatSize(sizeBytes);
+    meta.textContent = `${sizeText} · --:--`;
+    info.append(name, meta);
+    head.append(cover, info);
+
+    /* ── 控制行:播放 + 时间 + 进度条 + 静音/音量 + 下载 ── */
+    const controls = document.createElement("div");
+    controls.className = "media-audio-controls";
+
+    const playButton = document.createElement("button");
+    playButton.type = "button";
+    playButton.className = "media-audio-play";
+    playButton.title = "播放";
+    playButton.setAttribute("aria-label", "播放");
+    playButton.appendChild(createIcon("play"));
+
+    const timeNow = document.createElement("span");
+    timeNow.className = "media-audio-time";
+    timeNow.textContent = "0:00";
+    const timeTotal = document.createElement("span");
+    timeTotal.className = "media-audio-time";
+    timeTotal.textContent = "--:--";
+
+    const track = document.createElement("div");
+    track.className = "media-audio-track";
+    track.setAttribute("role", "slider");
+    track.setAttribute("tabindex", "0");
+    track.setAttribute("aria-label", "播放进度");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuenow", "0");
+    const fill = document.createElement("div");
+    fill.className = "media-audio-track-fill";
+    track.appendChild(fill);
+
+    const muteButton = document.createElement("button");
+    muteButton.type = "button";
+    muteButton.className = "media-audio-icon-btn";
+    muteButton.title = "静音";
+    muteButton.setAttribute("aria-label", "静音");
+    muteButton.appendChild(createIcon("volume-2"));
+
+    const volume = document.createElement("input");
+    volume.type = "range";
+    volume.className = "media-audio-volume";
+    volume.min = "0";
+    volume.max = "1";
+    volume.step = "0.05";
+    volume.value = "1";
+    volume.title = "音量";
+    volume.setAttribute("aria-label", "音量");
+
+    const downloadLink = document.createElement("a");
+    downloadLink.className = "media-audio-icon-btn";
+    downloadLink.href = `${src}?download=1`;
+    downloadLink.setAttribute("download", fileName);
+    downloadLink.title = "下载";
+    downloadLink.setAttribute("aria-label", "下载");
+    downloadLink.appendChild(createIcon("download"));
+
+    controls.append(playButton, timeNow, track, timeTotal, muteButton, volume, downloadLink);
+    card.append(head, controls, audio);
+
+    /* ── 状态同步 ── */
+    function syncPlayIcon() {
+      const playing = !audio.paused && !audio.ended;
+      playButton.replaceChildren(createIcon(playing ? "pause" : "play"));
+      playButton.title = playing ? "暂停" : "播放";
+      playButton.setAttribute("aria-label", playing ? "暂停" : "播放");
+      card.classList.toggle("is-playing", playing);
+    }
+
+    function syncDuration() {
+      const total = audio.duration;
+      if (Number.isFinite(total) && total > 0) {
+        timeTotal.textContent = formatTime(total);
+        meta.textContent = `${sizeText} · ${formatTime(total)}`;
+        track.setAttribute("aria-valuemax", String(Math.floor(total)));
+        track.classList.remove("is-static");
+      } else {
+        track.classList.add("is-static");
+      }
+    }
+
+    function syncProgress() {
+      const total = audio.duration;
+      const ratio = Number.isFinite(total) && total > 0 ? audio.currentTime / total : 0;
+      fill.style.width = `${(Math.min(Math.max(ratio, 0), 1) * 100).toFixed(2)}%`;
+      timeNow.textContent = formatTime(audio.currentTime);
+      track.setAttribute("aria-valuenow", String(Math.floor(audio.currentTime || 0)));
+      track.setAttribute("aria-valuetext", `${formatTime(audio.currentTime)} / ${timeTotal.textContent}`);
+    }
+
+    function syncVolume() {
+      const muted = audio.muted || audio.volume === 0;
+      muteButton.replaceChildren(createIcon(muted ? "volume-x" : "volume-2"));
+      muteButton.title = muted ? "取消静音" : "静音";
+      muteButton.setAttribute("aria-label", muted ? "取消静音" : "静音");
+      volume.value = String(audio.muted ? 0 : audio.volume);
+    }
+
+    playButton.addEventListener("click", () => {
+      if (audio.paused || audio.ended) audio.play();
+      else audio.pause();
+    });
+    muteButton.addEventListener("click", () => {
+      audio.muted = !audio.muted;
+    });
+    volume.addEventListener("input", () => {
+      audio.volume = Number(volume.value);
+      audio.muted = audio.volume === 0;
+    });
+
+    audio.addEventListener("play", syncPlayIcon);
+    audio.addEventListener("pause", syncPlayIcon);
+    audio.addEventListener("ended", syncPlayIcon);
+    audio.addEventListener("loadedmetadata", () => { syncDuration(); syncProgress(); });
+    audio.addEventListener("durationchange", syncDuration);
+    audio.addEventListener("timeupdate", syncProgress);
+    audio.addEventListener("volumechange", syncVolume);
+    audio.addEventListener("error", () => {
+      meta.textContent = `${sizeText} · 无法加载`;
+      card.classList.add("is-error");
+    });
+
+    /* 进度条:点击/拖动跳转,键盘左右 ±5s。 */
+    function seekToClientX(clientX) {
+      const total = audio.duration;
+      if (!Number.isFinite(total) || total <= 0) return;
+      const rect = track.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+      audio.currentTime = ratio * total;
+      syncProgress();
+    }
+    let dragging = false;
+    track.addEventListener("pointerdown", (event) => {
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
+      dragging = true;
+      track.classList.add("is-scrubbing");
+      track.setPointerCapture(event.pointerId);
+      seekToClientX(event.clientX);
+      event.preventDefault();
+    });
+    track.addEventListener("pointermove", (event) => {
+      if (dragging) seekToClientX(event.clientX);
+    });
+    const stopDrag = (event) => {
+      if (!dragging) return;
+      dragging = false;
+      track.classList.remove("is-scrubbing");
+      if (track.hasPointerCapture(event.pointerId)) track.releasePointerCapture(event.pointerId);
+    };
+    track.addEventListener("pointerup", stopDrag);
+    track.addEventListener("pointercancel", stopDrag);
+    track.addEventListener("keydown", (event) => {
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
+      if (event.key === "ArrowRight" || event.key === "ArrowUp") {
+        audio.currentTime = Math.min(audio.currentTime + 5, audio.duration);
+        event.preventDefault();
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
+        audio.currentTime = Math.max(audio.currentTime - 5, 0);
+        event.preventDefault();
+      } else if (event.key === " " || event.key === "Enter") {
+        playButton.click();
+        event.preventDefault();
+      }
+    });
+
+    syncPlayIcon();
+    syncVolume();
+    return card;
   }
 
   /* http 局域网源没有 navigator.clipboard,退回 execCommand。 */
@@ -66,8 +324,87 @@ window.MiyuShared = (() => {
     panel.querySelector(".shared-files-close").addEventListener("click", hide);
     panel.querySelector(".shared-files-refresh").addEventListener("click", refresh);
     listBox = panel.querySelector(".shared-files-list");
+
+    /* 批量操作工具条:全选切换 + 下载所选 + 删除所选,插在 header 与列表之间。 */
+    const toolbarBox = document.createElement("div");
+    toolbarBox.className = "shared-files-toolbar";
+    selectAllButton = toolButton("check-square", "全选", toggleSelectAll);
+    downloadSelectedButton = toolButton("download", "下载所选", downloadSelected);
+    deleteSelectedButton = toolButton("trash-2", "删除所选", deleteSelected, "danger");
+    toolbarBox.append(selectAllButton, downloadSelectedButton, deleteSelectedButton);
+    panel.querySelector(".shared-files-panel").insertBefore(toolbarBox, listBox);
+    syncToolbar();
+
     document.body.appendChild(panel);
     return panel;
+  }
+
+  function toolButton(iconName, label, onClick, extraClass) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `shared-files-tool${extraClass ? ` is-${extraClass}` : ""}`;
+    button.appendChild(createIcon(iconName));
+    const text = document.createElement("span");
+    text.textContent = label;
+    button.appendChild(text);
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  function syncToolbar() {
+    if (!selectAllButton) return;
+    const total = currentShares.length;
+    const count = selectedIds.size;
+    const allSelected = total > 0 && count >= total;
+    selectAllButton.disabled = total === 0;
+    selectAllButton.querySelector("span").textContent = allSelected ? "取消全选" : "全选";
+    downloadSelectedButton.disabled = count === 0;
+    deleteSelectedButton.disabled = count === 0;
+  }
+
+  /* 全选/取消全选只改选中集与复选框状态,不重建行,免得收起已展开的预览。 */
+  function toggleSelectAll() {
+    const allSelected = currentShares.length > 0 && selectedIds.size >= currentShares.length;
+    selectedIds.clear();
+    if (!allSelected) {
+      for (const share of currentShares) selectedIds.add(String(share.share_id));
+    }
+    for (const box of listBox.querySelectorAll(".shared-files-check")) {
+      box.checked = selectedIds.has(box.dataset.shareId);
+    }
+    syncToolbar();
+  }
+
+  /* 删除所选:复用单条删除的 DELETE /api/shared/{id},一次汇总确认。 */
+  async function deleteSelected() {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    if (!window.confirm(`删除 ${ids.length} 个分享?`)) return;
+    for (const id of ids) {
+      try {
+        await fetch(`/api/shared/${encodeURIComponent(id)}`, { method: "DELETE" });
+      } catch (_) {
+        /* 单条失败不阻塞其余;refresh 后残留条目自然回到列表。 */
+      }
+    }
+    selectedIds.clear();
+    refresh();
+  }
+
+  /* 下载所选:隐藏 <a> 依次 click,间隔 300ms 防浏览器拦截连发下载。 */
+  async function downloadSelected() {
+    const ids = [...selectedIds];
+    for (let i = 0; i < ids.length; i += 1) {
+      const share = currentShares.find((item) => String(item.share_id) === ids[i]);
+      const link = document.createElement("a");
+      link.href = downloadUrl(ids[i]);
+      link.setAttribute("download", share?.file_name || "");
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      if (i < ids.length - 1) await new Promise((resolve) => setTimeout(resolve, 300));
+    }
   }
 
   function hide() {
@@ -90,15 +427,22 @@ window.MiyuShared = (() => {
   }
 
   function render(shares) {
+    currentShares = shares;
+    const alive = new Set(shares.map((share) => String(share.share_id)));
+    for (const id of [...selectedIds]) {
+      if (!alive.has(id)) selectedIds.delete(id);
+    }
     listBox.textContent = "";
     if (!shares.length) {
       const empty = document.createElement("p");
       empty.className = "shared-files-empty";
       empty.textContent = "还没有分享任何文件。让 AI 调用 share_file 即可分享。";
       listBox.appendChild(empty);
+      syncToolbar();
       return;
     }
     for (const share of shares) listBox.appendChild(renderRow(share));
+    syncToolbar();
   }
 
   function renderRow(share) {
@@ -108,9 +452,21 @@ window.MiyuShared = (() => {
 
     const head = document.createElement("div");
     head.className = "shared-files-row-head";
+    const shareId = String(share.share_id);
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "shared-files-check";
+    check.dataset.shareId = shareId;
+    check.checked = selectedIds.has(shareId);
+    check.setAttribute("aria-label", `选择 ${share.file_name}`);
+    check.addEventListener("change", () => {
+      if (check.checked) selectedIds.add(shareId);
+      else selectedIds.delete(shareId);
+      syncToolbar();
+    });
     const icon = document.createElement("span");
     icon.className = "shared-files-icon";
-    icon.textContent = KIND_ICON[share.kind] || KIND_ICON.other;
+    icon.appendChild(kindIcon(share.kind));
     const name = document.createElement("span");
     name.className = "shared-files-name";
     name.textContent = share.title || share.file_name;
@@ -118,7 +474,7 @@ window.MiyuShared = (() => {
     const meta = document.createElement("span");
     meta.className = "shared-files-meta";
     meta.textContent = `${formatSize(share.size_bytes)} · ${MODE_LABEL[share.mode] || share.mode}`;
-    head.append(icon, name, meta);
+    head.append(check, icon, name, meta);
 
     const actions = document.createElement("div");
     actions.className = "shared-files-actions";
@@ -161,22 +517,24 @@ window.MiyuShared = (() => {
     const box = document.createElement("div");
     box.className = "shared-files-preview";
     const src = `/api/shared/${encodeURIComponent(share.share_id)}`;
-    let media;
-    if (share.kind === "video") {
-      media = document.createElement("video");
+    if (share.kind === "audio") {
+      box.appendChild(buildAudioPlayer(src, share.file_name, share.size_bytes));
+    } else if (share.kind === "video") {
+      const shell = document.createElement("div");
+      shell.className = "media-video-shell";
+      const media = document.createElement("video");
       media.controls = true;
       media.preload = "metadata";
-    } else if (share.kind === "audio") {
-      media = document.createElement("audio");
-      media.controls = true;
-      media.preload = "metadata";
+      media.src = src;
+      shell.appendChild(media);
+      box.appendChild(shell);
     } else {
-      media = document.createElement("img");
+      const media = document.createElement("img");
       media.alt = share.file_name;
       media.loading = "lazy";
+      media.src = src;
+      box.appendChild(media);
     }
-    media.src = src;
-    box.appendChild(media);
     row.appendChild(box);
   }
 
@@ -214,25 +572,30 @@ window.MiyuShared = (() => {
     card.className = "shared-attachment";
     const kind = String(payload.kind || "other");
     const src = `/api/shared/${encodeURIComponent(payload.share_id)}`;
-    if (kind === "video" || kind === "audio" || kind === "image") {
+    if (kind === "audio") {
+      /* 音频卡片自带文件名/大小/下载,不再额外挂下载条。 */
+      card.appendChild(buildAudioPlayer(src, payload.file_name, payload.size_bytes));
+      return card;
+    }
+    if (kind === "video" || kind === "image") {
       const box = document.createElement("div");
       box.className = "shared-attachment-preview";
-      let media;
       if (kind === "video") {
-        media = document.createElement("video");
+        const shell = document.createElement("div");
+        shell.className = "media-video-shell";
+        const media = document.createElement("video");
         media.controls = true;
         media.preload = "metadata";
-      } else if (kind === "audio") {
-        media = document.createElement("audio");
-        media.controls = true;
-        media.preload = "metadata";
+        media.src = src;
+        shell.appendChild(media);
+        box.appendChild(shell);
       } else {
-        media = document.createElement("img");
+        const media = document.createElement("img");
         media.alt = payload.file_name;
         media.loading = "lazy";
+        media.src = src;
+        box.appendChild(media);
       }
-      media.src = src;
-      box.appendChild(media);
       card.appendChild(box);
     }
     const row = document.createElement("a");
@@ -242,14 +605,17 @@ window.MiyuShared = (() => {
     row.title = "下载";
     const icon = document.createElement("span");
     icon.className = "shared-attachment-icon";
-    icon.textContent = KIND_ICON[kind] || KIND_ICON.other;
+    icon.appendChild(kindIcon(kind));
     const name = document.createElement("span");
     name.className = "shared-attachment-name";
     name.textContent = payload.file_name;
     const meta = document.createElement("span");
     meta.className = "shared-attachment-meta";
-    meta.textContent = `${formatSize(payload.size_bytes)} · 点击下载`;
-    row.append(icon, name, meta);
+    meta.textContent = formatSize(payload.size_bytes);
+    const hint = document.createElement("span");
+    hint.className = "shared-attachment-download";
+    hint.appendChild(createIcon("download"));
+    row.append(icon, name, meta, hint);
     card.appendChild(row);
     return card;
   }
