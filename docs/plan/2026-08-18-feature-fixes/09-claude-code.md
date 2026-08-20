@@ -277,3 +277,20 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
   stdin 可中途注入,但需要"常驻进程+排队注入"的重构;②WebUI 切走再切回,
   中转的工具卡片消失——重绘数据源 turn.tool_flow 与模型回放耦合,直接塞会
   污染回放/打断续传,需要 display-only 持久化车道(如 turns 新列)。
+
+## 15. 第八轮(2026-08-20 傍晚)
+
+- **task 经中转的子代理"空工具集"真相**:中转按设计丢弃外层工具定义
+  (工具循环不外交),SubagentRunner 的 Miyu 工具对内层 claude 不可见;此前
+  ephemeral 判定又把 subagent 作用域的原生工具/桥一并关掉,子代理彻底徒手。
+  修=subagent 作用域按同一双四档给原生工具+MCP 桥,子代理成为"嵌套 claude
+  代理"由内层自闭环(会话不持久保持)。真机:嵌套子代理经桥调
+  scientific_calculator,不可心算表达式逐位吻合。
+- **task 从去重表请回**:与 claude 原生 Task 语义不同——Miyu 子代理在
+  daemon 里作为后台任务运行、完成唤醒跟进;claude 的 Task 活在单次进程里。
+  task(发射)/job(查询停止)成对,不改名。
+- WebUI 删除最后一个可见会话双生新会话:前端兜底守卫只防并发不防先后
+  (deleteSession 与 session.deleted 事件先后各兜一次);按被删会话 id 加一
+  次性闩锁(app.js,随前端批待浏览器验收)。
+- 理论递归提示:外层 claude→mcp task→子代理→中转→内层 claude→mcp task…
+  与 claude_code 工具的递归同属 D19 放行范畴,由订阅限流自然约束。

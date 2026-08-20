@@ -221,10 +221,14 @@ impl OpenAiCompatibleClient {
             args.push("--system-prompt".into());
             args.push(system_prompt.to_string());
         }
-        // 工具面按双四档作用域装配;辅助请求(摘要/标题)永远无工具。
+        // 工具面按双四档作用域装配。subagent 作用域也给:中转不会把工具
+        // 循环交还给外层(SubagentRunner 收到的永远是最终文本),子代理的
+        // 干活能力全靠内层 claude 自己的原生工具 + MCP 桥闭环;真正的纯文
+        // 本辅助请求(摘要/标题/judge)仍然无工具。
+        let tool_capable = matches!(self.request_scope, "chat" | "subagent");
         let native_on =
-            !ephemeral && scope_allows(&runtime.native_tools, self.claude_code_dev_mode);
-        let miyu_on = !ephemeral && scope_allows(&runtime.miyu_tools, self.claude_code_dev_mode);
+            tool_capable && scope_allows(&runtime.native_tools, self.claude_code_dev_mode);
+        let miyu_on = tool_capable && scope_allows(&runtime.miyu_tools, self.claude_code_dev_mode);
         if native_on {
             // claude 原生工具(训练分布内)开放;无头模式没有交互审批,
             // 权限模式决定 Bash 等是否可用(默认 bypassPermissions)。
@@ -275,6 +279,9 @@ const BRIDGE_DUPLICATE_TOOLS: &[&str] = &[
     "grep",
     "todowrite",
 ];
+// task 不剔:它与 claude 原生 Task 语义不同——Miyu 子代理在 daemon 里作为
+// 后台任务运行、完成后唤醒开新轮跟进;claude 的 Task 活在单次进程里,轮末
+// 即杀。job(查询/停止)与 task(发射)成对。
 
 fn mcp_bridge_config(exclude_duplicates: bool) -> Option<String> {
     let session = crate::tools::workspace::try_session()?;
