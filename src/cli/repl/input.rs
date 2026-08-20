@@ -132,8 +132,11 @@ pub(in crate::cli) fn read_live_repl_input(
                     }
                     let mode = live.mode();
                     synchronized_terminal_update(CursorAfterUpdate::Hidden, || {
-                        live.commit_submission(&submission)
+                        live.commit_submission_render(&submission)
                     })?;
+                    // 光标位置查询在同步块外做:块内等终端应答会撑破 kitty
+                    // 的同步超时,半成品帧(光标在屏幕底部)被提前提交。
+                    live.commit_submission_finalize();
                     raw.keep_cursor_hidden();
                     return Ok(LiveReplOutcome::Submit(
                         mode,

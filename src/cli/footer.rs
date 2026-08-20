@@ -233,16 +233,13 @@ pub(in crate::cli) fn repl_footer_left(
     let thinking = footer.thinking.as_deref().unwrap_or_default();
     let colored_thinking = (!thinking.is_empty()).then(|| primary_footer_text(thinking));
     let mut colored_thinking = colored_thinking.unwrap_or_default();
-    // 回合运行中,模型信息右侧挂一个盲文转轮(与工具摘要同一组帧):一眼
-    // 可见 AI 是否还在干活(用户 08-20 点名)。
+    // 回合运行中,模型信息右侧是 Miyu 的声波律动(用户 08-20 选定):五柱
+    // 波浪的高度与亮度随帧流动,颜色跟随模式主色(普通蓝/dev 酒红)。
     if let Some(frame) = footer.running_spinner {
         if !colored_thinking.is_empty() {
             colored_thinking.push(' ');
         }
-        colored_thinking.push_str(&format!(
-            "\x1b[2m{}\x1b[0m",
-            render::wait_spinner::braille_frame(frame)
-        ));
+        colored_thinking.push_str(&sound_wave_frame(frame, mode == AgentMode::Dev));
     }
     let colored_thinking = colored_thinking.as_str();
     let provider = format!("\x1b[2m{}\x1b[0m", footer.provider);
@@ -288,6 +285,34 @@ pub(in crate::cli) fn repl_footer_left_parts(
         parts.push(thinking.to_string());
     }
     parts.join(" · ")
+}
+
+/// 声波律动帧:五柱波浪,正弦驱动高度,亮度分 dim/正常/亮 三档主题色。
+/// 每帧相位步进 0.24 rad,配合 80ms 的 footer tick 约每秒 3 rad,与演示稿
+/// 的流速一致。
+pub(in crate::cli) fn sound_wave_frame(frame: usize, dev: bool) -> String {
+    const LEVELS: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+    let (mid, hi) = if dev { ("35", "95") } else { ("34", "94") };
+    let t = frame as f32 * 0.24;
+    let mut out = String::new();
+    for i in 0..5 {
+        let height = ((t - i as f32 * 0.9).sin() + 1.0) / 2.0;
+        let glyph = LEVELS[((height * (LEVELS.len() - 1) as f32) as usize).min(LEVELS.len() - 1)];
+        if height > 0.72 {
+            out.push_str("[1m[");
+            out.push_str(hi);
+        } else if height > 0.35 {
+            out.push_str("[");
+            out.push_str(mid);
+        } else {
+            out.push_str("[2m[");
+            out.push_str(mid);
+        }
+        out.push('m');
+        out.push(glyph);
+        out.push_str("[0m");
+    }
+    out
 }
 
 pub(in crate::cli) fn colored_footer_mode_label(mode: AgentMode) -> String {

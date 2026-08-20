@@ -633,7 +633,7 @@ impl LiveReplTail {
     }
 
     /// footer 里的运行转轮:单行覆写(footer 行全宽 padding,直接盖不闪),
-    /// 33ms 的 spinner tick 上节流到 ~100ms 一帧。
+    /// 33ms 的 spinner tick 上节流到 ~80ms 一帧。
     pub(in crate::cli) fn tick_footer_spinner(&mut self) -> Result<()> {
         if !self.rendered || self.external_output_active {
             return Ok(());
@@ -641,7 +641,7 @@ impl LiveReplTail {
         let now = std::time::Instant::now();
         if self
             .footer_spinner_last
-            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(100))
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(80))
         {
             return Ok(());
         }
