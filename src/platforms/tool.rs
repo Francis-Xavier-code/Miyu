@@ -195,7 +195,7 @@ async fn send(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<Str
     if (!images.is_empty() || !files.is_empty()) && !context.host_tools_allowed() {
         bail!("local attachments require an authorized platform administrator");
     }
-    for image in images {
+    for image in &images {
         let path = required_path(image, "path")?;
         let alt = image
             .get("alt")
@@ -205,7 +205,7 @@ async fn send(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<Str
             .to_string();
         segments.push(OutboundSegment::ImagePath { path, alt });
     }
-    for file in files {
+    for file in &files {
         let path = required_path(file, "path")?;
         let name = file
             .get("name")
@@ -229,10 +229,17 @@ async fn send(arguments: Value, context: Arc<PlatformTurnContext>) -> Result<Str
     .to_string())
 }
 
-fn array<'a>(arguments: &'a Value, key: &str) -> Result<&'a [Value]> {
+fn array(arguments: &Value, key: &str) -> Result<Vec<Value>> {
     match arguments.get(key) {
-        None | Some(Value::Null) => Ok(&[]),
-        Some(Value::Array(values)) => Ok(values),
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => Ok(values.clone()),
+        // 模型常把数组写成「数组的 JSON 字符串」(真机实测 mimo-v2.5 给
+        // send_message_to_user 传的 images 就是这形态,补发图片被本行上一版
+        // 的硬校验拦死)。与 generate_image.reference_images 同款宽松解析。
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Array(values)) => Ok(values),
+            _ => bail!("{key} must be an array"),
+        },
         Some(_) => bail!("{key} must be an array"),
     }
 }
@@ -305,4 +312,28 @@ async fn query_token_usage(arguments: Value, context: Arc<PlatformTurnContext>) 
         .await
         .context("usage stats task panicked")??;
     Ok(crate::tools::usage_query::format_usage_summary(&stats, &range_key))
+}
+
+#[cfg(test)]
+mod argument_shape_tests {
+    use super::*;
+
+    /// 模型把 images 数组写成 JSON 字符串是真机高频形态(mimo-v2.5 实测),
+    /// 必须与真数组同样接受;垃圾字符串仍要报错。
+    #[test]
+    fn stringified_json_arrays_are_accepted() {
+        let arguments = serde_json::json!({
+            "images": "[{\"alt\": \"自画像\", \"path\": \"/tmp/a.png\"}]"
+        });
+        let images = array(&arguments, "images").unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["path"], "/tmp/a.png");
+
+        let real = serde_json::json!({ "images": [{ "path": "/tmp/b.png" }] });
+        assert_eq!(array(&real, "images").unwrap().len(), 1);
+
+        assert!(array(&serde_json::json!({ "images": "not json" }), "images").is_err());
+        assert!(array(&serde_json::json!({ "images": 3 }), "images").is_err());
+        assert!(array(&serde_json::json!({}), "images").unwrap().is_empty());
+    }
 }

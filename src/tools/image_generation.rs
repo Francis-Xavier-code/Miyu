@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const DESCRIPTION: &str = "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Pass reference_images to work from existing pictures (image-to-image); each entry takes the same kind of reference vision_analyze accepts — a local image path, an http(s) image URL, or a context_image_N id from the chat history. Emits an image event and returns a local path. Messaging platforms deliver emitted images automatically, so do not pass the same image to send_message_to_user. Do not call print_image unless the user explicitly asks to display it.";
+const DESCRIPTION: &str = "Generate an image from a text prompt using the configured OpenAI or RightCode image API. Pass reference_images to work from existing pictures (image-to-image); each entry takes the same kind of reference vision_analyze accepts — a local image path, an http(s) image URL, or a context_image_N id from the chat history. Emits an image event and returns a local path. Messaging platforms normally deliver emitted images automatically, so do not resend the image preemptively; only if the user reports it did not arrive, resend it once via send_message_to_user. Do not call print_image unless the user explicitly asks to display it.";
 
 fn parameters() -> Value {
     json!({
@@ -150,7 +150,10 @@ async fn generate_image(
 
 const PRINTED_INSTRUCTION: &str = "The generated image has already been emitted to the host and printed in the terminal. Do not call send_message_to_user or print_image for the same image unless the user explicitly asks to resend or redisplay it. Do not put the local file path in your reply.";
 
-const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event. Messaging platforms deliver emitted images automatically, so do not call send_message_to_user for the same image unless the user explicitly asks to resend it. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply.";
+// 「自动投递」失灵时模型要有自救出口:允许在用户反馈没收到时用
+// send_message_to_user(images=[{path,alt}]) 补发(08-20 真机:三张生成图未
+// 投递,模型试图补发却被旧措辞与参数校验双重拦死)。
+const EMITTED_INSTRUCTION: &str = "The generated image was saved to disk and emitted as an image event. Messaging platforms normally deliver emitted images automatically, so do not resend it preemptively. If the user reports the image did not arrive, resend it once with send_message_to_user, passing images=[{\"path\": ..., \"alt\": ...}] with this path. Do not call print_image unless the user explicitly asks to display it. Do not put the local file path in your reply text.";
 
 /// 把 `reference_images` 收成一串引用。
 ///

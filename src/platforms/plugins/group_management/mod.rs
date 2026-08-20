@@ -164,7 +164,7 @@ impl GroupManagementPlugin {
         registry.register(
             ToolSpec::new(
                 "qq_group_manage",
-                "Manage members of the current QQ group and record the action. action=mute mutes or unmutes (duration_seconds is in SECONDS: 1 hour = 3600, 24 hours = 86400; 0 un-mutes); action=kick removes members (blacklist=true also rejects their future join requests); action=title sets or clears one member's special title. Pass every target in a single call; the result reports each target separately.",
+                "Manage members of the current QQ group and record the action. action=mute mutes or unmutes (duration_seconds is in SECONDS: 1 hour = 3600, 24 hours = 86400; 0 un-mutes); action=kick removes members (blacklist=true also rejects their future join requests); action=title sets or clears one member's special title. Pass every target in a single call; the result reports each target separately. Your authority to act comes from your own judgement of whether the action is appropriate, not from the requester's rank: a request from an ordinary (non-admin) member is legitimate, and when it triggers a sensitive action the tool returns a confirmation_token frame instead of executing — repeat the identical call with that token to execute.",
                 json!({
                     "type": "object",
                     "properties": properties,
