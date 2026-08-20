@@ -76,20 +76,8 @@ pub(crate) fn format_usage_summary(stats: &crate::state::UsageStats, range_key: 
         ),
         format!("请求 {} 次 · 缓存命中率 {hit:.0}%", stats.totals.requests),
     ];
-    if stats.totals.costed_requests > 0 {
-        let coverage = if stats.totals.costed_requests < stats.totals.requests {
-            format!(
-                "(估算覆盖 {}/{} 次请求)",
-                stats.totals.costed_requests, stats.totals.requests
-            )
-        } else {
-            String::new()
-        };
-        lines.push(format!(
-            "估算消费 ≈${:.4}{coverage}",
-            stats.totals.cost
-        ));
-    }
+    // 金额估算不进工具输出(用户 08-20 裁定:models.dev 价目对不齐实际计费,
+    // 数字不准还容易被模型当真话复述)。WebUI 控制台的统计图表照旧。
     for source in &stats.sources {
         let name = match source.src.as_str() {
             "agent" => "智能体".to_string(),
