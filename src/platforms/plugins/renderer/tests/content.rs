@@ -438,3 +438,36 @@ fn documents_over_the_pixel_budget_fail_instead_of_truncating() {
     let error = render(&markdown, &config).unwrap_err();
     assert!(error.to_string().contains("pixel limit"));
 }
+
+/// 样张生成器(人工看效果用,不进 CI):cargo test render_font_sample -- --ignored
+#[test]
+#[ignore]
+fn render_font_sample() {
+    let markdown = r#"# 字体与圆角样张
+
+正文中文与 English mixed,行内代码 `cargo build --release` 应为等宽圆角小底衬。
+
+```rust
+fn main() {
+    let answer: u64 = 42; // 等宽对齐检查
+    let 中文注释 = "代码块里的中文回退到正文字体";
+    println!("iIlL1| oO0 {answer}");
+}
+```
+
+> 引用块保持原样。
+
+| 列 A | 列 B |
+|------|------|
+| `x1` | 对齐 |
+"#;
+    let pages = render(markdown, &RenderConfig::default()).unwrap();
+    let out = std::env::temp_dir().join("miyu-font-sample.png");
+    std::fs::write(&out, &pages[0].png).unwrap();
+    eprintln!(
+        "sample: {} ({}x{})",
+        out.display(),
+        pages[0].width,
+        pages[0].height
+    );
+}

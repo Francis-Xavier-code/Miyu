@@ -11,11 +11,17 @@ pub(in crate::platforms::plugins::renderer) const MAX_CUSTOM_FONT_FILES: usize =
 
 pub(in crate::platforms::plugins::renderer) const DEFAULT_BODY_FONT: &str = "Noto Sans CJK SC";
 
-pub(in crate::platforms::plugins::renderer) const DEFAULT_CODE_FONT: &str = "Noto Sans Mono CJK SC";
+// 代码字体:打包的 JetBrains Mono(拉丁等宽,OFL);CJK 字形经 FontSystem
+// 回退落到 NotoSansCJK。此前指向 "Noto Sans Mono CJK SC"——该字体从未被
+// 加载进 fontdb,resolve 静默回落 Sans,代码块整体非等宽(用户 08-20 点名)。
+pub(in crate::platforms::plugins::renderer) const DEFAULT_CODE_FONT: &str = "JetBrains Mono";
 
 pub(in crate::platforms::plugins::renderer) const DEFAULT_EMOJI_FONT: &str = "Noto Color Emoji";
 
 pub(in crate::platforms::plugins::renderer) const CJK_FONT_FILE: &str = "NotoSansCJK-Regular.ttc";
+
+pub(in crate::platforms::plugins::renderer) const CODE_FONT_FILE: &str =
+    "JetBrainsMono-Regular.ttf";
 
 pub(in crate::platforms::plugins::renderer) const EMOJI_FONT_FILE: &str = "NotoColorEmoji.ttf";
 
