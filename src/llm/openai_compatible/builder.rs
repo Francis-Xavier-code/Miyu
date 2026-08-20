@@ -62,7 +62,6 @@ impl OpenAiCompatibleClient {
             request_scope: "chat",
             continuation_health,
             claude_code,
-            claude_code_platform_blocked: false,
             claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
@@ -152,7 +151,6 @@ impl OpenAiCompatibleClient {
             request_scope: "chat",
             continuation_health,
             claude_code,
-            claude_code_platform_blocked: false,
             claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
@@ -214,7 +212,6 @@ impl OpenAiCompatibleClient {
             request_scope: "chat",
             continuation_health,
             claude_code,
-            claude_code_platform_blocked: false,
             claude_code_dev_mode: false,
         };
         client.restore_saved_thinking_variants(paths);
@@ -336,16 +333,8 @@ impl OpenAiCompatibleClient {
             // failover 换端点共享同一健康位(续传本就钉在原端点)。
             continuation_health: self.continuation_health.clone(),
             claude_code: self.claude_code.clone(),
-            claude_code_platform_blocked: self.claude_code_platform_blocked,
             claude_code_dev_mode: self.claude_code_dev_mode,
         }
-    }
-
-    /// 平台(QQ 等)回合置位:claude-code 走用户订阅额度,平台消息一律拒绝,
-    /// 池里有其他供应商时故障转移会自然接管。
-    pub fn with_platform_delivery(mut self, platform: bool) -> Self {
-        self.claude_code_platform_blocked = platform;
-        self
     }
 
     /// Agent 构造时声明会话模式:claude-code 的原生工具/Miyu 工具双作用域

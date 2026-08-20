@@ -269,10 +269,7 @@ async fn run_turn_task_inner(
             resources
                 .client
                 .clone()
-                .with_buffered_delivery(platform_context.is_some())
-                // 订阅中转仅限本机会话:平台回合命中 claude-code 端点时明确拒
-                // 绝,池里有其他供应商则故障转移接管。
-                .with_platform_delivery(platform_context.is_some()),
+                .with_buffered_delivery(platform_context.is_some()),
             active_tools,
             mode,
             audience,

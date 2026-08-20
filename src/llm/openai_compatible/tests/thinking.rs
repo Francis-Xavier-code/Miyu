@@ -373,7 +373,6 @@ fn mixed_client_keeps_variants_per_provider_and_model() {
         max_tokens_override: None,
         request_scope: "chat",
         claude_code: None,
-        claude_code_platform_blocked: false,
         claude_code_dev_mode: false,
         continuation_health: ResponsesContinuationHealth::detached(),
     };

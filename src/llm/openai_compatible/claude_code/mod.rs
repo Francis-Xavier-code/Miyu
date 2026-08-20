@@ -80,12 +80,6 @@ impl OpenAiCompatibleClient {
             .claude_code
             .clone()
             .context("claude-code runtime was not initialized for this client")?;
-        if self.claude_code_platform_blocked {
-            bail!(t(
-                "the claude-code provider relays through the user's Claude subscription and is limited to owner sessions; platform messages must use a different provider",
-                "claude-code 供应商走用户订阅额度,仅限本机会话使用;平台消息请配置其他供应商"
-            ));
-        }
         let model = self.provider.default_model.clone();
         let (system_prompt, conversation) = payload::split_system(messages);
         // 辅助请求(压缩摘要、标题、judge)一次一个 claude 会话即可,不建持久

@@ -163,6 +163,7 @@
     "session.deleted",
     "session.current_changed",
     "session.updated",
+    "session.reordered",
     "job.started",
     "job.finished",
     "job.acknowledged",
@@ -344,6 +345,8 @@
     liveRuns: new Map(),
     sessionMenuFor: null,
     sessionRenaming: null,
+    sessionDragId: null,
+    lastReorderIds: "",
     modeChooserOpen: false,
     modeChooserKeyHandler: null,
     sessionBusy: false,
@@ -3185,6 +3188,8 @@
     item.dataset.sessionId = id;
 
     const renaming = state.sessionRenaming === id;
+    // 侧栏拖拽排序(组内):HTML5 DnD,drop 时全量提交新顺序。
+    if (!renaming) attachSessionDrag(item, session, id);
     const main = document.createElement(renaming ? "div" : "button");
     main.className = `session-item-main${renaming ? " is-renaming" : ""}`;
     if (!renaming) {
@@ -3367,6 +3372,83 @@
       const glyph = BRAILLE_FRAMES[state.brailleFrame];
       for (const spinner of spinners) spinner.textContent = glyph;
     }, 90);
+  }
+
+  function clearSessionDropMarkers() {
+    if (!elements.sessionItems) return;
+    for (const el of elements.sessionItems.querySelectorAll(".drop-before, .drop-after")) {
+      el.classList.remove("drop-before", "drop-after");
+    }
+  }
+
+  function attachSessionDrag(item, session, id) {
+    item.draggable = true;
+    item.addEventListener("dragstart", (event) => {
+      state.sessionDragId = id;
+      item.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      try { event.dataTransfer.setData("text/plain", id); } catch (_) { /* 老内核 */ }
+    });
+    item.addEventListener("dragend", () => {
+      state.sessionDragId = null;
+      item.classList.remove("is-dragging");
+      clearSessionDropMarkers();
+    });
+    item.addEventListener("dragover", (event) => {
+      const dragId = state.sessionDragId;
+      if (!dragId || dragId === id) return;
+      // 只在同一分组(普通/dev)内排序,跨组语义(改会话模式)不存在。
+      const dragging = findSession(dragId);
+      if (!dragging || (dragging?.mode === "dev") !== (session?.mode === "dev")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      const rect = item.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      clearSessionDropMarkers();
+      item.classList.add(before ? "drop-before" : "drop-after");
+    });
+    item.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && item.contains(event.relatedTarget)) return;
+      item.classList.remove("drop-before", "drop-after");
+    });
+    item.addEventListener("drop", (event) => {
+      const dragId = state.sessionDragId;
+      if (!dragId || dragId === id) return;
+      event.preventDefault();
+      const before = item.classList.contains("drop-before");
+      clearSessionDropMarkers();
+      state.sessionDragId = null;
+      commitSessionReorder(dragId, id, before);
+    });
+  }
+
+  async function commitSessionReorder(dragId, targetId, before) {
+    const list = state.sessions;
+    const from = list.findIndex((s) => String(s?.session_id) === String(dragId));
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    let to = list.findIndex((s) => String(s?.session_id) === String(targetId));
+    if (to < 0) {
+      list.splice(from, 0, moved);
+      return;
+    }
+    list.splice(before ? to : to + 1, 0, moved);
+    renderSessionList();
+    // 全量提交当前顺序(两组按数组序混排;后端按序重写 sort_key,分组是
+    // 前端展示层的事)。终端车道会话不参与。
+    const ids = list
+      .filter((s) => !isTerminalSession(s?.session_id))
+      .map((s) => String(s.session_id));
+    state.lastReorderIds = ids.join("\n");
+    try {
+      await apiRequest("/api/sessions/order", {
+        method: "PUT",
+        body: JSON.stringify({ session_ids: ids })
+      });
+    } catch (error) {
+      showToast(error.message || "排序保存失败", "error");
+      refreshSessions();
+    }
   }
 
   function buildSessionGroupHeader(label, icon) {
@@ -3684,6 +3766,12 @@
   }
 
   function handleSessionEvent(name, data) {
+    if (name === "session.reordered") {
+      // 发起端已乐观重排(lastReorderIds 一致就不用刷);其它客户端拉一次。
+      const ids = Array.isArray(data?.session_ids) ? data.session_ids.map(String).join("\n") : "";
+      if (ids && ids !== state.lastReorderIds) refreshSessions();
+      return;
+    }
     const sessionId = String(data?.session_id || "");
     if (!sessionId) return;
     if (name === "session.created") {

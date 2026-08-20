@@ -381,6 +381,8 @@ pub struct SessionRecord {
     pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// 侧栏手动排序键,越小越靠前(v28)。
+    pub sort_key: i64,
 }
 
 #[derive(Debug, Clone)]

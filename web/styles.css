@@ -448,6 +448,19 @@ textarea:disabled {
   gap: 3px;
 }
 
+/* 侧栏拖拽排序:拖动中的行半透明,落点用主题色细线指示 */
+.session-item.is-dragging {
+  opacity: 0.45;
+}
+
+.session-item.drop-before {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+
+.session-item.drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+
 .session-item {
   position: relative;
   display: grid;

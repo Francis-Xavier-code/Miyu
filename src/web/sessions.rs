@@ -71,6 +71,29 @@ pub(in crate::web) struct UpdateSessionRequest {
     pub(in crate::web) workspace: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub(in crate::web) struct ReorderSessionsRequest {
+    pub(in crate::web) session_ids: Vec<String>,
+}
+
+/// 侧栏拖拽排序:按给定顺序重写会话展示序。
+pub(in crate::web) async fn reorder_sessions_http(
+    State(state): State<DaemonState>,
+    headers: HeaderMap,
+    Json(request): Json<ReorderSessionsRequest>,
+) -> std::result::Result<Response, ApiError> {
+    require_mutation(&headers, &state)?;
+    let data = handle_session_command(
+        &state,
+        IpcCommand::ReorderSessions {
+            session_ids: request.session_ids,
+        },
+    )
+    .await
+    .map_err(session_api_error)?;
+    Ok(Json(data).into_response())
+}
+
 pub(in crate::web) async fn update_session_http(
     State(state): State<DaemonState>,
     headers: HeaderMap,
@@ -333,7 +356,13 @@ pub(in crate::web) fn sessions_with_dev(
     if persona != crate::state::DEV_PERSONA {
         rows.extend(store.list_local_sessions(crate::state::DEV_PERSONA)?);
     }
-    rows.sort_by(|a, b| b.record.updated_at.cmp(&a.record.updated_at));
+    // 手动排序键优先(v28,越小越靠前);同键退回最近活跃。
+    rows.sort_by(|a, b| {
+        a.record
+            .sort_key
+            .cmp(&b.record.sort_key)
+            .then_with(|| b.record.updated_at.cmp(&a.record.updated_at))
+    });
     Ok(rows)
 }
 

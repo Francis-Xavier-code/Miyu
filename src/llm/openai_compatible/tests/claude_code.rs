@@ -1,5 +1,5 @@
 //! claude-code 中转协议:假 `claude` 脚本回放 stream-json,验证参数拼装、
-//! 载荷翻译、流事件→chunk、用量归一、会话续传与平台门禁。不碰真实订阅。
+//! 载荷翻译、流事件→chunk、用量归一与会话续传。不碰真实订阅。
 
 use crate::llm::openai_compatible::tests::shared::*;
 use crate::llm::openai_compatible::*;
@@ -216,27 +216,6 @@ async fn usage_limit_failures_classify_as_rate_limit() {
         .expect("usage limit should classify as an HTTP-style failure");
     assert_eq!(failure.kind, HttpFailureKind::RateLimit);
     assert_eq!(failure.status, 429);
-}
-
-/// 平台门禁:订阅中转仅限本机会话,平台回合直接拒绝。
-#[tokio::test]
-async fn platform_turns_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let client = claude_code_client(dir.path(), "cc-platform").with_platform_delivery(true);
-    let error = client
-        .chat_claude_code_stream(
-            vec![ChatMessage::plain("user", "hi")],
-            Vec::new(),
-            "req-test",
-            &mut |_| Ok(()),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("owner sessions")
-            || format!("{error:#}").contains("本机会话"),
-        "{error:#}"
-    );
 }
 
 /// binary 缺失要报可操作的错误,而不是裸 ENOENT。

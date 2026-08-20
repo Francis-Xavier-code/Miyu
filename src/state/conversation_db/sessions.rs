@@ -263,7 +263,7 @@ impl ConversationDb {
                     SELECT 1 FROM platform_session_bindings
                     WHERE platform_session_bindings.session_id = sessions.session_id
                ))
-             ORDER BY updated_at DESC"
+             ORDER BY sort_key ASC, updated_at DESC"
         ))?;
         let rows = stmt.query_map(params![persona, local_only], |row| {
             Ok(SessionOverview {
@@ -350,15 +350,34 @@ impl ConversationDb {
                 .unwrap_or(0),
             rand::random::<u32>()
         );
+        // 新会话插到本人格列表最前(sort_key 越小越靠前;手动排序语义下
+        // "最新建的在顶上"是唯一自动行为)。
         conn.execute(
-            "INSERT INTO sessions (session_id, persona, name, kind, parent_session_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            "INSERT INTO sessions (session_id, persona, name, kind, parent_session_id, created_at, updated_at, sort_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6,
+                     (SELECT COALESCE(MIN(sort_key), 1024) - 1024 FROM sessions
+                       WHERE persona = ?2 AND kind = 'user'))",
             params![session_id, persona, name, kind, parent_session_id, now],
         )?;
         drop(conn);
         Ok(self
             .session_record(&session_id)?
             .expect("session row just inserted"))
+    }
+
+    /// 会话手动排序:按给定顺序重写 sort_key(间隔 1024)。只动 user 会话,
+    /// 未列出的行保持原 key(组内拖拽只发本组也不破坏另一组)。
+    pub fn reorder_sessions(&self, ordered_ids: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for (index, session_id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE sessions SET sort_key = ?1 WHERE session_id = ?2 AND kind = 'user'",
+                params![(index as i64 + 1) * 1024, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn create_or_get_platform_session(
@@ -435,6 +454,7 @@ impl ConversationDb {
             archived: false,
             created_at: now.clone(),
             updated_at: now,
+            sort_key: 0,
         };
         tx.commit()?;
         Ok((record, true))

@@ -193,6 +193,10 @@ pub enum Command {
         #[serde(default)]
         mode: Option<String>,
     },
+    /// 会话列表手动排序:按给定顺序重写展示序(WebUI 侧栏拖拽)。
+    ReorderSessions {
+        session_ids: Vec<String>,
+    },
     /// Session the REPL was last on. Falls back to the current session and
     /// heals the stored pointer when it has gone stale.
     GetReplSession {

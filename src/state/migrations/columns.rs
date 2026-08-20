@@ -137,3 +137,31 @@ pub(in crate::state) fn apply_v24_retire_session_goals(conn: &Connection) -> Res
     conn.execute("DROP TABLE IF EXISTS goals", [])?;
     Ok(())
 }
+
+/// 会话手动排序:sort_key 越小越靠前。存量按「最近活跃在前」的老展示序
+/// 固化(间隔 1024 留插入空间),此后顺序只随用户拖动与新建变化,活跃不再
+/// 自动置顶。
+pub(in crate::state) fn apply_v28_session_sort_key(conn: &Connection) -> Result<()> {
+    // 幂等:上次跑到一半的残留库里列可能已存在(ALTER 没有 IF NOT EXISTS)。
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'sort_key'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN sort_key INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "WITH ranked AS (
+             SELECT session_id,
+                    ROW_NUMBER() OVER (PARTITION BY persona ORDER BY updated_at DESC) AS rn
+               FROM sessions
+              WHERE kind = 'user'
+         )
+         UPDATE sessions
+            SET sort_key = (SELECT rn * 1024 FROM ranked WHERE ranked.session_id = sessions.session_id)
+          WHERE kind = 'user';",
+    )?;
+    Ok(())
+}

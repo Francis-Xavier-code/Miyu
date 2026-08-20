@@ -156,6 +156,19 @@ pub(in crate::web) async fn handle_session_command(
             }
             Ok(json!({ "session": session_record_json(&record) }))
         }
+        IpcCommand::ReorderSessions { session_ids } => {
+            if session_ids.is_empty() {
+                return Err(t("no sessions to reorder", "没有可排序的会话").to_string());
+            }
+            store
+                .reorder_sessions(&session_ids)
+                .map_err(|error| safe_error_message(&error))?;
+            // 广播给其它客户端刷新列表;发起端在本地已乐观重排。
+            state
+                .events
+                .publish("session.reordered", json!({ "session_ids": session_ids }));
+            Ok(json!({ "ok": true }))
+        }
         IpcCommand::ToolCall {
             session,
             name,

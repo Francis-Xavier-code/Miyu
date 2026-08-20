@@ -350,3 +350,26 @@ miyu_tools 两次踩坑)——"默认没生效"先查配置残值。
   不变。测具坑:断言用"切换前后计数不变"的不变式——思考签里模型会复述
   指令原文,绝对值断言全是假警报;测试会话要每轮新建(老会话人格对指令式
   提示词逆反)。
+
+## 19. 第十二轮(2026-08-20 晚)——平台门禁撤销 + 侧栏拖拽排序
+
+- **平台门禁撤销(用户裁定翻转)**:claude-code 语义是普通供应商/模型,QQ 等
+  平台会话命中照常中转。撤除整套 claude_code_platform_blocked 机制
+  (字段/builder/with_platform_delivery/task.rs 调用点/门禁测试/wiki 文案)。
+  真机:隔离 daemon + 伪 NapCat(浏览器 WebSocket 连 /ws,loopback 空 token,
+  应答 API 帧),admin 私聊消息 → 订阅 haiku 真回复(池里仅 claude-code,
+  回复本身即中转铁证)。
+- **侧栏会话拖拽排序**:v28 迁移加 sessions.sort_key(存量按"最近活跃在前"
+  固化,间隔 1024;ALTER 前探列保证幂等——迁移测试的崩溃残留重放场景会
+  撞重复列);列表 ORDER BY sort_key ASC,updated_at DESC;
+  **sessions_with_dev 合并 normal+dev 后原本按 updated_at 重排,会覆盖
+  sort_key 序**(真机 PUT ok 但 GET 不变的根因)——sort_key 进
+  SessionRecord,合并排序改按它;新会话 sort_key=MIN-1024 插最前;
+  PUT /api/sessions/order(IpcCommand::ReorderSessions)全量重写序 +
+  session.reordered 事件广播;前端 HTML5 DnD(组内拖拽,drop-before/after
+  主题色指示线,乐观重排+全量提交,失败回滚 refreshSessions)。
+  **语义变化:排序固化后,会话活跃不再自动置顶,顺序只随拖动与新建变化。**
+  真机(playwright DragEvent 走真实绑定链):第 3 项拖至首位生效,服务端
+  GET 顺序持久化一致。
+- 顺手:用户真机配置里第四轮 normalize 回填的 200k 窗口残值清除
+  (haiku/sonnet/fable;opus=512000 是用户手设,保留)。

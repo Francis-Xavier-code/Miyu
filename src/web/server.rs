@@ -320,6 +320,7 @@ pub(in crate::web) fn router(state: DaemonState) -> Router {
             "/api/sessions",
             get(list_sessions_http).post(create_session_http),
         )
+        .route("/api/sessions/order", put(reorder_sessions_http))
         .route(
             "/api/sessions/{session_id}",
             patch(update_session_http).delete(delete_session_http),
