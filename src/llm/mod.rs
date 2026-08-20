@@ -389,6 +389,11 @@ pub enum ChatStreamKind {
     ReasoningPartStart,
     ReasoningPartEnd,
     ToolCall,
+    /// 中转(claude-code)侧闭环执行的工具调用開始:text 是
+    /// `{id,name,input}` JSON,回合层翻成标准 tool.started 卡片。
+    RemoteToolStarted,
+    /// 同上的收口:text 是 `{id,name,ok,output}` JSON → tool.finished。
+    RemoteToolFinished,
 }
 
 #[derive(Debug, Clone)]

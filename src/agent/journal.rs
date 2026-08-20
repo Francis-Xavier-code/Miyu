@@ -359,7 +359,10 @@ impl TurnJournalSink {
             ChatStreamKind::ToolCall => "tool_call_delta",
             ChatStreamKind::ReasoningReset
             | ChatStreamKind::ReasoningPartStart
-            | ChatStreamKind::ReasoningPartEnd => return Ok(()),
+            | ChatStreamKind::ReasoningPartEnd
+            // 中转侧工具活动在事件层已成卡片,journal 的流缓冲不收。
+            | ChatStreamKind::RemoteToolStarted
+            | ChatStreamKind::RemoteToolFinished => return Ok(()),
         };
         self.append(kind, None, None, Some(&pending.text), None, None)?;
         self.last_flush = Instant::now();

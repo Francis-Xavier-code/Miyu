@@ -20,16 +20,16 @@ use crate::llm::openai_compatible::*;
 /// 客户端构造期解析好的运行时参数(binary/工具作用域/权限模式),端点间共享。
 pub(in crate::llm::openai_compatible) struct ClaudeCodeRuntime {
     pub(in crate::llm::openai_compatible) binary: PathBuf,
-    /// Miyu home 根(MIYU_HOME):MCP 桥子进程必须显式带上,不赌 claude 会
-    /// 把父环境透传给 MCP server——透传缺失时桥会静默连到默认 home 的
-    /// daemon,拿错目录还不报错。
-    pub(in crate::llm::openai_compatible) home: PathBuf,
     /// claude 原生工具(Bash/Edit/Read…)的模式作用域:off/dev/normal/all。
     pub(in crate::llm::openai_compatible) native_tools: String,
     /// Miyu 工具经 MCP 桥挂给 claude 的模式作用域:off/dev/normal/all。
     pub(in crate::llm::openai_compatible) miyu_tools: String,
     /// 原生工具开启时的 --permission-mode(无头模式没有交互审批)。
     pub(in crate::llm::openai_compatible) permission_mode: String,
+    /// 每个 (provider\tmodel) 的 --autocompact 阈值:取 Miyu 的有效窗口值
+    /// (显式配置→目录→默认 168k),夹到 CLI 接受的 100k–1M。claude 在这个
+    /// 尺寸自压缩,会话 id 不变、续传不断——窗口语义单一来源是 Miyu 配置。
+    pub(in crate::llm::openai_compatible) autocompact: HashMap<String, u64>,
     pub(in crate::llm::openai_compatible) idle_timeout: Duration,
     pub(in crate::llm::openai_compatible) prefer_subscription: bool,
 }
@@ -46,10 +46,7 @@ pub(in crate::llm::openai_compatible) fn scope_allows(scope: &str, dev_mode: boo
 }
 
 impl ClaudeCodeRuntime {
-    pub(in crate::llm::openai_compatible) fn from_config(
-        config: &AppConfig,
-        paths: &MiyuPaths,
-    ) -> Self {
+    pub(in crate::llm::openai_compatible) fn from_config(config: &AppConfig) -> Self {
         let plugin = &config.plugins.claude_code;
         let binary = if plugin.binary.trim().is_empty() {
             PathBuf::from("claude")
@@ -58,10 +55,10 @@ impl ClaudeCodeRuntime {
         };
         Self {
             binary,
-            home: paths.root_dir.clone(),
             native_tools: plugin.native_tools.clone(),
             miyu_tools: plugin.miyu_tools.clone(),
             permission_mode: plugin.permission_mode.clone(),
+            autocompact: HashMap::new(),
             idle_timeout: Duration::from_secs(plugin.idle_timeout_seconds.max(30)),
             prefer_subscription: plugin.prefer_subscription,
         }
@@ -204,14 +201,12 @@ impl OpenAiCompatibleClient {
         .collect();
         args.push("--model".into());
         args.push(model.to_string());
-        // 用户在模型菜单显式配了上下文窗口,就同步给 claude 的自动压缩阈值
-        // (compact 后会话 id 不变,续传不断);没配则随 claude 自身默认。
-        // CLI 只收 100k–1M,低于下限的配置不透传。
-        if let Some(window) = self.provider.model_context_window.get(model) {
-            if (100_000..=1_000_000).contains(window) {
-                args.push("--autocompact".into());
-                args.push(window.to_string());
-            }
+        if let Some(window) = runtime
+            .autocompact
+            .get(&format!("{}\t{}", self.provider.id, model))
+        {
+            args.push("--autocompact".into());
+            args.push(window.to_string());
         }
         // 思考档:Miyu 的 thinking-variant 选择映射到 CLI 的 --effort。
         if let Some((_, variant)) = self.selected_reasoning_variant() {
@@ -290,15 +285,22 @@ fn mcp_bridge_config(runtime: &ClaudeCodeRuntime, exclude_duplicates: bool) -> O
     let mut env = serde_json::Map::new();
     env.insert("MIYU_SESSION".into(), json!(&*session));
     env.insert("MIYU_TURN_ORIGIN".into(), json!(origin));
-    env.insert("MIYU_HOME".into(), json!(runtime.home));
     if exclude_duplicates {
         env.insert(
             "MIYU_MCP_EXCLUDE".into(),
             json!(BRIDGE_DUPLICATE_TOOLS.join(",")),
         );
     }
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        env.insert("XDG_RUNTIME_DIR".into(), json!(xdg.to_string_lossy()));
+    // claude 给 MCP server 的是洁净环境,home/runtime 识别变量要显式带——
+    // 但必须**如实透传**(daemon 自己有什么才给什么):runtime 目录推导对
+    // "显式设了 MIYU_HOME"与"没设"给出不同路径(默认 home 显式设也会变
+    // 成哈希子目录),无条件塞 MIYU_HOME 会让 mcp-serve 连不上正常启动的
+    // daemon,静默滑进直连兜底(实测:目录缺 WebUI 工具、图片打进
+    // mcp-serve 自己的 stdout、资产全无)。
+    for key in ["MIYU_HOME", "XDG_RUNTIME_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(key.into(), json!(value.to_string_lossy()));
+        }
     }
     Some(
         json!({

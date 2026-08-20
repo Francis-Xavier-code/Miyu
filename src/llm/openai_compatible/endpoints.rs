@@ -292,6 +292,8 @@ pub(in crate::llm::openai_compatible) fn stream_chunk_commits_attempt(
     (chunk.kind == ChatStreamKind::ReasoningPartEnd
         && reasoning_visibility != ReasoningVisibility::Hidden)
         || chunk.kind == ChatStreamKind::ToolCall
+        || chunk.kind == ChatStreamKind::RemoteToolStarted
+        || chunk.kind == ChatStreamKind::RemoteToolFinished
         || (chunk.kind == ChatStreamKind::Content && !chunk.text.is_empty())
         || (reasoning_visibility == ReasoningVisibility::Full
             && chunk.kind == ChatStreamKind::Reasoning

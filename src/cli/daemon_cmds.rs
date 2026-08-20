@@ -162,13 +162,86 @@ pub(in crate::cli) async fn run_daemon_command(paths: &MiyuPaths, args: DaemonAr
 }
 
 pub(in crate::cli) async fn stop_daemon(paths: &MiyuPaths) -> Result<()> {
-    let Some(info) = ipc::daemon_info(paths).await else {
-        println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行"));
-        return Ok(());
-    };
-    ipc::shutdown_daemon(paths, &info).await?;
-    println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
+    match ipc::daemon_info(paths).await {
+        Some(info) => {
+            ipc::shutdown_daemon(paths, &info).await?;
+            println!("{}", t("Miyu daemon stopped", "Miyu daemon 已停止"));
+        }
+        None => println!("{}", t("Miyu daemon is not running", "Miyu daemon 未运行")),
+    }
+    // info 文件只指向最后一次 start 的进程:历史上多次 start 互相覆盖,会留
+    // 下仍占 8300 的孤儿 daemon——stop 谎报成功,后续测试全打在旧代码上,新
+    // daemon 被挤去随机端口(08-20 一天咬了两次)。正常关停后按进程表扫一遍
+    // 同一 home 的 `__daemon` 残留,全部清掉。
+    let swept = sweep_stray_daemons(paths).await;
+    if swept > 0 {
+        if is_zh() {
+            println!("已清理 {swept} 个残留 daemon 进程(历史 start 覆盖登记留下的孤儿)");
+        } else {
+            println!("cleaned up {swept} stray daemon process(es) left by overwritten launches");
+        }
+    }
     Ok(())
+}
+
+/// 扫描并终止属于本 home 的 `__daemon` 残留进程。归属按 /proc 环境里的
+/// MIYU_HOME 判定(未设 = 默认 ~/.miyu),隔离测试环境的 daemon 不受波及。
+async fn sweep_stray_daemons(paths: &MiyuPaths) -> usize {
+    let my_root = paths.root_dir.clone();
+    let default_root = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".miyu"));
+    let mut strays = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let mut parts = cmdline.split(|byte| *byte == 0);
+        let is_daemon = parts.next().is_some_and(|argv0| argv0.ends_with(b"miyu"))
+            && parts.next() == Some(b"__daemon");
+        if !is_daemon {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        let home = environ
+            .split(|byte| *byte == 0)
+            .find_map(|pair| pair.strip_prefix(b"MIYU_HOME="))
+            .map(|value| std::path::PathBuf::from(String::from_utf8_lossy(value).to_string()))
+            .or_else(|| default_root.clone());
+        if home.as_deref() != Some(my_root.as_path()) {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        strays.push(pid);
+    }
+    if strays.is_empty() {
+        return 0;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    for pid in &strays {
+        if std::fs::metadata(format!("/proc/{pid}")).is_ok() {
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    }
+    strays.len()
 }
 
 pub(in crate::cli) async fn print_daemon_status(paths: &MiyuPaths) -> Result<()> {

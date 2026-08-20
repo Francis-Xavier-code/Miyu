@@ -147,6 +147,8 @@ where
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut state = AnthropicStreamState::default();
+    // claude 侧工具调用 id → 名称,tool_result 帧只带 id,收口事件靠它配名。
+    let mut remote_tools: HashMap<String, String> = HashMap::new();
     let mut session_id: Option<String> = None;
     let mut final_frame: Option<Value> = None;
     loop {
@@ -186,18 +188,14 @@ where
                     }
                 }
             }
-            // 完整 assistant 帧带 tool_use 的完整入参:思考通道补一行摘要,
-            // 否则用户只看到 [tool: 名字] 不知道它在干什么。
+            // 完整 assistant 帧带 tool_use 的完整入参 → 标准 tool.started
+            // 卡片(claude 侧闭环执行,started/finished 都由流侧翻译)。
             Some("assistant") => {
-                for input_line in tool_use_summaries(&value) {
-                    push_reasoning_line(&mut state, &input_line, on_chunk)?;
-                }
+                emit_remote_tool_started(&value, &mut remote_tools, on_chunk)?;
             }
-            // user 帧是 CLI 回填的工具结果:同样给一行截断摘要。
+            // user 帧是 CLI 回填的工具结果 → tool.finished 收口。
             Some("user") => {
-                for result_line in tool_result_summaries(&value) {
-                    push_reasoning_line(&mut state, &result_line, on_chunk)?;
-                }
+                emit_remote_tool_finished(&value, &remote_tools, on_chunk)?;
             }
             Some("stream_event") => {
                 if let Some(event) = value.get("event") {
@@ -332,70 +330,89 @@ fn compact_line(text: &str, limit: usize) -> String {
     collapsed
 }
 
-fn tool_use_summaries(frame: &Value) -> Vec<String> {
-    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-        .filter_map(|block| {
-            let input = block.get("input")?;
-            let summary = compact_line(&input.to_string(), 160);
-            (summary != "{}").then(|| format!("  ⚙ {summary}\n"))
-        })
-        .collect()
-}
-
-fn tool_result_summaries(frame: &Value) -> Vec<String> {
-    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter_map(|block| {
-            let content = block.get("content")?;
-            let text = match content {
-                Value::String(text) => text.clone(),
-                Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => return None,
-            };
-            let summary = compact_line(&text, 200);
-            (!summary.is_empty()).then(|| format!("  ↳ {summary}\n"))
-        })
-        .collect()
-}
-
-fn push_reasoning_line<F>(
-    state: &mut AnthropicStreamState,
-    line: &str,
+fn emit_remote_tool_started<F>(
+    frame: &Value,
+    remote_tools: &mut HashMap<String, String>,
     on_chunk: &mut F,
 ) -> Result<()>
 where
     F: FnMut(ChatStreamChunk) -> Result<()>,
 {
-    if !state.reasoning_part_active {
-        if !state.reasoning.is_empty() && !state.reasoning.ends_with("\n\n") {
-            state.reasoning.push_str("\n\n");
+    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
         }
+        let id = block
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let raw_name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+        // MCP 前缀剥掉:Miyu 工具按本名显示(readable_tool_name 才认识),
+        // claude 原生工具保持原名。
+        let name = raw_name.strip_prefix("mcp__miyu__").unwrap_or(raw_name);
+        remote_tools.insert(id.clone(), name.to_string());
+        let input = block.get("input").cloned().unwrap_or(json!({}));
         on_chunk(ChatStreamChunk {
-            kind: ChatStreamKind::ReasoningPartStart,
-            text: String::new(),
+            kind: ChatStreamKind::RemoteToolStarted,
+            text: json!({ "id": id, "name": name, "input": input }).to_string(),
         })?;
-        state.reasoning_part_active = true;
     }
-    push_buffered_chunk(
-        &mut state.reasoning,
-        &mut state.reasoning_emitted,
-        ChatStreamKind::Reasoning,
-        line.to_string(),
-        on_chunk,
-    )
+    Ok(())
+}
+
+fn emit_remote_tool_finished<F>(
+    frame: &Value,
+    remote_tools: &HashMap<String, String>,
+    on_chunk: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ChatStreamChunk) -> Result<()>,
+{
+    let Some(blocks) = frame.pointer("/message/content").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let id = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let name = remote_tools
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "tool".to_string());
+        let ok = !block
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let output = match block.get("content") {
+            Some(Value::String(content)) => content.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        on_chunk(ChatStreamChunk {
+            kind: ChatStreamKind::RemoteToolFinished,
+            text: json!({
+                "id": id,
+                "name": name,
+                "ok": ok,
+                "output": compact_line(&output, 4000),
+            })
+            .to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 /// stream_event 内层事件 → 内容/思考缓冲。与 [`handle_anthropic_sse_data`]
@@ -482,18 +499,9 @@ where
                             )?;
                         }
                     }
-                    "tool_use" | "server_tool_use" | "mcp_tool_use" => {
-                        open_reasoning_part(state, on_chunk)?;
-                        let name = block.name.unwrap_or_else(|| "tool".to_string());
-                        let display = name.strip_prefix("mcp__miyu__").unwrap_or(&name);
-                        push_buffered_chunk(
-                            &mut state.reasoning,
-                            &mut state.reasoning_emitted,
-                            ChatStreamKind::Reasoning,
-                            format!("[tool: {display}]\n"),
-                            on_chunk,
-                        )?;
-                    }
+                    // tool_use 的展示交给完整 assistant 帧翻译出的
+                    // tool.started 卡片,这里不再往思考通道塞行。
+                    "tool_use" | "server_tool_use" | "mcp_tool_use" => {}
                     _ => {}
                 }
             }

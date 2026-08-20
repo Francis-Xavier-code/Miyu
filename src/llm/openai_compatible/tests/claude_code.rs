@@ -30,6 +30,8 @@ echo '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
 echo '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}'
 echo '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello from fake"}}}'
 echo '{"type":"stream_event","event":{"type":"content_block_stop","index":1}}'
+echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__miyu__use_meme","input":{"action":"show","id":"m1"}}]}}'
+echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"meme sent ok"}]}]}}'
 echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5}}}'
 echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"$sid\",\"result\":\"Hello from fake\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20,\"output_tokens\":5,\"output_tokens_details\":{\"thinking_tokens\":2}}}"
 "#,
@@ -47,10 +49,10 @@ fn claude_code_client(dir: &std::path::Path, provider_id: &str) -> OpenAiCompati
     let mut client = test_client(provider);
     client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
         binary: fake_claude_script(dir),
-        home: dir.to_path_buf(),
         native_tools: "off".to_string(),
         miyu_tools: "off".to_string(),
         permission_mode: "bypassPermissions".to_string(),
+        autocompact: HashMap::new(),
         idle_timeout: Duration::from_secs(30),
         prefer_subscription: true,
     }));
@@ -102,6 +104,24 @@ async fn first_turn_spawns_fresh_session_with_full_flags() {
     assert!(chunks
         .iter()
         .any(|chunk| chunk.kind == ChatStreamKind::Reasoning && chunk.text.contains("pondering")));
+    // claude 侧工具活动翻成标准卡片事件:started 带剥前缀的名字与入参,
+    // finished 带 ok 与结果文本。
+    let started = chunks
+        .iter()
+        .find(|chunk| chunk.kind == ChatStreamKind::RemoteToolStarted)
+        .expect("tool_use 帧应翻成 RemoteToolStarted");
+    let payload: serde_json::Value = serde_json::from_str(&started.text).unwrap();
+    assert_eq!(payload["name"], "use_meme");
+    assert_eq!(payload["id"], "toolu_1");
+    assert_eq!(payload["input"]["action"], "show");
+    let finished = chunks
+        .iter()
+        .find(|chunk| chunk.kind == ChatStreamKind::RemoteToolFinished)
+        .expect("tool_result 帧应翻成 RemoteToolFinished");
+    let payload: serde_json::Value = serde_json::from_str(&finished.text).unwrap();
+    assert_eq!(payload["name"], "use_meme");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["output"], "meme sent ok");
 
     let args = read(dir.path(), "args.txt");
     assert!(args.contains("--model\nhaiku"), "args: {args}");
@@ -226,10 +246,10 @@ async fn missing_binary_reports_actionable_error() {
     let mut client = claude_code_client(dir.path(), "cc-missing");
     client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
         binary: dir.path().join("no-such-claude"),
-        home: dir.path().to_path_buf(),
         native_tools: "off".to_string(),
         miyu_tools: "off".to_string(),
         permission_mode: "bypassPermissions".to_string(),
+        autocompact: HashMap::new(),
         idle_timeout: Duration::from_secs(30),
         prefer_subscription: true,
     }));
@@ -308,10 +328,10 @@ async fn native_tool_scope_shapes_the_cli_args() {
     let runtime = |scope: &str| {
         Arc::new(ClaudeCodeRuntime {
             binary: script.clone(),
-            home: dir.path().to_path_buf(),
             native_tools: scope.to_string(),
             miyu_tools: "off".to_string(),
             permission_mode: "bypassPermissions".to_string(),
+            autocompact: HashMap::new(),
             idle_timeout: Duration::from_secs(30),
             prefer_subscription: true,
         })
@@ -378,10 +398,10 @@ async fn duplicate_miyu_tools_are_excluded_when_both_toolsets_are_on() {
     let mut client = claude_code_client(dir.path(), "cc-dedupe");
     client.claude_code = Some(Arc::new(ClaudeCodeRuntime {
         binary: fake_claude_script(dir.path()),
-        home: dir.path().to_path_buf(),
         native_tools: "all".to_string(),
         miyu_tools: "all".to_string(),
         permission_mode: "bypassPermissions".to_string(),
+        autocompact: HashMap::new(),
         idle_timeout: Duration::from_secs(30),
         prefer_subscription: true,
     }));
@@ -408,4 +428,35 @@ async fn duplicate_miyu_tools_are_excluded_when_both_toolsets_are_on() {
         args.contains("glob") && args.contains("todowrite"),
         "glob/grep/todowrite 也在剔除表: {args}"
     );
+}
+
+/// --autocompact 跟随 Miyu 有效窗口(runtime 装配期夹到 100k–1M)。
+#[tokio::test]
+async fn autocompact_follows_the_effective_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = claude_code_client(dir.path(), "cc-window");
+    let mut runtime = ClaudeCodeRuntime {
+        binary: fake_claude_script(dir.path()),
+        native_tools: "off".to_string(),
+        miyu_tools: "off".to_string(),
+        permission_mode: "bypassPermissions".to_string(),
+        autocompact: HashMap::new(),
+        idle_timeout: Duration::from_secs(30),
+        prefer_subscription: true,
+    };
+    runtime
+        .autocompact
+        .insert("cc-window\thaiku".to_string(), 168_000);
+    client.claude_code = Some(Arc::new(runtime));
+    client
+        .chat_claude_code_stream(
+            vec![ChatMessage::plain("user", "hi")],
+            Vec::new(),
+            "req-test",
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    let args = read(dir.path(), "args.txt");
+    assert!(args.contains("--autocompact\n168000"), "{args}");
 }
