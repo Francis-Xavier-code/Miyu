@@ -79,6 +79,7 @@ pub async fn run(paths: MiyuPaths, args: WebArgs) -> Result<()> {
             config.active_persona_scope(),
             state_store.session_id().to_string(),
         )]),
+        runs_changed: Arc::new(tokio::sync::Notify::new()),
     }));
     let turn_engine = TurnEngineState::default();
     let memory_organizer = MemoryOrganizer::spawn()?;
@@ -657,15 +658,7 @@ pub(in crate::web) async fn usage_details_web(
     Ok(Json(json!({ "ok": true, "records": records })).into_response())
 }
 
-#[cfg(target_os = "linux")]
-pub(in crate::web) fn trim_process_memory() {
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(in crate::web) fn trim_process_memory() {}
+pub(in crate::web) use crate::runtime::trim_process_memory;
 
 pub(in crate::web) async fn shutdown_signal() {
     // systemd stop / `kill` 发的是 SIGTERM：必须与 SIGINT 一样走优雅停机

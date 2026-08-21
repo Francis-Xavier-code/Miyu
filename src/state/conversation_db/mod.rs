@@ -110,11 +110,14 @@ impl ConversationDb {
         conn.execute_batch(
             // auto_vacuum 必须在建表**之前**设，新库才认。老库这句是空转，
             // 由下面的 `reclaim_free_pages` 补一次 VACUUM 来落地。
+            // cache_size：本库存活数据只有个位数 MB、典型查询 1-2 ms，
+            // 默认 2 MB 页缓存对它是浪费，1 MB 足够且无感。
             "PRAGMA auto_vacuum = INCREMENTAL;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA cache_size = -1024;",
         )?;
         // Back up the database file before applying schema migrations to a
         // database that already holds data.

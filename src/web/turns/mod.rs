@@ -497,15 +497,22 @@ pub(in crate::web) async fn stop_session_runs(
             }
         }
     }
+    // 事件驱动：run 结束由 finish_run 的 runs_changed 通知。notified()
+    // 先于条件检查注册，不存在漏通知窗口；比旧 100ms 轮询响应还快。
     let deadline = tokio::time::Instant::now() + timeout;
+    let notify = state.manager.lock().unwrap().runs_changed.clone();
     loop {
+        let notified = notify.notified();
         if !state.manager.lock().unwrap().session_has_runs(session_id) {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
     }
 }
 

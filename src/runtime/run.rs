@@ -82,6 +82,9 @@ pub(crate) struct ManagerState {
     pub(crate) admin_busy: bool,
     pub(crate) context: ContextSnapshot,
     pub(crate) persona_session_ids: HashMap<String, String>,
+    /// 每当有 run 从 `active_runs` 移除时通知一次。等「某个/某些 run 结束」
+    /// 的循环靠它事件化，免掉定周期拿全局锁轮询。
+    pub(crate) runs_changed: Arc<tokio::sync::Notify>,
 }
 
 impl ManagerState {
@@ -192,6 +195,7 @@ pub(crate) fn finish_run(
         if let Some(followup) = run.platform_followup {
             followup.close();
         }
+        manager.runs_changed.notify_waiters();
     }
 }
 

@@ -273,7 +273,8 @@ async fn run_turn_task_inner(
             active_tools,
             mode,
             audience,
-        )?;
+        )?
+        .with_headless_pacing();
         let mut runtime_system_context = profile
             .as_ref()
             .map(|profile| profile.system_context.clone())

@@ -397,14 +397,15 @@ pub(in crate::web) fn rebuild_for_config(
         crate::models_cache::ensure_active_metadata(paths, &next_config);
         let client = OpenAiCompatibleClient::from_config(&next_config, paths)?;
         let registry = build_tool_registry(&next_config, paths, AgentMode::Normal, true)?;
-        Agent::new(
+        Ok(Agent::new(
             next_config.clone(),
             paths,
             target_state_store.clone(),
             client,
             registry,
             AgentMode::Normal,
-        )
+        )?
+        .with_headless_pacing())
     };
     let next_agent = if agent.is_some() {
         match build_agent() {

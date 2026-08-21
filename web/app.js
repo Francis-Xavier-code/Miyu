@@ -3366,6 +3366,7 @@
   /// 共用一个帧号还有个好处:重画时新建的元素直接落在当前帧上,不会从头闪。
   function startBrailleTicker() {
     window.setInterval(() => {
+      if (document.hidden) return;
       const spinners = document.querySelectorAll(".session-run-spinner");
       if (!spinners.length) return;
       state.brailleFrame = (state.brailleFrame + 1) % BRAILLE_FRAMES.length;
@@ -8309,6 +8310,7 @@
   }
 
   setInterval(() => {
+    if (document.hidden) return;
     const visible = visibleBackgroundJobs();
     if (!visible.length) return;
     // 只更新计时文本：全量重建会重启 CSS 旋转动画，导致 spinner 每秒瞬移回原点。
@@ -10539,6 +10541,11 @@
     // 灯箱自己不会画图标（图标集在这边），把工厂函数递过去。
     window.MiyuLightbox?.init({ makeIconSlot });
     startBrailleTicker();
+    // G2:页面不可见时给 body 挂 miyu-paused,CSS 据此暂停全部装饰动画。
+    // 实测(Xvfb+Chrome)不挂这个时隐藏窗口的合成负载与可见时完全一样。
+    const syncPaused = () => document.body.classList.toggle("miyu-paused", document.hidden);
+    document.addEventListener("visibilitychange", syncPaused);
+    syncPaused();
     loadBootstrap();
   }
 

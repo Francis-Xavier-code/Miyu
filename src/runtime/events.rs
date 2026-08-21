@@ -27,7 +27,15 @@ pub(crate) struct EventHub {
 pub(crate) struct EventHubInner {
     pub(crate) next_id: u64,
     pub(crate) records: VecDeque<EventRecord>,
+    /// `records` 里 kind+data 的字节和。上限只按条数（4096）时，流式
+    /// delta 夹杂大工具输出可以把重放缓冲顶到 10MB+；字节水位把它有界化，
+    /// 淘汰方向与条数满时一致（丢最旧）。
+    pub(crate) bytes: usize,
 }
+
+/// 重放缓冲的字节水位。达到后从头部淘汰——语义与「条数满丢最旧」相同，
+/// 只是多一个触发条件。
+pub(crate) const EVENT_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
 pub(crate) struct EventSubscription {
     pub(crate) pending: VecDeque<EventRecord>,
@@ -41,6 +49,7 @@ impl EventHub {
             inner: Arc::new(Mutex::new(EventHubInner {
                 next_id: 1,
                 records: VecDeque::with_capacity(EVENT_CAPACITY),
+                bytes: 0,
             })),
             sender,
         }
@@ -56,8 +65,14 @@ impl EventHub {
             data: serde_json::to_string(&data)
                 .unwrap_or_else(|_| "{\"error\":\"event serialization failed\"}".to_string()),
         };
-        if inner.records.len() == EVENT_CAPACITY {
-            inner.records.pop_front();
+        let record_bytes = record.kind.len() + record.data.len();
+        inner.bytes += record_bytes;
+        while inner.records.len() == EVENT_CAPACITY
+            || (inner.bytes > EVENT_BYTE_CAPACITY && !inner.records.is_empty())
+        {
+            if let Some(evicted) = inner.records.pop_front() {
+                inner.bytes -= evicted.kind.len() + evicted.data.len();
+            }
         }
         inner.records.push_back(record.clone());
         let _ = self.sender.send(record);

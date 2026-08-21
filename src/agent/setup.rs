@@ -115,7 +115,17 @@ impl Agent {
             last_compact_max_seq: std::sync::atomic::AtomicI64::new(-1),
             rapid_compacts: std::sync::atomic::AtomicU32::new(0),
             soft_notice_sent: std::sync::atomic::AtomicBool::new(false),
+            spinner_interval: crate::render::wait_spinner::SPINNER_INTERVAL,
         })
+    }
+
+    /// daemon 内跑的回合调用：SpinnerTick 出不了进程（event_map 丢弃，
+    /// REPL/一次性会话的动画由 CLI 本地定时器驱动），只剩 journal 尾部
+    /// 冲刷的兜底作用，降到 200ms。终端直连（CLI direct）不要调，动画
+    /// 帧率靠 40ms。
+    pub(crate) fn with_headless_pacing(mut self) -> Self {
+        self.spinner_interval = std::time::Duration::from_millis(200);
+        self
     }
 
     /// Stops the idle cache-keepalive loop (called whenever a new request is

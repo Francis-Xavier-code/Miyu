@@ -18,7 +18,7 @@ fn renderer_client_is_lazy_and_limits_are_bounded() {
     let renderer = MarkdownImageRenderer::new().unwrap();
     assert!(renderer.worker.try_lock().unwrap().process.is_none());
     assert_eq!(MAX_CACHED_GLYPHS, 2048);
-    assert_eq!(WORKER_IDLE_TIMEOUT, Duration::from_secs(60 * 60));
+    assert_eq!(WORKER_IDLE_TIMEOUT, Duration::from_secs(10 * 60));
     assert_eq!(RENDER_TIMEOUT, Duration::from_secs(60));
     // debug 二进制 550MB+,光映射自身就撞 512MB;开发构建放宽。
     #[cfg(not(debug_assertions))]

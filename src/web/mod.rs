@@ -232,6 +232,7 @@ impl DaemonState {
             admin_busy: false,
             context,
             persona_session_ids: HashMap::new(),
+            runs_changed: Arc::new(tokio::sync::Notify::new()),
         }));
         let events = EventHub::new();
         let questions = QuestionBroker::new();

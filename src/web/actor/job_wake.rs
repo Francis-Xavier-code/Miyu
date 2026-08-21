@@ -96,18 +96,27 @@ pub(in crate::web) async fn handle_job_completion(
                 stream_job_wake_to_origin_tty(stream_state, stream_completion, stream_wake).await;
             });
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(600);
-        while std::time::Instant::now() < deadline {
+        // 事件驱动：run 结束由 finish_run 的 runs_changed 通知，不再
+        // 500ms 拿全局锁轮询。notified() 在查条件**之前**注册，堵死
+        // 「查完没在等、通知恰好落空」的竞态；60s 慢速兜底纯属防御。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        let notify = state.manager.lock().unwrap().runs_changed.clone();
+        loop {
+            let notified = notify.notified();
             let still_running = state
                 .manager
                 .lock()
                 .unwrap()
                 .active_runs
                 .contains_key(&wake.run_id);
-            if !still_running {
+            if !still_running || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
         }
     }
     tools::jobs::acknowledge(&completion.job_id);

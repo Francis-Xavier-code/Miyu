@@ -684,7 +684,8 @@ pub(in crate::web) fn build_session_agent(
     crate::models_cache::ensure_active_metadata(paths, config);
     let client = OpenAiCompatibleClient::from_config(config, paths)?;
     let registry = build_tool_registry(config, paths, mode, true)?;
-    Agent::new(config.clone(), paths, state.clone(), client, registry, mode)
+    Ok(Agent::new(config.clone(), paths, state.clone(), client, registry, mode)?
+        .with_headless_pacing())
 }
 
 pub(in crate::web) fn session_state(

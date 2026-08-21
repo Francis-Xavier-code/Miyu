@@ -57,6 +57,7 @@ impl DaemonState {
             admin_busy: false,
             context,
             persona_session_ids: HashMap::new(),
+            runs_changed: Arc::new(tokio::sync::Notify::new()),
         }));
         let (actor_tx, _actor_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -117,7 +118,9 @@ pub(crate) struct TurnResources {
     pub(crate) restricted_tools: crate::tools::ToolRegistry,
 }
 
-pub(crate) const MAX_CACHED_TURN_RESOURCE_CONFIGS: usize = 16;
+// 8 而不是更多：每份 TurnResources 带三套完整工具注册表（实测 0.7–1.8 MB），
+// 满槽就是十几 MB 的悬崖；miss 的代价只是几 ms 的重建。
+pub(crate) const MAX_CACHED_TURN_RESOURCE_CONFIGS: usize = 8;
 
 pub(crate) struct TurnResourceCache {
     pub(crate) entries: HashMap<[u8; 32], Arc<TurnResources>>,

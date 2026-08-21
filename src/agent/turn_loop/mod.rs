@@ -166,7 +166,7 @@ impl Agent {
                     },
                 );
                 tokio::pin!(llm_future);
-                let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+                let mut spinner_interval = tokio::time::interval(self.spinner_interval);
                 spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 spinner_interval.tick().await;
                 let supersede = control.and_then(|control| control.supersede.as_deref());
@@ -761,7 +761,7 @@ impl Agent {
                     }
                 };
                 tokio::pin!(tool_future);
-                let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+                let mut spinner_interval = tokio::time::interval(self.spinner_interval);
                 spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 spinner_interval.tick().await;
                 let (output, tool_succeeded) = loop {
@@ -854,7 +854,7 @@ impl Agent {
                     let image_message = if uses_vision_fallback {
                         let image_future = self.clipboard_image_message(img);
                         tokio::pin!(image_future);
-                        let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+                        let mut spinner_interval = tokio::time::interval(self.spinner_interval);
                         spinner_interval
                             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         spinner_interval.tick().await;

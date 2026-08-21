@@ -102,7 +102,7 @@ impl Agent {
                 }
             }
             let mut remaining = slots.iter().filter(|slot| slot.future.is_some()).count();
-            let mut spinner_interval = tokio::time::interval(SPINNER_INTERVAL);
+            let mut spinner_interval = tokio::time::interval(self.spinner_interval);
             spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             spinner_interval.tick().await;
             while remaining > 0 {

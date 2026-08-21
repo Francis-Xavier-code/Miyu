@@ -43,11 +43,15 @@ pub(crate) fn spawn_scheduled_message_worker(state: crate::runtime::DaemonState)
         let mut fired: HashSet<String> = HashSet::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(TICK_SECONDS)).await;
-            let config = state.manager.lock().unwrap().config.clone();
-            if !config.platforms.qq.enabled {
-                continue;
-            }
-            let tasks = enabled_tasks(&config);
+            // 锁内只读开关并解析任务表，不整份深拷贝 AppConfig：这个 tick 在
+            // QQ 关闭/无任务的空闲期也一直在跑，拷贝是纯浪费。
+            let tasks = {
+                let manager = state.manager.lock().unwrap();
+                if !manager.config.platforms.qq.enabled {
+                    continue;
+                }
+                enabled_tasks(&manager.config)
+            };
             if tasks.is_empty() {
                 if !fired.is_empty() {
                     fired.clear();

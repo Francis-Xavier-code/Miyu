@@ -7463,3 +7463,13 @@ body[data-theme="linen"] .u-type-pill.t-aux { color: var(--md-sys-color-on-secon
     display: none;
   }
 }
+
+/* ── G2:不可见即暂停 ──
+   页面隐藏(切标签/最小化)时由 app.js 挂 miyu-paused。所有无限动画
+   (status-pulse/shimmer/typing-bounce/spin 等)暂停,恢复可见时原地续播,
+   视觉零变化。实测隐藏窗口不暂停时合成负载与可见时相同。 */
+body.miyu-paused *,
+body.miyu-paused *::before,
+body.miyu-paused *::after {
+  animation-play-state: paused !important;
+}

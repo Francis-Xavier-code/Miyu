@@ -51,7 +51,6 @@ use crate::question::{
     answered_tool_output, closed_tool_output, unavailable_tool_output, QuestionCancelled,
     QuestionExchange, QuestionRequest, QuestionResponse,
 };
-use crate::render::wait_spinner::SPINNER_INTERVAL;
 use crate::state::{
     QueuedPrompt, QueuedPromptAttachment, RedoCandidate, RedoInputKind, StateStore,
     TurnRedoCheckpointPayload,
@@ -298,6 +297,11 @@ pub struct Agent {
     rapid_compacts: std::sync::atomic::AtomicU32,
     /// One-shot "context is getting large" notice at the soft watermark.
     soft_notice_sent: std::sync::atomic::AtomicBool,
+    /// SpinnerTick 的发射周期。终端直连形态用 40ms 驱动动画；daemon 内
+    /// 的回合（平台/WebUI/子代理）tick 出不了进程（event_map 丢弃），
+    /// 唯一作用是给 journal 尾部冲刷兜底，200ms 足够——25Hz 定时器在
+    /// 每次 LLM 往返全程空转是活跃期最大的无谓唤醒源。
+    spinner_interval: std::time::Duration,
 }
 
 struct PreparedUserInput {

@@ -10,7 +10,9 @@
 
 use crate::platforms::plugins::renderer::*;
 
-pub(in crate::platforms::plugins::renderer) const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+// 10 分钟：worker 常驻约 30 MB（字体 + 塑形缓存），闲置回收后下次渲染
+// 自动重拉，冷启动只多付一次字体加载。
+pub(in crate::platforms::plugins::renderer) const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub(in crate::platforms::plugins::renderer) const RENDER_TIMEOUT: Duration = Duration::from_secs(60);
 

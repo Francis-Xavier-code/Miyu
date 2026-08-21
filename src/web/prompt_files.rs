@@ -126,7 +126,8 @@ pub(in crate::web) fn rebuild_for_models(
                 registry,
                 AgentMode::Normal,
             )
-            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?,
+            .map_err(|error| AdminFailure::Internal(safe_error_message(&error)))?
+            .with_headless_pacing(),
         )
     } else {
         None

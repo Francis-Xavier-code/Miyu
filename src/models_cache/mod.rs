@@ -121,6 +121,10 @@ pub fn try_load_active(paths: &crate::paths::MiyuPaths, config: &crate::config::
         retain_configured_models(&mut cache.data, config);
         let mut lock = cache_lock().lock().unwrap();
         *lock = Some(cache);
+        drop(lock);
+        // 3.6MB 的目录 JSON 全量解析出的临时树刚被释放，立刻还给 OS，
+        // 别让它抬着进程高水位（REPL 冷启动路径也走这里）。
+        crate::runtime::trim_process_memory();
     }
 }
 
@@ -149,6 +153,8 @@ pub fn spawn_background_refresh_active(
             retain_configured_models(&mut cache.data, &config);
             let mut lock = cache_lock().lock().unwrap();
             *lock = Some(cache);
+            drop(lock);
+            crate::runtime::trim_process_memory();
         }
     });
 }

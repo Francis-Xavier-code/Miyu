@@ -55,6 +55,7 @@ pub(super) fn manager_with_run(
             cumulative_cache_read_tokens: 0,
         },
         persona_session_ids: HashMap::new(),
+        runs_changed: Arc::new(tokio::sync::Notify::new()),
     }));
     (manager, cancel_rx)
 }
